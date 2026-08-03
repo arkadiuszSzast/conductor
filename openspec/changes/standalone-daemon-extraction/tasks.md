@@ -2,9 +2,9 @@
 
 ## 1. Extract the pure core
 
-- [ ] [core] Move pipeline types, pure interpreter, template renderer and structural validator from `opencode-conductor` into `@conductor/core` without semantic changes.
-- [ ] [test] Move interpreter, template and validator tests; preserve every existing case and test count.
-- [ ] [core] Define stable core exports and eliminate imports from Bun, filesystem, network, clock and SQLite.
+- [x] [core] Move pipeline types, pure interpreter, template renderer and structural validator from `opencode-conductor` into `@conductor/core` without semantic changes.
+- [x] [test] Move interpreter, template and validator tests; preserve every existing case and test count.
+- [x] [core] Define stable core exports and eliminate imports from Bun, filesystem, network, clock and SQLite.
 
 ## 2. Extract persistence and engine
 
