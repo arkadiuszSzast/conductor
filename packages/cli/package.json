@@ -1,0 +1,15 @@
+{
+  "name": "@conductor/cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The conductor CLI: init, start, status, approve, report, …",
+  "type": "module",
+  "main": "src/index.ts",
+  "module": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@conductor/server": "workspace:*"
+  }
+}

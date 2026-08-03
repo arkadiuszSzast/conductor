@@ -1,0 +1,15 @@
+{
+  "name": "@conductor/runner-opencode",
+  "version": "0.1.0",
+  "private": true,
+  "description": "opencode runner adapter — the old plugin, shrunk to a Runner.",
+  "type": "module",
+  "main": "src/index.ts",
+  "module": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@conductor/server": "workspace:*"
+  }
+}

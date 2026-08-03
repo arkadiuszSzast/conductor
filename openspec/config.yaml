@@ -1,0 +1,115 @@
+schema: spec-driven
+
+# Context — injected into every OpenSpec planning request.
+# Captures the product identity and the commitments that do not change per
+# change. Anything technical that isn't load-bearing here should stay open so
+# changes can decide it on the merits.
+context: |
+  # Product
+
+  Conductor is a self-hosted, runtime-agnostic system that drives AI coding
+  agents through configurable workflows the way CI systems drive builds:
+  workflow-as-data like GitHub Actions, a task board like Jira, and agents
+  that pull work themselves under human-set limits and human-owned gates.
+
+  The seed is `opencode-conductor`, an opencode plugin that drives a feature
+  through a persistent pipeline (design → implement → internal review → PR →
+  CI loop → external review → merge) with a SQLite state machine, a
+  reconciler, child agent sessions, human approval gates, a findings
+  lifecycle, and a small dashboard. Conductor is that seed carried into a
+  standalone service — by extraction and generalisation, not a rewrite.
+
+  # Commitments (the "what", not the "how")
+
+  - Standalone system, not a plugin. Own daemon/service with its own state,
+    API, and UI. Agent runtimes are integrations behind a `Runner`
+    abstraction; opencode is the first runner.
+  - Workflow-as-data, GitHub-Actions-style. Pipelines are declarative YAML
+    composed from reusable, versioned actions instead of engine built-ins.
+    Real graph semantics where the work demands them (`needs:`-style deps,
+    fan-out/fan-in, conditional edges) while keeping simple linear flows
+    simple. Triggers (`on:`) so work can start without a human typing a
+    command.
+  - The operational layer is first-class and carried over from the seed:
+    durable state surviving restarts, reconciler-driven progress, idle
+    detection and reaping, escalation to humans as a designed state (not a
+    crash), findings lifecycle with bot identity projection, human
+    approval/rejection with notes that flow into downstream steps.
+  - Resilience with patience: exponential backoff with jitter and a cap,
+    attempt budgets expressed in time-and-tries rather than tries alone, and
+    per-failure-class retry policies. Escalation remains the end state — it
+    should arrive after the system has genuinely waited out transient weather.
+  - SQLite is the source of truth; sessions are disposable executors.
+    Findings/gates/timeline live in the DB and surface through the API so the
+    board and third-party UIs are equals.
+  - Genuinely open source: no host-specific paths, no hardcoded model gateway,
+    no assumptions about one user's home directory. The gloam-idle setup is
+    *a* configuration, not *the* shape.
+
+  # Non-goals (for now)
+
+  - Not a hosted SaaS; self-hosted single-team first.
+  - Not an agent framework (no prompt/loop authoring DSL) — runners bring
+    their own agents; we orchestrate them.
+  - Not LLM-driven conflict prediction as a core mechanism (declarative scopes
+    first).
+  - Not a replacement for CI — it drives agents *around* existing CI.
+
+  # Confirmed decisions (do not reopen without a proposal)
+
+  - Name: Conductor.
+  - Language/runtime: Bun/TypeScript. `opencode-conductor` becomes the
+    `@conductor/runner-opencode` adapter.
+  - Repository: monorepo (Bun workspaces) — `packages/core`, `packages/server`,
+    `packages/runner-opencode`, `packages/cli`, `apps/web`, `docs`.
+  - v1 scope: Pillar 1 (standalone) + Pillar 2 (workflow-as-data) + operational
+    layer + resilience. The board and pull-scheduling are later phases, not
+    launch requirements.
+  - Actions v1: local registry (`actions/<name>@v1`); git-based resolution
+    (`owner/repo@v1`) comes later.
+  - Agent report-back is the daemon's HTTP API plus a `conductor` CLI — a
+    runner only needs createSession/prompt/status/note.
+
+  # Guardrails
+
+  - Extraction over rewrite: the conductor's engine/store/dashboard are the
+    seed of the standalone service; its tests and battle scars come along.
+  - Dogfooding is the north star: gloam-idle (and the benches) run on this
+    from the first extraction day. Feature filter: "does gloam need this this
+    week?"
+  - Scope is risk #1. Each phase ends in a working, dogfooded state.
+  - The GitHub Actions mental model is the UX benchmark: if someone who knows
+    GHA can't read one of our workflow files cold, the format is wrong.
+  - The DB schema is adopted additively: in-flight conductor features survive
+    the migration to the standalone daemon.
+
+rules:
+  proposal:
+    - State the user-facing outcome before any technical shape.
+    - Map the change to the pillars/non-goals above; flag anything that would
+      change a confirmed decision.
+    - Call out every opencode-conductor carry-over explicitly and justify it.
+    - Note migration impact on the conductor DB and on gloam-idle configs.
+  specs:
+    - Keep scenarios at the behavior level (workflow outcomes, gate
+      semantics, retry behaviour, runner contract) rather than implementation
+      detail.
+  design:
+    - List the open technical choices the design closes and the alternatives
+      considered.
+    - Note scheduler / concurrency implications, durability, and where side
+      effects live (interpreter pure, engine owns I/O).
+  tasks:
+    - Every task line MUST start with a category prefix in square brackets.
+    - "Allowed prefixes (combine, e.g. `[impl][db]`):"
+    - "  `[core]` pure engine / interpreter / workflow model / validation / templates"
+    - "  `[server]` daemon: HTTP API, reconciler, triggers, scheduler hooks, lifecycle"
+    - "  `[runner]` runner abstraction and runner adapters"
+    - "  `[cli]` conductor CLI surface"
+    - "  `[db]` schema migration / store accessors / queries / indexes"
+    - "  `[web]` board and exploration view UI"
+    - "  `[test]` tests at any layer"
+    - "  `[docs]` README / per-module doc / OpenAPI re-check"
+    - "  `[review]` explicit post-implementation review pass"
+    - "  `[fix]` build / test / type failure to diagnose"
+    - Keep the natural implementation order within a change.

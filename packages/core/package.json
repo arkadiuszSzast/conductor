@@ -1,0 +1,12 @@
+{
+  "name": "@conductor/core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pure engine: interpreter, workflow model, validation, templates.",
+  "type": "module",
+  "main": "src/index.ts",
+  "module": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}

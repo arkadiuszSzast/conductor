@@ -1,0 +1,15 @@
+{
+  "name": "@conductor/server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Daemon: HTTP API, reconciler, triggers, scheduler hooks.",
+  "type": "module",
+  "main": "src/index.ts",
+  "module": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@conductor/core": "workspace:*"
+  }
+}

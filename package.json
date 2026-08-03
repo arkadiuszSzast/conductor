@@ -1,0 +1,32 @@
+{
+  "name": "conductor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A self-hosted, runtime-agnostic CI for AI coding agents.",
+  "type": "module",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "lint": "tsc --noEmit --noUnusedLocals",
+    "build": "bun run typecheck"
+  },
+  "engines": {
+    "node": ">=24",
+    "bun": ">=1.0"
+  },
+  "dependencies": {
+    "@conductor/cli": "workspace:*",
+    "@conductor/core": "workspace:*",
+    "@conductor/runner-opencode": "workspace:*",
+    "@conductor/server": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.0"
+  }
+}
