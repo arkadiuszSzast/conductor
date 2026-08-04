@@ -104,6 +104,48 @@ prompt: "Your previous design: {{ feedback.jobs.arch-a.design }}
 Works with the existing `{{ dotted.path }}` renderer; the `jobs` nesting keeps
 lookup unambiguous.
 
+### Step outputs are a named map (GHA mirror), not a scalar
+
+`StepRuntime.output: string | null` became
+`outputs: Record<name, string>` and `step.completed` carries `outputs?`.
+A single scalar per step conflicted with the action-registry spec's typed
+multi-outputs (`git/push@v1` naturally publishes `sha` **and** `url`) and
+forced JSON-in-string workarounds. The GHA convention is mirrored end to
+end: command steps append `name=value` lines to `$CONDUCTOR_OUTPUT`, actions
+publish per their manifest, and the runner maps single-blob producers to a
+conventional name — agent report → `report`, human note → `notes`. The
+"one output" cases are runner conventions over one key in the map, not model
+limits; if agents later gain a `set_output` tool the event already carries a
+map and the core does not change. `JobDef.outputs` (declared expressions over
+step outputs) is unchanged — step outputs are the job's private detail, the
+declaration is its published, validatable contract.
+
+### The loop edge is `rerun`, never `needs` — and `feedback` is soft
+
+The DAG must stay acyclic, so a rerun target can never `needs` its judge;
+the loop edge is the `rerun` route declared on the routing step. This split
+gives the two context namespaces different guarantees, both intentional:
+
+- `needs.*` / `steps.*` are **hard**: the DAG ordered them, a missing value
+  is an error before side effects.
+- `feedback.*` is **soft**: outside a rerun the namespace is empty by
+  design — round 1 has no previous round. Prompts are written two-phase
+  ("empty in round 1"); no separate round-1/round-2 prompt variants.
+
+`feedback` references remain statically checkable against the loop edge:
+`feedback.jobs[J][S]` in job X is legal iff some `rerun` route targets X and
+J is one of that rerun's targets or its routing job (S its routing step).
+The check lands with the expression evaluator (`workflow-format` task 2.3).
+
+### Open question: explicit `escalate` route variant
+
+`onFail?: Route` encodes escalation as absence. Adding
+`Route = ... | { kind: "escalate" }` and making `onFail` required (parser
+default: escalate) would make the IR total and let outcomes route to
+escalation explicitly; the two engine-invariant escalations (unmapped
+outcome, exhausted `maxRounds`) would stay implicit. Deferred — revisit
+before the YAML parser freezes the authoring surface.
+
 ### Escalation is the safety valve
 
 At `maxRounds` the rerun escalates instead of looping. A human resumes with

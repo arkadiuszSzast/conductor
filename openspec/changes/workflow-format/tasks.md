@@ -33,5 +33,6 @@
 
 - [ ] [cli] Implement legacy JSON → v1 YAML conversion with builtin→action mapping and no guessed semantics.
 - [ ] [test] Build event-level parity fixtures running representative legacy pipelines through old and new interpreters.
-- [ ] [docs] Publish workflow reference, JSON schema/editor integration, expression language, action authoring and migration guide.
+- [x] [docs] Publish workflow reference (`docs/workflow-reference.md`), expression language (`docs/expressions.md`) and execution concepts (`docs/concepts.md`); planned-but-unimplemented behaviour is marked in place.
+- [ ] [docs] Publish JSON schema/editor integration, action authoring and migration guide (blocked on parser and registry).
 - [ ] [review] Review the dialect cold against the GHA UX benchmark and run security review of YAML/expression/action inputs.
