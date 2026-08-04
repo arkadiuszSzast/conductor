@@ -83,31 +83,38 @@ export interface HumanStep extends StepBase {
 }
 
 // ---------------------------------------------------------------------------
-// Retry — a sealed policy with a discriminated backoff strategy
+// Retry — sealed policies, each variant is self-contained (no all-null config)
 // ---------------------------------------------------------------------------
 
-export interface RetryPolicy {
-  /** Total attempts including the first. Default: 1 (no retry). */
-  readonly maxAttempts?: number
-  /** ISO-8601 duration (e.g. "10m"). Default: "10m". */
-  readonly maxElapsed?: string
-  /** Backoff strategy. Default: exp-backoff with sane defaults. */
-  readonly backoff?: BackoffDef
-}
+/** How to re-attempt a step that failed. Absent `retry` on a step behaves
+ *  like `{ strategy: "none" }`. */
+export type RetryPolicy =
+  | { readonly strategy: "none" }
+  | {
+      readonly strategy: "backoff"
+      /** Total attempts including the first. Must be ≥ 1. */
+      readonly maxAttempts: number
+      /** ISO-8601 duration (e.g. "PT10M") capping total elapsed time. */
+      readonly maxElapsed?: string
+      /** Backoff strategy — always required for a "backoff" policy. */
+      readonly backoff: BackoffDef
+    }
 
-/** Sealed: only "exp-backoff" for now; the discriminant lets the engine
- *  match-and-add strategies without opening a general eval surface. */
-export type BackoffDef = {
-  readonly strategy: "exp-backoff"
-  /** Initial delay in ms. Default: 1000. */
-  readonly initial?: number
-  /** Multiplier per attempt. Default: 2. */
-  readonly multiplier?: number
-  /** Max delay cap in ms. Default: 60000. */
-  readonly max?: number
-  /** Jitter mode. Default: "full". */
-  readonly jitter?: "none" | "full" | "equal"
-}
+/** Sealed: the discriminant lets the engine match-and-add strategies without
+ *  opening a general eval surface. */
+export type BackoffDef =
+  | { readonly strategy: "constant"; readonly delay: number }
+  | {
+      readonly strategy: "exponential"
+      /** First delay in ms. Must be ≥ 0. */
+      readonly initial: number
+      /** Delay multiplier per attempt. Must be ≥ 1. */
+      readonly multiplier: number
+      /** Delay cap in ms. Must be ≥ 0. */
+      readonly max: number
+      /** Jitter mode. Default: "full". */
+      readonly jitter?: "none" | "full" | "equal"
+    }
 
 // ---------------------------------------------------------------------------
 // Verdict routing (review loops)

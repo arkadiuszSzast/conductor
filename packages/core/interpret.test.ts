@@ -24,7 +24,7 @@ const steps: StepDef[] = [
     id: "gate",
     type: "command",
     run: ["./gradlew check"],
-    retry: { maxAttempts: 2 },
+    retry: { strategy: "backoff", maxAttempts: 2, backoff: { strategy: "constant", delay: 100 } },
     onFail: { goto: "fix_gate" },
   },
   { id: "fix_gate", type: "agent", role: "fixer", prompt: "fix the gate", then: "gate" },
@@ -188,7 +188,7 @@ describe("step.failed", () => {
       jobs: {
         main: {
           steps: [
-            { id: "flaky", type: "command", run: ["true"], retry: { maxAttempts: 2 } },
+            { id: "flaky", type: "command", run: ["true"], retry: { strategy: "backoff", maxAttempts: 2, backoff: { strategy: "constant", delay: 100 } } },
           ],
         },
       },
@@ -211,7 +211,7 @@ describe("step.failed", () => {
       jobs: {
         main: {
           steps: [
-            { id: "flaky", type: "command", run: ["true"], retry: { maxAttempts: 3 } },
+            { id: "flaky", type: "command", run: ["true"], retry: { strategy: "backoff", maxAttempts: 3, backoff: { strategy: "constant", delay: 100 } } },
           ],
         },
       },
@@ -252,7 +252,7 @@ describe("step.failed", () => {
       jobs: {
         main: {
           steps: [
-            { id: "solo", type: "command", run: ["true"], retry: { maxAttempts: 3 } },
+            { id: "solo", type: "command", run: ["true"], retry: { strategy: "backoff", maxAttempts: 3, backoff: { strategy: "constant", delay: 100 } } },
           ],
         },
       },

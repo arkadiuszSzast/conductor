@@ -126,3 +126,25 @@ events through both interpreters until parity is established.
   is a discriminated union keyed on `strategy` (`"exp-backoff"` today) with
   optional fields carrying defaults; `AgentStep.prompt` is required (the IR is
   self-describing). No `X | null` for absent config.
+- **Retry is a sealed policy, not a bag of nullable fields.**
+  `retry?: RetryPolicy` where `RetryPolicy = { strategy: "none" } |
+  { strategy: "backoff"; maxAttempts: number; maxElapsed?: string;
+  backoff: BackoffDef }` — a "backoff" policy always carries a required
+  `backoff`. `BackoffDef` is itself sealed: `{ strategy: "constant"; delay } |
+  { strategy: "exponential"; initial; multiplier; max; jitter? }`. The engine
+  fills jitter defaults; there is no all-null policy value.
+- **Within a job, steps are a path, not a graph.** `then?: string` names the
+  single next step (default: next in list); loops are explicit edges
+  (`onFail.goto`, verdict `goto`, `roundsWith`). Parallelism lives at the
+  **job** level (`needs`), so step-level fan-out (`then: string[]`) is not in
+  the model — adding it would force `currentStep` into a multi-active set.
+  Open question for a later change.
+- **Known gap: cross-job feedback loops.** A single job can express a bounded
+  consensus loop (`roundsWith`/`maxRounds`) and two jobs can run agents in
+  parallel (`needs`), but "parallel agents → consensus → re-run both with the
+  other's output" is NOT expressible: verdict `goto` is job-local, completed
+  jobs cannot be re-triggered, and there is no declared data flow routing one
+  step's `output` into another step's prompt (outputs are captured in
+  `StepRuntime.output`; prompt wiring is engine-side templating only). This is
+  the prime candidate for the next IR change (a loopable "phase" primitive +
+  step/job `inputs` referencing outputs).

@@ -253,7 +253,9 @@ function onFailed(
     steps: { [stepId]: { status: "failed" } },
   }
 
-  const retryMaxAttempts = step.retry?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS
+  const retryMaxAttempts = step.retry?.strategy === "backoff"
+    ? step.retry.maxAttempts
+    : DEFAULT_MAX_ATTEMPTS
 
   if (attempts >= retryMaxAttempts) {
     const failureReason = `"${jobId}/${stepId}" exhausted ${retryMaxAttempts} attempt(s)`

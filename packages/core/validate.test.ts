@@ -100,7 +100,7 @@ describe("validateWorkflow", () => {
         main: {
           steps: [
             { id: "a", type: "command", run: ["x"] },
-            { id: "b", type: "command", run: ["x"], retry: { maxAttempts: 3 }, onFail: { goto: "a" } },
+            { id: "b", type: "command", run: ["x"], retry: { strategy: "backoff", maxAttempts: 3, backoff: { strategy: "constant", delay: 100 } }, onFail: { goto: "a" } },
           ],
         },
       },
@@ -165,5 +165,67 @@ describe("validateWorkflow", () => {
       },
     })
     expect(r.errors.join("\n")).toContain("empty uses")
+  })
+
+  it("rejects a backoff retry with maxAttempts below 1", () => {
+    const r = validateWorkflow({
+      ...base,
+      jobs: {
+        main: {
+          steps: [
+            {
+              id: "a",
+              type: "command",
+              run: ["x"],
+              retry: { strategy: "backoff", maxAttempts: 0, backoff: { strategy: "constant", delay: 10 } },
+            },
+          ],
+        },
+      },
+    })
+    expect(r.errors.join("\n")).toContain("retry.maxAttempts")
+  })
+
+  it("rejects a constant backoff with a negative delay", () => {
+    const r = validateWorkflow({
+      ...base,
+      jobs: {
+        main: {
+          steps: [
+            {
+              id: "a",
+              type: "command",
+              run: ["x"],
+              retry: { strategy: "backoff", maxAttempts: 2, backoff: { strategy: "constant", delay: -1 } },
+            },
+          ],
+        },
+      },
+    })
+    expect(r.errors.join("\n")).toContain("backoff.delay")
+  })
+
+  it("rejects a malformed maxElapsed duration", () => {
+    const r = validateWorkflow({
+      ...base,
+      jobs: {
+        main: {
+          steps: [
+            {
+              id: "a",
+              type: "command",
+              run: ["x"],
+              retry: {
+                strategy: "backoff",
+                maxAttempts: 2,
+                maxElapsed: "10m",
+                backoff: { strategy: "constant", delay: 10 },
+              },
+            },
+          ],
+        },
+      },
+    })
+    expect(r.errors.join("\n")).toContain("ISO-8601")
   })
 })

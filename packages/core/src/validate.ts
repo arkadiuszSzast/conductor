@@ -156,22 +156,30 @@ function validateJob(
 }
 
 function validateRetry(retry: NonNullable<StepDef["retry"]>, where: string, errors: string[]): void {
-  if (retry.maxAttempts !== undefined && retry.maxAttempts < 1) {
+  if (retry.strategy === "none") return
+  if (retry.maxAttempts < 1) {
     errors.push(`${where}: retry.maxAttempts must be ≥ 1`)
   }
-  if (retry.backoff !== undefined) {
-    validateBackoff(retry.backoff, where, errors)
+  if (retry.maxElapsed !== undefined && !/^P(?:\d+[YMWD])?(?:T(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?)?$/.test(retry.maxElapsed)) {
+    errors.push(`${where}: retry.maxElapsed must be an ISO-8601 duration (e.g. "PT10M")`)
   }
+  validateBackoff(retry.backoff, where, errors)
 }
 
 function validateBackoff(backoff: BackoffDef, where: string, errors: string[]): void {
-  if (backoff.initial !== undefined && backoff.initial < 0) {
+  if (backoff.strategy === "constant") {
+    if (backoff.delay < 0) {
+      errors.push(`${where}: backoff.delay must be ≥ 0`)
+    }
+    return
+  }
+  if (backoff.initial < 0) {
     errors.push(`${where}: backoff.initial must be ≥ 0`)
   }
-  if (backoff.multiplier !== undefined && backoff.multiplier < 1) {
+  if (backoff.multiplier < 1) {
     errors.push(`${where}: backoff.multiplier must be ≥ 1`)
   }
-  if (backoff.max !== undefined && backoff.max < 0) {
+  if (backoff.max < 0) {
     errors.push(`${where}: backoff.max must be ≥ 0`)
   }
 }
@@ -217,7 +225,7 @@ function findUncountedCycles(steps: readonly StepDef[]): string[][] {
       counted.add(step.id)
       if (step.roundsWith !== undefined) counted.add(step.roundsWith)
     }
-    if (step.retry?.maxAttempts !== undefined) {
+    if (step.retry?.strategy === "backoff") {
       counted.add(step.id)
     }
   }
