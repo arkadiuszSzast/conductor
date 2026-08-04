@@ -126,3 +126,38 @@ of an operator rather than burning tokens.
 - `workflow-format` graph spec: makes its "return to an earlier job" clause
   concrete without re-shaping state.
 - `JobRuntime.reruns` is additive; existing fixtures default it to `{}`.
+
+## Confirmed: the IR is a normalised form
+
+The IR is the product of parsing, not the authoring surface. YAML keeps its
+sugar (omit `needs`, omit `outputs`, write a bare step); the parser fills the
+empty collection. So a field is optional in the IR only when its absence means
+something no empty value can express.
+
+- **Collections are total.** `WorkflowDef.on`, `WorkflowDef.inputs`,
+  `JobDef.needs`, `JobDef.outputs`, `StepBase.outcomes`, `ActionStep.with` and
+  `TriggerEvent.inputs` are required and may be empty. Empty `needs` means
+  "ready at once"; empty `outcomes` means "always advance".
+- **Optional means "absent ≠ empty".** `JobDef.if` (absent = "run when
+  dependencies succeeded", which `""` cannot express), `CommandStep.cwd`
+  (absent = the job's directory), `CommandStep.timeoutMs` (absent = no
+  timeout, `0` = expire immediately), `StepBase.onFail` (absent = escalate)
+  and every field of `Patch` (absent = leave alone).
+- **Choices are discriminated unions, not bags of optional fields.**
+  `Route` is `{kind:"next"} | {kind:"goto",stepId} | {kind:"rerun",target}`;
+  `RerunTarget` is `{scope:"steps",stepIds,maxRounds} | {scope:"jobs",jobIds,maxRounds}`;
+  `InputDef` is `{presence:"required"} | {presence:"optional",default}`;
+  `RetryPolicy` and `BackoffDef` likewise. An unrepresentable state — a route
+  with both `goto` and `rerun`, a rerun with neither steps nor jobs, an input
+  both required and defaulted — can no longer be constructed, so the
+  corresponding validation rules disappear.
+- **`then` is gone.** It was a second spelling of `goto`. The path is
+  declaration order; anything else is an explicit route.
+- **`onReject` and the human events are gone.** A human gate completes like
+  any other step: approving and rejecting are outcomes (`approved`,
+  `rejected`) carrying the note as `output`. `human.approved`/`human.rejected`
+  collapse into `step.completed`, so a gate can route, loop or rerun with
+  exactly the vocabulary every other step has.
+- **Test builders stand in for the parser.** `packages/core/testing.ts`
+  provides `agentStep`/`commandStep`/`job`/`workflow` and route helpers, so
+  tests read like authored workflows while the IR stays strict.

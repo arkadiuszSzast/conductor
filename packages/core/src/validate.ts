@@ -5,7 +5,7 @@
  *  - job `needs` form a DAG (no cycles)
  *  - every `needs` reference resolves
  *  - step ids are unique and non-empty within a job
- *  - every goto / then / rerun target exists within the same job
+ *  - every goto / rerun target exists within the same job
  *  - every agent step's role exists in `roles`
  *  - every loop edge carries a bounded counter
  *
@@ -14,7 +14,7 @@
  * process. Presets encode our recommendations instead.
  */
 
-import type { AgentStep, BackoffDef, JobDef, RerunTarget, StepDef, WorkflowDef } from "./types.ts"
+import type { AgentStep, BackoffDef, JobDef, RerunTarget, RetryPolicy, Route, StepDef, WorkflowDef } from "./types.ts"
 
 export interface ValidationResult {
   readonly errors: readonly string[]
@@ -118,27 +118,13 @@ function validateJob(
   for (const step of steps) {
     const stepWhere = `${where} step "${step.id}"`
 
-    if (step.then !== undefined && !stepExists(step.then)) {
-      errors.push(`${stepWhere}: then → "${step.then}" does not exist`)
+    for (const [outcome, route] of Object.entries(step.outcomes)) {
+      validateRoute(route, `outcomes["${outcome}"]`, def, jobId, stepExists, stepWhere, errors)
     }
-    if (step.outcomes) {
-      for (const [outcome, route] of Object.entries(step.outcomes)) {
-        validateRoute(route, `outcomes["${outcome}"]`, def, jobId, stepExists, stepWhere, errors)
-        if (route.goto === undefined && route.next !== true && route.rerun === undefined) {
-          warnings.push(`${stepWhere}: outcomes["${outcome}"] routes nowhere (no goto, next, or rerun)`)
-        }
-      }
+    if (step.onFail) {
+      validateRoute(step.onFail, "onFail", def, jobId, stepExists, stepWhere, errors)
     }
-    if (step.onFail) validateRoute(step.onFail, "onFail", def, jobId, stepExists, stepWhere, errors)
-    if (step.onReject) {
-      validateRoute(step.onReject, "onReject", def, jobId, stepExists, stepWhere, errors)
-      if (step.type !== "human") {
-        warnings.push(`${stepWhere}: onReject on a non-human step — rejection can never occur`)
-      }
-    }
-    if (step.retry !== undefined) {
-      validateRetry(step.retry, stepWhere, errors)
-    }
+    validateRetry(step.retry, stepWhere, errors)
 
     if (step.type === "agent") {
       validateAgentStep(step as AgentStep, def, stepWhere, errors)
@@ -159,7 +145,7 @@ function validateJob(
   }
 }
 
-function validateRetry(retry: NonNullable<StepDef["retry"]>, where: string, errors: string[]): void {
+function validateRetry(retry: RetryPolicy, where: string, errors: string[]): void {
   if (retry.strategy === "none") return
   if (retry.maxAttempts < 1) {
     errors.push(`${where}: retry.maxAttempts must be ≥ 1`)
@@ -189,11 +175,11 @@ function validateBackoff(backoff: BackoffDef, where: string, errors: string[]): 
 }
 
 // ---------------------------------------------------------------------------
-// Route validation (goto, next, rerun) shared by outcomes, onFail, onReject
+// Route validation (next, goto, rerun) shared by outcomes and onFail
 // ---------------------------------------------------------------------------
 
 function validateRoute(
-  route: { readonly goto?: string; readonly next?: boolean; readonly rerun?: RerunTarget },
+  route: Route,
   label: string,
   def: WorkflowDef,
   routingJobId: string,
@@ -202,20 +188,17 @@ function validateRoute(
   errors: string[],
 ): void {
   const where = `${stepWhere}: ${label}`
-  const hasGoto = route.goto !== undefined
-  const hasNext = route.next === true
-  const hasRerun = route.rerun !== undefined
-
-  if ((hasGoto || hasNext) && hasRerun) {
-    errors.push(`${where}: goto/next must not be combined with rerun`)
-    return
-  }
-
-  if (hasGoto && route.goto !== undefined && !stepExists(route.goto)) {
-    errors.push(`${where}: goto → "${route.goto}" does not exist`)
-  }
-  if (hasRerun && route.rerun !== undefined) {
-    validateRerunTarget(route.rerun, label, def, routingJobId, stepExists, stepWhere, errors)
+  switch (route.kind) {
+    case "next":
+      return
+    case "goto":
+      if (!stepExists(route.stepId)) {
+        errors.push(`${where}: goto → "${route.stepId}" does not exist`)
+      }
+      return
+    case "rerun":
+      validateRerunTarget(route.target, label, def, routingJobId, stepExists, stepWhere, errors)
+      return
   }
 }
 
@@ -233,27 +216,23 @@ function validateRerunTarget(
     errors.push(`${where}: rerun.maxRounds must be ≥ 1`)
   }
 
-  const hasSteps = rerun.stepIds !== undefined && rerun.stepIds.length > 0
-  const hasJobs = rerun.jobIds !== undefined && rerun.jobIds.length > 0
-
-  if (!hasSteps && !hasJobs) {
-    errors.push(`${where}: rerun needs at least one of stepIds or jobIds`)
-    return
-  }
-  if (hasSteps && hasJobs) {
-    errors.push(`${where}: rerun must not mix stepIds and jobIds`)
-    return
-  }
-
-  for (const stepId of rerun.stepIds ?? []) {
-    if (!stepExists(stepId)) {
-      errors.push(`${where}: rerun step "${stepId}" does not exist in this job`)
+  if (rerun.scope === "steps") {
+    if (rerun.stepIds.length === 0) {
+      errors.push(`${where}: rerun names no steps`)
     }
+    for (const stepId of rerun.stepIds) {
+      if (!stepExists(stepId)) {
+        errors.push(`${where}: rerun step "${stepId}" does not exist in this job`)
+      }
+    }
+    return
   }
 
-  for (const jobId of rerun.jobIds ?? []) {
-    const targetJob = def.jobs[jobId]
-    if (!targetJob) {
+  if (rerun.jobIds.length === 0) {
+    errors.push(`${where}: rerun names no jobs`)
+  }
+  for (const jobId of rerun.jobIds) {
+    if (!def.jobs[jobId]) {
       errors.push(`${where}: rerun job "${jobId}" does not exist`)
       continue
     }
@@ -304,28 +283,26 @@ function validateAgentStep(
 function findUncountedCycles(steps: readonly StepDef[]): string[][] {
   const stepsById = new Map(steps.map(step => [step.id, step]))
   const counted = new Set<string>()
+  const countLoop = (step: StepDef, route: Route): void => {
+    if (route.kind !== "rerun") return
+    counted.add(step.id)
+    if (route.target.scope === "steps") {
+      for (const rerunStepId of route.target.stepIds) counted.add(rerunStepId)
+    }
+  }
+
   for (const step of steps) {
-    if (step.retry?.strategy === "backoff") {
-      counted.add(step.id)
-    }
-    for (const route of Object.values(step.outcomes ?? {})) {
-      if (route.rerun) {
-        counted.add(step.id)
-        for (const rerunStepId of route.rerun.stepIds ?? []) counted.add(rerunStepId)
-      }
-    }
-    if (step.onFail?.rerun) {
-      counted.add(step.id)
-      for (const rerunStepId of step.onFail.rerun.stepIds ?? []) counted.add(rerunStepId)
-    }
+    if (step.retry.strategy === "backoff") counted.add(step.id)
+    for (const route of Object.values(step.outcomes)) countLoop(step, route)
+    if (step.onFail) countLoop(step, step.onFail)
   }
 
   const edges = (step: StepDef): string[] => {
     const targets: string[] = []
-    if (step.then !== undefined) targets.push(step.then)
-    for (const route of Object.values(step.outcomes ?? {})) {
-      if (route.goto !== undefined) targets.push(route.goto)
+    for (const route of Object.values(step.outcomes)) {
+      if (route.kind === "goto") targets.push(route.stepId)
     }
+    if (step.onFail?.kind === "goto") targets.push(step.onFail.stepId)
     return targets.filter(stepId => stepsById.has(stepId))
   }
 

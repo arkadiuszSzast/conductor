@@ -1,12 +1,20 @@
 import { describe, expect, it } from "bun:test"
 import { interpret } from "./src/interpret.ts"
-import type {
-  FeatureState,
-  JobRuntime,
-  PipelineEvent,
-  StepDef,
-  WorkflowDef,
-} from "./src/types.ts"
+import {
+  actionStep,
+  agentStep,
+  backoff,
+  commandStep,
+  featureState,
+  goto,
+  humanStep,
+  next,
+  job as defineJob,
+  jobRuntime,
+  rerunSteps,
+  workflow as mkWorkflow,
+} from "./testing.ts"
+import type { FeatureState, JobRuntime, PipelineEvent, StepDef, WorkflowDef } from "./src/types.ts"
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -19,67 +27,28 @@ const roles: WorkflowDef["roles"] = {
 }
 
 const steps: StepDef[] = [
-  { id: "implement", type: "agent", role: "implementer", prompt: "implement {{feature}}" },
-  {
-    id: "gate",
-    type: "command",
-    run: ["./gradlew check"],
-    retry: { strategy: "backoff", maxAttempts: 2, backoff: { strategy: "constant", delay: 100 } },
-    onFail: { goto: "fix_gate" },
-  },
-  { id: "fix_gate", type: "agent", role: "fixer", prompt: "fix the gate", then: "gate" },
-  {
-    id: "review",
-    type: "agent",
-    role: "reviewer",
-    prompt: "review the diff",
+  agentStep("implement", "implementer", "implement {{feature}}"),
+  commandStep("gate", ["./gradlew check"], { retry: backoff(2), onFail: goto("fix_gate") }),
+  agentStep("fix_gate", "fixer", "fix the gate", { outcomes: { done: goto("gate") } }),
+  agentStep("review", "reviewer", "review the diff", {
     outcomes: {
-      approved: { goto: "approve-merge" },
-      changes_requested: { rerun: { stepIds: ["fix_review"], maxRounds: 3 } },
+      approved: goto("approve-merge"),
+      changes_requested: rerunSteps(["fix_review"], 3),
     },
-  },
-  { id: "fix_review", type: "agent", role: "fixer", prompt: "fix the review findings", then: "review" },
-  { id: "approve-merge", type: "human", onReject: { goto: "fix_review" } },
-  { id: "merge", type: "action", uses: "git/pr-merge@v1" },
+  }),
+  agentStep("fix_review", "fixer", "fix the review findings", { outcomes: { done: goto("review") } }),
+  humanStep("approve-merge", { outcomes: { approved: next, rejected: goto("fix_review") } }),
+  actionStep("merge", "git/pr-merge@v1"),
 ]
 
-const workflow: WorkflowDef = {
-  name: "test",
-  roles,
-  jobs: { main: { steps } },
-}
+const workflow = mkWorkflow({ main: defineJob(steps) }, roles)
 
 function job(over: Partial<JobRuntime> = {}): JobRuntime {
-  return {
-    status: "running",
-    currentStep: null,
-    attempts: {},
-    rounds: {},
-    reruns: {},
-    outputs: {},
-    steps: {},
-    ...over,
-  }
+  return jobRuntime({ status: "running", ...over })
 }
 
 function state(over: Partial<FeatureState> = {}): FeatureState {
-  return {
-    id: "f1",
-    title: "Test feature",
-    slug: "test-feature",
-    projectDir: "/tmp/proj",
-    workflow: null,
-    description: null,
-    status: "running",
-    trigger: null,
-    input: {},
-    sessionId: null,
-    worktree: null,
-    branch: null,
-    pr: null,
-    jobs: { main: job() },
-    ...over,
-  }
+  return featureState({ main: job() }, over)
 }
 
 function evt(e: Omit<PipelineEvent, "jobId"> & { jobId?: string }): PipelineEvent {
@@ -184,17 +153,10 @@ describe("step.failed", () => {
   })
 
   it("escalates once retries are exhausted when there is no onFail route", () => {
-    const localWorkflow: WorkflowDef = {
-      name: "test",
+    const localWorkflow = mkWorkflow(
+      { main: defineJob([commandStep("flaky", ["true"], { retry: backoff(2) })]) },
       roles,
-      jobs: {
-        main: {
-          steps: [
-            { id: "flaky", type: "command", run: ["true"], retry: { strategy: "backoff", maxAttempts: 2, backoff: { strategy: "constant", delay: 100 } } },
-          ],
-        },
-      },
-    }
+    )
     const t = interpret(
       localWorkflow,
       state({
@@ -207,17 +169,10 @@ describe("step.failed", () => {
   })
 
   it("retries the same step when there is no goto", () => {
-    const localWorkflow: WorkflowDef = {
-      name: "test",
+    const localWorkflow = mkWorkflow(
+      { main: defineJob([commandStep("flaky", ["true"], { retry: backoff(3) })]) },
       roles,
-      jobs: {
-        main: {
-          steps: [
-            { id: "flaky", type: "command", run: ["true"], retry: { strategy: "backoff", maxAttempts: 3, backoff: { strategy: "constant", delay: 100 } } },
-          ],
-        },
-      },
-    }
+    )
     const t = interpret(
       localWorkflow,
       state({ jobs: { main: job({ currentStep: "flaky" }) } }),
@@ -228,17 +183,10 @@ describe("step.failed", () => {
   })
 
   it("escalates on the first failure when there is no retry and no onFail route", () => {
-    const localWorkflow: WorkflowDef = {
-      name: "test",
+    const localWorkflow = mkWorkflow(
+      { main: defineJob([commandStep("critical", ["true"])]) },
       roles,
-      jobs: {
-        main: {
-          steps: [
-            { id: "critical", type: "command", run: ["true"] },
-          ],
-        },
-      },
-    }
+    )
     const t = interpret(
       localWorkflow,
       state({ jobs: { main: job({ currentStep: "critical" }) } }),
@@ -248,17 +196,10 @@ describe("step.failed", () => {
   })
 
   it("treats maxAttempts as total executions including the first", () => {
-    const localWorkflow: WorkflowDef = {
-      name: "test",
+    const localWorkflow = mkWorkflow(
+      { main: defineJob([commandStep("solo", ["true"], { retry: backoff(3) })]) },
       roles,
-      jobs: {
-        main: {
-          steps: [
-            { id: "solo", type: "command", run: ["true"], retry: { strategy: "backoff", maxAttempts: 3, backoff: { strategy: "constant", delay: 100 } } },
-          ],
-        },
-      },
-    }
+    )
     const first = interpret(
       localWorkflow,
       state({ jobs: { main: job({ currentStep: "solo" }) } }),
@@ -335,49 +276,52 @@ describe("step.completed outcomes", () => {
 // Human interactions
 // ---------------------------------------------------------------------------
 
-describe("human interactions", () => {
-  it("human.approved advances past the gate to the next step", () => {
-    const t = interpret(
-      workflow,
-      state({
-        status: "waiting_human",
-        jobs: {
-          main: job({
-            currentStep: "approve-merge",
-            steps: { "approve-merge": { status: "waiting_human", output: null } },
-          }),
-        },
+describe("human gates", () => {
+  const atGate = () => state({
+    status: "waiting_human",
+    jobs: {
+      main: job({
+        currentStep: "approve-merge",
+        steps: { "approve-merge": { status: "waiting_human", output: null } },
       }),
-      evt({ kind: "human.approved", stepId: "approve-merge" }),
-    )
-    expect(t.decisions).toEqual([{ kind: "execute_step", jobId: "main", stepId: "merge" }])
-    expect(t.patch.status).toBe("running")
+    },
   })
 
-  it("human.approved is a noop when nothing awaits approval", () => {
+  it("an approving outcome advances past the gate", () => {
+    const t = interpret(
+      workflow,
+      atGate(),
+      evt({ kind: "step.completed", stepId: "approve-merge", outcome: "approved" }),
+    )
+    expect(t.decisions).toEqual([{ kind: "execute_step", jobId: "main", stepId: "merge" }])
+    expect(t.patch.jobs?.main?.steps?.["approve-merge"]?.status).toBe("succeeded")
+  })
+
+  it("is a noop when nothing awaits the gate", () => {
     const t = interpret(
       workflow,
       state({ jobs: { main: job({ currentStep: "gate" }) } }),
-      evt({ kind: "human.approved", stepId: "approve-merge" }),
+      evt({ kind: "step.completed", stepId: "approve-merge", outcome: "approved" }),
     )
     expect(t.decisions[0]?.kind).toBe("noop")
   })
 
-  it("human.rejected routes to onReject.goto", () => {
+  it("a rejecting outcome routes back to the fixer", () => {
     const t = interpret(
       workflow,
-      state({
-        status: "waiting_human",
-        jobs: {
-          main: job({
-            currentStep: "approve-merge",
-            steps: { "approve-merge": { status: "waiting_human", output: null } },
-          }),
-        },
-      }),
-      evt({ kind: "human.rejected", stepId: "approve-merge" }),
+      atGate(),
+      evt({ kind: "step.completed", stepId: "approve-merge", outcome: "rejected" }),
     )
     expect(t.decisions).toEqual([{ kind: "execute_step", jobId: "main", stepId: "fix_review" }])
+  })
+
+  it("carries the reviewer's note as the gate output", () => {
+    const t = interpret(
+      workflow,
+      atGate(),
+      evt({ kind: "step.completed", stepId: "approve-merge", outcome: "rejected", output: "needs tests" }),
+    )
+    expect(t.patch.jobs?.main?.steps?.["approve-merge"]?.output).toBe("needs tests")
   })
 
   it("pause and resume round-trip preserves the current step", () => {
@@ -434,7 +378,7 @@ describe("human interactions", () => {
     expect(t.decisions).toEqual([{ kind: "execute_step", jobId: "main", stepId: "gate" }])
     expect(t.patch.status).toBe("running")
     expect(t.patch.jobs?.main?.attempts).toEqual({ gate: 0, other: 1 })
-    expect(t.patch.jobs?.main?.rounds).toEqual({ gate: 0 })
+    expect(t.patch.jobs?.main?.reruns).toEqual({ gate: 0 })
   })
 
   it("resume on a running feature stays a noop", () => {
@@ -462,35 +406,22 @@ describe("human interactions", () => {
 // ---------------------------------------------------------------------------
 
 describe("DAG workflows", () => {
-  const dagWorkflow: WorkflowDef = {
-    name: "dag-test",
-    roles,
-    jobs: {
-      build: {
-        steps: [{ id: "compile", type: "command", run: ["make"] }],
-      },
-      "test-a": {
-        needs: ["build"],
-        steps: [{ id: "test", type: "command", run: ["make test-a"] }],
-      },
-      "test-b": {
-        needs: ["build"],
-        steps: [{ id: "test", type: "command", run: ["make test-b"] }],
-      },
-      review: {
-        needs: ["test-a", "test-b"],
-        steps: [
-          { id: "approve", type: "human" },
-          {
-            id: "merge",
-            type: "action",
-            uses: "git/pr-merge@v1",
-            onFail: { goto: "approve" },
-          },
+  const dagWorkflow = mkWorkflow(
+    {
+      build: defineJob([commandStep("compile", ["make"])]),
+      "test-a": defineJob([commandStep("test", ["make test-a"])], ["build"]),
+      "test-b": defineJob([commandStep("test", ["make test-b"])], ["build"]),
+      review: defineJob(
+        [
+          humanStep("approve"),
+          actionStep("merge", "git/pr-merge@v1", { onFail: goto("approve") }),
         ],
-      },
+        ["test-a", "test-b"],
+      ),
     },
-  }
+    roles,
+    "dag-test",
+  )
 
   function dagState(over: Partial<FeatureState> = {}): FeatureState {
     const baseJobs: Record<string, JobRuntime> = {}

@@ -3,6 +3,7 @@ import { name as core, interpret, render, validateWorkflow } from "@conductor/co
 import { name as server } from "@conductor/server"
 import { name as runner } from "@conductor/runner-opencode"
 import { name as cli } from "@conductor/cli"
+import type { FeatureState, WorkflowDef } from "@conductor/core"
 
 it("resolves every workspace package", () => {
   expect(core).toBe("@conductor/core")
@@ -13,13 +14,31 @@ it("resolves every workspace package", () => {
 })
 
 it("exports a working interpret + validateWorkflow pair", () => {
-  const workflow = {
+  const workflow: WorkflowDef = {
     name: "smoke",
+    on: [],
+    inputs: {},
     roles: { implementer: { agent: "build" } },
-    jobs: { main: { steps: [{ id: "impl", type: "agent", role: "implementer", prompt: "impl" }] } },
-  } as const
+    jobs: {
+      main: {
+        needs: [],
+        outputs: {},
+        steps: [
+          {
+            id: "impl",
+            type: "agent",
+            role: "implementer",
+            prompt: "impl",
+            outcomes: {},
+            retry: { strategy: "none" },
+          },
+        ],
+      },
+    },
+  }
   expect(validateWorkflow(workflow).errors).toEqual([])
-  const state = {
+
+  const state: FeatureState = {
     id: "f",
     title: "t",
     slug: "t",
@@ -33,8 +52,10 @@ it("exports a working interpret + validateWorkflow pair", () => {
     worktree: null,
     branch: null,
     pr: null,
-    jobs: { main: { status: "pending", currentStep: null, attempts: {}, rounds: {}, reruns: {}, outputs: {}, steps: {} } },
-  } as const
+    jobs: {
+      main: { status: "pending", currentStep: null, attempts: {}, reruns: {}, outputs: {}, steps: {} },
+    },
+  }
   expect(interpret(workflow, state, { kind: "feature.start" }).decisions[0]).toEqual({
     kind: "execute_step",
     jobId: "main",

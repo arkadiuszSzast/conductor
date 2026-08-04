@@ -6,36 +6,48 @@
  * builtin actions are gone (use `action` with `uses`), flat step lists
  * are gone (steps live inside `jobs`), and daemon config does not
  * leak into the pure core.
+ *
+ * This is the NORMALISED form: the product of parsing, not the authoring
+ * surface. YAML may omit `needs`, `outputs`, `on` and friends; the parser
+ * fills the empty collection. So a field is optional here only when its
+ * absence means something an empty value cannot express, and choices are
+ * modelled as discriminated unions rather than bags of optional fields.
  */
 
 // ---------------------------------------------------------------------------
-// Workflow definition (immutable, loaded from YAML by the server)
+// Workflow definition (immutable, produced by the parser)
 // ---------------------------------------------------------------------------
 
 export interface WorkflowDef {
   readonly name: string
-  readonly on?: readonly TriggerDef[]
-  readonly inputs?: Readonly<Record<string, InputDef>>
+  /** Empty means the workflow can only be started explicitly. */
+  readonly on: readonly TriggerDef[]
+  readonly inputs: Readonly<Record<string, InputDef>>
   readonly jobs: Readonly<Record<string, JobDef>>
   readonly roles: Readonly<Record<string, RoleDef>>
 }
 
 export type TriggerDef =
   | { readonly kind: "manual" }
-  | { readonly kind: "schedule"; readonly cron: string; readonly missedFire?: "skip" | "catch-up" }
+  | { readonly kind: "schedule"; readonly cron: string; readonly missedFire: "skip" | "catch-up" }
   | { readonly kind: "event"; readonly event: string }
 
-export interface InputDef {
-  readonly type: "string" | "number" | "boolean"
-  readonly required?: boolean
-  readonly default?: string | number | boolean
-}
+/** An input is either required or has a default — never both, never neither. */
+export type InputDef =
+  | { readonly type: InputType; readonly presence: "required" }
+  | { readonly type: InputType; readonly presence: "optional"; readonly default: string | number | boolean }
+
+export type InputType = "string" | "number" | "boolean"
 
 export interface JobDef {
-  readonly needs?: readonly string[]
+  /** Empty means the job is ready from the start. */
+  readonly needs: readonly string[]
+  /** Absent means "run when dependencies succeeded"; a condition overrides it
+   *  (e.g. `always()`), so absence and "empty condition" differ. */
   readonly if?: string
   readonly steps: readonly StepDef[]
-  readonly outputs?: Readonly<Record<string, string>>
+  /** Empty means the job publishes nothing to its dependents. */
+  readonly outputs: Readonly<Record<string, string>>
 }
 
 // ---------------------------------------------------------------------------
@@ -47,18 +59,17 @@ export type StepDef = AgentStep | ActionStep | CommandStep | HumanStep
 interface StepBase {
   readonly id: string
   readonly if?: string
-  readonly then?: string
   /** Routes keyed by the step's declared outcome. A step that completes its
    *  work reports an outcome (default `"done"`); the interpreter routes on it.
-   *  This is one mechanism for every "the step worked, here is its result"
-   *  case: review verdicts, consensus checks, classifiers, gate results. */
-  readonly outcomes?: Outcomes
-  /** Route taken when the step could NOT complete its work (crash, non-zero
-   *  exit, timeout, transport error) after its retry budget is exhausted.
-   *  Distinct from an outcome: a failure means "re-running may help". */
+   *  One mechanism for every "the step worked, here is its result" case:
+   *  review verdicts, consensus checks, classifiers, human gate decisions.
+   *  Empty means "always advance along the path". */
+  readonly outcomes: Outcomes
+  /** Where to go when the step could NOT complete its work (crash, non-zero
+   *  exit, timeout) after its retry budget is exhausted. Absent means escalate
+   *  — distinct from any route, so it cannot be an empty value. */
   readonly onFail?: Route
-  readonly retry?: RetryPolicy
-  readonly onReject?: Route
+  readonly retry: RetryPolicy
 }
 
 /** Outcome name → route. Outcome names are workflow-defined strings; the
@@ -67,25 +78,22 @@ export interface Outcomes {
   readonly [outcome: string]: Route
 }
 
-/** A route: exactly one of `goto`, `next`, `rerun`. Validation rejects a
- *  mixture. `rerun` re-executes earlier steps/jobs as a bounded loop. */
-export interface Route {
-  readonly goto?: string
-  readonly next?: boolean
-  readonly rerun?: RerunTarget
-}
+/** Where a route goes. Exactly one shape — no bag of optional targets. */
+export type Route =
+  /** Continue along the job's step path. */
+  | { readonly kind: "next" }
+  /** Jump to another step in the same job. */
+  | { readonly kind: "goto"; readonly stepId: string }
+  /** Re-execute earlier work as a bounded loop. */
+  | { readonly kind: "rerun"; readonly target: RerunTarget }
 
-/** Re-execute earlier work as a bounded loop. `stepIds` re-runs steps within
- *  the routing job (review/fix loops); `jobIds` re-runs upstream jobs and
- *  their downstream closure (parallel-agent consensus). At least one is
- *  required. */
-export interface RerunTarget {
-  readonly stepIds?: readonly string[]
-  readonly jobIds?: readonly string[]
-  /** Total iterations including the first run. Must be ≥ 1 — every loop is
-   *  bounded by construction. */
-  readonly maxRounds: number
-}
+/** What a rerun re-executes. Exactly one scope — steps within the routing
+ *  job (review/fix loops) or upstream jobs and their downstream closure
+ *  (parallel-agent consensus). `maxRounds` (≥ 1) bounds every loop by
+ *  construction. */
+export type RerunTarget =
+  | { readonly scope: "steps"; readonly stepIds: readonly string[]; readonly maxRounds: number }
+  | { readonly scope: "jobs"; readonly jobIds: readonly string[]; readonly maxRounds: number }
 
 /** An agent step performs LLM work. The `prompt` is always required —
  *  the IR must be self-describing; the engine may prepend role-level
@@ -99,13 +107,16 @@ export interface AgentStep extends StepBase {
 export interface ActionStep extends StepBase {
   readonly type: "action"
   readonly uses: string
-  readonly with?: Readonly<Record<string, unknown>>
+  /** Empty means the action takes no inputs. */
+  readonly with: Readonly<Record<string, unknown>>
 }
 
 export interface CommandStep extends StepBase {
   readonly type: "command"
   readonly run: readonly string[]
+  /** Absent means the job's working directory — distinct from any path. */
   readonly cwd?: string
+  /** Absent means no timeout; 0 would mean "expire immediately". */
   readonly timeoutMs?: number
 }
 
@@ -117,15 +128,15 @@ export interface HumanStep extends StepBase {
 // Retry — sealed policies, each variant is self-contained (no all-null config)
 // ---------------------------------------------------------------------------
 
-/** How to re-attempt a step that failed. Absent `retry` on a step behaves
- *  like `{ strategy: "none" }`. */
+/** How to re-attempt a step that could not complete its work. */
 export type RetryPolicy =
   | { readonly strategy: "none" }
   | {
       readonly strategy: "backoff"
       /** Total attempts including the first. Must be ≥ 1. */
       readonly maxAttempts: number
-      /** ISO-8601 duration (e.g. "PT10M") capping total elapsed time. */
+      /** ISO-8601 duration (e.g. "PT10M") capping total elapsed time.
+       *  Absent means only the attempt count bounds the retry. */
       readonly maxElapsed?: string
       /** Backoff strategy — always required for a "backoff" policy. */
       readonly backoff: BackoffDef
@@ -189,7 +200,7 @@ export type StepStatus =
 export interface TriggerEvent {
   readonly kind: string
   readonly deliveryId: string
-  readonly inputs?: Readonly<Record<string, unknown>>
+  readonly inputs: Readonly<Record<string, unknown>>
 }
 
 export interface FeatureState {
@@ -211,9 +222,9 @@ export interface FeatureState {
 
 export interface JobRuntime {
   readonly status: JobStatus
+  /** Null when the job has not started or has finished. */
   readonly currentStep: string | null
   readonly attempts: Readonly<Record<string, number>>
-  readonly rounds: Readonly<Record<string, number>>
   /** Per-routing-step rerun loop counter (survives closure reset). */
   readonly reruns: Readonly<Record<string, number>>
   readonly outputs: Readonly<Record<string, unknown>>
@@ -231,9 +242,15 @@ export interface StepRuntime {
 
 export type PipelineEvent =
   | { readonly kind: "feature.start" }
-  /** The step completed its work. `outcome` selects the route from the step's
-   *  `outcomes` map (default `"done"` when the step declares none); `output`
-   *  is the step's payload, available to later steps and to feedback. */
+  /** A step finished its work. `outcome` selects the route from the step's
+   *  `outcomes` map (default `"done"`); `output` is the step's payload,
+   *  available to later steps and to feedback.
+   *
+   *  A human gate uses the same event: approving is an outcome (`"approved"`
+   *  by default), rejecting is an outcome too (`"rejected"`), with the note
+   *  carried as `output`. The interpreter needs no separate human vocabulary
+   *  — a gate that wants to loop back on rejection just maps that outcome to
+   *  a rerun, exactly like a review step. */
   | {
       readonly kind: "step.completed"
       readonly jobId: string
@@ -244,8 +261,6 @@ export type PipelineEvent =
   /** The step could NOT complete its work (crash, non-zero exit, timeout).
    *  Subject to the retry budget, then `onFail`. */
   | { readonly kind: "step.failed"; readonly jobId: string; readonly stepId: string; readonly reason: string }
-  | { readonly kind: "human.approved"; readonly jobId: string; readonly stepId: string }
-  | { readonly kind: "human.rejected"; readonly jobId: string; readonly stepId: string; readonly notes?: string }
   | { readonly kind: "human.paused" }
   | { readonly kind: "human.resumed" }
   | { readonly kind: "human.abandoned" }
@@ -279,9 +294,13 @@ export interface Transition {
 
 export interface Feedback {
   readonly jobs: Readonly<Record<string, Readonly<Record<string, string>>>>
-  readonly message?: string
+  readonly message: string
 }
 
+/**
+ * A sparse update to `FeatureState`. Here optionality is meaningful: an
+ * absent field means "leave it alone", which no empty value can express.
+ */
 export interface Patch {
   readonly status?: FeatureStatus
   readonly jobs?: Readonly<Record<string, JobPatch>>
@@ -291,7 +310,6 @@ export interface JobPatch {
   readonly status?: JobStatus
   readonly currentStep?: string | null
   readonly attempts?: Readonly<Record<string, number>>
-  readonly rounds?: Readonly<Record<string, number>>
   readonly reruns?: Readonly<Record<string, number>>
   readonly outputs?: Readonly<Record<string, unknown>>
   readonly steps?: Readonly<Record<string, StepPatch>>

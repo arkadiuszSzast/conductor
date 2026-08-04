@@ -1,15 +1,25 @@
 import { describe, expect, it } from "bun:test"
 import { interpret } from "./src/interpret.ts"
 import { validateWorkflow } from "./src/validate.ts"
-import type {
-  FeatureState,
-  JobRuntime,
-  PipelineEvent,
-  WorkflowDef,
-} from "./src/types.ts"
+import {
+  actionStep,
+  agentStep,
+  backoff,
+  commandStep,
+  featureState,
+  goto,
+  humanStep,
+  job,
+  jobRuntime,
+  next,
+  rerunJobs,
+  rerunSteps,
+  workflow as mkWorkflow,
+} from "./testing.ts"
+import type { FeatureState, JobRuntime, WorkflowDef } from "./src/types.ts"
 
 // ---------------------------------------------------------------------------
-// Shared state helpers
+// Shared helpers
 // ---------------------------------------------------------------------------
 
 const roles: WorkflowDef["roles"] = {
@@ -18,59 +28,36 @@ const roles: WorkflowDef["roles"] = {
   planner: { agent: "build", model: "prov/plan" },
 }
 
-function mkJob(overrides: Partial<JobRuntime> = {}): JobRuntime {
-  return {
-    status: "pending",
-    currentStep: null,
-    attempts: {},
-    rounds: {},
-    reruns: {},
-    outputs: {},
-    steps: {},
-    ...overrides,
-  }
-}
+const mkJob = jobRuntime
 
 function mkState(jobs: Record<string, JobRuntime>, status: FeatureState["status"] = "running"): FeatureState {
-  return {
-    id: "f1", title: "t", slug: "t", projectDir: "/p",
-    workflow: "w", description: null, status,
-    trigger: null, input: {}, sessionId: null,
-    worktree: null, branch: null, pr: null,
-    jobs,
-  }
+  return featureState(jobs, { status })
 }
 
 // ---------------------------------------------------------------------------
 // Two-architect parallel consensus workflow (the motivating example)
 // ---------------------------------------------------------------------------
 
-const twoArchitectsWorkflow: WorkflowDef = {
-  name: "parallel-design",
-  roles,
-  jobs: {
-    "arch-a": { steps: [{ id: "design", type: "agent", role: "architect", prompt: "Design {{feature}}." }] },
-    "arch-b": { steps: [{ id: "design", type: "agent", role: "architect", prompt: "Design independently." }] },
-    consensus: {
-      needs: ["arch-a", "arch-b"],
-      steps: [
-        {
-          id: "check",
-          type: "agent",
-          role: "adjudicator",
-          prompt: "Compare designs.",
+const twoArchitectsWorkflow = mkWorkflow(
+  {
+    "arch-a": job([agentStep("design", "architect", "Design {{feature}}.")]),
+    "arch-b": job([agentStep("design", "architect", "Design independently.")]),
+    consensus: job(
+      [
+        agentStep("check", "adjudicator", "Compare designs.", {
           outcomes: {
-            agree: { next: true },
-            disagree: {
-              rerun: { jobIds: ["arch-a", "arch-b"], maxRounds: 3 },
-            },
+            agree: next,
+            disagree: rerunJobs(["arch-a", "arch-b"], 3),
           },
-        },
-        { id: "breakdown", type: "agent", role: "planner", prompt: "Split into tasks." },
+        }),
+        agentStep("breakdown", "planner", "Split into tasks."),
       ],
-    },
+      ["arch-a", "arch-b"],
+    ),
   },
-}
+  roles,
+  "parallel-design",
+)
 
 describe("cross-job rerun", () => {
   it("validates the two-architects workflow cleanly", () => {
@@ -181,25 +168,20 @@ describe("cross-job rerun", () => {
 // ---------------------------------------------------------------------------
 
 describe("onFail rerun", () => {
-  const failRerunWorkflow: WorkflowDef = {
-    name: "gate-rerun",
-    roles: { implementer: { agent: "build" } },
-    jobs: {
-      implement: { steps: [{ id: "code", type: "agent", role: "implementer", prompt: "Code it." }] },
-      gate: {
-        needs: ["implement"],
-        steps: [{
-          id: "check",
-          type: "command",
-          run: ["./gradlew check"],
-          retry: { strategy: "backoff", maxAttempts: 2, backoff: { strategy: "constant", delay: 100 } },
-          onFail: {
-            rerun: { jobIds: ["implement"], maxRounds: 2 },
-          },
-        }],
-      },
+  const failRerunWorkflow = mkWorkflow(
+    {
+      implement: job([agentStep("code", "implementer", "Code it.")]),
+      gate: job(
+        [commandStep("check", ["./gradlew check"], {
+          retry: backoff(2),
+          onFail: rerunJobs(["implement"], 2),
+        })],
+        ["implement"],
+      ),
     },
-  }
+    { implementer: { agent: "build" } },
+    "gate-rerun",
+  )
 
   it("validates cleanly", () => {
     expect(validateWorkflow(failRerunWorkflow).errors).toEqual([])
@@ -240,29 +222,21 @@ describe("onFail rerun", () => {
 })
 
 // ---------------------------------------------------------------------------
-// onReject rerun
+// Human gate rejection rerun
 // ---------------------------------------------------------------------------
 
-describe("onReject rerun", () => {
-  const rejectRerunWorkflow: WorkflowDef = {
-    name: "design-loop",
-    roles: { designer: { agent: "build" } },
-    jobs: {
-      design: { steps: [{ id: "draft", type: "agent", role: "designer", prompt: "Design." }] },
-      approval: {
-        needs: ["design"],
-        steps: [
-          {
-            id: "gate",
-            type: "human",
-            onReject: {
-              rerun: { jobIds: ["design"], maxRounds: 3 },
-            },
-          },
-        ],
-      },
+describe("human gate rejection rerun", () => {
+  const rejectRerunWorkflow = mkWorkflow(
+    {
+      design: job([agentStep("draft", "designer", "Design.")]),
+      approval: job(
+        [humanStep("gate", { outcomes: { rejected: rerunJobs(["design"], 3) } })],
+        ["design"],
+      ),
     },
-  }
+    { designer: { agent: "build" } },
+    "design-loop",
+  )
 
   it("reruns design on human rejection", () => {
     const state = mkState({
@@ -270,9 +244,11 @@ describe("onReject rerun", () => {
       approval: mkJob({ status: "waiting_human", currentStep: "gate" }),
     })
     const t = interpret(rejectRerunWorkflow, state, {
-      kind: "human.rejected",
+      kind: "step.completed",
       jobId: "approval",
       stepId: "gate",
+      outcome: "rejected",
+      output: "not convinced",
     })
     expect(t.decisions[0]?.kind).toBe("execute_step")
     expect((t.decisions[0] as { jobId: string }).jobId).toBe("design")
@@ -280,6 +256,7 @@ describe("onReject rerun", () => {
     expect(t.patch.jobs?.approval?.reruns?.gate).toBe(1)
     expect(t.feedback?.jobs?.design?.draft).toBe("draft")
     expect(t.feedback?.message).toContain("rejected")
+    expect(t.feedback?.jobs?.approval?.gate).toBe("not convinced")
   })
 })
 
@@ -288,64 +265,52 @@ describe("onReject rerun", () => {
 // ---------------------------------------------------------------------------
 
 describe("rerun validation", () => {
+  const roleSet = { a: { agent: "build" } }
+
   it("rejects rerun to a missing job", () => {
-    const v = validateWorkflow({
-      name: "x",
-      roles: { a: { agent: "build" } },
-      jobs: {
-        src: { steps: [{ id: "s", type: "agent", role: "a", prompt: "s", outcomes: { ok: { rerun: { jobIds: ["ghost"], maxRounds: 2 } } } }] },
-      },
-    })
+    const v = validateWorkflow(mkWorkflow(
+      { src: job([agentStep("s", "a", "s", { outcomes: { ok: rerunJobs(["ghost"], 2) } })]) },
+      roleSet,
+    ))
     expect(v.errors.join("\n")).toContain('"ghost" does not exist')
   })
 
   it("rejects rerun to the routing job itself", () => {
-    const v = validateWorkflow({
-      name: "x",
-      roles: { a: { agent: "build" } },
-      jobs: {
-        a: { steps: [{ id: "s", type: "agent", role: "a", prompt: "s", outcomes: { ok: { rerun: { jobIds: ["a"], maxRounds: 2 } } } }] },
-      },
-    })
+    const v = validateWorkflow(mkWorkflow(
+      { a: job([agentStep("s", "a", "s", { outcomes: { ok: rerunJobs(["a"], 2) } })]) },
+      roleSet,
+    ))
     expect(v.errors.join("\n")).toContain("must not be the routing job")
   })
 
   it("rejects rerun to a downstream job", () => {
-    const v = validateWorkflow({
-      name: "x",
-      roles: { a: { agent: "build" } },
-      jobs: {
-        src: { steps: [{ id: "s", type: "agent", role: "a", prompt: "s", outcomes: { ok: { rerun: { jobIds: ["downstream"], maxRounds: 2 } } } }] },
-        downstream: { needs: ["src"], steps: [{ id: "d", type: "command", run: ["echo ok"] }] },
+    const v = validateWorkflow(mkWorkflow(
+      {
+        src: job([agentStep("s", "a", "s", { outcomes: { ok: rerunJobs(["downstream"], 2) } })]),
+        downstream: job([commandStep("d", ["echo ok"])], ["src"]),
       },
-    })
+      roleSet,
+    ))
     expect(v.errors.join("\n")).toContain("downstream")
   })
 
   it("rejects maxRounds below 1", () => {
-    const v = validateWorkflow({
-      name: "x",
-      roles: { a: { agent: "build" } },
-      jobs: {
-        upstream: { steps: [{ id: "s", type: "command", run: ["echo"] }] },
-        src: {
-          needs: ["upstream"],
-          steps: [{ id: "s", type: "agent", role: "a", prompt: "s", outcomes: { ok: { rerun: { jobIds: ["upstream"], maxRounds: 0 } } } }],
-        },
+    const v = validateWorkflow(mkWorkflow(
+      {
+        upstream: job([commandStep("s", ["echo"])]),
+        src: job([agentStep("s", "a", "s", { outcomes: { ok: rerunJobs(["upstream"], 0) } })], ["upstream"]),
       },
-    })
+      roleSet,
+    ))
     expect(v.errors.join("\n")).toContain("maxRounds must be ≥ 1")
   })
 
-  it("rejects goto combined with rerun", () => {
-    const v = validateWorkflow({
-      name: "x",
-      roles: { a: { agent: "build" } },
-      jobs: {
-        src: { steps: [{ id: "s", type: "agent", role: "a", prompt: "s", outcomes: { ok: { goto: "s", rerun: { jobIds: ["x"], maxRounds: 2 } } } }] },
-      },
-    })
-    expect(v.errors.join("\n")).toContain("must not be combined")
+  it("rejects a rerun naming no targets", () => {
+    const v = validateWorkflow(mkWorkflow(
+      { src: job([agentStep("s", "a", "s", { outcomes: { ok: rerunJobs([], 2) } })]) },
+      roleSet,
+    ))
+    expect(v.errors.join("\n")).toContain("names no jobs")
   })
 })
 
@@ -354,24 +319,14 @@ describe("rerun validation", () => {
 // ---------------------------------------------------------------------------
 
 describe("outcome semantics", () => {
-  const linear: WorkflowDef = {
-    name: "linear",
-    roles: { a: { agent: "build" } },
-    jobs: {
-      main: {
-        steps: [
-          { id: "one", type: "agent", role: "a", prompt: "one" },
-          { id: "two", type: "agent", role: "a", prompt: "two" },
-        ],
-      },
-    },
-  }
+  const linear = mkWorkflow(
+    { main: job([agentStep("one", "a", "one"), agentStep("two", "a", "two")]) },
+    { a: { agent: "build" } },
+  )
 
   it("a step without outcomes advances regardless of the reported outcome", () => {
     const state = mkState({ main: mkJob({ status: "running", currentStep: "one" }) })
-    const withDefault = interpret(linear, state, {
-      kind: "step.completed", jobId: "main", stepId: "one",
-    })
+    const withDefault = interpret(linear, state, { kind: "step.completed", jobId: "main", stepId: "one" })
     const withName = interpret(linear, state, {
       kind: "step.completed", jobId: "main", stepId: "one", outcome: "anything",
     })
@@ -388,18 +343,15 @@ describe("outcome semantics", () => {
   })
 
   it("escalates on an outcome missing from a declared outcomes map", () => {
-    const declared: WorkflowDef = {
-      name: "declared",
-      roles: { a: { agent: "build" } },
-      jobs: {
-        main: {
-          steps: [
-            { id: "classify", type: "agent", role: "a", prompt: "c", outcomes: { cat: { next: true } } },
-            { id: "after", type: "agent", role: "a", prompt: "a" },
-          ],
-        },
+    const declared = mkWorkflow(
+      {
+        main: job([
+          agentStep("classify", "a", "c", { outcomes: { cat: next } }),
+          agentStep("after", "a", "a"),
+        ]),
       },
-    }
+      { a: { agent: "build" } },
+    )
     const t = interpret(declared, mkState({ main: mkJob({ status: "running", currentStep: "classify" }) }), {
       kind: "step.completed", jobId: "main", stepId: "classify", outcome: "dog",
     })
@@ -408,25 +360,18 @@ describe("outcome semantics", () => {
   })
 
   it("routes a multi-branch classifier to the matching branch", () => {
-    const classifier: WorkflowDef = {
-      name: "classifier",
-      roles: { a: { agent: "build" } },
-      jobs: {
-        main: {
-          steps: [
-            {
-              id: "classify", type: "agent", role: "a", prompt: "c",
-              outcomes: {
-                cat: { goto: "cat-branch" },
-                dog: { goto: "dog-branch" },
-              },
-            },
-            { id: "cat-branch", type: "command", run: ["echo cat"] },
-            { id: "dog-branch", type: "command", run: ["echo dog"] },
-          ],
-        },
+    const classifier = mkWorkflow(
+      {
+        main: job([
+          agentStep("classify", "a", "c", {
+            outcomes: { cat: goto("cat-branch"), dog: goto("dog-branch") },
+          }),
+          commandStep("cat-branch", ["echo cat"]),
+          commandStep("dog-branch", ["echo dog"]),
+        ]),
       },
-    }
+      { a: { agent: "build" } },
+    )
     const t = interpret(classifier, mkState({ main: mkJob({ status: "running", currentStep: "classify" }) }), {
       kind: "step.completed", jobId: "main", stepId: "classify", outcome: "dog",
     })
@@ -449,29 +394,26 @@ describe("outcome semantics", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Step-level rerun (replaces roundsWith)
+// Step-level rerun (the in-job review loop)
 // ---------------------------------------------------------------------------
 
 describe("step-level rerun", () => {
-  const reviewLoop: WorkflowDef = {
-    name: "review-loop",
-    roles: { reviewer: { agent: "review" }, fixer: { agent: "build" } },
-    jobs: {
-      main: {
-        steps: [
-          {
-            id: "review", type: "agent", role: "reviewer", prompt: "review",
-            outcomes: {
-              approved: { goto: "merge" },
-              changes_requested: { rerun: { stepIds: ["fix"], maxRounds: 3 } },
-            },
+  const reviewLoop = mkWorkflow(
+    {
+      main: job([
+        agentStep("review", "reviewer", "review", {
+          outcomes: {
+            approved: goto("merge"),
+            changes_requested: rerunSteps(["fix"], 3),
           },
-          { id: "fix", type: "agent", role: "fixer", prompt: "fix", then: "review" },
-          { id: "merge", type: "action", uses: "git/merge@v1" },
-        ],
-      },
+        }),
+        agentStep("fix", "fixer", "fix", { outcomes: { done: goto("review") } }),
+        actionStep("merge", "git/merge@v1"),
+      ]),
     },
-  }
+    { reviewer: { agent: "review" }, fixer: { agent: "build" } },
+    "review-loop",
+  )
 
   it("validates cleanly", () => {
     expect(validateWorkflow(reviewLoop).errors).toEqual([])
@@ -479,10 +421,15 @@ describe("step-level rerun", () => {
 
   it("loops back to the fixer and counts the round", () => {
     const state = mkState({
-      main: mkJob({ status: "running", currentStep: "review", steps: { review: { status: "running", output: "findings" } } }),
+      main: mkJob({
+        status: "running",
+        currentStep: "review",
+        steps: { review: { status: "running", output: "findings" } },
+      }),
     })
     const t = interpret(reviewLoop, state, {
-      kind: "step.completed", jobId: "main", stepId: "review", outcome: "changes_requested", output: "findings",
+      kind: "step.completed", jobId: "main", stepId: "review",
+      outcome: "changes_requested", output: "findings",
     })
     expect(t.decisions).toEqual([{ kind: "execute_step", jobId: "main", stepId: "fix" }])
     expect(t.patch.jobs?.main?.reruns?.review).toBe(1)
@@ -509,28 +456,10 @@ describe("step-level rerun", () => {
   })
 
   it("rejects rerun to a step outside the job", () => {
-    const v = validateWorkflow({
-      name: "x",
-      roles: { a: { agent: "build" } },
-      jobs: {
-        main: { steps: [{ id: "s", type: "agent", role: "a", prompt: "s", outcomes: { redo: { rerun: { stepIds: ["ghost"], maxRounds: 2 } } } }] },
-      },
-    })
+    const v = validateWorkflow(mkWorkflow(
+      { main: job([agentStep("s", "a", "s", { outcomes: { redo: rerunSteps(["ghost"], 2) } })]) },
+      { a: { agent: "build" } },
+    ))
     expect(v.errors.join("\n")).toContain('rerun step "ghost" does not exist')
-  })
-
-  it("rejects mixing stepIds and jobIds", () => {
-    const v = validateWorkflow({
-      name: "x",
-      roles: { a: { agent: "build" } },
-      jobs: {
-        up: { steps: [{ id: "u", type: "command", run: ["echo"] }] },
-        main: {
-          needs: ["up"],
-          steps: [{ id: "s", type: "agent", role: "a", prompt: "s", outcomes: { redo: { rerun: { stepIds: ["s"], jobIds: ["up"], maxRounds: 2 } } } }],
-        },
-      },
-    })
-    expect(v.errors.join("\n")).toContain("must not mix")
   })
 })
