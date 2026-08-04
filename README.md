@@ -79,3 +79,5 @@ current backlog.
 ## License
 
 [MIT](LICENSE)
+
+<!-- probe: claude review smoke test, remove before merge -->
