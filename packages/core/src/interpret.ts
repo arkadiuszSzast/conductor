@@ -560,8 +560,10 @@ function onFailed(
  * becomes terminal (`failed`) so the DAG can react — independent branches keep
  * running, dependents skip, and `if: always()`/`failure()` jobs get their turn.
  *
- * The feature only escalates when the failure leaves nothing else to do; a
- * human is needed exactly then, not while sibling branches are still working.
+ * The feature only escalates when the failure leaves nothing else to do: every
+ * other job — including unrelated branches `propagate` never visits — must be
+ * terminal. A human is needed exactly then, not while sibling branches are
+ * still working or a gate is waiting.
  */
 function onJobFailed(
   workflow: WorkflowDef,
@@ -577,15 +579,32 @@ function onJobFailed(
   const cascade = propagate(workflow, state, failedJobId, "failed")
   const patch = mergePatches(failurePatch, { jobs: cascade.jobPatches })
 
-  if (cascade.decisions.length > 0) {
-    return buildTransition(cascade.decisions, mergePatches(patch, { status: "running" }))
+  // `propagate` only walks the failed job's dependents, so unrelated jobs are
+  // invisible to it. Mirror `onJobComplete`'s all-jobs check before deciding
+  // the failure is the end of the road.
+  const anyOtherActive = Object.keys(workflow.jobs).some(jobId => {
+    if (jobId === failedJobId) return false
+    const patched = cascade.jobPatches[jobId]?.status
+    if (patched) return patched !== "skipped" && patched !== "succeeded"
+    const current = state.jobs[jobId]?.status ?? "pending"
+    return current !== "succeeded" && current !== "failed" && current !== "skipped"
+  })
+
+  if (cascade.decisions.length === 0) {
+    if (anyOtherActive) {
+      return buildTransition(
+        [{ kind: "noop", reason: `job "${failedJobId}" failed, other jobs still active` }],
+        patch,
+      )
+    }
+    // Nothing left to run anywhere: the failure is the end of the road.
+    return buildTransition(
+      [{ kind: "escalate", reason }],
+      mergePatches(patch, { status: "escalated" }),
+    )
   }
 
-  // Nothing left to run anywhere: the failure is the end of the road.
-  return buildTransition(
-    [{ kind: "escalate", reason }],
-    mergePatches(patch, { status: "escalated" }),
-  )
+  return buildTransition(cascade.decisions, patch)
 }
 
 function onResumed(workflow: WorkflowDef, state: FeatureState): Transition {
@@ -597,6 +616,40 @@ function onResumed(workflow: WorkflowDef, state: FeatureState): Transition {
   const jobPatches: Record<string, JobPatch> = {}
 
   for (const [jobId, jobRuntime] of Object.entries(state.jobs)) {
+    // A job that failed at a step (`onJobFailed`: status "failed", currentStep
+    // null) resumes by retrying that step with a fresh budget instead of
+    // falling through to onStart and replaying the whole workflow.
+    if (jobRuntime.status === "failed") {
+      const failedStepId = Object.entries(jobRuntime.steps).find(
+        ([, stepRuntime]) => stepRuntime.status === "failed",
+      )?.[0]
+      if (failedStepId === undefined) {
+        decisions.push({
+          kind: "escalate",
+          reason: `job "${jobId}" failed but no failed step is recorded`,
+        })
+        continue
+      }
+      const job = findJob(workflow, jobId)
+      const step = job && findStep(job, failedStepId)
+      if (!job || !step) {
+        decisions.push({
+          kind: "escalate",
+          reason: `failed step "${failedStepId}" in job "${jobId}" no longer exists`,
+        })
+        continue
+      }
+      decisions.push({ kind: "execute_step", jobId, stepId: failedStepId })
+      jobPatches[jobId] = {
+        status: "running",
+        currentStep: failedStepId,
+        attempts: { ...jobRuntime.attempts, [failedStepId]: 0 },
+        reruns: { ...jobRuntime.reruns, [failedStepId]: 0 },
+        steps: { [failedStepId]: { status: "running" } },
+      }
+      continue
+    }
+
     if (jobRuntime.status !== "running" || jobRuntime.currentStep === null) continue
 
     const job = findJob(workflow, jobId)

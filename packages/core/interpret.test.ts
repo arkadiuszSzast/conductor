@@ -115,7 +115,7 @@ describe("step.completed", () => {
       workflow,
       state({
         jobs: {
-          main: job({ currentStep: "review", rounds: { review: 1 } }),
+          main: job({ currentStep: "review", reruns: { review: 1 } }),
         },
       }),
       evt({ kind: "step.completed", stepId: "review", outcome: "approved" }),
@@ -369,7 +369,7 @@ describe("human gates", () => {
           main: job({
             currentStep: "gate",
             attempts: { gate: 2, other: 1 },
-            rounds: { gate: 3 },
+            reruns: { gate: 3 },
           }),
         },
       }),
@@ -379,6 +379,34 @@ describe("human gates", () => {
     expect(t.patch.status).toBe("running")
     expect(t.patch.jobs?.main?.attempts).toEqual({ gate: 0, other: 1 })
     expect(t.patch.jobs?.main?.reruns).toEqual({ gate: 0 })
+  })
+
+  it("resume from a job-level failure retries the failed step with its budget reset", () => {
+    // The exact state onJobFailed produces: status "failed", currentStep null,
+    // the exhausted step recorded as failed, not "running" with a currentStep.
+    const t = interpret(
+      workflow,
+      state({
+        status: "escalated",
+        jobs: {
+          main: job({
+            status: "failed",
+            currentStep: null,
+            attempts: { gate: 2, other: 1 },
+            reruns: { gate: 3 },
+            steps: { gate: { status: "failed", output: null } },
+          }),
+        },
+      }),
+      { kind: "human.resumed" },
+    )
+    expect(t.decisions).toEqual([{ kind: "execute_step", jobId: "main", stepId: "gate" }])
+    expect(t.patch.status).toBe("running")
+    expect(t.patch.jobs?.main?.status).toBe("running")
+    expect(t.patch.jobs?.main?.currentStep).toBe("gate")
+    expect(t.patch.jobs?.main?.attempts).toEqual({ gate: 0, other: 1 })
+    expect(t.patch.jobs?.main?.reruns).toEqual({ gate: 0 })
+    expect(t.patch.jobs?.main?.steps?.gate?.status).toBe("running")
   })
 
   it("resume on a running feature stays a noop", () => {
@@ -524,10 +552,38 @@ describe("DAG workflows", () => {
     )
     // branch-b is untouched and still running, so the feature is not escalated.
     expect(t.patch.jobs?.["branch-b"]).toBeUndefined()
-    expect(t.patch.status).toBe("running")
+    expect(t.patch.status).not.toBe("escalated")
     expect(t.decisions).toContainEqual({
       kind: "skip_job", jobId: "after-a", reason: "a dependency failed or was skipped",
     })
+  })
+
+  it("escalates only when every other job is terminal", () => {
+    const parallel = mkWorkflow(
+      {
+        "branch-a": defineJob([commandStep("a1", ["make a"])]),
+        "branch-b": defineJob([commandStep("b1", ["make b"])]),
+      },
+      roles,
+      "parallel",
+    )
+    const t = interpret(
+      parallel,
+      state({
+        jobs: {
+          "branch-a": job({ status: "running", currentStep: "a1" }),
+          "branch-b": job({ status: "running", currentStep: "b1" }),
+        },
+      }),
+      { kind: "step.failed", jobId: "branch-a", stepId: "a1", reason: "boom" },
+    )
+    // branch-b shares no dependency with branch-a, so propagate() never visits
+    // it — but it is still actively running, so the feature must not escalate
+    // and orphan it the way a solo-job failure would.
+    expect(t.decisions).toEqual([{ kind: "noop", reason: expect.stringContaining("branch-a") }])
+    expect(t.patch.jobs?.["branch-b"]).toBeUndefined()
+    expect(t.patch.status).not.toBe("escalated")
+    expect(t.patch.jobs?.["branch-a"]?.status).toBe("failed")
   })
 
   it("runs an always() job after a dependency fails", () => {
