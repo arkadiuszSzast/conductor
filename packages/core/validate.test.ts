@@ -6,7 +6,7 @@ const base: WorkflowDef = {
   name: "v",
   roles: { implementer: { agent: "build" } },
   jobs: {
-    main: { steps: [{ id: "impl", type: "agent", role: "implementer" }] },
+    main: { steps: [{ id: "impl", type: "agent", role: "implementer", prompt: "impl" }] },
   },
 }
 
@@ -50,7 +50,7 @@ describe("validateWorkflow", () => {
     const r = validateWorkflow({
       ...base,
       jobs: {
-        main: { steps: [{ id: "a", type: "agent", role: "nope" }] },
+        main: { steps: [{ id: "a", type: "agent", role: "nope", prompt: "a" }] },
       },
     })
     expect(r.errors.join("\n")).toContain('role "nope"')
@@ -93,14 +93,14 @@ describe("validateWorkflow", () => {
     expect(r.errors.join("\n")).toContain("unbounded loop")
   })
 
-  it("accepts a loop reached only via on_fail.goto (bounded by attempts)", () => {
+  it("accepts a loop reached via onFail.goto (bounded by retry.maxAttempts)", () => {
     const r = validateWorkflow({
       ...base,
       jobs: {
         main: {
           steps: [
             { id: "a", type: "command", run: ["x"] },
-            { id: "b", type: "command", run: ["x"], on_fail: { goto: "a", max_attempts: 3 } },
+            { id: "b", type: "command", run: ["x"], retry: { maxAttempts: 3 }, onFail: { goto: "a" } },
           ],
         },
       },
@@ -114,8 +114,8 @@ describe("validateWorkflow", () => {
       jobs: {
         main: {
           steps: [
-            { id: "r", type: "agent", role: "implementer", rounds_with: "fix", max_rounds: 3, on_verdict: { approved: { next: true }, changes_requested: { goto: "fix" } } },
-            { id: "fix", type: "agent", role: "implementer", then: "r" },
+            { id: "r", type: "agent", role: "implementer", prompt: "r", roundsWith: "fix", maxRounds: 3, onVerdict: { approved: { next: true }, changes_requested: { goto: "fix" } } },
+            { id: "fix", type: "agent", role: "implementer", prompt: "fix", then: "r" },
           ],
         },
       },
@@ -128,19 +128,19 @@ describe("validateWorkflow", () => {
       ...base,
       jobs: {
         main: {
-          steps: [{ id: "a", type: "agent", role: "implementer", on_verdict: { ok: {} } }],
+          steps: [{ id: "a", type: "agent", role: "implementer", prompt: "a", onVerdict: { ok: {} } }],
         },
       },
     })
     expect(r.warnings.join("\n")).toContain("routes nowhere")
   })
 
-  it("warns when on_reject is used on a non-human step", () => {
+  it("warns when onReject is used on a non-human step", () => {
     const r = validateWorkflow({
       ...base,
       jobs: {
         main: {
-          steps: [{ id: "a", type: "command", run: ["x"], on_reject: { goto: "a" } }],
+          steps: [{ id: "a", type: "command", run: ["x"], onReject: { goto: "a" } }],
         },
       },
     })

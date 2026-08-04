@@ -19,19 +19,26 @@ const roles: WorkflowDef["roles"] = {
 }
 
 const steps: StepDef[] = [
-  { id: "implement", type: "agent", role: "implementer" },
-  { id: "gate", type: "command", run: ["./gradlew check"], on_fail: { goto: "fix_gate", max_attempts: 2 } },
-  { id: "fix_gate", type: "agent", role: "fixer", then: "gate" },
+  { id: "implement", type: "agent", role: "implementer", prompt: "implement {{feature}}" },
+  {
+    id: "gate",
+    type: "command",
+    run: ["./gradlew check"],
+    retry: { maxAttempts: 2 },
+    onFail: { goto: "fix_gate" },
+  },
+  { id: "fix_gate", type: "agent", role: "fixer", prompt: "fix the gate", then: "gate" },
   {
     id: "review",
     type: "agent",
     role: "reviewer",
-    rounds_with: "fix_review",
-    max_rounds: 3,
-    on_verdict: { approved: { next: true }, changes_requested: { goto: "fix_review" } },
+    prompt: "review the diff",
+    roundsWith: "fix_review",
+    maxRounds: 3,
+    onVerdict: { approved: { next: true }, changes_requested: { goto: "fix_review" } },
   },
-  { id: "fix_review", type: "agent", role: "fixer", then: "review" },
-  { id: "approve-merge", type: "human", on_reject: { goto: "fix_review" } },
+  { id: "fix_review", type: "agent", role: "fixer", prompt: "fix the review findings", then: "review" },
+  { id: "approve-merge", type: "human", onReject: { goto: "fix_review" } },
   { id: "merge", type: "action", uses: "git/pr-merge@v1" },
 ]
 
@@ -152,23 +159,46 @@ describe("step.succeeded", () => {
 // ---------------------------------------------------------------------------
 
 describe("step.failed", () => {
-  it("routes to on_fail.goto and counts the attempt", () => {
+  it("retries the same step while the retry budget remains", () => {
     const t = interpret(
       workflow,
       state({ jobs: { main: job({ currentStep: "gate" }) } }),
       evt({ kind: "step.failed", stepId: "gate", reason: "exit 1" }),
     )
-    expect(t.decisions).toEqual([{ kind: "execute_step", jobId: "main", stepId: "fix_gate" }])
+    expect(t.decisions).toEqual([{ kind: "execute_step", jobId: "main", stepId: "gate" }])
     expect(t.patch.jobs?.main?.attempts).toEqual({ gate: 1 })
   })
 
-  it("escalates when max_attempts is exhausted", () => {
+  it("routes to onFail.goto once the retry budget is exhausted", () => {
     const t = interpret(
       workflow,
       state({
         jobs: { main: job({ currentStep: "gate", attempts: { gate: 2 } }) },
       }),
       evt({ kind: "step.failed", stepId: "gate", reason: "exit 1" }),
+    )
+    expect(t.decisions).toEqual([{ kind: "execute_step", jobId: "main", stepId: "fix_gate" }])
+    expect(t.patch.jobs?.main?.attempts).toEqual({ gate: 3 })
+  })
+
+  it("escalates once retries are exhausted when there is no onFail route", () => {
+    const localWorkflow: WorkflowDef = {
+      name: "test",
+      roles,
+      jobs: {
+        main: {
+          steps: [
+            { id: "flaky", type: "command", run: ["true"], retry: { maxAttempts: 2 } },
+          ],
+        },
+      },
+    }
+    const t = interpret(
+      localWorkflow,
+      state({
+        jobs: { main: job({ currentStep: "flaky", attempts: { flaky: 2 } }) },
+      }),
+      evt({ kind: "step.failed", stepId: "flaky", reason: "network" }),
     )
     expect(t.decisions[0]?.kind).toBe("escalate")
     expect(t.patch.status).toBe("escalated")
@@ -181,7 +211,7 @@ describe("step.failed", () => {
       jobs: {
         main: {
           steps: [
-            { id: "flaky", type: "command", run: ["true"], on_fail: { max_attempts: 3 } },
+            { id: "flaky", type: "command", run: ["true"], retry: { maxAttempts: 3 } },
           ],
         },
       },
@@ -195,14 +225,14 @@ describe("step.failed", () => {
     expect(t.patch.jobs?.main?.attempts).toEqual({ flaky: 1 })
   })
 
-  it("escalates immediately when on_fail.escalate is set", () => {
+  it("escalates on the first failure when there is no retry and no onFail route", () => {
     const localWorkflow: WorkflowDef = {
       name: "test",
       roles,
       jobs: {
         main: {
           steps: [
-            { id: "critical", type: "command", run: ["true"], on_fail: { escalate: true } },
+            { id: "critical", type: "command", run: ["true"] },
           ],
         },
       },
@@ -215,12 +245,16 @@ describe("step.failed", () => {
     expect(t.decisions[0]?.kind).toBe("escalate")
   })
 
-  it("defaults to a single attempt when on_fail is absent", () => {
+  it("treats maxAttempts as total executions including the first", () => {
     const localWorkflow: WorkflowDef = {
       name: "test",
       roles,
       jobs: {
-        main: { steps: [{ id: "solo", type: "command", run: ["true"] }] },
+        main: {
+          steps: [
+            { id: "solo", type: "command", run: ["true"], retry: { maxAttempts: 3 } },
+          ],
+        },
       },
     }
     const first = interpret(
@@ -232,9 +266,7 @@ describe("step.failed", () => {
 
     const second = interpret(
       localWorkflow,
-      state({
-        jobs: { main: job({ currentStep: "solo", attempts: { solo: 1 } }) },
-      }),
+      state({ jobs: { main: job({ currentStep: "solo", attempts: { solo: 2 } }) } }),
       evt({ kind: "step.failed", stepId: "solo", reason: "x" }),
     )
     expect(second.decisions[0]?.kind).toBe("escalate")
@@ -256,7 +288,7 @@ describe("step.verdict", () => {
     expect(t.patch.jobs?.main?.rounds).toEqual({ review: 1 })
   })
 
-  it("escalates after max_rounds without approval", () => {
+  it("escalates after maxRounds without approval", () => {
     const t = interpret(
       workflow,
       state({
@@ -330,7 +362,7 @@ describe("human interactions", () => {
     expect(t.decisions[0]?.kind).toBe("noop")
   })
 
-  it("human.rejected routes to on_reject.goto", () => {
+  it("human.rejected routes to onReject.goto", () => {
     const t = interpret(
       workflow,
       state({
@@ -452,7 +484,7 @@ describe("DAG workflows", () => {
             id: "merge",
             type: "action",
             uses: "git/pr-merge@v1",
-            on_fail: { goto: "approve" },
+            onFail: { goto: "approve" },
           },
         ],
       },

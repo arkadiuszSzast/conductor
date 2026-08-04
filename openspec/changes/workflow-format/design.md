@@ -111,3 +111,18 @@ events through both interpreters until parity is established.
   per-step `attempts`/`rounds`/`outputs` replace the seed's single
   `currentStep` + per-feature counters; the interpreter returns `decisions[]`
   + `patch` so fan-out yields multiple decisions for one event.
+- **No daemon/opencode coupling in the IR.** Removed from the seed: `PublishDef`
+  + `tokenCommand` (publishing is a server concern, not a workflow shape) and
+  `RoleDef.session`. `RoleDef` is pure metadata (`agent`, optional `model`,
+  `variant`) resolved by the engine.
+- **Failure = two separate knobs.** `retry.maxAttempts` is the retry budget
+  for the same step (default 1 = no retry; `maxAttempts` counts total
+  executions including the first). `onFail.goto` routes only once retries are
+  exhausted; with no route, exhaustion escalates. Notification-on-failure is a
+  plain step reached via `onFail.goto`, not a shell escape hatch inside
+  `onFail` — the interpreter stays pure (routing) and the engine owns side
+  effects.
+- **Sealed over nullable.** `maxRounds` is `number | "unlimited"`; `BackoffDef`
+  is a discriminated union keyed on `strategy` (`"exp-backoff"` today) with
+  optional fields carrying defaults; `AgentStep.prompt` is required (the IR is
+  self-describing). No `X | null` for absent config.

@@ -16,7 +16,7 @@ it("exports a working interpret + validateWorkflow pair", () => {
   const workflow = {
     name: "smoke",
     roles: { implementer: { agent: "build" } },
-    jobs: { main: { steps: [{ id: "impl", type: "agent", role: "implementer" }] } },
+    jobs: { main: { steps: [{ id: "impl", type: "agent", role: "implementer", prompt: "impl" }] } },
   } as const
   expect(validateWorkflow(workflow).errors).toEqual([])
   const state = {

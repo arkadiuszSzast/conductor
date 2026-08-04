@@ -48,18 +48,21 @@ interface StepBase {
   readonly id: string
   readonly if?: string
   readonly then?: string
-  readonly on_fail?: OnFail
-  readonly on_reject?: { readonly goto: string }
+  readonly onFail?: { readonly goto?: string }
+  readonly retry?: RetryPolicy
+  readonly onReject?: { readonly goto: string }
 }
 
+/** An agent step performs LLM work. The `prompt` is always required —
+ *  the IR must be self-describing; the engine may prepend role-level
+ *  context, but the step itself carries the template. */
 export interface AgentStep extends StepBase {
   readonly type: "agent"
   readonly role: string
-  readonly prompt?: string
-  readonly on_verdict?: OnVerdict
-  readonly rounds_with?: string
-  readonly max_rounds?: number
-  readonly publish?: PublishDef
+  readonly prompt: string
+  readonly onVerdict?: OnVerdict
+  readonly roundsWith?: string
+  readonly maxRounds?: number | "unlimited"
 }
 
 export interface ActionStep extends StepBase {
@@ -72,7 +75,7 @@ export interface CommandStep extends StepBase {
   readonly type: "command"
   readonly run: readonly string[]
   readonly cwd?: string
-  readonly timeout_ms?: number
+  readonly timeoutMs?: number
 }
 
 export interface HumanStep extends StepBase {
@@ -80,47 +83,52 @@ export interface HumanStep extends StepBase {
 }
 
 // ---------------------------------------------------------------------------
-// Routing
+// Retry — a sealed policy with a discriminated backoff strategy
 // ---------------------------------------------------------------------------
 
-export interface OnFail {
-  readonly goto?: string
-  readonly max_attempts?: number
-  readonly escalate?: boolean
-  readonly retry?: RetryPolicy
-}
-
 export interface RetryPolicy {
-  readonly max_attempts?: number
-  readonly max_elapsed?: string
+  /** Total attempts including the first. Default: 1 (no retry). */
+  readonly maxAttempts?: number
+  /** ISO-8601 duration (e.g. "10m"). Default: "10m". */
+  readonly maxElapsed?: string
+  /** Backoff strategy. Default: exp-backoff with sane defaults. */
   readonly backoff?: BackoffDef
 }
 
-export interface BackoffDef {
-  readonly initial: number
-  readonly multiplier: number
-  readonly max: number
-  readonly jitter: "none" | "full" | "equal"
+/** Sealed: only "exp-backoff" for now; the discriminant lets the engine
+ *  match-and-add strategies without opening a general eval surface. */
+export type BackoffDef = {
+  readonly strategy: "exp-backoff"
+  /** Initial delay in ms. Default: 1000. */
+  readonly initial?: number
+  /** Multiplier per attempt. Default: 2. */
+  readonly multiplier?: number
+  /** Max delay cap in ms. Default: 60000. */
+  readonly max?: number
+  /** Jitter mode. Default: "full". */
+  readonly jitter?: "none" | "full" | "equal"
 }
 
+// ---------------------------------------------------------------------------
+// Verdict routing (review loops)
+// ---------------------------------------------------------------------------
+
+/** `verdict` is the structured outcome of an agent's review/evaluation step
+ *  (e.g. "approved", "changes_requested"). It is NOT GitHub-specific — any
+ *  review process produces a verdict. `onVerdict` maps verdict strings to
+ *  routing targets. */
 export interface OnVerdict {
   readonly [verdict: string]: { readonly goto?: string; readonly next?: boolean }
 }
 
 // ---------------------------------------------------------------------------
-// Roles and publishing
+// Roles (pure metadata — the engine resolves agent/model/variant)
 // ---------------------------------------------------------------------------
 
 export interface RoleDef {
   readonly agent: string
   readonly model?: string
   readonly variant?: string
-  readonly session?: "fresh" | "feature"
-}
-
-export interface PublishDef {
-  readonly mode: "github-review" | "comment-only" | "none"
-  readonly tokenCommand?: string
 }
 
 // ---------------------------------------------------------------------------
