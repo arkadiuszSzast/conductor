@@ -13,8 +13,8 @@
  * linear steps — produces exactly one decision.
  */
 
+import { DEFAULT_OUTCOME } from "./types.ts"
 import type {
-  AgentStep,
   Decision,
   FeatureState,
   FeatureStatus,
@@ -30,7 +30,6 @@ import type {
 } from "./types.ts"
 
 const DEFAULT_MAX_ATTEMPTS = 1
-const DEFAULT_MAX_ROUNDS = 3
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -43,9 +42,8 @@ export function interpret(
 ): Transition {
   switch (event.kind) {
     case "feature.start":     return onStart(workflow)
-    case "step.succeeded":    return onSucceeded(workflow, state, event.jobId, event.stepId, event.output)
+    case "step.completed":    return onCompleted(workflow, state, event.jobId, event.stepId, event.outcome ?? DEFAULT_OUTCOME, event.output)
     case "step.failed":       return onFailed(workflow, state, event.jobId, event.stepId, event.reason)
-    case "step.verdict":      return onVerdict(workflow, state, event.jobId, event.stepId, event.verdict, event.output)
     case "human.approved":    return onHumanApproved(workflow, state, event.jobId, event.stepId)
     case "human.rejected":    return onHumanRejected(workflow, state, event.jobId, event.stepId)
     case "human.paused":      return buildTransition([{ kind: "pause" }], { status: "paused" })
@@ -90,15 +88,14 @@ function firstStepId(job: JobDef): string | null {
   return job.steps[0]?.id ?? null
 }
 
+/** The next step along the job's path: an explicit `then`, otherwise the
+ *  next step in declaration order. Loop-back steps (e.g. a fixer) are reached
+ *  by an explicit `goto`/`rerun`, so a route that wants to skip them must say
+ *  so explicitly. */
 function nextStepId(job: JobDef, currentStep: StepDef): string | null {
   if (currentStep.then !== undefined) return currentStep.then
-  const reviewPartner = currentStep.type === "agent" ? (currentStep as AgentStep).roundsWith : undefined
   const index = stepIndex(job, currentStep.id)
-  for (let candidate = index + 1; candidate < job.steps.length; candidate++) {
-    const step = job.steps[candidate]
-    if (step && step.id !== reviewPartner) return step.id
-  }
-  return null
+  return job.steps[index + 1]?.id ?? null
 }
 
 // ---------------------------------------------------------------------------
@@ -193,28 +190,111 @@ function onRerun(
     )
   }
 
-  const closure = computeRerunClosure(rerun.jobIds, workflow)
+  const feedback = buildFeedback(state, rerun, routingJobId, routingStepId, reason, routingStepOutput)
 
+  // Step-level rerun: loop back to earlier steps of the routing job. The
+  // job keeps running; only the named steps are re-executed.
+  if (rerun.stepIds && rerun.stepIds.length > 0) {
+    return rerunSteps(workflow, routingJobId, routingStepId, rerun.stepIds, rounds, routingRuntime, feedback)
+  }
+
+  return rerunJobs(workflow, state, routingJobId, routingStepId, rerun.jobIds ?? [], rounds, routingRuntime, feedback)
+}
+
+function buildFeedback(
+  state: FeatureState,
+  rerun: RerunTarget,
+  routingJobId: string,
+  routingStepId: string,
+  reason: string,
+  routingStepOutput?: string,
+): Feedback {
   const feedbackJobs: Record<string, Record<string, string>> = {}
 
-  for (const jobId of rerun.jobIds) {
+  const collectFrom = (jobId: string, only?: readonly string[]): void => {
     const jobRuntime = state.jobs[jobId]
-    if (!jobRuntime) continue
+    if (!jobRuntime) return
     const stepOutputs: Record<string, string> = {}
-    for (const [sid, stepState] of Object.entries(jobRuntime.steps)) {
-      if (stepState.output !== null) stepOutputs[sid] = stepState.output
+    for (const [stepId, stepState] of Object.entries(jobRuntime.steps)) {
+      if (only && !only.includes(stepId)) continue
+      if (stepState.output !== null) stepOutputs[stepId] = stepState.output
     }
-    if (Object.keys(stepOutputs).length > 0) feedbackJobs[jobId] = stepOutputs
+    if (Object.keys(stepOutputs).length > 0) {
+      feedbackJobs[jobId] = { ...feedbackJobs[jobId], ...stepOutputs }
+    }
   }
 
-  const routingOutput = routingStepOutput ?? routingRuntime?.steps[routingStepId]?.output
+  if (rerun.stepIds && rerun.stepIds.length > 0) {
+    collectFrom(routingJobId)
+  }
+  for (const jobId of rerun.jobIds ?? []) collectFrom(jobId)
+
+  const routingOutput = routingStepOutput ?? state.jobs[routingJobId]?.steps[routingStepId]?.output
   if (routingOutput !== null && routingOutput !== undefined) {
-    if (!feedbackJobs[routingJobId]) feedbackJobs[routingJobId] = {}
-    feedbackJobs[routingJobId][routingStepId] = routingOutput
+    feedbackJobs[routingJobId] = { ...feedbackJobs[routingJobId], [routingStepId]: routingOutput }
   }
 
-  const feedback: Feedback = { jobs: feedbackJobs, message: reason }
+  return { jobs: feedbackJobs, message: reason }
+}
 
+function rerunSteps(
+  workflow: WorkflowDef,
+  routingJobId: string,
+  routingStepId: string,
+  stepIds: readonly string[],
+  rounds: number,
+  routingRuntime: FeatureState["jobs"][string] | undefined,
+  feedback: Feedback,
+): Transition {
+  const job = findJob(workflow, routingJobId)
+  const entryStepId = stepIds[0]
+  const step = job && entryStepId !== undefined ? findStep(job, entryStepId) : undefined
+
+  if (!job || entryStepId === undefined || !step) {
+    return buildTransition(
+      [{ kind: "escalate", reason: `rerun step "${entryStepId ?? "<none>"}" does not exist in job "${routingJobId}"` }],
+      { status: "escalated" },
+    )
+  }
+
+  const clearedSteps: Record<string, { status: "pending"; output: null }> = {}
+  for (const stepId of stepIds) clearedSteps[stepId] = { status: "pending", output: null }
+
+  const jobPatch: JobPatch = {
+    status: "running",
+    currentStep: entryStepId,
+    reruns: { ...routingRuntime?.reruns, [routingStepId]: rounds },
+    steps: {
+      ...clearedSteps,
+      [entryStepId]: step.type === "human" ? { status: "waiting_human" } : { status: "running" },
+    },
+  }
+
+  const decision: Decision = step.type === "human"
+    ? { kind: "wait_human", jobId: routingJobId, stepId: entryStepId }
+    : { kind: "execute_step", jobId: routingJobId, stepId: entryStepId }
+
+  return {
+    decisions: [decision],
+    patch: {
+      status: step.type === "human" ? "waiting_human" : "running",
+      jobs: { [routingJobId]: jobPatch },
+    },
+    feedback,
+  }
+}
+
+function rerunJobs(
+  workflow: WorkflowDef,
+  state: FeatureState,
+  routingJobId: string,
+  routingStepId: string,
+  jobIds: readonly string[],
+  rounds: number,
+  routingRuntime: FeatureState["jobs"][string] | undefined,
+  feedback: Feedback,
+): Transition {
+  const closure = computeRerunClosure(jobIds, workflow)
   const jobPatches: Record<string, JobPatch> = {}
 
   for (const closureJobId of closure) {
@@ -231,9 +311,21 @@ function onRerun(
     }
   }
 
+  if (!closure.has(routingJobId)) {
+    jobPatches[routingJobId] = {
+      status: "pending",
+      currentStep: null,
+      attempts: {},
+      rounds: {},
+      reruns: { ...routingRuntime?.reruns, [routingStepId]: rounds },
+      outputs: {},
+      steps: {},
+    }
+  }
+
   const decisions: Decision[] = []
 
-  for (const rerunJobId of rerun.jobIds) {
+  for (const rerunJobId of jobIds) {
     const rerunJob = findJob(workflow, rerunJobId)
     if (!rerunJob) {
       decisions.push({ kind: "skip_job", jobId: rerunJobId, reason: "job no longer exists" })
@@ -241,11 +333,7 @@ function onRerun(
     }
     const stepId = firstStepId(rerunJob)
     if (!stepId) {
-      jobPatches[rerunJobId] = {
-        ...jobPatches[rerunJobId],
-        status: "succeeded",
-        currentStep: null,
-      }
+      jobPatches[rerunJobId] = { ...jobPatches[rerunJobId], status: "succeeded", currentStep: null }
       continue
     }
     const step = findStep(rerunJob, stepId)!
@@ -316,16 +404,23 @@ function onStart(workflow: WorkflowDef): Transition {
   return buildTransition(decisions, { status: "running", jobs: jobPatches })
 }
 
-function onSucceeded(
+/**
+ * A step finished its work and reported an outcome. One mechanism covers
+ * every "it worked, here is the result" case: plain completion, review
+ * verdicts, consensus checks, classifiers. `step.failed` is the separate
+ * "it could not do its work" path with its own retry budget.
+ */
+function onCompleted(
   workflow: WorkflowDef,
   state: FeatureState,
   jobId: string,
   stepId: string,
+  outcome: string,
   output?: string,
 ): Transition {
   const jobRuntime = state.jobs[jobId]
   if (!jobRuntime || jobRuntime.currentStep !== stepId) {
-    return noopTransition(`stale success for "${jobId}/${stepId}"`)
+    return noopTransition(`stale completion for "${jobId}/${stepId}"`)
   }
 
   const job = findJob(workflow, jobId)
@@ -337,13 +432,43 @@ function onSucceeded(
     )
   }
 
-  const entry = enterStep(workflow, state, jobId, nextStepId(job, step))
+  const completedPatch: Patch = {
+    jobs: { [jobId]: { steps: { [stepId]: { status: "succeeded", output: output ?? null } } } },
+  }
+
+  // No declared outcomes: any outcome simply advances along the step path.
+  if (step.outcomes === undefined) {
+    const entry = enterStep(workflow, state, jobId, nextStepId(job, step))
+    return buildTransition(
+      entry.decisions as Decision[],
+      mergePatches(completedPatch, entry.patch),
+    )
+  }
+
+  const route = step.outcomes[outcome]
+  if (!route) {
+    return buildTransition(
+      [{ kind: "escalate", reason: `unmapped outcome "${outcome}" at "${jobId}/${stepId}"` }],
+      mergePatches(completedPatch, { status: "escalated" }),
+    )
+  }
+
+  if (route.rerun) {
+    const rerunTransition = onRerun(
+      workflow, state, jobId, stepId, route.rerun, `outcome "${outcome}"`, output,
+    )
+    return {
+      decisions: rerunTransition.decisions,
+      patch: mergePatches(completedPatch, rerunTransition.patch),
+      feedback: rerunTransition.feedback,
+    }
+  }
+
+  const target = route.goto ?? nextStepId(job, step) ?? null
+  const entry = enterStep(workflow, state, jobId, target)
   return buildTransition(
     entry.decisions as Decision[],
-    mergePatches(
-      { jobs: { [jobId]: { steps: { [stepId]: { status: "succeeded", output: output ?? null } } } } },
-      entry.patch,
-    ),
+    mergePatches(completedPatch, entry.patch),
   )
 }
 
@@ -414,69 +539,6 @@ function onFailed(
         },
       },
     },
-  )
-}
-
-function onVerdict(
-  workflow: WorkflowDef,
-  state: FeatureState,
-  jobId: string,
-  stepId: string,
-  verdict: string,
-  output?: string,
-): Transition {
-  const jobRuntime = state.jobs[jobId]
-  const job = findJob(workflow, jobId)
-  const step = job && findStep(job, stepId)
-
-  if (!job || !jobRuntime || !step || step.type !== "agent") {
-    return noopTransition(`verdict for invalid step "${jobId}/${stepId}"`)
-  }
-  if (jobRuntime.currentStep !== stepId) {
-    return noopTransition(`stale verdict for "${jobId}/${stepId}"`)
-  }
-
-  const agentStep = step as AgentStep
-  let rounds = jobRuntime.rounds
-
-  if (agentStep.roundsWith !== undefined) {
-    const completedRounds = (jobRuntime.rounds[stepId] ?? 0) + 1
-    rounds = { ...jobRuntime.rounds, [stepId]: completedRounds }
-    const maxRounds = agentStep.maxRounds === "unlimited"
-      ? Number.POSITIVE_INFINITY
-      : (agentStep.maxRounds ?? DEFAULT_MAX_ROUNDS)
-    const route = agentStep.onVerdict?.[verdict]
-    const loopsBack = route?.goto !== undefined && route.goto === agentStep.roundsWith
-    if (loopsBack && completedRounds >= maxRounds) {
-      return buildTransition(
-        [{ kind: "escalate", reason: `"${jobId}/${stepId}" reached ${maxRounds} round(s)` }],
-        { status: "escalated", jobs: { [jobId]: { rounds } } },
-      )
-    }
-  }
-
-  const route = agentStep.onVerdict?.[verdict]
-  if (!route) {
-    return buildTransition(
-      [{ kind: "escalate", reason: `unmapped verdict "${verdict}"` }],
-      { status: "escalated", jobs: { [jobId]: { rounds } } },
-    )
-  }
-
-  if (route.rerun) {
-    const rerunTransition = onRerun(workflow, state, jobId, stepId, route.rerun, `verdict "${verdict}"`, output)
-    return {
-      decisions: rerunTransition.decisions,
-      patch: mergePatches({ jobs: { [jobId]: { rounds } } }, rerunTransition.patch),
-      feedback: rerunTransition.feedback,
-    }
-  }
-
-  const target = route.goto ?? nextStepId(job, agentStep) ?? null
-  const entry = enterStep(workflow, state, jobId, target)
-  return buildTransition(
-    entry.decisions as Decision[],
-    mergePatches({ jobs: { [jobId]: { rounds } } }, entry.patch),
   )
 }
 

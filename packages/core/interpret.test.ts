@@ -33,9 +33,10 @@ const steps: StepDef[] = [
     type: "agent",
     role: "reviewer",
     prompt: "review the diff",
-    roundsWith: "fix_review",
-    maxRounds: 3,
-    onVerdict: { approved: { next: true }, changes_requested: { goto: "fix_review" } },
+    outcomes: {
+      approved: { goto: "approve-merge" },
+      changes_requested: { rerun: { stepIds: ["fix_review"], maxRounds: 3 } },
+    },
   },
   { id: "fix_review", type: "agent", role: "fixer", prompt: "fix the review findings", then: "review" },
   { id: "approve-merge", type: "human", onReject: { goto: "fix_review" } },
@@ -99,15 +100,15 @@ describe("feature.start", () => {
 })
 
 // ---------------------------------------------------------------------------
-// step.succeeded
+// step.completed (plain advance)
 // ---------------------------------------------------------------------------
 
-describe("step.succeeded", () => {
+describe("step.completed", () => {
   it("advances to the next step in list order", () => {
     const t = interpret(
       workflow,
       state({ jobs: { main: job({ currentStep: "implement" }) } }),
-      evt({ kind: "step.succeeded", stepId: "implement" }),
+      evt({ kind: "step.completed", stepId: "implement" }),
     )
     expect(t.decisions).toEqual([{ kind: "execute_step", jobId: "main", stepId: "gate" }])
   })
@@ -116,7 +117,7 @@ describe("step.succeeded", () => {
     const t = interpret(
       workflow,
       state({ jobs: { main: job({ currentStep: "fix_gate" }) } }),
-      evt({ kind: "step.succeeded", stepId: "fix_gate" }),
+      evt({ kind: "step.completed", stepId: "fix_gate" }),
     )
     expect(t.decisions).toEqual([{ kind: "execute_step", jobId: "main", stepId: "gate" }])
   })
@@ -125,7 +126,7 @@ describe("step.succeeded", () => {
     const t = interpret(
       workflow,
       state({ jobs: { main: job({ currentStep: "merge" }) } }),
-      evt({ kind: "step.succeeded", stepId: "merge" }),
+      evt({ kind: "step.completed", stepId: "merge" }),
     )
     expect(t.decisions).toEqual([{ kind: "finish" }])
     expect(t.patch.status).toBe("done")
@@ -135,7 +136,7 @@ describe("step.succeeded", () => {
     const t = interpret(
       workflow,
       state({ jobs: { main: job({ currentStep: "review" }) } }),
-      evt({ kind: "step.succeeded", stepId: "implement" }),
+      evt({ kind: "step.completed", stepId: "implement" }),
     )
     expect(t.decisions[0]?.kind).toBe("noop")
   })
@@ -148,7 +149,7 @@ describe("step.succeeded", () => {
           main: job({ currentStep: "review", rounds: { review: 1 } }),
         },
       }),
-      evt({ kind: "step.verdict", stepId: "review", verdict: "approved" }),
+      evt({ kind: "step.completed", stepId: "review", outcome: "approved" }),
     )
     expect(t.decisions).toEqual([{ kind: "wait_human", jobId: "main", stepId: "approve-merge" }])
     expect(t.patch.status).toBe("waiting_human")
@@ -275,57 +276,56 @@ describe("step.failed", () => {
 })
 
 // ---------------------------------------------------------------------------
-// step.verdict (review loops)
+// step.completed outcomes (review loops)
 // ---------------------------------------------------------------------------
 
-describe("step.verdict", () => {
-  it("routes changes_requested to the fix step and counts the round", () => {
+describe("step.completed outcomes", () => {
+  it("routes changes_requested to the fix step and counts the rerun round", () => {
     const t = interpret(
       workflow,
       state({ jobs: { main: job({ currentStep: "review" }) } }),
-      evt({ kind: "step.verdict", stepId: "review", verdict: "changes_requested" }),
+      evt({ kind: "step.completed", stepId: "review", outcome: "changes_requested" }),
     )
     expect(t.decisions).toEqual([{ kind: "execute_step", jobId: "main", stepId: "fix_review" }])
-    expect(t.patch.jobs?.main?.rounds).toEqual({ review: 1 })
+    expect(t.patch.jobs?.main?.reruns).toEqual({ review: 1 })
   })
 
   it("escalates after maxRounds without approval", () => {
     const t = interpret(
       workflow,
       state({
-        jobs: { main: job({ currentStep: "review", rounds: { review: 2 } }) },
+        jobs: { main: job({ currentStep: "review", reruns: { review: 3 } }) },
       }),
-      evt({ kind: "step.verdict", stepId: "review", verdict: "changes_requested" }),
+      evt({ kind: "step.completed", stepId: "review", outcome: "changes_requested" }),
     )
     expect(t.decisions[0]?.kind).toBe("escalate")
-    expect(t.patch.jobs?.main?.rounds).toEqual({ review: 3 })
   })
 
-  it("approved verdict proceeds past the loop to the human gate", () => {
+  it("approved outcome proceeds past the loop to the human gate", () => {
     const t = interpret(
       workflow,
       state({
-        jobs: { main: job({ currentStep: "review", rounds: { review: 2 } }) },
+        jobs: { main: job({ currentStep: "review", reruns: { review: 2 } }) },
       }),
-      evt({ kind: "step.verdict", stepId: "review", verdict: "approved" }),
+      evt({ kind: "step.completed", stepId: "review", outcome: "approved" }),
     )
     expect(t.decisions).toEqual([{ kind: "wait_human", jobId: "main", stepId: "approve-merge" }])
   })
 
-  it("escalates on an unmapped verdict", () => {
+  it("escalates on an unmapped outcome", () => {
     const t = interpret(
       workflow,
       state({ jobs: { main: job({ currentStep: "review" }) } }),
-      evt({ kind: "step.verdict", stepId: "review", verdict: "wat" }),
+      evt({ kind: "step.completed", stepId: "review", outcome: "wat" }),
     )
     expect(t.decisions[0]?.kind).toBe("escalate")
   })
 
-  it("ignores a stale verdict", () => {
+  it("ignores a stale outcome", () => {
     const t = interpret(
       workflow,
       state({ jobs: { main: job({ currentStep: "gate" }) } }),
-      evt({ kind: "step.verdict", stepId: "review", verdict: "approved" }),
+      evt({ kind: "step.completed", stepId: "review", outcome: "approved" }),
     )
     expect(t.decisions[0]?.kind).toBe("noop")
   })
@@ -516,7 +516,7 @@ describe("DAG workflows", () => {
           review: job({ status: "pending" }),
         },
       }),
-      { kind: "step.succeeded", jobId: "build", stepId: "compile" },
+      { kind: "step.completed", jobId: "build", stepId: "compile" },
     )
     expect(t.decisions).toContainEqual({ kind: "execute_step", jobId: "test-a", stepId: "test" })
     expect(t.decisions).toContainEqual({ kind: "execute_step", jobId: "test-b", stepId: "test" })
@@ -549,7 +549,7 @@ describe("DAG workflows", () => {
           review: job({ status: "running", currentStep: "merge" }),
         },
       }),
-      { kind: "step.succeeded", jobId: "review", stepId: "merge" },
+      { kind: "step.completed", jobId: "review", stepId: "merge" },
     )
     expect(t.decisions).toEqual([{ kind: "finish" }])
     expect(t.patch.status).toBe("done")

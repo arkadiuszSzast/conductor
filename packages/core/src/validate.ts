@@ -5,7 +5,7 @@
  *  - job `needs` form a DAG (no cycles)
  *  - every `needs` reference resolves
  *  - step ids are unique and non-empty within a job
- *  - every goto / then / roundsWith target exists within the same job
+ *  - every goto / then / rerun target exists within the same job
  *  - every agent step's role exists in `roles`
  *  - every loop edge carries a bounded counter
  *
@@ -121,6 +121,14 @@ function validateJob(
     if (step.then !== undefined && !stepExists(step.then)) {
       errors.push(`${stepWhere}: then → "${step.then}" does not exist`)
     }
+    if (step.outcomes) {
+      for (const [outcome, route] of Object.entries(step.outcomes)) {
+        validateRoute(route, `outcomes["${outcome}"]`, def, jobId, stepExists, stepWhere, errors)
+        if (route.goto === undefined && route.next !== true && route.rerun === undefined) {
+          warnings.push(`${stepWhere}: outcomes["${outcome}"] routes nowhere (no goto, next, or rerun)`)
+        }
+      }
+    }
     if (step.onFail) validateRoute(step.onFail, "onFail", def, jobId, stepExists, stepWhere, errors)
     if (step.onReject) {
       validateRoute(step.onReject, "onReject", def, jobId, stepExists, stepWhere, errors)
@@ -133,7 +141,7 @@ function validateJob(
     }
 
     if (step.type === "agent") {
-      validateAgentStep(step as AgentStep, def, jobId, stepExists, stepWhere, errors, warnings)
+      validateAgentStep(step as AgentStep, def, stepWhere, errors)
     }
     if (step.type === "command" && step.run.length === 0) {
       errors.push(`${stepWhere}: command step has an empty run list`)
@@ -146,7 +154,7 @@ function validateJob(
   for (const cycle of findUncountedCycles(steps)) {
     errors.push(
       `unbounded loop in ${where} with no attempt/round counter: ${cycle.join(" → ")} — ` +
-        `add retry.maxAttempts or use roundsWith/maxRounds on one of its steps`,
+        `add a retry budget or route the loop through rerun with maxRounds`,
     )
   }
 }
@@ -181,7 +189,7 @@ function validateBackoff(backoff: BackoffDef, where: string, errors: string[]): 
 }
 
 // ---------------------------------------------------------------------------
-// Route validation (goto, rerun) shared by onFail, onReject, onVerdict
+// Route validation (goto, next, rerun) shared by outcomes, onFail, onReject
 // ---------------------------------------------------------------------------
 
 function validateRoute(
@@ -207,7 +215,7 @@ function validateRoute(
     errors.push(`${where}: goto → "${route.goto}" does not exist`)
   }
   if (hasRerun && route.rerun !== undefined) {
-    validateRerunTarget(route.rerun, label, def, routingJobId, stepWhere, errors)
+    validateRerunTarget(route.rerun, label, def, routingJobId, stepExists, stepWhere, errors)
   }
 }
 
@@ -216,6 +224,7 @@ function validateRerunTarget(
   label: string,
   def: WorkflowDef,
   routingJobId: string,
+  stepExists: (stepId: string) => boolean,
   stepWhere: string,
   errors: string[],
 ): void {
@@ -223,7 +232,26 @@ function validateRerunTarget(
   if (rerun.maxRounds < 1) {
     errors.push(`${where}: rerun.maxRounds must be ≥ 1`)
   }
-  for (const jobId of rerun.jobIds) {
+
+  const hasSteps = rerun.stepIds !== undefined && rerun.stepIds.length > 0
+  const hasJobs = rerun.jobIds !== undefined && rerun.jobIds.length > 0
+
+  if (!hasSteps && !hasJobs) {
+    errors.push(`${where}: rerun needs at least one of stepIds or jobIds`)
+    return
+  }
+  if (hasSteps && hasJobs) {
+    errors.push(`${where}: rerun must not mix stepIds and jobIds`)
+    return
+  }
+
+  for (const stepId of rerun.stepIds ?? []) {
+    if (!stepExists(stepId)) {
+      errors.push(`${where}: rerun step "${stepId}" does not exist in this job`)
+    }
+  }
+
+  for (const jobId of rerun.jobIds ?? []) {
     const targetJob = def.jobs[jobId]
     if (!targetJob) {
       errors.push(`${where}: rerun job "${jobId}" does not exist`)
@@ -261,28 +289,11 @@ function isDownstreamOf(ancestor: string, target: string, def: WorkflowDef): boo
 function validateAgentStep(
   step: AgentStep,
   def: WorkflowDef,
-  routingJobId: string,
-  stepExists: (stepId: string) => boolean,
   where: string,
   errors: string[],
-  warnings: string[],
 ): void {
   if (!def.roles || !(step.role in def.roles)) {
     errors.push(`${where}: role "${step.role}" is not defined in roles`)
-  }
-  if (step.roundsWith !== undefined && !stepExists(step.roundsWith)) {
-    errors.push(`${where}: roundsWith → "${step.roundsWith}" does not exist`)
-  }
-  if (step.maxRounds !== undefined && step.maxRounds !== "unlimited" && step.maxRounds < 1) {
-    errors.push(`${where}: maxRounds must be ≥ 1 or "unlimited"`)
-  }
-  if (step.onVerdict) {
-    for (const [verdict, route] of Object.entries(step.onVerdict)) {
-      validateRoute(route, `onVerdict["${verdict}"]`, def, routingJobId, stepExists, where, errors)
-      if (route.goto === undefined && route.next !== true && route.rerun === undefined) {
-        warnings.push(`${where}: onVerdict["${verdict}"] routes nowhere (no goto, next, or rerun)`)
-      }
-    }
   }
 }
 
@@ -294,22 +305,26 @@ function findUncountedCycles(steps: readonly StepDef[]): string[][] {
   const stepsById = new Map(steps.map(step => [step.id, step]))
   const counted = new Set<string>()
   for (const step of steps) {
-    if (step.type === "agent" && (step.roundsWith !== undefined || step.maxRounds !== undefined)) {
-      counted.add(step.id)
-      if (step.roundsWith !== undefined) counted.add(step.roundsWith)
-    }
     if (step.retry?.strategy === "backoff") {
       counted.add(step.id)
+    }
+    for (const route of Object.values(step.outcomes ?? {})) {
+      if (route.rerun) {
+        counted.add(step.id)
+        for (const rerunStepId of route.rerun.stepIds ?? []) counted.add(rerunStepId)
+      }
+    }
+    if (step.onFail?.rerun) {
+      counted.add(step.id)
+      for (const rerunStepId of step.onFail.rerun.stepIds ?? []) counted.add(rerunStepId)
     }
   }
 
   const edges = (step: StepDef): string[] => {
     const targets: string[] = []
     if (step.then !== undefined) targets.push(step.then)
-    if (step.type === "agent" && step.onVerdict) {
-      for (const route of Object.values(step.onVerdict)) {
-        if (route.goto !== undefined) targets.push(route.goto)
-      }
+    for (const route of Object.values(step.outcomes ?? {})) {
+      if (route.goto !== undefined) targets.push(route.goto)
     }
     return targets.filter(stepId => stepsById.has(stepId))
   }

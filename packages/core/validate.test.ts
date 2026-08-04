@@ -108,13 +108,22 @@ describe("validateWorkflow", () => {
     expect(r.errors).toEqual([])
   })
 
-  it("accepts a review loop bounded by rounds_with", () => {
+  it("accepts a review loop bounded by rerun.stepIds", () => {
     const r = validateWorkflow({
       ...base,
       jobs: {
         main: {
           steps: [
-            { id: "r", type: "agent", role: "implementer", prompt: "r", roundsWith: "fix", maxRounds: 3, onVerdict: { approved: { next: true }, changes_requested: { goto: "fix" } } },
+            {
+              id: "r",
+              type: "agent",
+              role: "implementer",
+              prompt: "r",
+              outcomes: {
+                approved: { next: true },
+                changes_requested: { rerun: { stepIds: ["fix"], maxRounds: 3 } },
+              },
+            },
             { id: "fix", type: "agent", role: "implementer", prompt: "fix", then: "r" },
           ],
         },
@@ -128,7 +137,7 @@ describe("validateWorkflow", () => {
       ...base,
       jobs: {
         main: {
-          steps: [{ id: "a", type: "agent", role: "implementer", prompt: "a", onVerdict: { ok: {} } }],
+          steps: [{ id: "a", type: "agent", role: "implementer", prompt: "a", outcomes: { ok: {} } }],
         },
       },
     })

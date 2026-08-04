@@ -2,42 +2,50 @@
 
 Parallel multi-agent workflows need cross-job feedback loops. The canonical
 example: two architects design a feature in parallel, a third agent checks
-their agreement, and on disagreement both architects re-run with each other's
-output plus a note on what conflicts — repeating until they converge, then a
-planner splits the agreed design into tasks.
+whether they agree, and on disagreement both architects re-run with each
+other's output plus a note on what conflicts — repeating until they converge,
+then a planner splits the agreed design into tasks.
 
-Today the IR cannot express this. Verdict/failure routing is job-local
-(`onVerdict.goto` targets a step in the same job), completed jobs cannot be
-re-triggered, and there is no way to feed one step's output back into another
-step's prompt. The `workflow-format` graph spec already states that "verdict/
-failure routes MAY return to an earlier step **or job** when a budget bounds
-the cycle" — the interpreter implements only the step case. This change closes
-that gap.
+Two gaps blocked this. First, routing was job-local: a route could only target
+a step in the same job, completed jobs could not be re-triggered, and one
+step's output could not reach another step's prompt. Second, the IR modelled
+"the step finished" in two different ways — `step.succeeded` for plain
+completion and a separate `step.verdict` carrying a review verdict — which
+tied structured results to a review-shaped special case and hard-coded the
+review vocabulary into the engine.
 
 ## What Changes
 
-- **`rerun` routing target.** `onVerdict`, `onFail` and `onReject` routes gain
-  `rerun: { jobIds: [...], maxRounds: N }`. A route is either `goto`, `next`,
-  or `rerun` — never a mix.
-- **Loop counter survives reset.** `JobRuntime.reruns` holds a per-routing-step
-  counter on the routing job. Each rerun increments it; at `maxRounds` the
-  interpreter escalates instead of looping.
-- **Deterministic closure reset.** A rerun resets the target jobs AND their
-  entire downstream closure (via `needs`) to `pending`, preserving the routing
-  job's `reruns` counter. Dependents re-enter through the normal fan-in path.
-- **Feedback data flow.** The transition carries a `feedback` snapshot —
-  nested `jobs.<jobId>.<stepId>` outputs from the pre-reset round plus a
-  `message`. The engine injects it into the prompt context of re-run steps, so
-  a prompt can reference `{{ feedback.jobs.arch-a.design }}` and
-  `{{ feedback.message }}`.
-- **Validation.** `rerun` targets must exist, must be strict ancestors of the
-  routing job (never self or a dependent), and must carry `maxRounds ≥ 1`.
+- **One completion mechanism.** `step.succeeded` and `step.verdict` collapse
+  into `step.completed { outcome?, output? }`. A step that finished its work
+  reports an outcome; the workflow declares `outcomes: { <name>: route }` and
+  the interpreter routes on the name. Outcome names are workflow-defined
+  strings — `agree`/`disagree`, `approved`/`changes_requested`, `cat`/`dog`,
+  anything. The engine attaches meaning to none of them. A step with no
+  `outcomes` simply advances along its path (default outcome `"done"`).
+- **`step.failed` stays separate and means something different.** A failure is
+  "the step could not do its work" (crash, non-zero exit, timeout) and is
+  therefore subject to the retry budget: re-running the *same* step may help.
+  An outcome is "the step did its work, here is the result" — re-running it
+  would just produce the same answer, so outcomes route elsewhere.
+- **`rerun` routing target.** Any route (`outcomes[...]`, `onFail`,
+  `onReject`) may carry `rerun: { stepIds? | jobIds?, maxRounds }`. `stepIds`
+  loops back to earlier steps of the same job (review/fix); `jobIds` re-runs
+  upstream jobs and their downstream closure (parallel-agent consensus).
+- **`roundsWith`/`maxRounds` are removed.** They were an agent-only, review-
+  shaped loop primitive; `rerun.stepIds` covers the same shape with one
+  counter, one budget rule and feedback for free.
+- **Loop counter and feedback.** `JobRuntime.reruns` counts iterations per
+  routing step and survives the closure reset. The transition carries a
+  `feedback` snapshot — pre-reset step outputs plus a `message` — which the
+  engine injects into re-run prompts (`{{ feedback.jobs.arch-a.design }}`,
+  `{{ feedback.message }}`).
 
 ## Non-goals
 
 - No workflow-level stages/phases abstraction.
 - No general step-level fan-out (`then: string[]`) — parallelism stays at the
   job level.
-- No durable history of every prompt/input beyond the feedback snapshot.
-- No automatic convergence detection — the budget escalation is the safety
-  valve; the agents decide when to agree.
+- No engine-defined outcome vocabulary or outcome-name validation beyond
+  "the route it maps to must exist".
+- No automatic convergence detection — the round budget is the safety valve.

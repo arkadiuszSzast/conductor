@@ -1,35 +1,84 @@
 ## ADDED Requirements
 
-### Requirement: Routes may re-run upstream jobs with a bounded loop
-`onVerdict`, `onFail` and `onReject` routes MAY carry a `rerun` target
-(`{ jobIds: string[], maxRounds: number }`) in addition to `goto`/`next`. A
-route with a `rerun` SHALL NOT combine it with `goto` or `next` on the same
-route. Each rerun SHALL increment a per-routing-step counter on the routing
-job; when the counter exceeds `maxRounds` the interpreter SHALL escalate with
-the loop summary instead of re-running.
+### Requirement: Step completion reports a workflow-defined outcome
+A step that completes its work SHALL report `step.completed` with an optional
+`outcome` name (default `"done"`) and optional `output`. A step MAY declare an
+`outcomes` map from outcome name to route. Outcome names SHALL be
+workflow-defined strings to which the engine attaches no built-in meaning. A
+step with no `outcomes` map SHALL advance along its path regardless of the
+reported outcome. A reported outcome that is not present in a declared
+`outcomes` map SHALL escalate rather than fall through.
+
+#### Scenario: Consensus check routes on its own vocabulary
+- **GIVEN** an agent step declaring `outcomes: { agree: {next: true}, disagree: {rerun: ...} }`
+- **WHEN** it completes with outcome `agree`
+- **THEN** the workflow advances to the next step, and no rerun occurs
+
+#### Scenario: Classifier routes to one of several branches
+- **GIVEN** a step declaring outcomes `cat`, `dog` and `bird`, each with a
+  distinct `goto`
+- **WHEN** it completes with outcome `dog`
+- **THEN** the interpreter dispatches the step named by the `dog` route
+
+#### Scenario: Unmapped outcome escalates
+- **WHEN** a step with a declared `outcomes` map completes with an outcome not
+  present in that map
+- **THEN** the feature escalates naming the step and the unmapped outcome
+
+#### Scenario: Plain step advances without declaring outcomes
+- **WHEN** a step with no `outcomes` map completes
+- **THEN** the workflow advances to the next step in the job's path
+
+### Requirement: Failure is distinct from outcome
+`step.failed` SHALL mean the step could not complete its work and SHALL
+consume the step's retry budget before taking `onFail`. A completion outcome
+SHALL NOT consume the retry budget and SHALL NOT re-execute the reporting step
+in place. An evaluation that completes and reports an unfavourable result
+SHALL be modelled as an outcome, not a failure.
+
+#### Scenario: Disagreement does not retry the adjudicator
+- **WHEN** a consensus step completes with outcome `disagree`
+- **THEN** the adjudicator step is not re-executed in place and its attempt
+  counter is unchanged
+
+#### Scenario: Crash retries the same step
+- **WHEN** a step reports `step.failed` and its retry budget is not exhausted
+- **THEN** the same step is dispatched again and its attempt counter increments
+
+### Requirement: Routes may re-run earlier steps or upstream jobs with a bounded loop
+Any route (`outcomes[...]`, `onFail`, `onReject`) MAY carry
+`rerun: { stepIds?, jobIds?, maxRounds }` instead of `goto`/`next`. A route
+SHALL NOT combine `rerun` with `goto` or `next`, and a `rerun` SHALL NOT mix
+`stepIds` with `jobIds`. Each rerun SHALL increment a per-routing-step counter
+on the routing job; when the counter exceeds `maxRounds` the interpreter SHALL
+escalate with the loop summary instead of re-running.
+
+#### Scenario: Review loop re-runs a fixer step in the same job
+- **GIVEN** a review step routing `changes_requested → rerun: { stepIds: [fix], maxRounds: 3 }`
+- **WHEN** it completes with outcome `changes_requested`
+- **THEN** the `fix` step is cleared and dispatched, and the routing step's
+  rerun counter increments
 
 #### Scenario: Consensus disagreement re-runs both architects
 - **GIVEN** jobs `arch-a` and `arch-b` (no needs) and job `consensus` needing
-  both, whose `check` step routes `disagree → rerun: [arch-a, arch-b]` with
-  `maxRounds: 3`
-- **WHEN** `consensus/check` reports verdict `disagree`
+  both, whose `check` step routes `disagree → rerun: { jobIds: [arch-a, arch-b], maxRounds: 3 }`
+- **WHEN** `consensus/check` completes with outcome `disagree`
 - **THEN** `arch-a`, `arch-b`, `consensus` and their downstream dependents are
   reset to `pending` (the routing job keeps its loop counter), `arch-a` and
   `arch-b` entry steps are dispatched, and the transition carries a feedback
   snapshot of the pre-reset outputs
 
-#### Scenario: Non-converging consensus escalates
+#### Scenario: Non-converging loop escalates
 - **GIVEN** the same workflow and `maxRounds: 3`
 - **WHEN** `disagree` is reported a fourth time
-- **THEN** the interpreter escalates with the feedback/reason summary and no
-  job is re-run
+- **THEN** the interpreter escalates with the loop summary and no job is re-run
 
-### Requirement: A rerun resets the transitive downstream closure
-The reset set for a `rerun` SHALL be the target jobs plus every job that
-transitively depends on them through `needs`, all returned to `pending`. The
-routing job SHALL be reset like any other member, except that its `reruns`
-counter is preserved so the loop stays bounded across rounds. Jobs outside
-the closure SHALL be untouched.
+### Requirement: A job rerun resets the transitive downstream closure
+The reset set for a job-level `rerun` SHALL be the target jobs plus every job
+that transitively depends on them through `needs`, all returned to `pending`.
+The routing job SHALL be reset like any other member, except that its `reruns`
+counter is preserved so the loop stays bounded across rounds. Jobs outside the
+closure SHALL be untouched.
 
 #### Scenario: Downstream consumers recompute after a rerun
 - **GIVEN** `arch-a → consensus → breakdown` and `arch-b → consensus`
@@ -38,22 +87,23 @@ the closure SHALL be untouched.
   new consensus round terminates
 
 ### Requirement: Feedback from the previous round is available to re-run steps
-A rerun transition SHALL carry `feedback: { jobs: { <jobId>: { <stepId>: output } }, message?: string }`
-built from the pre-reset state: every step output of the rerun targets plus
-the routing step's output, and the route reason as `message`. The prompt
-template of a re-run step SHALL be able to reference these as dotted paths
-(e.g. `{{ feedback.jobs.arch-a.design }}`, `{{ feedback.message }}`).
+A rerun transition SHALL carry
+`feedback: { jobs: { <jobId>: { <stepId>: output } }, message? }` built from
+the pre-reset state: the step outputs of the rerun targets plus the routing
+step's output, with the route reason as `message`. Prompt templates of re-run
+steps SHALL be able to reference these as dotted paths.
 
 #### Scenario: Architect re-runs with the other architect's output
-- **GIVEN** `arch-a/design` produced output `DESIGN_A` and `arch-b/design`
-  produced `DESIGN_B` in round 1, and a rerun is triggered
+- **GIVEN** `arch-a/design` produced `DESIGN_A` and `arch-b/design` produced
+  `DESIGN_B`, and a rerun is triggered
 - **WHEN** `arch-a/design` re-executes
-- **THEN** its prompt context contains `feedback.jobs["arch-a"]["design"] =
-  "DESIGN_A"`, `feedback.jobs["arch-b"]["design"] = "DESIGN_B"`, and
-  `feedback.message` is the disagreement reason
+- **THEN** its prompt context contains `feedback.jobs["arch-a"]["design"]`,
+  `feedback.jobs["arch-b"]["design"]` and `feedback.message`
 
-### Requirement: Rerun targets are validated as strict ancestors
-Validation SHALL reject a `rerun` whose target does not exist, is the routing
-job itself, depends transitively on the routing job, or whose `maxRounds` is
-less than 1. The needs graph SHALL remain acyclic; `rerun` is the only
-backward edge and is always budgeted.
+### Requirement: Rerun targets are validated
+Validation SHALL reject a `rerun` whose `stepIds` name steps absent from the
+routing job; whose `jobIds` name a job that does not exist, is the routing job
+itself, or transitively depends on the routing job; which mixes `stepIds` with
+`jobIds`; which names neither; or whose `maxRounds` is below 1. The `needs`
+graph SHALL remain acyclic; `rerun` is the only backward edge and is always
+budgeted.

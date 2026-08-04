@@ -48,24 +48,42 @@ interface StepBase {
   readonly id: string
   readonly if?: string
   readonly then?: string
-  readonly onFail?: RerunRoute
+  /** Routes keyed by the step's declared outcome. A step that completes its
+   *  work reports an outcome (default `"done"`); the interpreter routes on it.
+   *  This is one mechanism for every "the step worked, here is its result"
+   *  case: review verdicts, consensus checks, classifiers, gate results. */
+  readonly outcomes?: Outcomes
+  /** Route taken when the step could NOT complete its work (crash, non-zero
+   *  exit, timeout, transport error) after its retry budget is exhausted.
+   *  Distinct from an outcome: a failure means "re-running may help". */
+  readonly onFail?: Route
   readonly retry?: RetryPolicy
-  readonly onReject?: RerunRoute
+  readonly onReject?: Route
 }
 
-/** A failure/rejection/verdict route: exactly one of `goto`, `next`, `rerun`.
- *  Validation rejects a mixture. `rerun` re-triggers upstream jobs as a
- *  bounded loop (see `cross-job-loops`). */
-export interface RerunRoute {
+/** Outcome name → route. Outcome names are workflow-defined strings; the
+ *  interpreter attaches no meaning to any particular name. */
+export interface Outcomes {
+  readonly [outcome: string]: Route
+}
+
+/** A route: exactly one of `goto`, `next`, `rerun`. Validation rejects a
+ *  mixture. `rerun` re-executes earlier steps/jobs as a bounded loop. */
+export interface Route {
   readonly goto?: string
   readonly next?: boolean
   readonly rerun?: RerunTarget
 }
 
+/** Re-execute earlier work as a bounded loop. `stepIds` re-runs steps within
+ *  the routing job (review/fix loops); `jobIds` re-runs upstream jobs and
+ *  their downstream closure (parallel-agent consensus). At least one is
+ *  required. */
 export interface RerunTarget {
-  readonly jobIds: readonly string[]
-  /** Total iterations including the first run. Must be ≥ 1 — every cross-job
-   *  cycle is bounded by construction. */
+  readonly stepIds?: readonly string[]
+  readonly jobIds?: readonly string[]
+  /** Total iterations including the first run. Must be ≥ 1 — every loop is
+   *  bounded by construction. */
   readonly maxRounds: number
 }
 
@@ -76,9 +94,6 @@ export interface AgentStep extends StepBase {
   readonly type: "agent"
   readonly role: string
   readonly prompt: string
-  readonly onVerdict?: OnVerdict
-  readonly roundsWith?: string
-  readonly maxRounds?: number | "unlimited"
 }
 
 export interface ActionStep extends StepBase {
@@ -131,18 +146,6 @@ export type BackoffDef =
       /** Jitter mode. Default: "full". */
       readonly jitter?: "none" | "full" | "equal"
     }
-
-// ---------------------------------------------------------------------------
-// Verdict routing (review loops)
-// ---------------------------------------------------------------------------
-
-/** `verdict` is the structured outcome of an agent's review/evaluation step
- *  (e.g. "approved", "changes_requested"). It is NOT GitHub-specific — any
- *  review process produces a verdict. `onVerdict` maps verdict strings to
- *  routing targets. */
-export interface OnVerdict {
-  readonly [verdict: string]: RerunRoute
-}
 
 // ---------------------------------------------------------------------------
 // Roles (pure metadata — the engine resolves agent/model/variant)
@@ -228,14 +231,27 @@ export interface StepRuntime {
 
 export type PipelineEvent =
   | { readonly kind: "feature.start" }
-  | { readonly kind: "step.succeeded"; readonly jobId: string; readonly stepId: string; readonly output?: string }
+  /** The step completed its work. `outcome` selects the route from the step's
+   *  `outcomes` map (default `"done"` when the step declares none); `output`
+   *  is the step's payload, available to later steps and to feedback. */
+  | {
+      readonly kind: "step.completed"
+      readonly jobId: string
+      readonly stepId: string
+      readonly outcome?: string
+      readonly output?: string
+    }
+  /** The step could NOT complete its work (crash, non-zero exit, timeout).
+   *  Subject to the retry budget, then `onFail`. */
   | { readonly kind: "step.failed"; readonly jobId: string; readonly stepId: string; readonly reason: string }
-  | { readonly kind: "step.verdict"; readonly jobId: string; readonly stepId: string; readonly verdict: string; readonly output?: string }
   | { readonly kind: "human.approved"; readonly jobId: string; readonly stepId: string }
   | { readonly kind: "human.rejected"; readonly jobId: string; readonly stepId: string; readonly notes?: string }
   | { readonly kind: "human.paused" }
   | { readonly kind: "human.resumed" }
   | { readonly kind: "human.abandoned" }
+
+/** The outcome assumed when a step reports completion without naming one. */
+export const DEFAULT_OUTCOME = "done"
 
 // ---------------------------------------------------------------------------
 // Decisions — the interpreter's output (can be multiple for DAG fan-out)
