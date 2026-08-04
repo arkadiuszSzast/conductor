@@ -112,6 +112,17 @@ itself, or transitively depends on the routing job; which mixes `stepIds` with
 graph SHALL remain acyclic; `rerun` is the only backward edge and is always
 budgeted.
 
+#### Scenario: Sibling rerun target is rejected
+- **WHEN** a workflow routes `rerun: { jobIds: [sibling] }` where `sibling`
+  is not an ancestor of the routing job through `needs`
+- **THEN** validation fails naming the routing step and the offending job,
+  because rerunning a non-ancestor would never re-trigger the routing job
+
+#### Scenario: Unbounded rerun is unrepresentable
+- **WHEN** a workflow declares a `rerun` with `maxRounds: 0` or a `goto`
+  cycle with no budget on any edge
+- **THEN** validation rejects it — every loop carries a bound by construction
+
 ### Requirement: A failed job is terminal and the DAG reacts to it
 When a step exhausts its retry budget with no `onFail` route, its job SHALL
 become `failed` (terminal) rather than immediately escalating the feature.

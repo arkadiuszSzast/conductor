@@ -6,6 +6,7 @@
 - [ ] [core] Implement strict source-mapped YAML parsing with duplicate-key/custom-tag/alias limits and actionable unknown-field errors.
 - [x] [core] Implement schema/type/reference validation, graph cycle diagnostics and bounded-loop checks.
 - [ ] [test] Add golden valid/invalid workflow fixtures, including minimal linear, fan-out/fan-in, gates, findings loops and malformed YAML.
+- [ ] [test] Parse and validate the two-architect consensus workflow from `docs/workflow-reference.md` as a golden fixture (moved from `cross-job-loops`).
 
 ## 2. Pure graph interpreter
 

@@ -56,4 +56,4 @@
 ## 8. Docs
 
 - [x] [docs] Document outcomes, the outcome-vs-failure boundary, `rerun` and the `feedback.*` namespace in `design.md`.
-- [ ] [docs] Add the two-architect consensus workflow to the workflow reference once the YAML parser lands (blocked on `workflow-format` task 1.2).
+- [x] [docs] Two-architect consensus example published in `docs/workflow-reference.md`; end-to-end YAML validation of it moved to `workflow-format` (blocked there on the parser, task 1.2).
