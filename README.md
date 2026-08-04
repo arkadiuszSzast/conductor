@@ -45,6 +45,15 @@ in [`openspec/changes/`](openspec/changes).
 7. **Genuinely open source** — no host-specific paths, no hardcoded model
    gateway.
 
+## Documentation
+
+- [Concepts](docs/concepts.md) — the execution model: jobs, outcomes vs
+  failures, loops, feedback, escalation.
+- [Workflow reference](docs/workflow-reference.md) — every `conductor.yaml`
+  field, GHA-style.
+- [Expressions](docs/expressions.md) — the `{{ }}` template contexts and
+  their guarantees.
+
 ## Repository layout
 
 ```

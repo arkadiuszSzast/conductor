@@ -96,3 +96,60 @@ explicit routes, roles/models, prompts, gates and params. Builtin names map to
 bundled actions. It refuses unsupported/ambiguous shapes rather than guessing.
 Converted files are validated and a semantic test runs representative legacy
 events through both interpreters until parity is established.
+
+## Confirmed: canonical IR shape
+
+- **No flat pipeline.** Every workflow is `jobs: { <id>: JobDef }`; a linear
+  workflow is one job with ordered steps. The interpreter is DAG-aware from
+  the start (`onJobDone` unblocks dependents), so later fan-out/fan-in work
+  does not re-shape state.
+- **No builtin action names in the engine.** Step kinds are exactly `agent`,
+  `action` (with `uses`), `command`, `human`. Engine "builtin" names from the
+  seed (e.g. `git/pr-merge`) are external `uses` targets, resolved by the
+  action registry later.
+- **State is durable and job-scoped.** `FeatureState.jobs[].currentStep` +
+  per-step `attempts`/`reruns`/`outputs` replace the seed's single
+  `currentStep` + per-feature counters; the interpreter returns `decisions[]`
+  + `patch` so fan-out yields multiple decisions for one event.
+- **No daemon/opencode coupling in the IR.** Removed from the seed: `PublishDef`
+  + `tokenCommand` (publishing is a server concern, not a workflow shape) and
+  `RoleDef.session`. `RoleDef` is pure metadata (`agent`, optional `model`,
+  `variant`) resolved by the engine.
+- **Failure = two separate knobs.** `retry.maxAttempts` is the retry budget
+  for the same step (default 1 = no retry; `maxAttempts` counts total
+  executions including the first). `onFail` routes only once retries are
+  exhausted; with no route, the **job fails** and the DAG reacts (dependents
+  skip, `failure()` jobs run, the feature escalates only when nothing else is
+  runnable — per `cross-job-loops`). Notification-on-failure is a plain step
+  reached via `onFail`, not a shell escape hatch — the interpreter stays pure
+  (routing) and the engine owns side effects.
+- **Sealed over nullable.** `BackoffDef` is a discriminated union keyed on
+  `strategy` with optional fields carrying defaults; `AgentStep.prompt` is
+  required (the IR is self-describing). No `X | null` for absent config.
+  (Superseded detail: `maxRounds: number | "unlimited"` became a plain
+  required `number ≥ 1` in `cross-job-loops` — every loop is bounded by
+  construction.)
+- **Retry is a sealed policy, not a bag of nullable fields.**
+  `retry?: RetryPolicy` where `RetryPolicy = { strategy: "none" } |
+  { strategy: "backoff"; maxAttempts: number; maxElapsed?: string;
+  backoff: BackoffDef }` — a "backoff" policy always carries a required
+  `backoff`. `BackoffDef` is itself sealed: `{ strategy: "constant"; delay } |
+  { strategy: "exponential"; initial; multiplier; max; jitter? }`. The engine
+  fills jitter defaults; there is no all-null policy value.
+- **Within a job, steps are a path, not a graph.** The path is declaration
+  order; loops are explicit route edges (`outcomes`, `onFail`, `rerun` after
+  `cross-job-loops` — `then`/`roundsWith` were removed). Parallelism lives at
+  the **job** level (`needs`), so step-level fan-out is not in the model —
+  adding it would force `currentStep` into a multi-active set. Open question
+  for a later change.
+- **Resolved gap: cross-job feedback loops.** "Parallel agents → consensus →
+  re-run both with the other's output" was not expressible in the original IR.
+  The `cross-job-loops` change closed it: completion is
+  `step.completed { outcome?, outputs? }` routed via per-step `outcomes`
+  maps, loops are `rerun` routes (step scope for review/fix, job scope with
+  transitive closure reset for consensus), step outputs are GHA-style named
+  maps, and rerun transitions carry a `feedback` snapshot of the pre-reset
+  round for re-run prompts. `roundsWith`, `then`, `onVerdict`, `onReject` and
+  the separate human events were removed. See
+  `openspec/changes/cross-job-loops/design.md` — its decisions supersede the
+  step-routing shapes sketched in this document.
