@@ -240,7 +240,11 @@ export interface JobRuntime {
 
 export interface StepRuntime {
   readonly status: StepStatus
-  readonly output: string | null
+  /** Named outputs reported on completion (GHA-style `name=value` pairs).
+   *  Empty means the step published nothing. The runner decides the names:
+   *  command steps write `$CONDUCTOR_OUTPUT`, agent steps report under
+   *  `report`, human gates under `notes`, actions per their manifest. */
+  readonly outputs: Readonly<Record<string, string>>
 }
 
 // ---------------------------------------------------------------------------
@@ -250,20 +254,20 @@ export interface StepRuntime {
 export type PipelineEvent =
   | { readonly kind: "feature.start" }
   /** A step finished its work. `outcome` selects the route from the step's
-   *  `outcomes` map (default `"done"`); `output` is the step's payload,
-   *  available to later steps and to feedback.
+   *  `outcomes` map (default `"done"`); `outputs` are the step's named
+   *  payloads, available to later steps and to feedback.
    *
    *  A human gate uses the same event: approving is an outcome (`"approved"`
    *  by default), rejecting is an outcome too (`"rejected"`), with the note
-   *  carried as `output`. The interpreter needs no separate human vocabulary
-   *  — a gate that wants to loop back on rejection just maps that outcome to
-   *  a rerun, exactly like a review step. */
+   *  carried in `outputs` (e.g. `{ notes }`). The interpreter needs no
+   *  separate human vocabulary — a gate that wants to loop back on rejection
+   *  just maps that outcome to a rerun, exactly like a review step. */
   | {
       readonly kind: "step.completed"
       readonly jobId: string
       readonly stepId: string
       readonly outcome?: string
-      readonly output?: string
+      readonly outputs?: Readonly<Record<string, string>>
     }
   /** The step could NOT complete its work (crash, non-zero exit, timeout).
    *  Subject to the retry budget, then `onFail`. */
@@ -294,13 +298,16 @@ export interface Transition {
   readonly patch: Patch
   /** Feedback snapshot attached to a `rerun` transition: the pre-reset round's
    *  step outputs plus the route reason. The engine merges `feedback` into the
-   *  template context of re-run steps (`{{ feedback.jobs.<jobId>.<stepId> }}`,
-   *  `{{ feedback.message }}`). */
+   *  template context of re-run steps
+   *  (`{{ feedback.jobs.<jobId>.<stepId>.<name> }}`, `{{ feedback.message }}`). */
   readonly feedback?: Feedback
 }
 
+/** Job → step → named outputs, snapshotted before the rerun reset. Once the
+ *  expression evaluator resolves `JobDef.outputs`, declared job outputs will
+ *  join this shape; today only step outputs exist. */
 export interface Feedback {
-  readonly jobs: Readonly<Record<string, Readonly<Record<string, string>>>>
+  readonly jobs: Readonly<Record<string, Readonly<Record<string, Readonly<Record<string, string>>>>>>
   readonly message: string
 }
 
@@ -324,5 +331,5 @@ export interface JobPatch {
 
 export interface StepPatch {
   readonly status?: StepStatus
-  readonly output?: string | null
+  readonly outputs?: Readonly<Record<string, string>>
 }

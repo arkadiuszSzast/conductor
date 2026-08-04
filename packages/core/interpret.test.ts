@@ -282,7 +282,7 @@ describe("human gates", () => {
     jobs: {
       main: job({
         currentStep: "approve-merge",
-        steps: { "approve-merge": { status: "waiting_human", output: null } },
+        steps: { "approve-merge": { status: "waiting_human", outputs: {} } },
       }),
     },
   })
@@ -319,9 +319,9 @@ describe("human gates", () => {
     const t = interpret(
       workflow,
       atGate(),
-      evt({ kind: "step.completed", stepId: "approve-merge", outcome: "rejected", output: "needs tests" }),
+      evt({ kind: "step.completed", stepId: "approve-merge", outcome: "rejected", outputs: { notes: "needs tests" } }),
     )
-    expect(t.patch.jobs?.main?.steps?.["approve-merge"]?.output).toBe("needs tests")
+    expect(t.patch.jobs?.main?.steps?.["approve-merge"]?.outputs).toEqual({ notes: "needs tests" })
   })
 
   it("pause and resume round-trip preserves the current step", () => {
@@ -351,7 +351,7 @@ describe("human gates", () => {
         jobs: {
           main: job({
             currentStep: "approve-merge",
-            steps: { "approve-merge": { status: "waiting_human", output: null } },
+            steps: { "approve-merge": { status: "waiting_human", outputs: {} } },
           }),
         },
       }),
@@ -394,7 +394,7 @@ describe("human gates", () => {
             currentStep: null,
             attempts: { gate: 2, other: 1 },
             reruns: { gate: 3 },
-            steps: { gate: { status: "failed", output: null } },
+            steps: { gate: { status: "failed", outputs: {} } },
           }),
         },
       }),

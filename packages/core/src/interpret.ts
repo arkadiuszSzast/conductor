@@ -44,7 +44,7 @@ export function interpret(
 ): Transition {
   switch (event.kind) {
     case "feature.start":     return onStart(workflow)
-    case "step.completed":    return onCompleted(workflow, state, event.jobId, event.stepId, event.outcome ?? DEFAULT_OUTCOME, event.output)
+    case "step.completed":    return onCompleted(workflow, state, event.jobId, event.stepId, event.outcome ?? DEFAULT_OUTCOME, event.outputs)
     case "step.failed":       return onFailed(workflow, state, event.jobId, event.stepId, event.reason)
     case "human.paused":      return buildTransition([{ kind: "pause" }], { status: "paused" })
     case "human.resumed":     return onResumed(workflow, state)
@@ -175,7 +175,7 @@ function onRerun(
   routingStepId: string,
   rerun: RerunTarget,
   reason: string,
-  routingStepOutput?: string,
+  routingStepOutputs?: Readonly<Record<string, string>>,
 ): Transition {
   const routingRuntime = state.jobs[routingJobId]
   const rounds = (routingRuntime?.reruns[routingStepId] ?? 0) + 1
@@ -187,7 +187,7 @@ function onRerun(
     )
   }
 
-  const feedback = buildFeedback(state, rerun, routingJobId, routingStepId, reason, routingStepOutput)
+  const feedback = buildFeedback(state, rerun, routingJobId, routingStepId, reason, routingStepOutputs)
 
   // Step scope: loop back inside the routing job — the job keeps running and
   // only the named steps are re-executed. Job scope: reset the targets and
@@ -203,17 +203,17 @@ function buildFeedback(
   routingJobId: string,
   routingStepId: string,
   reason: string,
-  routingStepOutput?: string,
+  routingStepOutputs?: Readonly<Record<string, string>>,
 ): Feedback {
-  const feedbackJobs: Record<string, Record<string, string>> = {}
+  const feedbackJobs: Record<string, Record<string, Readonly<Record<string, string>>>> = {}
 
   const collectFrom = (jobId: string, only?: readonly string[]): void => {
     const jobRuntime = state.jobs[jobId]
     if (!jobRuntime) return
-    const stepOutputs: Record<string, string> = {}
+    const stepOutputs: Record<string, Readonly<Record<string, string>>> = {}
     for (const [stepId, stepState] of Object.entries(jobRuntime.steps)) {
       if (only && !only.includes(stepId)) continue
-      if (stepState.output !== null) stepOutputs[stepId] = stepState.output
+      if (Object.keys(stepState.outputs).length > 0) stepOutputs[stepId] = stepState.outputs
     }
     if (Object.keys(stepOutputs).length > 0) {
       feedbackJobs[jobId] = { ...feedbackJobs[jobId], ...stepOutputs }
@@ -226,9 +226,9 @@ function buildFeedback(
     for (const jobId of rerun.jobIds) collectFrom(jobId)
   }
 
-  const routingOutput = routingStepOutput ?? state.jobs[routingJobId]?.steps[routingStepId]?.output
-  if (routingOutput !== null && routingOutput !== undefined) {
-    feedbackJobs[routingJobId] = { ...feedbackJobs[routingJobId], [routingStepId]: routingOutput }
+  const routingOutputs = routingStepOutputs ?? state.jobs[routingJobId]?.steps[routingStepId]?.outputs
+  if (routingOutputs !== undefined && Object.keys(routingOutputs).length > 0) {
+    feedbackJobs[routingJobId] = { ...feedbackJobs[routingJobId], [routingStepId]: routingOutputs }
   }
 
   return { jobs: feedbackJobs, message: reason }
@@ -254,8 +254,8 @@ function rerunSteps(
     )
   }
 
-  const clearedSteps: Record<string, { status: "pending"; output: null }> = {}
-  for (const stepId of stepIds) clearedSteps[stepId] = { status: "pending", output: null }
+  const clearedSteps: Record<string, { status: "pending"; outputs: Record<string, never> }> = {}
+  for (const stepId of stepIds) clearedSteps[stepId] = { status: "pending", outputs: {} }
 
   const jobPatch: JobPatch = {
     status: "running",
@@ -411,7 +411,7 @@ function onCompleted(
   jobId: string,
   stepId: string,
   outcome: string,
-  output?: string,
+  outputs?: Readonly<Record<string, string>>,
 ): Transition {
   const jobRuntime = state.jobs[jobId]
   if (!jobRuntime || jobRuntime.currentStep !== stepId) {
@@ -428,7 +428,7 @@ function onCompleted(
   }
 
   const completedPatch: Patch = {
-    jobs: { [jobId]: { steps: { [stepId]: { status: "succeeded", output: output ?? null } } } },
+    jobs: { [jobId]: { steps: { [stepId]: { status: "succeeded", outputs: outputs ?? {} } } } },
   }
 
   const declaresOutcomes = Object.keys(step.outcomes).length > 0
@@ -436,7 +436,7 @@ function onCompleted(
   // No declared outcomes: any outcome simply advances along the step path.
   if (!declaresOutcomes) {
     return applyRoute(
-      { kind: "next" }, workflow, state, job, step, `outcome "${outcome}"`, completedPatch, output,
+      { kind: "next" }, workflow, state, job, step, `outcome "${outcome}"`, completedPatch, outputs,
     )
   }
 
@@ -449,7 +449,7 @@ function onCompleted(
   }
 
   return applyRoute(
-    route, workflow, state, job, step, `outcome "${outcome}"`, completedPatch, output,
+    route, workflow, state, job, step, `outcome "${outcome}"`, completedPatch, outputs,
   )
 }
 
@@ -465,7 +465,7 @@ function applyRoute(
   step: StepDef,
   reason: string,
   basePatch: Patch,
-  output?: string,
+  outputs?: Readonly<Record<string, string>>,
 ): Transition {
   const jobId = jobIdOf(workflow, job)
 
@@ -479,7 +479,7 @@ function applyRoute(
       return buildTransition(entry.decisions as Decision[], mergePatches(basePatch, entry.patch))
     }
     case "rerun": {
-      const rerun = onRerun(workflow, state, jobId, step.id, route.target, reason, output)
+      const rerun = onRerun(workflow, state, jobId, step.id, route.target, reason, outputs)
       return {
         decisions: rerun.decisions,
         patch: mergePatches(basePatch, rerun.patch),

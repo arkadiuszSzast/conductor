@@ -2,7 +2,8 @@
 
 ### Requirement: Step completion reports a workflow-defined outcome
 A step that completes its work SHALL report `step.completed` with an optional
-`outcome` name (default `"done"`) and optional `output`. A step MAY declare an
+`outcome` name (default `"done"`) and optional named `outputs`
+(`Record<name, value>`, GHA-style). A step MAY declare an
 `outcomes` map from outcome name to route. Outcome names SHALL be
 workflow-defined strings to which the engine attaches no built-in meaning. A
 step with no `outcomes` map SHALL advance along its path regardless of the
@@ -88,17 +89,20 @@ closure SHALL be untouched.
 
 ### Requirement: Feedback from the previous round is available to re-run steps
 A rerun transition SHALL carry
-`feedback: { jobs: { <jobId>: { <stepId>: output } }, message? }` built from
-the pre-reset state: the step outputs of the rerun targets plus the routing
-step's output, with the route reason as `message`. Prompt templates of re-run
-steps SHALL be able to reference these as dotted paths.
+`feedback: { jobs: { <jobId>: { <stepId>: { <name>: value } } }, message }`
+built from the pre-reset state: the named step outputs of the rerun targets
+plus the routing step's outputs, with the route reason as `message`. Prompt
+templates of re-run steps SHALL be able to reference these as dotted paths.
+A step publishes multiple named outputs (GHA-style `name=value`); a step with
+no outputs contributes nothing to the snapshot.
 
 #### Scenario: Architect re-runs with the other architect's output
-- **GIVEN** `arch-a/design` produced `DESIGN_A` and `arch-b/design` produced
-  `DESIGN_B`, and a rerun is triggered
+- **GIVEN** `arch-a/design` produced output `report: DESIGN_A` and
+  `arch-b/design` produced `report: DESIGN_B`, and a rerun is triggered
 - **WHEN** `arch-a/design` re-executes
-- **THEN** its prompt context contains `feedback.jobs["arch-a"]["design"]`,
-  `feedback.jobs["arch-b"]["design"]` and `feedback.message`
+- **THEN** its prompt context contains
+  `feedback.jobs["arch-a"]["design"]["report"]`,
+  `feedback.jobs["arch-b"]["design"]["report"]` and `feedback.message`
 
 ### Requirement: Rerun targets are validated
 Validation SHALL reject a `rerun` whose `stepIds` name steps absent from the

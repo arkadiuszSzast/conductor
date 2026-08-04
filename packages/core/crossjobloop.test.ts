@@ -80,16 +80,16 @@ describe("cross-job rerun", () => {
 
   it("disagree triggers rerun with feedback snapshot", () => {
     const state = mkState({
-      "arch-a": mkJob({ status: "succeeded", currentStep: null, steps: { design: { status: "succeeded", output: "DESIGN_A" } } }),
-      "arch-b": mkJob({ status: "succeeded", currentStep: null, steps: { design: { status: "succeeded", output: "DESIGN_B" } } }),
-      consensus: mkJob({ status: "running", currentStep: "check", steps: { check: { status: "running", output: "they disagree" } } }),
+      "arch-a": mkJob({ status: "succeeded", currentStep: null, steps: { design: { status: "succeeded", outputs: { report: "DESIGN_A" } } } }),
+      "arch-b": mkJob({ status: "succeeded", currentStep: null, steps: { design: { status: "succeeded", outputs: { report: "DESIGN_B" } } } }),
+      consensus: mkJob({ status: "running", currentStep: "check", steps: { check: { status: "running", outputs: { report: "they disagree" } } } }),
     })
     const t = interpret(twoArchitectsWorkflow, state, {
       kind: "step.completed",
       jobId: "consensus",
       stepId: "check",
       outcome: "disagree",
-      output: "They disagree about X.",
+      outputs: { report: "They disagree about X." },
     })
 
     expect(t.decisions).toHaveLength(2)
@@ -106,16 +106,16 @@ describe("cross-job rerun", () => {
     expect(archAJob?.currentStep).toBe("design")
 
     expect(t.feedback).toBeDefined()
-    expect(t.feedback?.jobs["arch-a"]?.design).toBe("DESIGN_A")
-    expect(t.feedback?.jobs["arch-b"]?.design).toBe("DESIGN_B")
-    expect(t.feedback?.jobs?.consensus?.check).toBe("They disagree about X.")
+    expect(t.feedback?.jobs["arch-a"]?.design).toEqual({ report: "DESIGN_A" })
+    expect(t.feedback?.jobs["arch-b"]?.design).toEqual({ report: "DESIGN_B" })
+    expect(t.feedback?.jobs?.consensus?.check).toEqual({ report: "They disagree about X." })
     expect(t.feedback?.message).toContain("disagree")
   })
 
   it("agree proceeds to breakdown without rerun", () => {
     const state = mkState({
-      "arch-a": mkJob({ status: "succeeded", currentStep: null, steps: { design: { status: "succeeded", output: "DESIGN_A" } } }),
-      "arch-b": mkJob({ status: "succeeded", currentStep: null, steps: { design: { status: "succeeded", output: "DESIGN_B" } } }),
+      "arch-a": mkJob({ status: "succeeded", currentStep: null, steps: { design: { status: "succeeded", outputs: { report: "DESIGN_A" } } } }),
+      "arch-b": mkJob({ status: "succeeded", currentStep: null, steps: { design: { status: "succeeded", outputs: { report: "DESIGN_B" } } } }),
       consensus: mkJob({ status: "running", currentStep: "check" }),
     })
     const t = interpret(twoArchitectsWorkflow, state, {
@@ -130,8 +130,8 @@ describe("cross-job rerun", () => {
 
   it("escalates after maxRounds (non-converging)", () => {
     const state = mkState({
-      "arch-a": mkJob({ status: "succeeded", currentStep: null, steps: { design: { status: "succeeded", output: "v3" } } }),
-      "arch-b": mkJob({ status: "succeeded", currentStep: null, steps: { design: { status: "succeeded", output: "v3" } } }),
+      "arch-a": mkJob({ status: "succeeded", currentStep: null, steps: { design: { status: "succeeded", outputs: { report: "v3" } } } }),
+      "arch-b": mkJob({ status: "succeeded", currentStep: null, steps: { design: { status: "succeeded", outputs: { report: "v3" } } } }),
       consensus: mkJob({ status: "running", currentStep: "check", reruns: { check: 3 } }),
     })
     const t = interpret(twoArchitectsWorkflow, state, {
@@ -166,11 +166,11 @@ describe("cross-job rerun", () => {
     )
 
     const state = mkState({
-      "arch-a": mkJob({ status: "succeeded", steps: { design: { status: "succeeded", output: "D1" } } }),
-      "arch-b": mkJob({ status: "succeeded", steps: { design: { status: "succeeded", output: "D2" } } }),
+      "arch-a": mkJob({ status: "succeeded", steps: { design: { status: "succeeded", outputs: { report: "D1" } } } }),
+      "arch-b": mkJob({ status: "succeeded", steps: { design: { status: "succeeded", outputs: { report: "D2" } } } }),
       consensus: mkJob({ status: "running", currentStep: "check" }),
-      publish: mkJob({ status: "succeeded", steps: { push: { status: "succeeded", output: "pushed" } } }),
-      announce: mkJob({ status: "succeeded", steps: { notify: { status: "succeeded", output: "sent" } } }),
+      publish: mkJob({ status: "succeeded", steps: { push: { status: "succeeded", outputs: { report: "pushed" } } } }),
+      announce: mkJob({ status: "succeeded", steps: { notify: { status: "succeeded", outputs: { report: "sent" } } } }),
     })
 
     const t = interpret(chained, state, {
@@ -189,8 +189,8 @@ describe("cross-job rerun", () => {
 
   it("clears currentStep on every job in the reset closure", () => {
     const state = mkState({
-      "arch-a": mkJob({ status: "succeeded", steps: { design: { status: "succeeded", output: "D1" } } }),
-      "arch-b": mkJob({ status: "succeeded", steps: { design: { status: "succeeded", output: "D2" } } }),
+      "arch-a": mkJob({ status: "succeeded", steps: { design: { status: "succeeded", outputs: { report: "D1" } } } }),
+      "arch-b": mkJob({ status: "succeeded", steps: { design: { status: "succeeded", outputs: { report: "D2" } } } }),
       consensus: mkJob({ status: "running", currentStep: "check" }),
     })
     const t = interpret(twoArchitectsWorkflow, state, {
@@ -228,7 +228,7 @@ describe("onFail rerun", () => {
 
   it("reruns implement when gate exhausts retries", () => {
     const state = mkState({
-      implement: mkJob({ status: "succeeded", currentStep: null, steps: { code: { status: "succeeded", output: "v1" } } }),
+      implement: mkJob({ status: "succeeded", currentStep: null, steps: { code: { status: "succeeded", outputs: { report: "v1" } } } }),
       gate: mkJob({ status: "running", currentStep: "check", attempts: { check: 2 } }),
     })
     const t = interpret(failRerunWorkflow, state, {
@@ -242,13 +242,13 @@ describe("onFail rerun", () => {
     expect(t.patch.jobs?.gate?.status).toBe("pending")
     expect(t.patch.jobs?.gate?.currentStep).toBeNull()
     expect(t.patch.jobs?.gate?.reruns?.check).toBe(1)
-    expect(t.feedback?.jobs?.implement?.code).toBe("v1")
+    expect(t.feedback?.jobs?.implement?.code).toEqual({ report: "v1" })
     expect(t.feedback?.message).toContain("exhausted 2 attempt")
   })
 
   it("escalates on rerun exhaustion", () => {
     const state = mkState({
-      implement: mkJob({ status: "succeeded", currentStep: null, steps: { code: { status: "succeeded", output: "v2" } } }),
+      implement: mkJob({ status: "succeeded", currentStep: null, steps: { code: { status: "succeeded", outputs: { report: "v2" } } } }),
       gate: mkJob({ status: "running", currentStep: "check", attempts: { check: 2 }, reruns: { check: 2 } }),
     })
     const t = interpret(failRerunWorkflow, state, {
@@ -280,7 +280,7 @@ describe("human gate rejection rerun", () => {
 
   it("reruns design on human rejection", () => {
     const state = mkState({
-      design: mkJob({ status: "succeeded", currentStep: null, steps: { draft: { status: "succeeded", output: "draft" } } }),
+      design: mkJob({ status: "succeeded", currentStep: null, steps: { draft: { status: "succeeded", outputs: { report: "draft" } } } }),
       approval: mkJob({ status: "waiting_human", currentStep: "gate" }),
     })
     const t = interpret(rejectRerunWorkflow, state, {
@@ -288,15 +288,15 @@ describe("human gate rejection rerun", () => {
       jobId: "approval",
       stepId: "gate",
       outcome: "rejected",
-      output: "not convinced",
+      outputs: { notes: "not convinced" },
     })
     expect(t.decisions[0]?.kind).toBe("execute_step")
     expect((t.decisions[0] as { jobId: string }).jobId).toBe("design")
     expect(t.patch.jobs?.approval?.status).toBe("pending")
     expect(t.patch.jobs?.approval?.reruns?.gate).toBe(1)
-    expect(t.feedback?.jobs?.design?.draft).toBe("draft")
+    expect(t.feedback?.jobs?.design?.draft).toEqual({ report: "draft" })
     expect(t.feedback?.message).toContain("rejected")
-    expect(t.feedback?.jobs?.approval?.gate).toBe("not convinced")
+    expect(t.feedback?.jobs?.approval?.gate).toEqual({ notes: "not convinced" })
   })
 })
 
@@ -410,12 +410,24 @@ describe("outcome semantics", () => {
     expect(withName.decisions).toEqual([{ kind: "execute_step", jobId: "main", stepId: "two" }])
   })
 
-  it("records the step output on completion", () => {
+  it("records the step outputs on completion", () => {
     const state = mkState({ main: mkJob({ status: "running", currentStep: "one" }) })
     const t = interpret(linear, state, {
-      kind: "step.completed", jobId: "main", stepId: "one", output: "RESULT",
+      kind: "step.completed", jobId: "main", stepId: "one", outputs: { report: "RESULT" },
     })
-    expect(t.patch.jobs?.main?.steps?.one).toEqual({ status: "succeeded", output: "RESULT" })
+    expect(t.patch.jobs?.main?.steps?.one).toEqual({ status: "succeeded", outputs: { report: "RESULT" } })
+  })
+
+  it("records multiple named outputs from a single step", () => {
+    const state = mkState({ main: mkJob({ status: "running", currentStep: "one" }) })
+    const t = interpret(linear, state, {
+      kind: "step.completed", jobId: "main", stepId: "one",
+      outputs: { sha: "abc123", url: "https://example.test/pr/1" },
+    })
+    expect(t.patch.jobs?.main?.steps?.one?.outputs).toEqual({
+      sha: "abc123",
+      url: "https://example.test/pr/1",
+    })
   })
 
   it("escalates on an outcome missing from a declared outcomes map", () => {
@@ -500,17 +512,17 @@ describe("step-level rerun", () => {
       main: mkJob({
         status: "running",
         currentStep: "review",
-        steps: { review: { status: "running", output: "findings" } },
+        steps: { review: { status: "running", outputs: { report: "findings" } } },
       }),
     })
     const t = interpret(reviewLoop, state, {
       kind: "step.completed", jobId: "main", stepId: "review",
-      outcome: "changes_requested", output: "findings",
+      outcome: "changes_requested", outputs: { report: "findings" },
     })
     expect(t.decisions).toEqual([{ kind: "execute_step", jobId: "main", stepId: "fix" }])
     expect(t.patch.jobs?.main?.reruns?.review).toBe(1)
     expect(t.patch.jobs?.main?.status).toBe("running")
-    expect(t.feedback?.jobs?.main?.review).toBe("findings")
+    expect(t.feedback?.jobs?.main?.review).toEqual({ report: "findings" })
   })
 
   it("escalates when the round budget is exhausted", () => {

@@ -20,7 +20,7 @@ engine.
 ### Completion is one event with an outcome
 
 ```ts
-{ kind: "step.completed", jobId, stepId, outcome?: string, output?: string }
+{ kind: "step.completed", jobId, stepId, outcome?: string, outputs?: Record<string, string> }
 ```
 
 The step declares what its outcomes mean:
@@ -87,8 +87,8 @@ backward.
 ```ts
 interface Transition { decisions; patch; feedback?: Feedback }
 interface Feedback {
-  jobs: Record<jobId, Record<stepId, string>>   // pre-reset outputs
-  message?: string                              // outcome / failure reason
+  jobs: Record<jobId, Record<stepId, Record<name, string>>>  // pre-reset named outputs
+  message: string                                            // outcome / failure reason
 }
 ```
 
@@ -155,7 +155,8 @@ something no empty value can express.
   declaration order; anything else is an explicit route.
 - **`onReject` and the human events are gone.** A human gate completes like
   any other step: approving and rejecting are outcomes (`approved`,
-  `rejected`) carrying the note as `output`. `human.approved`/`human.rejected`
+  `rejected`) carrying the note in `outputs` (e.g. `notes`).
+  `human.approved`/`human.rejected`
   collapse into `step.completed`, so a gate can route, loop or rerun with
   exactly the vocabulary every other step has.
 - **Test builders stand in for the parser.** `packages/core/testing.ts`

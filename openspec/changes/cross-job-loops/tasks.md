@@ -2,7 +2,7 @@
 
 ## 1. Unify completion into outcomes
 
-- [x] [core] Collapse `step.succeeded` and `step.verdict` into `step.completed { outcome?, output? }` with `DEFAULT_OUTCOME = "done"`.
+- [x] [core] Collapse `step.succeeded` and `step.verdict` into `step.completed { outcome?, outputs? }` with `DEFAULT_OUTCOME = "done"`.
 - [x] [core] Replace agent-only `onVerdict` with `outcomes: { <name>: Route }` on every step kind; escalate on an unmapped declared outcome.
 - [x] [core] Keep `step.failed` as the retry-budget path; document the outcome-vs-failure boundary in the IR.
 
@@ -37,7 +37,13 @@
 - [x] [core] Fold `human.approved`/`human.rejected` into `step.completed` outcomes; remove `onReject`.
 - [x] [test] Add `packages/core/testing.ts` builders standing in for the parser; migrate all tests onto them.
 
-## 6. DAG failure semantics (from PR review)
+## 6. Named step outputs (GHA mirror)
+
+- [x] [core] Replace scalar `StepRuntime.output: string | null` with `outputs: Record<name, string>` (GHA-style `name=value`); `step.completed` carries `outputs?`.
+- [x] [core] Nest `Feedback` one level: `jobs.<jobId>.<stepId>.<name>`, snapshotting named outputs.
+- [x] [test] Cover multi-output steps and the nested feedback shape.
+
+## 7. DAG failure semantics (from PR review)
 
 - [x] [core] Mark a job `failed` when its step exhausts retries with no route, instead of escalating the whole feature.
 - [x] [core] Propagate terminal status to a fixpoint so multi-hop skip chains (A→B→C) resolve in one pass.
@@ -47,7 +53,7 @@
 - [x] [core] Require rerun job targets to be true ancestors, and reject duplicates.
 - [x] [test] Cover job-level failure, multi-hop skip cascade, independent-branch survival, `always()`/`failure()`, transitive closure reset, sibling rerun rejection and `currentStep` clearing.
 
-## 7. Docs
+## 8. Docs
 
 - [x] [docs] Document outcomes, the outcome-vs-failure boundary, `rerun` and the `feedback.*` namespace in `design.md`.
 - [ ] [docs] Add the two-architect consensus workflow to the workflow reference once the YAML parser lands (blocked on `workflow-format` task 1.2).

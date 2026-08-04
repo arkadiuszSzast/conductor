@@ -17,7 +17,7 @@ review vocabulary into the engine.
 ## What Changes
 
 - **One completion mechanism.** `step.succeeded` and `step.verdict` collapse
-  into `step.completed { outcome?, output? }`. A step that finished its work
+  into `step.completed { outcome?, outputs? }`. A step that finished its work
   reports an outcome; the workflow declares `outcomes: { <name>: route }` and
   the interpreter routes on the name. Outcome names are workflow-defined
   strings — `agree`/`disagree`, `approved`/`changes_requested`, `cat`/`dog`,
