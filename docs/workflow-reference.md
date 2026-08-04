@@ -545,8 +545,8 @@ jobs:
         action: { uses: git/push@v1 }        # outputs: sha, url
 
       - id: pr-review
-        human:
-          prompt: "PR: {{ steps.push.outputs.url }} — zatwierdź albo odrzuć z uwagami."
+        human: {}          # approver sees the feature/step context; a gate
+                           # prompt field is (planned)
         outcomes:
           approved: next
           rejected:
