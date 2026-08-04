@@ -1,132 +1,169 @@
 import { describe, expect, it } from "bun:test"
-import { validatePipeline } from "./src/validate"
-import type { PipelineDef } from "./src/types"
+import { validateWorkflow } from "./src/validate.ts"
+import type { WorkflowDef } from "./src/types.ts"
 
-const roles = {
-  implementer: { agent: "build" },
-  reviewer: { agent: "review" },
-  fixer: { agent: "build" },
+const base: WorkflowDef = {
+  name: "v",
+  roles: { implementer: { agent: "build" } },
+  jobs: {
+    main: { steps: [{ id: "impl", type: "agent", role: "implementer" }] },
+  },
 }
 
-describe("validatePipeline", () => {
-  it("accepts a well-formed pipeline", () => {
-    const def: PipelineDef = {
-      roles,
-      pipeline: [
-        { id: "implement", type: "agent", role: "implementer" },
-        { id: "gate", type: "command", run: ["make check"], on_fail: { goto: "fix", max_attempts: 2 } },
-        { id: "fix", type: "agent", role: "fixer", then: "gate" },
-        {
-          id: "review",
-          type: "agent",
-          role: "reviewer",
-          rounds_with: "fix_review",
-          on_verdict: { approved: { next: true }, changes_requested: { goto: "fix_review" } },
+describe("validateWorkflow", () => {
+  it("accepts a minimal workflow", () => {
+    const r = validateWorkflow(base)
+    expect(r.errors).toEqual([])
+  })
+
+  it("rejects a workflow with no jobs", () => {
+    const r = validateWorkflow({ ...base, jobs: {} })
+    expect(r.errors.length).toBeGreaterThan(0)
+  })
+
+  it("rejects duplicate step ids in a job", () => {
+    const r = validateWorkflow({
+      ...base,
+      jobs: {
+        main: {
+          steps: [
+            { id: "a", type: "command", run: ["x"] },
+            { id: "a", type: "command", run: ["y"] },
+          ],
         },
-        { id: "fix_review", type: "agent", role: "fixer", then: "review" },
-        { id: "merge", type: "builtin", action: "pr.merge" },
-      ],
-    }
-    const result = validatePipeline(def)
-    expect(result.errors).toEqual([])
+      },
+    })
+    expect(r.errors.join("\n")).toContain("duplicate step id")
   })
 
-  it("rejects an empty pipeline", () => {
-    const result = validatePipeline({ roles, pipeline: [] })
-    expect(result.errors.length).toBe(1)
+  it("rejects a then edge to a missing step", () => {
+    const r = validateWorkflow({
+      ...base,
+      jobs: {
+        main: { steps: [{ id: "a", type: "command", run: ["x"], then: "ghost" }] },
+      },
+    })
+    expect(r.errors.join("\n")).toContain('then → "ghost"')
   })
 
-  it("rejects duplicate step ids", () => {
-    const def: PipelineDef = {
-      roles,
-      pipeline: [
-        { id: "a", type: "command", run: ["true"] },
-        { id: "a", type: "command", run: ["true"] },
-      ],
-    }
-    expect(validatePipeline(def).errors.some((e) => e.includes("duplicate"))).toBe(true)
+  it("rejects an unknown role", () => {
+    const r = validateWorkflow({
+      ...base,
+      jobs: {
+        main: { steps: [{ id: "a", type: "agent", role: "nope" }] },
+      },
+    })
+    expect(r.errors.join("\n")).toContain('role "nope"')
   })
 
-  it("rejects dangling then / on_fail.goto / rounds_with / on_verdict.goto", () => {
-    const def: PipelineDef = {
-      roles,
-      pipeline: [
-        { id: "a", type: "command", run: ["true"], then: "ghost1", on_fail: { goto: "ghost2" } },
-        {
-          id: "b",
-          type: "agent",
-          role: "reviewer",
-          rounds_with: "ghost3",
-          on_verdict: { approved: { goto: "ghost4" } },
+  it("rejects a dependency on a missing job", () => {
+    const r = validateWorkflow({
+      ...base,
+      jobs: {
+        a: { steps: [{ id: "s", type: "command", run: ["x"] }] },
+        b: { needs: ["ghost"], steps: [{ id: "s", type: "command", run: ["x"] }] },
+      },
+    })
+    expect(r.errors.join("\n")).toContain('"b": needs → "ghost"')
+  })
+
+  it("rejects a job dependency cycle", () => {
+    const r = validateWorkflow({
+      ...base,
+      jobs: {
+        a: { needs: ["b"], steps: [{ id: "s", type: "command", run: ["x"] }] },
+        b: { needs: ["a"], steps: [{ id: "s", type: "command", run: ["x"] }] },
+      },
+    })
+    expect(r.errors.join("\n")).toContain("cycle")
+  })
+
+  it("rejects an unbounded step loop with no counter", () => {
+    const r = validateWorkflow({
+      ...base,
+      jobs: {
+        main: {
+          steps: [
+            { id: "a", type: "command", run: ["x"], then: "b" },
+            { id: "b", type: "command", run: ["x"], then: "a" },
+          ],
         },
-      ],
-    }
-    const { errors } = validatePipeline(def)
-    expect(errors.some((e) => e.includes("ghost1"))).toBe(true)
-    expect(errors.some((e) => e.includes("ghost2"))).toBe(true)
-    expect(errors.some((e) => e.includes("ghost3"))).toBe(true)
-    expect(errors.some((e) => e.includes("ghost4"))).toBe(true)
+      },
+    })
+    expect(r.errors.join("\n")).toContain("unbounded loop")
   })
 
-  it("rejects an agent step with an unknown role", () => {
-    const def: PipelineDef = {
-      roles,
-      pipeline: [{ id: "a", type: "agent", role: "nonexistent" }],
-    }
-    expect(validatePipeline(def).errors.some((e) => e.includes("nonexistent"))).toBe(true)
-  })
-
-  it("rejects a command step with an empty run list", () => {
-    const def: PipelineDef = {
-      roles,
-      pipeline: [{ id: "a", type: "command", run: [] }],
-    }
-    expect(validatePipeline(def).errors.some((e) => e.includes("empty run"))).toBe(true)
-  })
-
-  it("rejects an unbounded then-loop with no counter", () => {
-    const def: PipelineDef = {
-      roles,
-      pipeline: [
-        { id: "a", type: "command", run: ["true"], then: "b" },
-        { id: "b", type: "command", run: ["true"], then: "a" },
-      ],
-    }
-    expect(validatePipeline(def).errors.some((e) => e.includes("unbounded loop"))).toBe(true)
-  })
-
-  it("accepts a loop bounded by rounds_with", () => {
-    const def: PipelineDef = {
-      roles,
-      pipeline: [
-        {
-          id: "review",
-          type: "agent",
-          role: "reviewer",
-          rounds_with: "fix",
-          max_rounds: 3,
-          on_verdict: { approved: { next: true }, changes_requested: { goto: "fix" } },
+  it("accepts a loop reached only via on_fail.goto (bounded by attempts)", () => {
+    const r = validateWorkflow({
+      ...base,
+      jobs: {
+        main: {
+          steps: [
+            { id: "a", type: "command", run: ["x"] },
+            { id: "b", type: "command", run: ["x"], on_fail: { goto: "a", max_attempts: 3 } },
+          ],
         },
-        { id: "fix", type: "agent", role: "fixer", then: "review" },
-      ],
-    }
-    expect(validatePipeline(def).errors).toEqual([])
+      },
+    })
+    expect(r.errors).toEqual([])
   })
 
-  it("warns when an on_verdict route goes nowhere", () => {
-    const def: PipelineDef = {
-      roles,
-      pipeline: [
-        {
-          id: "review",
-          type: "agent",
-          role: "reviewer",
-          on_verdict: { approved: {} },
+  it("accepts a review loop bounded by rounds_with", () => {
+    const r = validateWorkflow({
+      ...base,
+      jobs: {
+        main: {
+          steps: [
+            { id: "r", type: "agent", role: "implementer", rounds_with: "fix", max_rounds: 3, on_verdict: { approved: { next: true }, changes_requested: { goto: "fix" } } },
+            { id: "fix", type: "agent", role: "implementer", then: "r" },
+          ],
         },
-      ],
-    }
-    const { errors, warnings } = validatePipeline(def)
-    expect(errors).toEqual([])
-    expect(warnings.some((w) => w.includes("routes nowhere"))).toBe(true)
+      },
+    })
+    expect(r.errors).toEqual([])
+  })
+
+  it("warns when an agent step routes nowhere", () => {
+    const r = validateWorkflow({
+      ...base,
+      jobs: {
+        main: {
+          steps: [{ id: "a", type: "agent", role: "implementer", on_verdict: { ok: {} } }],
+        },
+      },
+    })
+    expect(r.warnings.join("\n")).toContain("routes nowhere")
+  })
+
+  it("warns when on_reject is used on a non-human step", () => {
+    const r = validateWorkflow({
+      ...base,
+      jobs: {
+        main: {
+          steps: [{ id: "a", type: "command", run: ["x"], on_reject: { goto: "a" } }],
+        },
+      },
+    })
+    expect(r.warnings.join("\n")).toContain("non-human")
+  })
+
+  it("rejects an empty command run list", () => {
+    const r = validateWorkflow({
+      ...base,
+      jobs: {
+        main: { steps: [{ id: "a", type: "command", run: [] }] },
+      },
+    })
+    expect(r.errors.join("\n")).toContain("empty run")
+  })
+
+  it("rejects an action step with no uses", () => {
+    const r = validateWorkflow({
+      ...base,
+      jobs: {
+        main: { steps: [{ id: "a", type: "action", uses: "" }] },
+      },
+    })
+    expect(r.errors.join("\n")).toContain("empty uses")
   })
 })

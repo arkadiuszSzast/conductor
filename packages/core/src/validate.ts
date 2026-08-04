@@ -1,95 +1,165 @@
 /**
- * Structural validation of a pipeline definition.
+ * Structural validation of a workflow definition.
  *
- * The engine validates ONLY what it needs to execute safely:
- *  - step ids are unique and non-empty
- *  - every goto / then / rounds_with target exists
+ * The interpreter validates ONLY what it needs to execute safely:
+ *  - job `needs` form a DAG (no cycles)
+ *  - every `needs` reference resolves
+ *  - step ids are unique and non-empty within a job
+ *  - every goto / then / rounds_with target exists within the same job
  *  - every agent step's role exists in `roles`
- *  - every loop edge (on_fail.goto, rounds_with) carries a bounded counter
+ *  - every loop edge carries a bounded counter
  *
  * Opinions (e.g. "reviewer and fixer should use different models") are NOT
  * errors. They may surface as warnings; project owners decide their own
  * process. Presets encode our recommendations instead.
  */
 
-import type { AgentStep, PipelineDef, StepDef } from "./types"
+import type { AgentStep, JobDef, StepDef, WorkflowDef } from "./types.ts"
 
 export interface ValidationResult {
   readonly errors: readonly string[]
   readonly warnings: readonly string[]
 }
 
-export function validatePipeline(def: PipelineDef): ValidationResult {
+export function validateWorkflow(def: WorkflowDef): ValidationResult {
   const errors: string[] = []
   const warnings: string[] = []
-  const steps = def.pipeline ?? []
+  const jobIds = new Set(Object.keys(def.jobs))
 
-  if (steps.length === 0) {
-    return { errors: ["pipeline is empty — define at least one step"], warnings }
+  if (jobIds.size === 0) {
+    return { errors: ["workflow has no jobs — define at least one"], warnings }
   }
 
-  // Unique, non-empty ids
+  validateJobDag(def, jobIds, errors)
+
+  for (const [jobId, job] of Object.entries(def.jobs)) {
+    validateJob(jobId, job, def, errors, warnings)
+  }
+
+  return { errors, warnings }
+}
+
+// ---------------------------------------------------------------------------
+// DAG validation
+// ---------------------------------------------------------------------------
+
+function validateJobDag(def: WorkflowDef, jobIds: Set<string>, errors: string[]): void {
+  for (const [id, job] of Object.entries(def.jobs)) {
+    for (const need of job.needs ?? []) {
+      if (!jobIds.has(need)) {
+        errors.push(`job "${id}": needs → "${need}" does not exist`)
+      }
+      if (need === id) {
+        errors.push(`job "${id}": needs itself`)
+      }
+    }
+  }
+
+  const visited = new Set<string>()
+  const onStack = new Set<string>()
+
+  for (const start of jobIds) {
+    if (visited.has(start)) continue
+    const stack: string[] = []
+    const dfs = (id: string): void => {
+      if (onStack.has(id)) {
+        const cycle = stack.slice(stack.indexOf(id))
+        errors.push(`job dependency cycle: ${[...cycle, id].join(" → ")}`)
+        return
+      }
+      if (visited.has(id)) return
+      visited.add(id)
+      stack.push(id)
+      onStack.add(id)
+      const job = def.jobs[id]
+      if (job) {
+        for (const need of job.needs ?? []) {
+          if (jobIds.has(need)) dfs(need)
+        }
+      }
+      stack.pop()
+      onStack.delete(id)
+    }
+    dfs(start)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Per-job validation
+// ---------------------------------------------------------------------------
+
+function validateJob(
+  jobId: string,
+  job: JobDef,
+  def: WorkflowDef,
+  errors: string[],
+  warnings: string[],
+): void {
+  const steps = job.steps
+  const where = `job "${jobId}"`
+
+  if (steps.length === 0) {
+    errors.push(`${where}: no steps — define at least one`)
+    return
+  }
+
   const ids = new Set<string>()
   for (const step of steps) {
     if (!step.id || step.id.trim() === "") {
-      errors.push("a step has an empty id")
+      errors.push(`${where}: a step has an empty id`)
       continue
     }
-    if (ids.has(step.id)) errors.push(`duplicate step id: "${step.id}"`)
+    if (ids.has(step.id)) errors.push(`${where}: duplicate step id "${step.id}"`)
     ids.add(step.id)
   }
 
   const exists = (id: string) => ids.has(id)
 
   for (const step of steps) {
-    const where = `step "${step.id}"`
+    const sw = `${where} step "${step.id}"`
 
     if (step.then !== undefined && !exists(step.then)) {
-      errors.push(`${where}: then → "${step.then}" does not exist`)
+      errors.push(`${sw}: then → "${step.then}" does not exist`)
     }
     if (step.on_fail?.goto !== undefined && !exists(step.on_fail.goto)) {
-      errors.push(`${where}: on_fail.goto → "${step.on_fail.goto}" does not exist`)
+      errors.push(`${sw}: on_fail.goto → "${step.on_fail.goto}" does not exist`)
     }
     if (step.on_reject !== undefined) {
       if (!exists(step.on_reject.goto)) {
-        errors.push(`${where}: on_reject.goto → "${step.on_reject.goto}" does not exist`)
+        errors.push(`${sw}: on_reject.goto → "${step.on_reject.goto}" does not exist`)
       }
-      if (step.requires_human !== true) {
-        warnings.push(`${where}: on_reject without requires_human — rejection can never occur`)
+      if (step.type !== "human") {
+        warnings.push(`${sw}: on_reject on a non-human step — rejection can never occur`)
       }
     }
 
     if (step.type === "agent") {
-      validateAgentStep(step, def, exists, errors, warnings)
+      validateAgentStep(step as AgentStep, def, exists, sw, errors, warnings)
     }
     if (step.type === "command" && step.run.length === 0) {
-      errors.push(`${where}: command step has an empty run list`)
+      errors.push(`${sw}: command step has an empty run list`)
+    }
+    if (step.type === "action" && (!step.uses || step.uses.trim() === "")) {
+      errors.push(`${sw}: action step has an empty uses field`)
     }
   }
 
-  // Loop boundedness: any backward edge must carry a counter.
-  // on_fail.goto without max_attempts defaults to 1 (bounded) — fine.
-  // rounds_with without max_rounds defaults to 3 (bounded) — fine.
-  // An explicit `then` that jumps backwards with no counter on the cycle
-  // is the dangerous shape: a free loop the engine can never exit.
   for (const cycle of findUncountedCycles(steps)) {
     errors.push(
-      `unbounded loop with no attempt/round counter: ${cycle.join(" → ")} — ` +
+      `unbounded loop in ${where} with no attempt/round counter: ${cycle.join(" → ")} — ` +
         `add on_fail.max_attempts or use rounds_with/max_rounds on one of its steps`,
     )
   }
-
-  return { errors, warnings }
 }
 
 function validateAgentStep(
   step: AgentStep,
-  def: PipelineDef,
+  def: WorkflowDef,
   exists: (id: string) => boolean,
+  where: string,
   errors: string[],
   warnings: string[],
 ): void {
-  const where = `step "${step.id}"`
   if (!def.roles || !(step.role in def.roles)) {
     errors.push(`${where}: role "${step.role}" is not defined in roles`)
   }
@@ -108,14 +178,10 @@ function validateAgentStep(
   }
 }
 
-/**
- * Detect cycles reachable through `then`/`on_verdict.goto` edges where NO
- * step on the cycle carries a counter (on_fail.max_attempts, max_rounds,
- * or participates in a rounds_with pair). Those cycles can spin forever.
- *
- * on_fail.goto edges are excluded from cycle detection: attempts on the
- * failing step are always bounded (default max_attempts = 1).
- */
+// ---------------------------------------------------------------------------
+// Uncounted cycle detection (within a job's step list)
+// ---------------------------------------------------------------------------
+
 function findUncountedCycles(steps: readonly StepDef[]): string[][] {
   const byId = new Map(steps.map((s) => [s.id, s]))
   const counted = new Set<string>()

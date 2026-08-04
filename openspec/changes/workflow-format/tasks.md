@@ -2,15 +2,15 @@
 
 ## 1. Define and parse the format
 
-- [ ] [core] Define the versioned workflow IR for triggers, inputs, jobs, needs, conditions, outputs and four step kinds.
+- [x] [core] Define the versioned workflow IR for triggers, inputs, jobs, needs, conditions, outputs and four step kinds.
 - [ ] [core] Implement strict source-mapped YAML parsing with duplicate-key/custom-tag/alias limits and actionable unknown-field errors.
-- [ ] [core] Implement schema/type/reference validation, graph cycle diagnostics and bounded-loop checks.
+- [x] [core] Implement schema/type/reference validation, graph cycle diagnostics and bounded-loop checks.
 - [ ] [test] Add golden valid/invalid workflow fixtures, including minimal linear, fan-out/fan-in, gates, findings loops and malformed YAML.
 
 ## 2. Pure graph interpreter
 
-- [ ] [core] Generalise the pure interpreter from one current step to durable job/step state and a deterministic set of decisions.
-- [ ] [core] Implement dependency readiness, terminal propagation, conditions, output availability and explicit bounded route loops.
+- [x] [core] Generalise the pure interpreter from one current step to durable job/step state and a deterministic set of decisions.
+- [x] [core] Implement dependency readiness, terminal propagation, conditions, output availability and explicit bounded route loops.
 - [ ] [core] Implement the safe expression parser/type checker/evaluator and `{{ }}` template integration without ambient capabilities.
 - [ ] [test] Add table and property-based tests for graph determinism, fan-out/fan-in, skip propagation, stale events and cycle budgets.
 

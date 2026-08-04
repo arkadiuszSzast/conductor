@@ -96,3 +96,18 @@ explicit routes, roles/models, prompts, gates and params. Builtin names map to
 bundled actions. It refuses unsupported/ambiguous shapes rather than guessing.
 Converted files are validated and a semantic test runs representative legacy
 events through both interpreters until parity is established.
+
+## Confirmed: canonical IR shape
+
+- **No flat pipeline.** Every workflow is `jobs: { <id>: JobDef }`; a linear
+  workflow is one job with ordered steps. The interpreter is DAG-aware from
+  the start (`onJobDone` unblocks dependents), so later fan-out/fan-in work
+  does not re-shape state.
+- **No builtin action names in the engine.** Step kinds are exactly `agent`,
+  `action` (with `uses`), `command`, `human`. Engine "builtin" names from the
+  seed (e.g. `git/pr-merge`) are external `uses` targets, resolved by the
+  action registry later.
+- **State is durable and job-scoped.** `FeatureState.jobs[].currentStep` +
+  per-step `attempts`/`rounds`/`outputs` replace the seed's single
+  `currentStep` + per-feature counters; the interpreter returns `decisions[]`
+  + `patch` so fan-out yields multiple decisions for one event.
