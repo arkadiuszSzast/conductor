@@ -33,7 +33,7 @@ it("exports a working interpret + validateWorkflow pair", () => {
     worktree: null,
     branch: null,
     pr: null,
-    jobs: { main: { status: "pending", currentStep: null, attempts: {}, rounds: {}, outputs: {}, steps: {} } },
+    jobs: { main: { status: "pending", currentStep: null, attempts: {}, rounds: {}, reruns: {}, outputs: {}, steps: {} } },
   } as const
   expect(interpret(workflow, state, { kind: "feature.start" }).decisions[0]).toEqual({
     kind: "execute_step",

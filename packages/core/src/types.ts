@@ -48,9 +48,25 @@ interface StepBase {
   readonly id: string
   readonly if?: string
   readonly then?: string
-  readonly onFail?: { readonly goto?: string }
+  readonly onFail?: RerunRoute
   readonly retry?: RetryPolicy
-  readonly onReject?: { readonly goto: string }
+  readonly onReject?: RerunRoute
+}
+
+/** A failure/rejection/verdict route: exactly one of `goto`, `next`, `rerun`.
+ *  Validation rejects a mixture. `rerun` re-triggers upstream jobs as a
+ *  bounded loop (see `cross-job-loops`). */
+export interface RerunRoute {
+  readonly goto?: string
+  readonly next?: boolean
+  readonly rerun?: RerunTarget
+}
+
+export interface RerunTarget {
+  readonly jobIds: readonly string[]
+  /** Total iterations including the first run. Must be ≥ 1 — every cross-job
+   *  cycle is bounded by construction. */
+  readonly maxRounds: number
 }
 
 /** An agent step performs LLM work. The `prompt` is always required —
@@ -125,7 +141,7 @@ export type BackoffDef =
  *  review process produces a verdict. `onVerdict` maps verdict strings to
  *  routing targets. */
 export interface OnVerdict {
-  readonly [verdict: string]: { readonly goto?: string; readonly next?: boolean }
+  readonly [verdict: string]: RerunRoute
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +211,8 @@ export interface JobRuntime {
   readonly currentStep: string | null
   readonly attempts: Readonly<Record<string, number>>
   readonly rounds: Readonly<Record<string, number>>
+  /** Per-routing-step rerun loop counter (survives closure reset). */
+  readonly reruns: Readonly<Record<string, number>>
   readonly outputs: Readonly<Record<string, unknown>>
   readonly steps: Readonly<Record<string, StepRuntime>>
 }
@@ -212,7 +230,7 @@ export type PipelineEvent =
   | { readonly kind: "feature.start" }
   | { readonly kind: "step.succeeded"; readonly jobId: string; readonly stepId: string; readonly output?: string }
   | { readonly kind: "step.failed"; readonly jobId: string; readonly stepId: string; readonly reason: string }
-  | { readonly kind: "step.verdict"; readonly jobId: string; readonly stepId: string; readonly verdict: string }
+  | { readonly kind: "step.verdict"; readonly jobId: string; readonly stepId: string; readonly verdict: string; readonly output?: string }
   | { readonly kind: "human.approved"; readonly jobId: string; readonly stepId: string }
   | { readonly kind: "human.rejected"; readonly jobId: string; readonly stepId: string; readonly notes?: string }
   | { readonly kind: "human.paused" }
@@ -236,6 +254,16 @@ export type Decision =
 export interface Transition {
   readonly decisions: readonly Decision[]
   readonly patch: Patch
+  /** Feedback snapshot attached to a `rerun` transition: the pre-reset round's
+   *  step outputs plus the route reason. The engine merges `feedback` into the
+   *  template context of re-run steps (`{{ feedback.jobs.<jobId>.<stepId> }}`,
+   *  `{{ feedback.message }}`). */
+  readonly feedback?: Feedback
+}
+
+export interface Feedback {
+  readonly jobs: Readonly<Record<string, Readonly<Record<string, string>>>>
+  readonly message?: string
 }
 
 export interface Patch {
@@ -248,6 +276,8 @@ export interface JobPatch {
   readonly currentStep?: string | null
   readonly attempts?: Readonly<Record<string, number>>
   readonly rounds?: Readonly<Record<string, number>>
+  readonly reruns?: Readonly<Record<string, number>>
+  readonly outputs?: Readonly<Record<string, unknown>>
   readonly steps?: Readonly<Record<string, StepPatch>>
 }
 

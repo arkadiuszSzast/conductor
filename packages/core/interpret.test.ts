@@ -54,6 +54,7 @@ function job(over: Partial<JobRuntime> = {}): JobRuntime {
     currentStep: null,
     attempts: {},
     rounds: {},
+    reruns: {},
     outputs: {},
     steps: {},
     ...over,

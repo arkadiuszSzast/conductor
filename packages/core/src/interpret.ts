@@ -18,10 +18,12 @@ import type {
   Decision,
   FeatureState,
   FeatureStatus,
+  Feedback,
   JobDef,
   JobPatch,
   Patch,
   PipelineEvent,
+  RerunTarget,
   StepDef,
   Transition,
   WorkflowDef,
@@ -43,7 +45,7 @@ export function interpret(
     case "feature.start":     return onStart(workflow)
     case "step.succeeded":    return onSucceeded(workflow, state, event.jobId, event.stepId, event.output)
     case "step.failed":       return onFailed(workflow, state, event.jobId, event.stepId, event.reason)
-    case "step.verdict":      return onVerdict(workflow, state, event.jobId, event.stepId, event.verdict)
+    case "step.verdict":      return onVerdict(workflow, state, event.jobId, event.stepId, event.verdict, event.output)
     case "human.approved":    return onHumanApproved(workflow, state, event.jobId, event.stepId)
     case "human.rejected":    return onHumanRejected(workflow, state, event.jobId, event.stepId)
     case "human.paused":      return buildTransition([{ kind: "pause" }], { status: "paused" })
@@ -148,6 +150,125 @@ function enterStep(
     [{ kind: "execute_step", jobId, stepId }],
     { jobs: { [jobId]: { ...jobPatch, steps: { [stepId]: { status: "running" } } } } },
   )
+}
+
+// ---------------------------------------------------------------------------
+// Rerun (cross-job feedback loop)
+// ---------------------------------------------------------------------------
+
+/** Transitive downstream closure: the rerun targets plus every job that
+ *  transitively depends on them through `needs`. */
+function computeRerunClosure(rerunJobIds: readonly string[], workflow: WorkflowDef): Set<string> {
+  const closure = new Set(rerunJobIds)
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const [jobId, job] of Object.entries(workflow.jobs)) {
+      if (closure.has(jobId)) continue
+      if (job.needs?.some(need => closure.has(need))) {
+        closure.add(jobId)
+        changed = true
+      }
+    }
+  }
+  return closure
+}
+
+function onRerun(
+  workflow: WorkflowDef,
+  state: FeatureState,
+  routingJobId: string,
+  routingStepId: string,
+  rerun: RerunTarget,
+  reason: string,
+  routingStepOutput?: string,
+): Transition {
+  const routingRuntime = state.jobs[routingJobId]
+  const rounds = (routingRuntime?.reruns[routingStepId] ?? 0) + 1
+
+  if (rounds > rerun.maxRounds) {
+    return buildTransition(
+      [{ kind: "escalate", reason: `"${routingJobId}/${routingStepId}" exhausted ${rerun.maxRounds} rerun round(s)` }],
+      { status: "escalated" },
+    )
+  }
+
+  const closure = computeRerunClosure(rerun.jobIds, workflow)
+
+  const feedbackJobs: Record<string, Record<string, string>> = {}
+
+  for (const jobId of rerun.jobIds) {
+    const jobRuntime = state.jobs[jobId]
+    if (!jobRuntime) continue
+    const stepOutputs: Record<string, string> = {}
+    for (const [sid, stepState] of Object.entries(jobRuntime.steps)) {
+      if (stepState.output !== null) stepOutputs[sid] = stepState.output
+    }
+    if (Object.keys(stepOutputs).length > 0) feedbackJobs[jobId] = stepOutputs
+  }
+
+  const routingOutput = routingStepOutput ?? routingRuntime?.steps[routingStepId]?.output
+  if (routingOutput !== null && routingOutput !== undefined) {
+    if (!feedbackJobs[routingJobId]) feedbackJobs[routingJobId] = {}
+    feedbackJobs[routingJobId][routingStepId] = routingOutput
+  }
+
+  const feedback: Feedback = { jobs: feedbackJobs, message: reason }
+
+  const jobPatches: Record<string, JobPatch> = {}
+
+  for (const closureJobId of closure) {
+    jobPatches[closureJobId] = {
+      status: "pending",
+      currentStep: null,
+      attempts: {},
+      rounds: {},
+      reruns: closureJobId === routingJobId
+        ? { ...routingRuntime?.reruns, [routingStepId]: rounds }
+        : {},
+      outputs: {},
+      steps: {},
+    }
+  }
+
+  const decisions: Decision[] = []
+
+  for (const rerunJobId of rerun.jobIds) {
+    const rerunJob = findJob(workflow, rerunJobId)
+    if (!rerunJob) {
+      decisions.push({ kind: "skip_job", jobId: rerunJobId, reason: "job no longer exists" })
+      continue
+    }
+    const stepId = firstStepId(rerunJob)
+    if (!stepId) {
+      jobPatches[rerunJobId] = {
+        ...jobPatches[rerunJobId],
+        status: "succeeded",
+        currentStep: null,
+      }
+      continue
+    }
+    const step = findStep(rerunJob, stepId)!
+    if (step.type === "human") {
+      decisions.push({ kind: "wait_human", jobId: rerunJobId, stepId })
+      jobPatches[rerunJobId] = {
+        ...jobPatches[rerunJobId],
+        status: "running",
+        currentStep: stepId,
+        steps: { [stepId]: { status: "waiting_human" } },
+      }
+    } else {
+      decisions.push({ kind: "execute_step", jobId: rerunJobId, stepId })
+      jobPatches[rerunJobId] = {
+        ...jobPatches[rerunJobId],
+        status: "running",
+        currentStep: stepId,
+        steps: { [stepId]: { status: "running" } },
+      }
+    }
+  }
+
+  return { decisions, patch: { status: "running", jobs: jobPatches }, feedback }
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +380,14 @@ function onFailed(
 
   if (attempts >= retryMaxAttempts) {
     const failureReason = `"${jobId}/${stepId}" exhausted ${retryMaxAttempts} attempt(s)`
+    if (step.onFail?.rerun) {
+      const rerunTransition = onRerun(workflow, state, jobId, stepId, step.onFail.rerun, failureReason)
+      return {
+        decisions: rerunTransition.decisions,
+        patch: mergePatches({ jobs: { [jobId]: failedPatch } }, rerunTransition.patch),
+        feedback: rerunTransition.feedback,
+      }
+    }
     if (step.onFail?.goto) {
       const entry = enterStep(workflow, state, jobId, step.onFail.goto)
       return buildTransition(
@@ -294,6 +423,7 @@ function onVerdict(
   jobId: string,
   stepId: string,
   verdict: string,
+  output?: string,
 ): Transition {
   const jobRuntime = state.jobs[jobId]
   const job = findJob(workflow, jobId)
@@ -331,6 +461,15 @@ function onVerdict(
       [{ kind: "escalate", reason: `unmapped verdict "${verdict}"` }],
       { status: "escalated", jobs: { [jobId]: { rounds } } },
     )
+  }
+
+  if (route.rerun) {
+    const rerunTransition = onRerun(workflow, state, jobId, stepId, route.rerun, `verdict "${verdict}"`, output)
+    return {
+      decisions: rerunTransition.decisions,
+      patch: mergePatches({ jobs: { [jobId]: { rounds } } }, rerunTransition.patch),
+      feedback: rerunTransition.feedback,
+    }
   }
 
   const target = route.goto ?? nextStepId(job, agentStep) ?? null
@@ -386,6 +525,18 @@ function onHumanRejected(
       [{ kind: "escalate", reason: `unknown step "${jobId}/${stepId}"` }],
       { status: "escalated" },
     )
+  }
+
+  if (step.onReject?.rerun) {
+    const rerunTransition = onRerun(workflow, state, jobId, stepId, step.onReject.rerun, `human rejected at "${jobId}/${stepId}"`)
+    return {
+      decisions: rerunTransition.decisions,
+      patch: mergePatches(
+        { status: "running", jobs: { [jobId]: { steps: { [stepId]: { status: "failed" } } } } },
+        rerunTransition.patch,
+      ),
+      feedback: rerunTransition.feedback,
+    }
   }
 
   if (step.onReject?.goto !== undefined) {
@@ -560,6 +711,8 @@ function mergeJobPatches(base: JobPatch, extra: JobPatch): JobPatch {
     currentStep: extra.currentStep ?? base.currentStep,
     attempts: extra.attempts ?? base.attempts,
     rounds: extra.rounds ?? base.rounds,
+    reruns: extra.reruns ?? base.reruns,
+    outputs: extra.outputs ?? base.outputs,
     steps: { ...base.steps, ...extra.steps },
   }
 }

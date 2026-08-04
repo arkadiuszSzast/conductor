@@ -14,7 +14,7 @@
  * process. Presets encode our recommendations instead.
  */
 
-import type { AgentStep, BackoffDef, JobDef, StepDef, WorkflowDef } from "./types.ts"
+import type { AgentStep, BackoffDef, JobDef, RerunTarget, StepDef, WorkflowDef } from "./types.ts"
 
 export interface ValidationResult {
   readonly errors: readonly string[]
@@ -121,13 +121,9 @@ function validateJob(
     if (step.then !== undefined && !stepExists(step.then)) {
       errors.push(`${stepWhere}: then → "${step.then}" does not exist`)
     }
-    if (step.onFail?.goto !== undefined && !stepExists(step.onFail.goto)) {
-      errors.push(`${stepWhere}: onFail.goto → "${step.onFail.goto}" does not exist`)
-    }
-    if (step.onReject !== undefined) {
-      if (!stepExists(step.onReject.goto)) {
-        errors.push(`${stepWhere}: onReject.goto → "${step.onReject.goto}" does not exist`)
-      }
+    if (step.onFail) validateRoute(step.onFail, "onFail", def, jobId, stepExists, stepWhere, errors)
+    if (step.onReject) {
+      validateRoute(step.onReject, "onReject", def, jobId, stepExists, stepWhere, errors)
       if (step.type !== "human") {
         warnings.push(`${stepWhere}: onReject on a non-human step — rejection can never occur`)
       }
@@ -137,7 +133,7 @@ function validateJob(
     }
 
     if (step.type === "agent") {
-      validateAgentStep(step as AgentStep, def, stepExists, stepWhere, errors, warnings)
+      validateAgentStep(step as AgentStep, def, jobId, stepExists, stepWhere, errors, warnings)
     }
     if (step.type === "command" && step.run.length === 0) {
       errors.push(`${stepWhere}: command step has an empty run list`)
@@ -184,9 +180,88 @@ function validateBackoff(backoff: BackoffDef, where: string, errors: string[]): 
   }
 }
 
+// ---------------------------------------------------------------------------
+// Route validation (goto, rerun) shared by onFail, onReject, onVerdict
+// ---------------------------------------------------------------------------
+
+function validateRoute(
+  route: { readonly goto?: string; readonly next?: boolean; readonly rerun?: RerunTarget },
+  label: string,
+  def: WorkflowDef,
+  routingJobId: string,
+  stepExists: (stepId: string) => boolean,
+  stepWhere: string,
+  errors: string[],
+): void {
+  const where = `${stepWhere}: ${label}`
+  const hasGoto = route.goto !== undefined
+  const hasNext = route.next === true
+  const hasRerun = route.rerun !== undefined
+
+  if ((hasGoto || hasNext) && hasRerun) {
+    errors.push(`${where}: goto/next must not be combined with rerun`)
+    return
+  }
+
+  if (hasGoto && route.goto !== undefined && !stepExists(route.goto)) {
+    errors.push(`${where}: goto → "${route.goto}" does not exist`)
+  }
+  if (hasRerun && route.rerun !== undefined) {
+    validateRerunTarget(route.rerun, label, def, routingJobId, stepWhere, errors)
+  }
+}
+
+function validateRerunTarget(
+  rerun: RerunTarget,
+  label: string,
+  def: WorkflowDef,
+  routingJobId: string,
+  stepWhere: string,
+  errors: string[],
+): void {
+  const where = `${stepWhere}: ${label}`
+  if (rerun.maxRounds < 1) {
+    errors.push(`${where}: rerun.maxRounds must be ≥ 1`)
+  }
+  for (const jobId of rerun.jobIds) {
+    const targetJob = def.jobs[jobId]
+    if (!targetJob) {
+      errors.push(`${where}: rerun job "${jobId}" does not exist`)
+      continue
+    }
+    if (jobId === routingJobId) {
+      errors.push(`${where}: rerun job "${jobId}" must not be the routing job itself`)
+      continue
+    }
+    if (isDownstreamOf(routingJobId, jobId, def)) {
+      errors.push(`${where}: rerun job "${jobId}" is downstream of the routing job "${routingJobId}" (must be upstream/ancestor)`)
+    }
+  }
+}
+
+/** True if `target` is downstream of `ancestor` (i.e. `target` transitively
+ *  depends on `ancestor` through the needs graph). */
+function isDownstreamOf(ancestor: string, target: string, def: WorkflowDef): boolean {
+  const queue = [ancestor]
+  const visited = new Set(queue)
+  while (queue.length > 0) {
+    const current = queue.shift()!
+    for (const [jobId, job] of Object.entries(def.jobs)) {
+      if (visited.has(jobId)) continue
+      if (job.needs?.includes(current)) {
+        if (jobId === target) return true
+        visited.add(jobId)
+        queue.push(jobId)
+      }
+    }
+  }
+  return false
+}
+
 function validateAgentStep(
   step: AgentStep,
   def: WorkflowDef,
+  routingJobId: string,
   stepExists: (stepId: string) => boolean,
   where: string,
   errors: string[],
@@ -203,11 +278,9 @@ function validateAgentStep(
   }
   if (step.onVerdict) {
     for (const [verdict, route] of Object.entries(step.onVerdict)) {
-      if (route.goto !== undefined && !stepExists(route.goto)) {
-        errors.push(`${where}: onVerdict["${verdict}"].goto → "${route.goto}" does not exist`)
-      }
-      if (route.goto === undefined && route.next !== true) {
-        warnings.push(`${where}: onVerdict["${verdict}"] routes nowhere (no goto, next != true)`)
+      validateRoute(route, `onVerdict["${verdict}"]`, def, routingJobId, stepExists, where, errors)
+      if (route.goto === undefined && route.next !== true && route.rerun === undefined) {
+        warnings.push(`${where}: onVerdict["${verdict}"] routes nowhere (no goto, next, or rerun)`)
       }
     }
   }
