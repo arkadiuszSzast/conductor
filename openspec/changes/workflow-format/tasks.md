@@ -10,7 +10,8 @@
 ## 2. Pure graph interpreter
 
 - [x] [core] Generalise the pure interpreter from one current step to durable job/step state and a deterministic set of decisions.
-- [x] [core] Implement dependency readiness, terminal propagation, conditions, output availability and explicit bounded route loops.
+- [x] [core] Implement dependency readiness, terminal propagation (success and failure), `always()`/`failure()` conditions with multi-hop skip cascade, and explicit bounded route loops.
+- [ ] [core] Implement job output availability: resolve `JobDef.outputs` against step outputs once a job succeeds and expose them to dependents. Blocked on the expression evaluator below — `JobDef.outputs`/`JobRuntime.outputs` are declared but not yet computed.
 - [ ] [core] Implement the safe expression parser/type checker/evaluator and `{{ }}` template integration without ambient capabilities.
 - [ ] [test] Add table and property-based tests for graph determinism, fan-out/fan-in, skip propagation, stale events and cycle budgets.
 

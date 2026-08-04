@@ -37,7 +37,17 @@
 - [x] [core] Fold `human.approved`/`human.rejected` into `step.completed` outcomes; remove `onReject`.
 - [x] [test] Add `packages/core/testing.ts` builders standing in for the parser; migrate all tests onto them.
 
-## 6. Docs
+## 6. DAG failure semantics (from PR review)
+
+- [x] [core] Mark a job `failed` when its step exhausts retries with no route, instead of escalating the whole feature.
+- [x] [core] Propagate terminal status to a fixpoint so multi-hop skip chains (A→B→C) resolve in one pass.
+- [x] [core] Make `if: failure()` skip when every dependency succeeded (previously it ran unconditionally).
+- [x] [core] Escalate only when a failure leaves nothing runnable; finish `escalated` (not `done`) when any job failed.
+- [x] [core] Fix `mergeJobPatches` dropping an explicit `currentStep: null` (`??` treats null as nullish).
+- [x] [core] Require rerun job targets to be true ancestors, and reject duplicates.
+- [x] [test] Cover job-level failure, multi-hop skip cascade, independent-branch survival, `always()`/`failure()`, transitive closure reset, sibling rerun rejection and `currentStep` clearing.
+
+## 7. Docs
 
 - [x] [docs] Document outcomes, the outcome-vs-failure boundary, `rerun` and the `feedback.*` namespace in `design.md`.
 - [ ] [docs] Add the two-architect consensus workflow to the workflow reference once the YAML parser lands (blocked on `workflow-format` task 1.2).

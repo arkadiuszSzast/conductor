@@ -145,21 +145,60 @@ describe("cross-job rerun", () => {
     expect(t.feedback).toBeUndefined()
   })
 
-  it("downstream jobs are reset in the closure", () => {
+  it("resets the whole transitive downstream closure, not just direct dependents", () => {
+    // arch-a/arch-b → consensus → publish → announce: a rerun of the
+    // architects must reset every job that transitively consumed their work.
+    const chained = mkWorkflow(
+      {
+        "arch-a": job([agentStep("design", "architect", "Design.")]),
+        "arch-b": job([agentStep("design", "architect", "Design.")]),
+        consensus: job(
+          [agentStep("check", "adjudicator", "Compare.", {
+            outcomes: { agree: next, disagree: rerunJobs(["arch-a", "arch-b"], 3) },
+          })],
+          ["arch-a", "arch-b"],
+        ),
+        publish: job([commandStep("push", ["./publish"])], ["consensus"]),
+        announce: job([commandStep("notify", ["./announce"])], ["publish"]),
+      },
+      roles,
+      "chained",
+    )
+
     const state = mkState({
-      "arch-a": mkJob({ status: "succeeded", currentStep: null, steps: { design: { status: "succeeded", output: "D1" } } }),
-      "arch-b": mkJob({ status: "succeeded", currentStep: null, steps: { design: { status: "succeeded", output: "D2" } } }),
+      "arch-a": mkJob({ status: "succeeded", steps: { design: { status: "succeeded", output: "D1" } } }),
+      "arch-b": mkJob({ status: "succeeded", steps: { design: { status: "succeeded", output: "D2" } } }),
       consensus: mkJob({ status: "running", currentStep: "check" }),
+      publish: mkJob({ status: "succeeded", steps: { push: { status: "succeeded", output: "pushed" } } }),
+      announce: mkJob({ status: "succeeded", steps: { notify: { status: "succeeded", output: "sent" } } }),
     })
-    const t = interpret(twoArchitectsWorkflow, state, {
-      kind: "step.completed",
-      jobId: "consensus",
-      stepId: "check",
-      outcome: "disagree",
+
+    const t = interpret(chained, state, {
+      kind: "step.completed", jobId: "consensus", stepId: "check", outcome: "disagree",
     })
 
     expect(t.patch.jobs?.consensus?.status).toBe("pending")
     expect(t.patch.jobs?.consensus?.reruns?.check).toBe(1)
+    // One hop past the routing job...
+    expect(t.patch.jobs?.publish?.status).toBe("pending")
+    expect(t.patch.jobs?.publish?.steps).toEqual({})
+    // ...and two hops, which only the transitive walk reaches.
+    expect(t.patch.jobs?.announce?.status).toBe("pending")
+    expect(t.patch.jobs?.announce?.steps).toEqual({})
+  })
+
+  it("clears currentStep on every job in the reset closure", () => {
+    const state = mkState({
+      "arch-a": mkJob({ status: "succeeded", steps: { design: { status: "succeeded", output: "D1" } } }),
+      "arch-b": mkJob({ status: "succeeded", steps: { design: { status: "succeeded", output: "D2" } } }),
+      consensus: mkJob({ status: "running", currentStep: "check" }),
+    })
+    const t = interpret(twoArchitectsWorkflow, state, {
+      kind: "step.completed", jobId: "consensus", stepId: "check", outcome: "disagree",
+    })
+    // The routing job is reset too: a `pending` job pointing at the step that
+    // just ran would be an inconsistent pair.
+    expect(t.patch.jobs?.consensus?.currentStep).toBeNull()
   })
 })
 
@@ -201,6 +240,7 @@ describe("onFail rerun", () => {
     expect(t.decisions[0]?.kind).toBe("execute_step")
     expect((t.decisions[0] as { jobId: string }).jobId).toBe("implement")
     expect(t.patch.jobs?.gate?.status).toBe("pending")
+    expect(t.patch.jobs?.gate?.currentStep).toBeNull()
     expect(t.patch.jobs?.gate?.reruns?.check).toBe(1)
     expect(t.feedback?.jobs?.implement?.code).toBe("v1")
     expect(t.feedback?.message).toContain("exhausted 2 attempt")
@@ -303,6 +343,42 @@ describe("rerun validation", () => {
       roleSet,
     ))
     expect(v.errors.join("\n")).toContain("maxRounds must be ≥ 1")
+  })
+
+  it("rejects rerun to an unrelated sibling job", () => {
+    // Neither ancestor nor descendant: rerunning it would never reset the
+    // routing job, leaving it stuck forever.
+    const v = validateWorkflow(mkWorkflow(
+      {
+        sibling: job([commandStep("s", ["echo"])]),
+        src: job([agentStep("s", "a", "s", { outcomes: { ok: rerunJobs(["sibling"], 2) } })]),
+      },
+      roleSet,
+    ))
+    expect(v.errors.join("\n")).toContain("is not an ancestor")
+  })
+
+  it("accepts rerun to a transitive ancestor", () => {
+    const v = validateWorkflow(mkWorkflow(
+      {
+        root: job([commandStep("r", ["echo"])]),
+        middle: job([commandStep("m", ["echo"])], ["root"]),
+        leaf: job([agentStep("s", "a", "s", { outcomes: { ok: rerunJobs(["root"], 2) } })], ["middle"]),
+      },
+      roleSet,
+    ))
+    expect(v.errors).toEqual([])
+  })
+
+  it("rejects a duplicated rerun job", () => {
+    const v = validateWorkflow(mkWorkflow(
+      {
+        up: job([commandStep("u", ["echo"])]),
+        src: job([agentStep("s", "a", "s", { outcomes: { ok: rerunJobs(["up", "up"], 2) } })], ["up"]),
+      },
+      roleSet,
+    ))
+    expect(v.errors.join("\n")).toContain("appears more than once")
   })
 
   it("rejects a rerun naming no targets", () => {

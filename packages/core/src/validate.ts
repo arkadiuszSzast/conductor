@@ -231,7 +231,14 @@ function validateRerunTarget(
   if (rerun.jobIds.length === 0) {
     errors.push(`${where}: rerun names no jobs`)
   }
+
+  const seen = new Set<string>()
   for (const jobId of rerun.jobIds) {
+    if (seen.has(jobId)) {
+      errors.push(`${where}: rerun job "${jobId}" appears more than once`)
+      continue
+    }
+    seen.add(jobId)
     if (!def.jobs[jobId]) {
       errors.push(`${where}: rerun job "${jobId}" does not exist`)
       continue
@@ -240,8 +247,13 @@ function validateRerunTarget(
       errors.push(`${where}: rerun job "${jobId}" must not be the routing job itself`)
       continue
     }
-    if (isDownstreamOf(routingJobId, jobId, def)) {
-      errors.push(`${where}: rerun job "${jobId}" is downstream of the routing job "${routingJobId}" (must be upstream/ancestor)`)
+    // A rerun must go backward through the DAG. "Not downstream" is not
+    // enough — a sibling in an unrelated branch is neither downstream nor
+    // an ancestor, but rerunning it never resets the routing job (the
+    // forward-walk closure would not reach it), leaving the routing job
+    // stuck. Require a true ancestor: routing must transitively `needs` target.
+    if (!isDownstreamOf(jobId, routingJobId, def)) {
+      errors.push(`${where}: rerun job "${jobId}" is not an ancestor of the routing job "${routingJobId}" (the routing job must transitively depend on it via needs)`)
     }
   }
 }
@@ -255,7 +267,7 @@ function isDownstreamOf(ancestor: string, target: string, def: WorkflowDef): boo
     const current = queue.shift()!
     for (const [jobId, job] of Object.entries(def.jobs)) {
       if (visited.has(jobId)) continue
-      if (job.needs?.includes(current)) {
+      if (job.needs.includes(current)) {
         if (jobId === target) return true
         visited.add(jobId)
         queue.push(jobId)

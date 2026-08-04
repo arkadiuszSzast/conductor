@@ -46,7 +46,12 @@ export interface JobDef {
    *  (e.g. `always()`), so absence and "empty condition" differ. */
   readonly if?: string
   readonly steps: readonly StepDef[]
-  /** Empty means the job publishes nothing to its dependents. */
+  /** Named outputs published to dependent jobs, as expressions over step
+   *  outputs. Empty means the job publishes nothing.
+   *
+   *  NOT YET EVALUATED: the interpreter does not resolve these — that needs
+   *  the expression evaluator (`workflow-format` task 2.3). Declared here so
+   *  the IR is stable; `JobRuntime.outputs` stays empty until it lands. */
   readonly outputs: Readonly<Record<string, string>>
 }
 
@@ -227,6 +232,8 @@ export interface JobRuntime {
   readonly attempts: Readonly<Record<string, number>>
   /** Per-routing-step rerun loop counter (survives closure reset). */
   readonly reruns: Readonly<Record<string, number>>
+  /** Resolved values of `JobDef.outputs`. Always empty today — see the note
+   *  on `JobDef.outputs`; step results live in `steps[].output`. */
   readonly outputs: Readonly<Record<string, unknown>>
   readonly steps: Readonly<Record<string, StepRuntime>>
 }

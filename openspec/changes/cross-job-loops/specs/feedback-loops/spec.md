@@ -107,3 +107,32 @@ itself, or transitively depends on the routing job; which mixes `stepIds` with
 `jobIds`; which names neither; or whose `maxRounds` is below 1. The `needs`
 graph SHALL remain acyclic; `rerun` is the only backward edge and is always
 budgeted.
+
+### Requirement: A failed job is terminal and the DAG reacts to it
+When a step exhausts its retry budget with no `onFail` route, its job SHALL
+become `failed` (terminal) rather than immediately escalating the feature.
+Dependents SHALL then be evaluated: those with no condition SHALL be skipped,
+`if: always()` jobs SHALL run, and `if: failure()` jobs SHALL run only when a
+dependency failed or was skipped. A skipped job SHALL itself be terminal and
+its own dependents SHALL be evaluated in the same pass, since a skipped job
+emits no event of its own. The feature SHALL escalate only when the failure
+leaves no other job able to run, and a run whose jobs are all terminal with at
+least one failure SHALL end `escalated`, never `done`.
+
+#### Scenario: Multi-hop skip cascade
+- **GIVEN** `build → test-a`, `build → test-b`, and `review` needing both tests
+- **WHEN** `build`'s only step exhausts its retries with no `onFail` route
+- **THEN** `build` becomes `failed`, `test-a` and `test-b` are skipped, and
+  `review` is skipped in the same transition
+
+#### Scenario: Independent branch survives a sibling failure
+- **GIVEN** `branch-a` and `branch-b` with no dependency between them, both running
+- **WHEN** `branch-a` fails
+- **THEN** `branch-b` is untouched, the feature stays `running`, and only
+  `branch-a`'s dependents are skipped
+
+#### Scenario: Cleanup and recovery conditions
+- **WHEN** a dependency fails
+- **THEN** an `if: always()` dependent runs and an `if: failure()` dependent runs
+- **WHEN** every dependency succeeds
+- **THEN** the `if: failure()` dependent is skipped

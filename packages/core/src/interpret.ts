@@ -21,6 +21,7 @@ import type {
   Feedback,
   JobDef,
   JobPatch,
+  JobStatus,
   Patch,
   PipelineEvent,
   RerunTarget,
@@ -530,10 +531,7 @@ function onFailed(
   if (attempts >= retryMaxAttempts) {
     const failureReason = `"${jobId}/${stepId}" exhausted ${retryMaxAttempts} attempt(s): ${reason}`
     if (step.onFail === undefined) {
-      return buildTransition(
-        [{ kind: "escalate", reason: failureReason }],
-        { status: "escalated", jobs: { [jobId]: failedPatch } },
-      )
+      return onJobFailed(workflow, state, jobId, failedPatch, failureReason)
     }
     return applyRoute(
       step.onFail, workflow, state, job, step, failureReason,
@@ -554,6 +552,39 @@ function onFailed(
         },
       },
     },
+  )
+}
+
+/**
+ * A job could not finish: its step ran out of retries with no route. The job
+ * becomes terminal (`failed`) so the DAG can react — independent branches keep
+ * running, dependents skip, and `if: always()`/`failure()` jobs get their turn.
+ *
+ * The feature only escalates when the failure leaves nothing else to do; a
+ * human is needed exactly then, not while sibling branches are still working.
+ */
+function onJobFailed(
+  workflow: WorkflowDef,
+  state: FeatureState,
+  failedJobId: string,
+  failedPatch: JobPatch,
+  reason: string,
+): Transition {
+  const failurePatch: Patch = {
+    jobs: { [failedJobId]: { ...failedPatch, status: "failed", currentStep: null } },
+  }
+
+  const cascade = propagate(workflow, state, failedJobId, "failed")
+  const patch = mergePatches(failurePatch, { jobs: cascade.jobPatches })
+
+  if (cascade.decisions.length > 0) {
+    return buildTransition(cascade.decisions, mergePatches(patch, { status: "running" }))
+  }
+
+  // Nothing left to run anywhere: the failure is the end of the road.
+  return buildTransition(
+    [{ kind: "escalate", reason }],
+    mergePatches(patch, { status: "escalated" }),
   )
 }
 
@@ -604,6 +635,98 @@ function onResumed(workflow: WorkflowDef, state: FeatureState): Transition {
 // DAG: job completion and dependent evaluation
 // ---------------------------------------------------------------------------
 
+/**
+ * A job reached a terminal status. Walk the DAG forward to a fixpoint: every
+ * dependent whose `needs` are now all terminal either starts or is skipped,
+ * and a freshly skipped job is itself terminal, so its own dependents are
+ * evaluated in the same pass. Without the fixpoint a multi-hop chain
+ * (A → B → C) would leave C pending forever, because no event ever fires for
+ * a job that was skipped rather than executed.
+ */
+interface Cascade {
+  readonly decisions: Decision[]
+  readonly jobPatches: Record<string, JobPatch>
+  readonly terminal: Record<string, JobStatus>
+}
+
+function propagate(
+  workflow: WorkflowDef,
+  state: FeatureState,
+  originJobId: string,
+  originStatus: JobStatus,
+): Cascade {
+  const decisions: Decision[] = []
+  const jobPatches: Record<string, JobPatch> = {}
+  const terminal: Record<string, JobStatus> = { [originJobId]: originStatus }
+
+  const statusOf = (jobId: string): JobStatus =>
+    terminal[jobId] ?? state.jobs[jobId]?.status ?? "pending"
+
+  const isTerminalStatus = (status: JobStatus): boolean =>
+    status === "succeeded" || status === "failed" || status === "skipped"
+
+  let changed = true
+  while (changed) {
+    changed = false
+
+    for (const [dependentId, dependentJob] of Object.entries(workflow.jobs)) {
+      if (jobPatches[dependentId]) continue
+      if ((state.jobs[dependentId]?.status ?? "pending") !== "pending") continue
+      if (dependentJob.needs.length === 0) continue
+
+      const needStatuses = dependentJob.needs.map(statusOf)
+      if (!needStatuses.every(isTerminalStatus)) continue
+
+      const anyFailed = needStatuses.some(status => status === "failed" || status === "skipped")
+      const condition = dependentJob.if
+
+      const skip = (reason: string): void => {
+        decisions.push({ kind: "skip_job", jobId: dependentId, reason })
+        jobPatches[dependentId] = { status: "skipped", currentStep: null }
+        terminal[dependentId] = "skipped"
+        changed = true
+      }
+
+      if (anyFailed && condition !== "always()" && condition !== "failure()") {
+        skip("a dependency failed or was skipped")
+        continue
+      }
+      if (!anyFailed && condition === "failure()") {
+        skip("if: failure() but every dependency succeeded")
+        continue
+      }
+
+      const stepId = firstStepId(dependentJob)
+      if (stepId === null) {
+        jobPatches[dependentId] = { status: "succeeded", currentStep: null }
+        terminal[dependentId] = "succeeded"
+        changed = true
+        continue
+      }
+
+      const step = findStep(dependentJob, stepId)!
+      if (step.type === "human") {
+        decisions.push({ kind: "wait_human", jobId: dependentId, stepId })
+        jobPatches[dependentId] = {
+          status: "running",
+          currentStep: stepId,
+          steps: { [stepId]: { status: "waiting_human" } },
+        }
+      } else {
+        decisions.push({ kind: "execute_step", jobId: dependentId, stepId })
+        jobPatches[dependentId] = {
+          status: "running",
+          currentStep: stepId,
+          steps: { [stepId]: { status: "running" } },
+        }
+      }
+      changed = true
+    }
+  }
+
+  return { decisions, jobPatches, terminal }
+}
+
 function onJobComplete(
   workflow: WorkflowDef,
   state: FeatureState,
@@ -613,76 +736,34 @@ function onJobComplete(
     jobs: { [completedJobId]: { status: "succeeded", currentStep: null } },
   }
 
-  const decisions: Decision[] = []
-  const dependentPatches: Record<string, JobPatch> = {}
+  const cascade = propagate(workflow, state, completedJobId, "succeeded")
+  const patch = mergePatches(completedPatch, { jobs: cascade.jobPatches })
 
-  for (const [dependentId, dependentJob] of Object.entries(workflow.jobs)) {
-    if (state.jobs[dependentId]?.status !== "pending") continue
-    if (!dependentJob.needs?.includes(completedJobId)) continue
-
-    const needStatuses = (dependentJob.needs ?? []).map(needId =>
-      needId === completedJobId
-        ? "satisfied" as const
-        : (state.jobs[needId]?.status ?? "pending"),
-    )
-    const allReady = needStatuses.every(status =>
-      status === "satisfied" || status === "succeeded" || status === "failed" || status === "skipped",
-    )
-    if (!allReady) continue
-
-    const anyFailed = needStatuses.some(status => status === "failed" || status === "skipped")
-
-    if (anyFailed && dependentJob.if !== "always()" && dependentJob.if !== "failure()") {
-      decisions.push({ kind: "skip_job", jobId: dependentId, reason: "dependency failed" })
-      dependentPatches[dependentId] = { status: "skipped", currentStep: null }
-      continue
-    }
-
-    const stepId = firstStepId(dependentJob)
-    if (stepId === null) {
-      dependentPatches[dependentId] = { status: "succeeded", currentStep: null }
-      continue
-    }
-
-    const step = findStep(dependentJob, stepId)!
-    if (step.type === "human") {
-      decisions.push({ kind: "wait_human", jobId: dependentId, stepId })
-      dependentPatches[dependentId] = {
-        status: "running",
-        currentStep: stepId,
-        steps: { [stepId]: { status: "waiting_human" } },
-      }
-    } else {
-      decisions.push({ kind: "execute_step", jobId: dependentId, stepId })
-      dependentPatches[dependentId] = {
-        status: "running",
-        currentStep: stepId,
-        steps: { [stepId]: { status: "running" } },
-      }
-    }
-  }
-
-  const allTerminal = Object.keys(workflow.jobs).every(jobId =>
-    jobId === completedJobId
-      || dependentPatches[jobId]?.status === "skipped"
-      || ["succeeded", "failed", "skipped"].includes(state.jobs[jobId]?.status ?? "pending"),
-  )
+  const allTerminal = Object.keys(workflow.jobs).every(jobId => {
+    if (jobId === completedJobId) return true
+    const patched = cascade.jobPatches[jobId]?.status
+    if (patched) return patched === "skipped" || patched === "succeeded"
+    const current = state.jobs[jobId]?.status ?? "pending"
+    return current === "succeeded" || current === "failed" || current === "skipped"
+  })
 
   if (allTerminal) {
+    const anyFailed = Object.values(cascade.terminal).some(status => status === "failed")
+      || Object.values(state.jobs).some(jobRuntime => jobRuntime.status === "failed")
     return buildTransition(
-      [{ kind: "finish" }],
-      mergePatches(completedPatch, mergePatches({ jobs: dependentPatches }, { status: "done" })),
+      [...cascade.decisions, { kind: "finish" }],
+      mergePatches(patch, { status: anyFailed ? "escalated" : "done" }),
     )
   }
 
-  if (decisions.length === 0) {
+  if (cascade.decisions.length === 0) {
     return buildTransition(
       [{ kind: "noop", reason: `job "${completedJobId}" completed, no dependents ready` }],
-      mergePatches(completedPatch, { jobs: dependentPatches }),
+      patch,
     )
   }
 
-  return buildTransition(decisions, mergePatches(completedPatch, { jobs: dependentPatches }))
+  return buildTransition(cascade.decisions, patch)
 }
 
 // ---------------------------------------------------------------------------
@@ -706,13 +787,23 @@ function mergePatches(base: Patch, extra: Patch): Patch {
   return result
 }
 
+/**
+ * `??` treats `null` as nullish, which loses meaning for nullable fields:
+ * an explicit `currentStep: null` on `extra` (every rerun sets that on the
+ * closure jobs) would silently fall back to `base.currentStep` = `undefined`,
+ * leaving a job in an inconsistent `pending` + old-currentStep state. Use
+ * `in`-checks so an explicit `null` in `extra` overrides the base.
+ */
 function mergeJobPatches(base: JobPatch, extra: JobPatch): JobPatch {
+  const pick = <K extends keyof JobPatch>(key: K): JobPatch[K] =>
+    (key in extra ? extra[key] : base[key])
+
   return {
-    status: extra.status ?? base.status,
-    currentStep: extra.currentStep ?? base.currentStep,
-    attempts: extra.attempts ?? base.attempts,
-    reruns: extra.reruns ?? base.reruns,
-    outputs: extra.outputs ?? base.outputs,
+    status: pick("status"),
+    currentStep: pick("currentStep"),
+    attempts: pick("attempts"),
+    reruns: pick("reruns"),
+    outputs: pick("outputs"),
     steps: { ...base.steps, ...extra.steps },
   }
 }

@@ -161,3 +161,26 @@ something no empty value can express.
 - **Test builders stand in for the parser.** `packages/core/testing.ts`
   provides `agentStep`/`commandStep`/`job`/`workflow` and route helpers, so
   tests read like authored workflows while the IR stays strict.
+
+## Confirmed: job failure is terminal, not automatically fatal
+
+Review of this PR surfaced that `JobStatus: "failed"`/`"skipped"` and the
+`skip_job` decision were unreachable: a step exhausting its retries escalated
+the whole feature and never marked its own job failed, so fan-in never saw a
+failed dependency and the `always()`/`failure()` branches were dead code.
+
+Now a step that exhausts its retry budget with no `onFail` route marks its
+**job** `failed` and the graph reacts:
+
+- Dependents with no condition are **skipped**, and a skipped job is itself
+  terminal, so the cascade continues — `A → B → C` skips C in the same pass.
+  This matters because a skipped job produces no event of its own; without a
+  fixpoint walk C would stay `pending` forever.
+- `if: always()` runs regardless; `if: failure()` runs **only** when a
+  dependency failed or was skipped, and is skipped when everything succeeded
+  (previously it would have run unconditionally).
+- The feature escalates only when the failure leaves nothing else to run.
+  An independent branch keeps working; a human is called exactly when the run
+  can no longer make progress on its own.
+- A run that reaches the end with any failed job finishes `escalated` rather
+  than `done`, so a partially-failed DAG is never reported as success.

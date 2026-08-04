@@ -453,7 +453,7 @@ describe("DAG workflows", () => {
     expect(t.decisions).toContainEqual({ kind: "execute_step", jobId: "test-b", stepId: "test" })
   })
 
-  it("escalates when a step exhausts its retry budget", () => {
+  it("marks the job failed and cascades skips through the DAG", () => {
     const t = interpret(
       dagWorkflow,
       dagState({
@@ -466,7 +466,137 @@ describe("DAG workflows", () => {
       }),
       { kind: "step.failed", jobId: "build", stepId: "compile", reason: "exit 1" },
     )
+
+    expect(t.patch.jobs?.build?.status).toBe("failed")
+    expect(t.patch.jobs?.build?.currentStep).toBeNull()
+
+    // Direct dependents skip...
+    expect(t.decisions).toContainEqual({
+      kind: "skip_job", jobId: "test-a", reason: "a dependency failed or was skipped",
+    })
+    expect(t.decisions).toContainEqual({
+      kind: "skip_job", jobId: "test-b", reason: "a dependency failed or was skipped",
+    })
+    // ...and the multi-hop dependent skips in the same pass, with no event of
+    // its own to trigger it.
+    expect(t.decisions).toContainEqual({
+      kind: "skip_job", jobId: "review", reason: "a dependency failed or was skipped",
+    })
+    expect(t.patch.jobs?.review?.status).toBe("skipped")
+  })
+
+  it("escalates when a failure leaves nothing else to run", () => {
+    const solo = mkWorkflow(
+      { only: defineJob([commandStep("compile", ["make"])]) },
+      roles,
+      "solo",
+    )
+    const t = interpret(
+      solo,
+      state({ jobs: { only: job({ status: "running", currentStep: "compile" }) } }),
+      { kind: "step.failed", jobId: "only", stepId: "compile", reason: "exit 1" },
+    )
     expect(t.decisions[0]?.kind).toBe("escalate")
+    expect(t.patch.status).toBe("escalated")
+    expect(t.patch.jobs?.only?.status).toBe("failed")
+  })
+
+  it("lets an independent branch keep running when a sibling fails", () => {
+    const forked = mkWorkflow(
+      {
+        "branch-a": defineJob([commandStep("a1", ["make a"])]),
+        "branch-b": defineJob([commandStep("b1", ["make b"])]),
+        "after-a": defineJob([commandStep("x", ["echo"])], ["branch-a"]),
+      },
+      roles,
+      "forked",
+    )
+    const t = interpret(
+      forked,
+      state({
+        jobs: {
+          "branch-a": job({ status: "running", currentStep: "a1" }),
+          "branch-b": job({ status: "running", currentStep: "b1" }),
+          "after-a": job({ status: "pending" }),
+        },
+      }),
+      { kind: "step.failed", jobId: "branch-a", stepId: "a1", reason: "boom" },
+    )
+    // branch-b is untouched and still running, so the feature is not escalated.
+    expect(t.patch.jobs?.["branch-b"]).toBeUndefined()
+    expect(t.patch.status).toBe("running")
+    expect(t.decisions).toContainEqual({
+      kind: "skip_job", jobId: "after-a", reason: "a dependency failed or was skipped",
+    })
+  })
+
+  it("runs an always() job after a dependency fails", () => {
+    const withCleanup = mkWorkflow(
+      {
+        work: defineJob([commandStep("do", ["make"])]),
+        cleanup: defineJob([commandStep("clean", ["rm -rf tmp"])], ["work"], "always()"),
+      },
+      roles,
+      "cleanup-flow",
+    )
+    const t = interpret(
+      withCleanup,
+      state({
+        jobs: {
+          work: job({ status: "running", currentStep: "do" }),
+          cleanup: job({ status: "pending" }),
+        },
+      }),
+      { kind: "step.failed", jobId: "work", stepId: "do", reason: "boom" },
+    )
+    expect(t.decisions).toContainEqual({ kind: "execute_step", jobId: "cleanup", stepId: "clean" })
+    expect(t.patch.jobs?.work?.status).toBe("failed")
+  })
+
+  it("skips a failure() job when every dependency succeeded", () => {
+    const withRecovery = mkWorkflow(
+      {
+        work: defineJob([commandStep("do", ["make"])]),
+        recover: defineJob([commandStep("fix", ["./recover"])], ["work"], "failure()"),
+      },
+      roles,
+      "recovery-flow",
+    )
+    const t = interpret(
+      withRecovery,
+      state({
+        jobs: {
+          work: job({ status: "running", currentStep: "do" }),
+          recover: job({ status: "pending" }),
+        },
+      }),
+      { kind: "step.completed", jobId: "work", stepId: "do" },
+    )
+    expect(t.decisions).toContainEqual({
+      kind: "skip_job", jobId: "recover", reason: "if: failure() but every dependency succeeded",
+    })
+  })
+
+  it("runs a failure() job when a dependency failed", () => {
+    const withRecovery = mkWorkflow(
+      {
+        work: defineJob([commandStep("do", ["make"])]),
+        recover: defineJob([commandStep("fix", ["./recover"])], ["work"], "failure()"),
+      },
+      roles,
+      "recovery-flow",
+    )
+    const t = interpret(
+      withRecovery,
+      state({
+        jobs: {
+          work: job({ status: "running", currentStep: "do" }),
+          recover: job({ status: "pending" }),
+        },
+      }),
+      { kind: "step.failed", jobId: "work", stepId: "do", reason: "boom" },
+    )
+    expect(t.decisions).toContainEqual({ kind: "execute_step", jobId: "recover", stepId: "fix" })
   })
 
   it("finishes when all jobs are terminal", () => {
