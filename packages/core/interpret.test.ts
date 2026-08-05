@@ -27,7 +27,7 @@ const roles: WorkflowDef["roles"] = {
 }
 
 const steps: StepDef[] = [
-  agentStep("implement", "implementer", "implement {{feature}}"),
+  agentStep("implement", "implementer", "implement the feature"),
   commandStep("gate", ["./gradlew check"], { retry: backoff(2), onFail: goto("fix_gate") }),
   agentStep("fix_gate", "fixer", "fix the gate", { outcomes: { done: goto("gate") } }),
   agentStep("review", "reviewer", "review the diff", {

@@ -1,18 +1,52 @@
 # Expressions and template contexts
 
 Workflow strings may embed `{{ ... }}` expressions. This page defines every
-context, what resolves when, and what validation guarantees. *(The expression
-evaluator is in progress — `workflow-format` task 2.3. Contexts and
-semantics below are settled; the resolving code has not landed.)*
+context, what resolves when, and what validation guarantees. The grammar,
+validator and evaluator live in `packages/core/src/expression.ts` and
+`packages/core/src/template.ts`; validation-time checks live in
+`packages/core/src/validate.ts`.
 
 ## Design constraints
 
 Expressions are deterministic and bounded: property lookup, literals,
 equality/relational/boolean operators, null coalescing, and whitelisted
-status functions (`always()`, `failure()`, …). No ambient filesystem,
-network, clock, randomness or code evaluation. Expressions are parsed and
-type-checked at validation time and evaluated in the pure core against
-persisted state.
+status functions (`success()`, `failure()`, `cancelled()`, `always()`). No
+ambient filesystem, network, clock, randomness or code evaluation —
+`env.*`, `eval()`, arithmetic and any other unknown function are parse
+errors. Expressions are parsed and type-checked at validation time and
+evaluated in the pure core against persisted state.
+
+The concrete grammar (loosest to tightest binding):
+
+```
+expr      := or ( "??" or )*          # null coalescing catches hard misses too
+or        := and ( "||" and )*
+and       := eq ( "&&" eq )*
+eq        := rel ( ("==" | "!=") rel )*
+rel       := unary ( ("<" | "<=" | ">" | ">=") unary )*
+unary     := ("!" | "-") unary | primary
+primary   := literal | call | path | "(" expr ")"
+path      := ident ( "." ident | "[" string "]" )*
+call      := ident "(" ")"
+```
+
+Bracket indices must be string literals (`needs["arch-a"]`, never
+`needs[k]`) — dynamic keys would defeat the static reference validation
+below.
+
+## Status functions
+
+`success()`, `failure()`, `cancelled()` and `always()` are the only callable
+names. They take no arguments. The evaluator never computes them: the caller
+(engine/reconciler) precomputes each function's boolean value from persisted
+state and passes it into the context as data (`functions: { always: true,
+failure: false, ... }`). An expression like `failure()` is therefore
+wholly deterministic given the state that produced the context.
+
+`if:` conditions use the same grammar. Today the interpreter recognises
+`always()` and `failure()` on jobs; general boolean conditions over the
+contexts are evaluated engine-side with the same context (planned — see the
+workflow reference).
 
 ## Contexts at a glance
 
@@ -135,8 +169,9 @@ also what makes `feedback` references checkable:
 
 So in the consensus example, inside the architects the legal references are
 exactly: both architects' steps, and `consensus`/`agree`. Anything else —
-a typo, a job outside the loop — is a validation error. *(planned — this
-check lands with the evaluator)*
+a typo, a job outside the loop — is a validation error. Step-scope reruns
+allow `feedback.jobs["<routing-job>"]["<step>"]` for any step of the routing
+job, since the loop lives inside it.
 
 ## Runner-populated environment
 

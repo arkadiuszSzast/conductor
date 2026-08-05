@@ -195,8 +195,9 @@ Two context namespaces, two guarantees:
 
 The `feedback.*` reference is still statically checkable: a reference to
 `feedback.jobs[J][S]` in job X is legal iff some `rerun` route targets X and
-J is one of that rerun's targets (or the routing job itself). *(planned —
-lands with the expression evaluator)*
+J is one of that rerun's targets (or the routing job itself). The check
+lives in validation; the reference resolves at runtime from the rerun's
+snapshot.
 
 ## Escalation, pausing, resuming
 

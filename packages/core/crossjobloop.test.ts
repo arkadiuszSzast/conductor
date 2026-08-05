@@ -40,7 +40,7 @@ function mkState(jobs: Record<string, JobRuntime>, status: FeatureState["status"
 
 const twoArchitectsWorkflow = mkWorkflow(
   {
-    "arch-a": job([agentStep("design", "architect", "Design {{feature}}.")]),
+    "arch-a": job([agentStep("design", "architect", "Design the feature.")]),
     "arch-b": job([agentStep("design", "architect", "Design independently.")]),
     consensus: job(
       [

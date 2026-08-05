@@ -1,13 +1,14 @@
 import { expect, it } from "bun:test"
-import { name as core, interpret, render, validateWorkflow } from "@conductor/core"
+import { name as core, interpret, renderTemplate, validateWorkflow } from "@conductor/core"
 import { name as server } from "@conductor/server"
 import { name as runner } from "@conductor/runner-opencode"
 import { name as cli } from "@conductor/cli"
-import type { FeatureState, WorkflowDef } from "@conductor/core"
+import type { EvalContext, FeatureState, WorkflowDef } from "@conductor/core"
 
 it("resolves every workspace package", () => {
   expect(core).toBe("@conductor/core")
-  expect(render("{{value}}", { value: core }).text).toBe("@conductor/core")
+  const context: EvalContext = { inputs: {}, steps: {}, needs: {} }
+  expect(renderTemplate("hello {{ 'core' }}", context).text).toBe("hello core")
   expect(server).toBe("@conductor/server")
   expect(runner).toBe("@conductor/runner-opencode")
   expect(cli).toBe("@conductor/cli")

@@ -46,6 +46,56 @@ operators, null coalescing, and whitelisted status functions (`success`,
 Templates in strings remain `{{ ... }}` for migration continuity. Parse and
 type-check expressions during validation; evaluate in the pure core.
 
+#### Expression language details (task 2.3, landed)
+
+Recorded here because they decide the grammar, not just its implementation.
+
+- **Status functions are data, not code.** `always()`, `failure()`, … are
+  zero-argument and the evaluator never computes them; the caller passes
+  precomputed booleans into the context (`functions: { always: true }`).
+  The only callable names are the whitelist — anything else (including
+  `eval()`) is a parse error, so there is no ambient capability by
+  construction.
+- **No arithmetic.** The grammar has `!` and unary `-` (negative literals),
+  equality/relational/boolean operators and `??`; no `+ - * /`, no string
+  concatenation. Job `outputs` compose values via templates instead.
+- **Bracket indices are string literals only.** `needs["arch-a"]`, never a
+  variable or number — dynamic keys would make references un-validatable.
+- **Contexts and hard/soft semantics** as in `docs/expressions.md`:
+  `inputs.*`/`steps.*`/`needs.*` are hard (a miss raises and must be
+  reported before side effects; `??` can supply a default), `feedback.*` is
+  soft (resolves to null/empty outside a rerun by design). The evaluator is
+  pure — the caller (engine) builds the `EvalContext` from persisted state
+  via `buildEvalContext`, so the interpreter stays free of I/O.
+- **Step output names are static only where the step kind fixes them**:
+  `agent` publishes exactly `report`, `human` exactly `notes`;
+  `command`/`action` outputs are dynamic (runner- or manifest-defined), so
+  any output name passes validation and is treated as an unknown type.
+- **`needs.X.outputs.Y` requires X in `needs` and Y in X's declared
+  `outputs`.** Reference validation is DAG-shaped, not just name-shaped.
+- **`feedback.jobs[J][S]` legality is rerun-shaped**: legal in job X iff a
+  rerun route targets X; J must be a rerun target or the routing job (S the
+  routing step). Step-scope reruns make any step of the routing job legal.
+- **Job `outputs` are templates, not bare expressions.** A value is a
+  `{{ ... }}` string (the docs' `{{ steps.x.outputs.report }}` form) that
+  renders to a string when the job succeeds. A declared output that fails to
+  evaluate resolves to `null`, never fails the job — consumers read an
+  explicit empty value. This resolves the `NOT YET EVALUATED` gap in
+  `JobDef.outputs`/`JobRuntime.outputs` (task 2.2-output-availability).
+  Job outputs may read only `inputs.*` and the job's own `steps.*` — not
+  `feedback.*` (the post-success resolution has no rerun snapshot) and not
+  `needs.*` (re-publishing a dependency's output is a smell; reference the
+  producer directly).
+- **General `if:` conditions are validated but inert, and say so.** The
+  interpreter's readiness cascade still consults only the literal
+  `always()`/`failure()`; any other syntactically valid job condition
+  produces a validation *warning* ("validated but not evaluated") instead of
+  being silently ignored. Evaluating general conditions at readiness time is
+  a later engine change.
+- **Bare dotted paths are gone.** The old template allowed `{{feature}}`;
+  the expression grammar requires a context root, so `{{feature}}` is now a
+  validation error naming the available contexts.
+
 ### Local actions
 
 Registry search paths are explicit daemon config, with a bundled read-only

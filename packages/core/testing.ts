@@ -48,16 +48,27 @@ export function humanStep(id: string, options?: StepOptions): HumanStep {
   return { ...stepBase(id, options), type: "human" }
 }
 
-export function job(steps: readonly StepDef[], needs: readonly string[] = [], jobIf?: string): JobDef {
-  return { needs, steps, outputs: {}, ...(jobIf ? { if: jobIf } : {}) }
+export function job(
+  steps: readonly StepDef[],
+  needs: readonly string[] = [],
+  jobIf?: string,
+  outputs?: Readonly<Record<string, string>>,
+): JobDef {
+  return {
+    needs,
+    steps,
+    outputs: outputs ?? {},
+    ...(jobIf ? { if: jobIf } : {}),
+  }
 }
 
 export function workflow(
   jobs: Readonly<Record<string, JobDef>>,
   roles: WorkflowDef["roles"],
   name = "test",
+  inputs: WorkflowDef["inputs"] = {},
 ): WorkflowDef {
-  return { name, on: [], inputs: {}, jobs, roles }
+  return { name, on: [], inputs, jobs, roles }
 }
 
 export const next: Route = { kind: "next" }
