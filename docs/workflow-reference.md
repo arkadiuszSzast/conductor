@@ -2,9 +2,9 @@
 
 Complete reference for `conductor.yaml`. Field semantics are defined by the
 canonical IR in `packages/core/src/types.ts`; the YAML shown here is the
-authoring surface the parser normalises into that IR. *(The YAML parser is in
-progress — see `openspec/changes/workflow-format/tasks.md` task 1.2. Field
-names and semantics below are settled; sugar/shorthand may still evolve.)*
+authoring surface the parser (`packages/core/src/parse.ts`) normalises into
+that IR. Field names and semantics below are settled; sugar/shorthand may
+still evolve.
 
 Conventions used below:
 

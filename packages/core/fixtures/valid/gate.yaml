@@ -1,0 +1,22 @@
+name: gate
+
+roles:
+  implementer: { agent: build }
+
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Do the work. Rejection notes: {{ feedback.jobs['main']['approve']['notes'] }}"
+      - id: approve
+        human: {}
+        outcomes:
+          approved: next
+          rejected:
+            rerun: { scope: steps, stepIds: [implement], maxRounds: 3 }
+      - id: ship
+        action:
+          uses: git/push@v1
+          with: { remote: origin }

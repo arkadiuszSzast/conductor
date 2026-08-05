@@ -1,0 +1,47 @@
+name: review-fix-loop
+on:
+  - manual
+  - { schedule: { cron: "0 6 * * *", missedFire: skip } }
+  - { event: push }
+
+inputs:
+  feature: { type: string, required: true }
+  budget: { type: number, default: 3 }
+  dry-run: { type: boolean, default: false }
+
+roles:
+  implementer: { agent: build, model: prov/implementer }
+  reviewer: { agent: review, model: prov/reviewer, variant: careful }
+
+jobs:
+  deliver:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: |
+            Implement {{ inputs.feature }}.
+            Previous round: {{ feedback.jobs["deliver"]["implement"]["report"] }}
+            Review notes: {{ feedback.jobs["deliver"]["review"]["report"] }}
+      - id: review
+        agent:
+          role: reviewer
+          prompt: "Review the diff."
+        outcomes:
+          approved: next
+          changes_requested:
+            rerun: { scope: steps, stepIds: [implement], maxRounds: 3 }
+      - id: merge
+        action:
+          uses: git/pr-merge@v1
+          with: { method: squash }
+        retry:
+          maxAttempts: 3
+          maxElapsed: PT10M
+          backoff: { strategy: exponential, initial: 1000, multiplier: 2, max: 60000, jitter: full }
+        onFail: { goto: report-failure }
+      - id: report-failure
+        command:
+          run: ["echo merge failed"]
+          cwd: packages/core
+          timeoutMs: 60000

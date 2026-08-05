@@ -1,0 +1,13 @@
+name: duplicate-key
+name: duplicate-key-again
+
+roles:
+  implementer: { agent: build }
+
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "work"

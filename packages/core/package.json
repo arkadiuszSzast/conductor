@@ -8,5 +8,8 @@
   "module": "src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
   }
 }
