@@ -18,10 +18,11 @@
 
 ## 3. Local action registry
 
-- [ ] [server] Define action manifest, typed input/output and JSON execution protocols plus configured registry resolution.
+- [x] [core] Define ActionManifest IR, typed input/output, capability vocabulary, manifest YAML parser and validation, pure registry resolution with content digest and `with:` input checking, and JSON execution protocol envelope types.
+- [ ] [server] Wire configured registry search paths (bundled + local), load manifests from disk, and expose the populated `ActionRegistry` to the daemon pre-start check and the reconciler.
 - [ ] [server] Record resolved action version/content digest and enforce declared capability policy at dispatch.
 - [ ] [server] Extract every seed builtin into a bundled `@v1` action; remove action-name dispatch from the engine.
-- [ ] [test] Port built-in behavioural/idempotency tests to action contract tests and add unavailable/version/capability diagnostics.
+- [x] [test] Add action registry contract tests: versioned resolution with deterministic digest, missing action/version diagnostics naming paths, incompatible `with:` inputs, unknown capabilities, safe IO variants; golden manifest fixtures (valid/invalid) in `packages/core/fixtures/actions/`.
 
 ## 4. Triggers and durable execution
 

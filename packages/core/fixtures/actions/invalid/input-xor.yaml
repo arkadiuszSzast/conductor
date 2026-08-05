@@ -1,0 +1,6 @@
+name: git/push
+version: 1.2.0
+inputs:
+  remote: { type: string, required: true, default: origin }
+  branch: { type: string }
+run: [bun, run, main.ts]

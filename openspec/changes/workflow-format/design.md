@@ -182,6 +182,64 @@ and audit, not a false security boundary.
 Seed built-ins migrate action-by-action with their existing tests. There is no
 `switch(actionName)` in the engine; registry dispatch is uniform.
 
+#### Action registry core (task 3.1, landed) — `packages/core/src/action.ts`
+
+Manifest, validation, resolution and `with:` checking all live in core —
+like the workflow parser/validator — because they are pure: string →
+manifest → validate → resolve with no I/O and no daemon config. The daemon
+only supplies the registry contents and (task 3.2+) executes.
+
+- **Manifest shape.** Authoring surface is a small YAML file:
+  `name`, `version` (`major.minor.patch`), optional `description`, `inputs`,
+  `outputs`, `capabilities`, `run`. `run` is a list for a subprocess (JSON
+  protocol over stdio) or `{ handler: <name> }` for an in-process shipped
+  action; the parser normalises both to the discriminated IR
+  (`kind: "process" | "inprocess"`). Typed IO mirrors the workflow `InputDef`
+  pattern — an input is required or has a default, never both, never neither —
+  so the IR is a safe variant, not a bag of optional fields. Input/output
+  type vocabulary: `string | number | boolean | string[] | number[] |
+  boolean[]`. Array types must be quoted in flow maps (`type: "string[]"`) —
+  brackets are YAML flow indicators. `version` values that look numeric
+  (`1.2`) must be quoted too or the parser reports a scalar-type error.
+- **Capabilities vocabulary** is `filesystem | process | network | git |
+  credentials`. The parser rejects undeclared capabilities at shape level
+  (source-mapped); `validateActionManifest` re-checks defensively for
+  hand-loaded manifests. Declarations are guardrails and audit, not a
+  security boundary (see above).
+- **Registry model.** `ActionRegistry` is an immutable `name → [{ manifest,
+  sourcePath? }]` map; `buildActionRegistry` keys entries by their manifest
+  name so key ↔ `uses` lookup stay consistent. `sourcePath` is load-time
+  provenance the daemon sets (bundled + configured paths); the resolver never
+  reads it, diagnostics quote it. The resolver is config-agnostic: it sees
+  only the map.
+- **Resolution.** `resolveAction(uses, registry)` parses `name@v<ref>` (`@v1`,
+  `@v1.2`, `@v1.2.3`), looks up the name, and picks the highest manifest on
+  the matched version line — a major ref tracks the newest minor/patch. It
+  returns the matched manifest plus a content digest; `validateWorkflow`
+  stays registry-free.
+- **Digest lifecycle.** The digest is SHA-256 over the manifest's canonical
+  content (stable JSON, keys sorted, insertion-order independent), computed
+  at resolution. It pins the exact resolved manifest — identity, version, IO
+  contract, capabilities, entry point — so a run reproduces the same
+  definition. The daemon records it in run state (task 3.2); hashing the
+  implementation *bytes* is a server-side load concern (3.2+) and not part of
+  the core digest.
+- **Missing-action diagnostics.** Failure messages are built purely in core
+  and name the searched registry paths: for a missing name the message lists
+  the source paths of every registry entry (or "none — the registry is
+  empty") plus what the registry provides; for a missing version it lists the
+  matched name's paths and the available versions. This is a daemon pre-start
+  check, not part of `validateWorkflow`.
+- **`with:` validation happens at reservation.** `validateActionInputs`
+  rejects undeclared keys, missing required inputs and literal values of the
+  wrong type. A `{{ ... }}` template value defers the type check to
+  dispatch-time enforcement (3.2) — its rendered type is unknown pre-run.
+- **JSON protocol — envelope types only.** `ActionRunContext` (feature/job/
+  step identity, workdir, typed inputs after defaults, declared capabilities)
+  and `ActionResult` (`succeeded` + outputs | `failed` + error) are pure
+  types. Pending/polling and the wire format are deliberately deferred to the
+  polling work (3.2+); `status` stays `succeeded | failed` until then.
+
 ### Triggers
 
 Manual API events and cron schedules write a durable `trigger_event` first,

@@ -1,0 +1,3 @@
+name: github/await-checks
+version: 1.0.0
+run: { handler: github/await-checks }
