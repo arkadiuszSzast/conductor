@@ -148,9 +148,9 @@ describe("legacy database adoption", () => {
       rounds: { review: 2 },
       workflow: null,
       description: null,
+      escalation: "budget exhausted",
     })
     expect(store.getActiveRun("initial-feature")).toMatchObject({ id: "initial-run", nudges: 0 })
-    expect((adopted.db.query("SELECT escalation FROM feature WHERE id = ?").get("initial-feature") as { escalation: string }).escalation).toBe("budget exhausted")
     adopted.close()
   })
 
@@ -240,9 +240,9 @@ describe("legacy database adoption", () => {
       pr: 42,
       attempts: { review: 2 },
       rounds: { review: 3 },
+      escalation: null,
     })
     expect(store.getActiveRun("legacy-feature")).toMatchObject({ id: "run-1", attempt: 2, nudges: 1 })
-    expect((adopted.db.query("SELECT escalation FROM feature WHERE id = ?").get("legacy-feature") as { escalation: string | null }).escalation).toBeNull()
     expect(store.listFindings("legacy-feature")).toEqual([expect.objectContaining({ id: "F1", status: "reopened", resolution: "needs follow-up", threadId: "thread-1", tags: ["security"] })])
     expect(store.getTransitions("legacy-feature")).toEqual([expect.objectContaining({ decision: "execute", detail: "review" })])
     expect((adopted.db.query("SELECT status, last_reply FROM review_thread WHERE thread_id = ?").get("thread-1") as { status: string; last_reply: string })).toEqual({ status: "reopened", last_reply: "still open" })

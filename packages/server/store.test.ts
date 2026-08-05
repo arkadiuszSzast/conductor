@@ -63,6 +63,12 @@ describe("feature lifecycle", () => {
     })
     expect(store.getFeature(feature.id)?.status).toBe("escalated")
     expect(store.getFeature(feature.id)?.attempts).toEqual({ gate: 2 })
+    expect(store.getFeature(feature.id)?.escalation).toBe("gate exhausted attempts")
+    store.applyTransition(feature.id, { kind: "human.resumed" }, {
+      decision: { kind: "execute", stepId: "gate" },
+      patch: { status: "running", escalation: null },
+    })
+    expect(store.getFeature(feature.id)?.escalation).toBeNull()
   })
 
   it("filters active features and finds by PR", () => {

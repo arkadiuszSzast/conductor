@@ -18,6 +18,7 @@ export interface LegacyFeatureState {
   readonly pr: number | null
   readonly attempts: Readonly<Record<string, number>>
   readonly rounds: Readonly<Record<string, number>>
+  readonly escalation: string | null
 }
 
 export type LegacyPipelineEvent =
@@ -47,6 +48,7 @@ export interface LegacyTransition {
     currentStep: string | null
     attempts: Readonly<Record<string, number>>
     rounds: Readonly<Record<string, number>>
+    escalation: string | null
   }>
 }
 
@@ -65,6 +67,7 @@ interface FeatureRow {
   pr: number | null
   attempts: string
   rounds: string
+  escalation: string | null
 }
 
 function toState(row: FeatureRow): LegacyFeatureState {
@@ -83,6 +86,7 @@ function toState(row: FeatureRow): LegacyFeatureState {
     pr: row.pr,
     attempts: JSON.parse(row.attempts) as Record<string, number>,
     rounds: JSON.parse(row.rounds) as Record<string, number>,
+    escalation: row.escalation,
   }
 }
 
@@ -152,7 +156,10 @@ export class Store {
         sets.push("rounds = ?")
         params.push(JSON.stringify(patch.rounds))
       }
-      if (decision.kind === "escalate") {
+      if (patch.escalation !== undefined) {
+        sets.push("escalation = ?")
+        params.push(patch.escalation)
+      } else if (decision.kind === "escalate") {
         sets.push("escalation = ?")
         params.push(decision.reason)
       }
