@@ -240,6 +240,35 @@ only supplies the registry contents and (task 3.2+) executes.
   types. Pending/polling and the wire format are deliberately deferred to the
   polling work (3.2+); `status` stays `succeeded | failed` until then.
 
+#### Action registry server wiring (task 3.1, landed) — `packages/server/src/`
+
+The server owns registry configuration and filesystem I/O. The daemon-facing
+config names a base directory, one bundled read-only registry path, and ordered
+local paths. Relative paths resolve from the configured base directory; no home
+or host path is implied. Search order is bundled first, then local paths in
+declaration order. A later path has higher precedence for the same exact
+`name@version`; duplicates within one path are deterministic load errors naming
+all conflicting manifests.
+
+- **Loader convention.** Registry roots are scanned recursively in lexical
+  order for `action.yaml` and `action.yml`. Missing/unreadable paths and files,
+  malformed YAML, semantic manifest errors, and same-precedence duplicates are
+  aggregated and sorted by source location. A failed load yields no partial
+  registry. Symlinks inside a registry root are rejected with a diagnostic so
+  traversal stays finite and entries are never silently skipped. Every accepted
+  entry carries its absolute manifest `sourcePath`.
+- **Pre-start reservation check.** `checkWorkflowReservation` walks every
+  action step in workflow/job declaration order, calls core `resolveAction`,
+  then `validateActionInputs`, and returns all useful diagnostics before a run
+  can start. It remains separate from `validateWorkflow`. Resolution
+  diagnostics also name every configured search root because core registry
+  entries only retain paths of manifests that were actually found.
+- **Reconciler hand-off.** A successful reservation exposes immutable bindings
+  keyed by `(jobId, stepId)`, containing the resolved manifest, digest, and
+  source provenance. The reconciler receives a read-only lookup seam; action
+  execution, capability enforcement, and durable version/digest persistence
+  remain task 3.2 work.
+
 ### Triggers
 
 Manual API events and cron schedules write a durable `trigger_event` first,
