@@ -5,7 +5,7 @@
   },
   "include": [
     "packages/*/src",
-    "packages/*.test.ts",
+    "packages/*/*.test.ts",
     "apps/*/src",
     "test"
   ]

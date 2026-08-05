@@ -51,7 +51,9 @@ function state(over: Partial<FeatureState> = {}): FeatureState {
   return featureState({ main: job() }, over)
 }
 
-function evt(e: Omit<PipelineEvent, "jobId"> & { jobId?: string }): PipelineEvent {
+type Distribute<U> = U extends unknown ? Omit<U, "jobId"> : never
+
+function evt(e: Distribute<PipelineEvent>): PipelineEvent {
   return { jobId: "main", ...e } as PipelineEvent
 }
 

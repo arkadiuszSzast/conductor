@@ -73,7 +73,7 @@ describe("cross-job rerun", () => {
     })
     const t = interpret(twoArchitectsWorkflow, state, { kind: "feature.start" })
     expect(t.decisions).toHaveLength(2)
-    const jobIds = (t.decisions as { jobId: string }[]).map(d => d.jobId)
+    const jobIds = (t.decisions as readonly { jobId: string }[]).map(d => d.jobId)
     expect(jobIds).toContain("arch-a")
     expect(jobIds).toContain("arch-b")
   })
@@ -93,7 +93,7 @@ describe("cross-job rerun", () => {
     })
 
     expect(t.decisions).toHaveLength(2)
-    const jobIds = (t.decisions as { jobId: string }[]).map(d => d.jobId)
+    const jobIds = (t.decisions as readonly { jobId: string }[]).map(d => d.jobId)
     expect(jobIds).toContain("arch-a")
     expect(jobIds).toContain("arch-b")
 
@@ -281,7 +281,7 @@ describe("human gate rejection rerun", () => {
   it("reruns design on human rejection", () => {
     const state = mkState({
       design: mkJob({ status: "succeeded", currentStep: null, steps: { draft: { status: "succeeded", outputs: { report: "draft" } } } }),
-      approval: mkJob({ status: "waiting_human", currentStep: "gate" }),
+      approval: mkJob({ status: "running", currentStep: "gate" }),
     })
     const t = interpret(rejectRerunWorkflow, state, {
       kind: "step.completed",

@@ -47,8 +47,8 @@ const INPUT_TYPES: readonly InputType[] = ["string", "number", "boolean"]
 const STEP_KINDS = ["agent", "command", "action", "human"] as const
 
 export function parseWorkflow(source: string): ParseWorkflowResult {
-  if (source.length > MAX_SOURCE_LENGTH) {
-    return { ok: false, errors: [{ message: `document exceeds ${MAX_SOURCE_LENGTH} characters`, line: 1, col: 1 }] }
+  if (new TextEncoder().encode(source).length > MAX_SOURCE_LENGTH) {
+    return { ok: false, errors: [{ message: `document exceeds ${MAX_SOURCE_LENGTH} bytes`, line: 1, col: 1 }] }
   }
 
   const lineCounter = new LineCounter()

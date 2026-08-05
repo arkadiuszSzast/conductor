@@ -83,11 +83,14 @@ parser/validator boundary:
   route mapping has exactly one of `goto`/`rerun`; `rerun` carries the scope's
   matching id list (`stepIds` xor `jobIds`); a constant backoff rejects
   exponential fields and vice versa. `retry` without `backoff` is a parse
-  error (the IR has no `{strategy:"backoff"}` without one). Value ranges
-  (`maxAttempts ≥ 1`, `maxRounds ≥ 1`, `timeoutMs ≥ 1`, backoff parameter
-  ranges) are enforced in the parser because they are part of a valid shape;
-  `maxElapsed` ISO-8601 format is checked in `validate.ts` like the other
-  string-format checks.
+  error (the IR has no `{strategy:"backoff"}` without one). The parser checks
+  types and integer-ness (`maxAttempts`, `maxRounds`, `delay`, `initial`,
+  `max`, `timeoutMs`) and `timeoutMs ≥ 1`; the *value ranges* the shape
+  requires (`maxAttempts ≥ 1`, `maxRounds ≥ 1`, backoff parameter ranges)
+  are part of the semantic invariants, so they live with the other
+  structural checks in `validate.ts` (`validateRetry`/`validateBackoff`/
+  `validateRerunTarget`). `maxElapsed` ISO-8601 format is likewise checked in
+  `validate.ts`.
 - **`with:` values are preserved generically** (strings/numbers/booleans/
   lists/maps, `null` for empty values) because action inputs are an opaque
   payload until the registry lands; everything else in the dialect is typed.
