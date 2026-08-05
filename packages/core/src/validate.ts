@@ -39,7 +39,7 @@ export function validateWorkflow(def: WorkflowDef): ValidationResult {
     validateJob(jobId, job, def, errors, warnings)
   }
 
-  validateExpressions(def, errors)
+  validateExpressions(def, errors, warnings)
 
   return { errors, warnings }
 }
@@ -426,7 +426,7 @@ function collectRerunRoutes(def: WorkflowDef): readonly RerunRoute[] {
   return routes
 }
 
-function validateExpressions(def: WorkflowDef, errors: string[]): void {
+function validateExpressions(def: WorkflowDef, errors: string[], warnings: string[]): void {
   const refs = collectRefs(def)
   const rerunRoutes = collectRerunRoutes(def)
 
@@ -441,6 +441,15 @@ function validateExpressions(def: WorkflowDef, errors: string[]): void {
         def,
         errors,
       })
+      // The interpreter's skip cascade only consults the literal conditions
+      // `always()`/`failure()`; a general boolean is validated but not yet
+      // evaluated at readiness time, so warn instead of silently ignoring it.
+      if (job.if !== "always()" && job.if !== "failure()") {
+        warnings.push(
+          `job "${jobId}": if — only "always()" and "failure()" affect job readiness today; ` +
+            `this condition is validated but not evaluated`,
+        )
+      }
     }
 
     for (const [name, expression] of Object.entries(job.outputs)) {
@@ -448,10 +457,13 @@ function validateExpressions(def: WorkflowDef, errors: string[]): void {
       const sources = extractExpressions(expression)
       if (sources.length === 0) continue
       for (const source of sources) {
+        // Job outputs render post-success against the job's own steps and the
+        // trigger inputs; `resolveJobOutputs` never receives a feedback
+        // snapshot, so a feedback read here would silently resolve empty.
         validateExpression(source, {
           where,
           typeOfPath: path => typeOfJobPath(path, jobId, job, def, refs),
-          allowedRoots: new Set(["inputs", "steps", "feedback"]),
+          allowedRoots: new Set(["inputs", "steps"]),
           feedbackRoot: jobId,
           rerunRoutes,
           def,

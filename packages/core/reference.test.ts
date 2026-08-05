@@ -87,17 +87,24 @@ describe("expression validation", () => {
     expect(errorsIn(withIf)).toEqual([])
   })
 
-  it("validates a job if condition over needs and inputs", () => {
+  it("validates a job if condition over needs and inputs (accepted with an inert-condition warning)", () => {
     const good = {
       ...base.jobs,
       gated: job([commandStep("c", ["true"])], ["arch-a"], "needs['arch-a'].outputs.design == 'go'"),
     }
-    expect(errorsIn(good)).toEqual([])
+    const result = validateWorkflow({ ...base, jobs: good })
+    expect(result.errors).toEqual([])
+    expect(result.warnings.join("\n")).toContain('job "gated": if')
     const bad = {
       ...base.jobs,
       gated: job([commandStep("c", ["true"])], ["arch-a"], "needs['ghost'].outputs.x == 'go'"),
     }
     expect(errorsIn(bad).join("\n")).toContain('job "gated": if')
+  })
+
+  it("does not warn for the interpreted always()/failure() conditions", () => {
+    const jobs = { ...base.jobs, cleanup: job([commandStep("c", ["true"])], ["arch-a"], "always()") }
+    expect(validateWorkflow({ ...base, jobs }).warnings).toEqual([])
   })
 
   it("rejects a syntax error in a job if condition", () => {
@@ -454,5 +461,19 @@ describe("job outputs reference validation", () => {
       ),
     }
     expect(errorsIn(jobs).join("\n")).toContain('outputs["o"]')
+  })
+
+  it("rejects a job output reading feedback — resolveJobOutputs has no snapshot", () => {
+    const jobs = {
+      "arch-a": job(
+        [agentStep("design", "architect", "design")],
+        [],
+        undefined,
+        { reason: "{{ feedback.message }}" },
+      ),
+      "arch-b": job([agentStep("design", "architect", "design")]),
+      consensus: consensusJob,
+    }
+    expect(errorsIn(jobs).join("\n")).toContain('outputs["reason"]')
   })
 })

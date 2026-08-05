@@ -82,6 +82,16 @@ Recorded here because they decide the grammar, not just its implementation.
   evaluate resolves to `null`, never fails the job — consumers read an
   explicit empty value. This resolves the `NOT YET EVALUATED` gap in
   `JobDef.outputs`/`JobRuntime.outputs` (task 2.2-output-availability).
+  Job outputs may read only `inputs.*` and the job's own `steps.*` — not
+  `feedback.*` (the post-success resolution has no rerun snapshot) and not
+  `needs.*` (re-publishing a dependency's output is a smell; reference the
+  producer directly).
+- **General `if:` conditions are validated but inert, and say so.** The
+  interpreter's readiness cascade still consults only the literal
+  `always()`/`failure()`; any other syntactically valid job condition
+  produces a validation *warning* ("validated but not evaluated") instead of
+  being silently ignored. Evaluating general conditions at readiness time is
+  a later engine change.
 - **Bare dotted paths are gone.** The old template allowed `{{feature}}`;
   the expression grammar requires a context root, so `{{feature}}` is now a
   validation error naming the available contexts.
