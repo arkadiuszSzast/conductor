@@ -203,9 +203,14 @@ Routes the step when it **could not do its work** (crash, non-zero exit,
 timeout) after the retry budget is spent. This is a different lane from
 `outcomes` — see [Outcomes vs failures](concepts.md#outcomes-vs-failures-the-core-distinction).
 
-> Open design question: making `onFail` required with an explicit
-> `escalate` route variant (total model instead of absent-means-escalate)
-> is under consideration; see the decision log.
+There is deliberately no `escalate` route variant: an escalate-immediately
+edge would bypass the DAG's failure reaction (`if: failure()`
+cleanup/notification jobs would never run). Absent `onFail` is the settled
+shape — the job fails, the DAG reacts, and escalation arrives only when
+nothing else is runnable. Failure notifications belong in an
+`if: failure()` job (in-workflow) or a daemon event subscriber on the
+escalation event (install-wide); see the decision log in
+`openspec/changes/workflow-format/design.md`.
 
 ### `steps[*].retry`
 

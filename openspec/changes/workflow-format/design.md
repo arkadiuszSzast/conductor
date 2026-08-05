@@ -173,6 +173,27 @@ events through both interpreters until parity is established.
   runnable — per `cross-job-loops`). Notification-on-failure is a plain step
   reached via `onFail`, not a shell escape hatch — the interpreter stays pure
   (routing) and the engine owns side effects.
+- **Resolved: `onFail` stays `Route?`; no `escalate` route variant.** The
+  open question "make `onFail` required with an explicit `escalate` variant
+  (total model)" is closed as **no**, for the parser freeze:
+  - An `escalate`-immediately variant would bypass the DAG's failure
+    reaction — `if: failure()` cleanup/notification jobs would never run,
+    which contradicts the settled failure model above. Softening it to
+    "escalate after `failure()` jobs finish" is just "job failed and nothing
+    else runnable" minus waiting for independent branches — a third,
+    subtly different mode with no carrying use case.
+  - Failure notifications (e.g. Telegram) have two homes, both orthogonal
+    to `onFail`'s shape: a `if: failure()` job inside the workflow (runs in
+    the window between job failure and feature escalation), and a daemon
+    event subscriber on the `escalated` timeline event
+    (`standalone-daemon-extraction`, API/SSE) for install-wide policies.
+    Neither is helped nor harmed by a total `onFail` — only by
+    escalate-immediate, which is exactly the variant rejected.
+  - Totality as an IR-explicitness measure (`onFail: Route | {kind:"fail"}`
+    with the parser filling `fail` as the default) remains available later
+    as a mechanical, semantics-free change; it is not worth blocking the
+    parser on. In YAML, absent `onFail` keeps meaning "job fails, DAG
+    reacts".
 - **Sealed over nullable.** `BackoffDef` is a discriminated union keyed on
   `strategy` with optional fields carrying defaults; `AgentStep.prompt` is
   required (the IR is self-describing). No `X | null` for absent config.
