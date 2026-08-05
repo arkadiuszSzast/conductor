@@ -59,6 +59,26 @@ renames are deferred. The legacy DB path is importable/configurable — never
 hardcoded as the daemon's universal default. Before migrating a real gloam DB,
 copy it and run migration + recovery contract tests against the copy.
 
+The extracted persistence API separates `openDatabase`/connection close,
+`migrateDatabase`/`runMigrations`, and injected `Store` construction. Database
+paths are explicit configuration; the server does not infer a home directory.
+Every opened connection enables WAL and foreign keys before use.
+
+Migration IDs are stable ordered strings (`0001_...` onward). The ledger must
+be an exact prefix of the compiled migration list; unknown, missing or reordered
+history fails startup rather than guessing. Each migration body and its ledger
+insert share one Bun SQLite transaction, so an exception or interruption marks
+neither as applied. Historical seed schema stages are represented as additive,
+idempotent migrations: base legacy tables, `workflow`, `nudges`, review threads,
+findings and `description`. Existing tables and columns are neither renamed nor
+rebuilt, and the workflow-format job/step graph schema remains deferred.
+
+Until the graph persistence task lands, `@conductor/server` exports explicit
+`LegacyFeatureState`/transition types for the extracted store. This avoids
+misrepresenting the seed's single `current_step` and attempts/rounds maps as the
+new core graph state while preserving the store's observable semantics for the
+engine extraction.
+
 ### Reconciler ownership
 
 The daemon owns one lifecycle-managed reconciler. The existing confirmation of

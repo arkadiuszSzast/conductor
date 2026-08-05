@@ -8,7 +8,7 @@
 
 ## 2. Extract persistence and engine
 
-- [ ] [db] Move SQLite DB, store and existing additive migrations into `@conductor/server`; introduce an atomic migration ledger without destructive renames.
+- [x] [db] Move SQLite DB, store and existing additive migrations into `@conductor/server`; introduce an atomic migration ledger without destructive renames.
 - [ ] [server] Move engine, reconciler, actions, GitHub integration and findings publication behind explicit dependency interfaces.
 - [ ] [test] Move engine, store, built-in, preset and review-publishing tests; preserve all observed battle-scar behaviours.
 - [ ] [test][db] Add contract fixtures copied from a legacy conductor DB and prove in-flight state survives migration and restart.
