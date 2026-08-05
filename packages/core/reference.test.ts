@@ -70,13 +70,15 @@ describe("expression validation", () => {
   })
 
   it("rejects a type error in an expression", () => {
-    const def = workflow({
-      main: job([agentStep("a", "architect", "{{ 1 == 1 }}")]),
-    })
+    const def = workflow(
+      { main: job([agentStep("a", "architect", "{{ 1 == 1 }}")]) },
+      roles,
+    )
     // boolean expression inside a prompt is fine; a number/boolean misuse is not
-    const def2 = workflow({
-      main: job([agentStep("a", "architect", "{{ 'x' && true }}")]),
-    })
+    const def2 = workflow(
+      { main: job([agentStep("a", "architect", "{{ 'x' && true }}")]) },
+      roles,
+    )
     expect(validateWorkflow({ ...def, jobs: def2.jobs }).errors.join("\n")).toContain(
       '"&&" expects boolean, got string',
     )
@@ -273,16 +275,6 @@ describe("the docs' feature-delivery example (IR form)", () => {
 })
 
 describe("steps.* reference validation", () => {
-  const def = workflow(
-    {
-      main: job([
-        agentStep("first", "architect", "one"),
-        agentStep("second", "architect", "two"),
-      ]),
-    },
-    roles,
-  )
-
   it("allows an earlier step's declared output", () => {
     const prompt = "{{ steps.first.outputs.report }}"
     const jobs = { main: job([agentStep("first", "architect", "one"), agentStep("second", "architect", prompt)]) }
@@ -321,7 +313,7 @@ describe("steps.* reference validation", () => {
 describe("needs.* reference validation", () => {
   it("rejects a dependency not listed in needs", () => {
     const jobs = {
-      "arch-a": base.jobs["arch-a"],
+      "arch-a": base.jobs["arch-a"]!,
       consensus: job([agentStep("agree", "judge", "{{ needs['arch-a'].outputs.design }}")]),
     }
     expect(errorsIn(jobs).join("\n")).toContain("needs.arch-a.outputs.design")
@@ -329,7 +321,7 @@ describe("needs.* reference validation", () => {
 
   it("rejects an undeclared job output", () => {
     const jobs = {
-      "arch-a": base.jobs["arch-a"],
+      "arch-a": base.jobs["arch-a"]!,
       consensus: job(
         [agentStep("agree", "judge", "{{ needs['arch-a'].outputs.branch }}")],
         ["arch-a"],
@@ -340,7 +332,7 @@ describe("needs.* reference validation", () => {
 
   it("accepts a declared job output of a listed dependency", () => {
     const jobs = {
-      "arch-a": base.jobs["arch-a"],
+      "arch-a": base.jobs["arch-a"]!,
       consensus: job(
         [agentStep("agree", "judge", "{{ needs['arch-a'].outputs.design }}")],
         ["arch-a"],
@@ -452,7 +444,7 @@ describe("job outputs reference validation", () => {
 
   it("rejects a job output reading needs — job outputs are job-local", () => {
     const jobs = {
-      "arch-a": base.jobs["arch-a"],
+      "arch-a": base.jobs["arch-a"]!,
       consensus: job(
         [agentStep("agree", "judge", "x")],
         ["arch-a"],

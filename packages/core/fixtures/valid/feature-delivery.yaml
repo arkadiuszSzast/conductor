@@ -1,0 +1,133 @@
+name: feature-delivery
+on: [manual]
+
+inputs:
+  feature: { type: string, required: true }
+
+roles:
+  architect:   { agent: build,  model: prov/architect }
+  judge:       { agent: review, model: prov/judge }
+  implementer: { agent: build,  model: prov/implementer }
+  quality:     { agent: review, model: prov/quality }
+  reviewer:    { agent: review, model: prov/reviewer }
+
+jobs:
+  architect-a:
+    outputs:
+      design: "{{ steps.design.outputs.report }}"
+    steps:
+      - id: design
+        agent:
+          role: architect
+          prompt: |
+            Zaproponuj architekturę dla {{ inputs.feature }}.
+
+            Twoja poprzednia propozycja (pusta w rundzie 1):
+            {{ feedback.jobs["architect-a"]["design"]["report"] }}
+            Propozycja drugiego architekta:
+            {{ feedback.jobs["architect-b"]["design"]["report"] }}
+            Uwagi sędziego: {{ feedback.jobs["consensus"]["agree"]["report"] }}
+            Powód zwrotki: {{ feedback.message }}
+
+  architect-b:
+    outputs:
+      design: "{{ steps.design.outputs.report }}"
+    steps:
+      - id: design
+        agent:
+          role: architect
+          prompt: |
+            Zaproponuj niezależną architekturę dla {{ inputs.feature }}.
+
+            Twoja poprzednia propozycja (pusta w rundzie 1):
+            {{ feedback.jobs["architect-b"]["design"]["report"] }}
+            Propozycja drugiego architekta:
+            {{ feedback.jobs["architect-a"]["design"]["report"] }}
+            Uwagi sędziego: {{ feedback.jobs["consensus"]["agree"]["report"] }}
+
+  consensus:
+    needs: [architect-a, architect-b]
+    outputs:
+      decision: "{{ steps.agree.outputs.report }}"
+    steps:
+      - id: agree
+        agent:
+          role: judge
+          prompt: |
+            Porównaj architektury; odpowiedz outcome'em approved albo
+            changes_requested. Rozumowanie ZAWSZE w raporcie.
+
+            A: {{ needs["architect-a"].outputs.design }}
+            B: {{ needs["architect-b"].outputs.design }}
+        outcomes:
+          approved: next
+          changes_requested:
+            rerun: { scope: jobs, jobIds: [architect-a, architect-b], maxRounds: 5 }
+
+  deliver:
+    needs: [consensus]
+    steps:
+      - id: worktree
+        command:
+          run:
+            - |
+              name="feature-{{ inputs.feature }}"
+              git worktree add "../$name" -b "$name"
+              echo "branch=$name"               >> "$CONDUCTOR_OUTPUT"
+              echo "path=$(cd ../$name && pwd)" >> "$CONDUCTOR_OUTPUT"
+
+      - id: openspec
+        agent:
+          role: implementer
+          prompt: |
+            Napisz zmianę OpenSpec. Pracuj w {{ steps.worktree.outputs.path }}.
+            Uzgodniona architektura: {{ needs["consensus"].outputs.decision }}
+
+      - id: implement
+        agent:
+          role: implementer
+          prompt: |
+            Zaimplementuj {{ inputs.feature }} według
+            {{ steps.openspec.outputs.report }}.
+
+            Poprzednia iteracja: {{ feedback.jobs["deliver"]["implement"]["report"] }}
+            Uwagi quality: {{ feedback.jobs["deliver"]["quality"]["report"] }}
+            Uwagi review: {{ feedback.jobs["deliver"]["internal-review"]["report"] }}
+            Uwagi z PR: {{ feedback.jobs["deliver"]["pr-review"]["notes"] }}
+
+      - id: quality
+        agent:
+          role: quality
+          prompt: "Build, testy, lint. Odpowiedz approved albo issues; problemy w raporcie."
+        outcomes:
+          approved: next
+          issues:
+            rerun: { scope: steps, stepIds: [implement], maxRounds: 3 }
+
+      - id: internal-review
+        agent:
+          role: reviewer
+          prompt: "Zreviewuj diff. approved albo changes_requested; uwagi w raporcie."
+        outcomes:
+          approved: next
+          changes_requested:
+            rerun: { scope: steps, stepIds: [implement, quality], maxRounds: 3 }
+
+      - id: push
+        action: { uses: git/push@v1 }        # outputs: sha, url
+
+      - id: pr-review
+        human: {}          # approver sees the feature/step context; a gate
+                           # prompt field is (planned)
+        outcomes:
+          approved: next
+          rejected:
+            rerun: { scope: steps, stepIds: [implement, quality, internal-review], maxRounds: 3 }
+
+      - id: merge
+        action:
+          uses: git/pr-merge@v1
+          with: { method: squash }
+        retry:
+          maxAttempts: 3
+          backoff: { strategy: constant, delay: 30000 }

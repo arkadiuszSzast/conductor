@@ -28,6 +28,8 @@ export type {
   TypeOfPath,
   Value,
 } from "./expression.ts"
+export { parseWorkflow } from "./parse.ts"
+export type { ParseError, ParseWorkflowResult } from "./parse.ts"
 export { validateWorkflow } from "./validate.ts"
 export type * from "./types.ts"
 export type { RenderResult } from "./template.ts"

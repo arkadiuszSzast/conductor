@@ -1,0 +1,12 @@
+name: unknown-field
+
+roles:
+  implementer: { agent: build }
+
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          promt: "work"

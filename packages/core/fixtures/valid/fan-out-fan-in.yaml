@@ -1,0 +1,42 @@
+name: fan-out-fan-in
+
+roles:
+  worker: { agent: build }
+  judge: { agent: review }
+
+jobs:
+  branch-a:
+    outputs:
+      result: "{{ steps.work.outputs.report }}"
+    steps:
+      - id: work
+        agent:
+          role: worker
+          prompt: "Take approach A."
+
+  branch-b:
+    outputs:
+      result: "{{ steps.work.outputs.report }}"
+    steps:
+      - id: work
+        agent:
+          role: worker
+          prompt: "Take approach B."
+
+  merge:
+    needs: [branch-a, branch-b]
+    steps:
+      - id: pick
+        agent:
+          role: judge
+          prompt: |
+            A: {{ needs["branch-a"].outputs.result }}
+            B: {{ needs["branch-b"].outputs.result }}
+
+  cleanup:
+    needs: [merge]
+    if: always()
+    steps:
+      - id: sweep
+        command:
+          run: ["rm -rf tmp"]

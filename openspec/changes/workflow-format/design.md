@@ -24,6 +24,78 @@ strict and source-mapped: unknown keys are errors. YAML aliases/custom tags
 are disabled; duplicate keys are errors; input size and nesting are bounded.
 This avoids surprising parser semantics and denial-of-service shapes.
 
+#### Parser task (task 1.2, landed) — `packages/core/src/parse.ts`
+
+Parser decisions, recorded because they settle the authoring surface and the
+parser/validator boundary:
+
+- **Library: `yaml` (eemeli/yaml v2).** The core's first runtime dependency.
+  Chosen over `js-yaml`: a typed CST-aware API with per-node ranges, a
+  `LineCounter` for line/column positions, built-in `uniqueKeys` detection,
+  and `visit` over the parsed tree for the tag/anchor/alias and depth passes.
+  `js-yaml` loses source positions on nodes. There is no pure-JS alternative
+  with this fidelity; the parser stays pure regardless (string → `ParseResult`,
+  no I/O). `yaml` resolves `on` as the string `"on"` (not `true`) with
+  `stringKeys`, which is what GHA authors write.
+- **Parser owns shape and syntax; `validateWorkflow` owns graph and
+  references.** The parser fills empty collections, builds the discriminated
+  unions, and rejects any YAML that cannot become a well-formed `WorkflowDef`.
+  Everything in `docs/workflow-reference.md` under "Validation" (DAG cycles,
+  missing goto/needs/role/rerun targets, unbounded loops, expression and
+  reference checks) stays in `validate.ts` — the parser never re-implements
+  it. The IR documents this split.
+- **Aliases are banned, not bounded.** `yaml`'s `maxAliasCount` caps expansion
+  at 100 aliases, but an anchored alias still surfaces in the IR with no
+  source position of the *original* definition, and alias-based constructs
+  would blur a source-mapped error's location. Rejecting `*alias`/`&anchor`
+  outright is stricter than the task requires ("or sharp expansion limit")
+  and reads better for a config format whose target users write the YAML by
+  hand. Default `parseDocument` options are `uniqueKeys: true` (duplicate
+  keys are errors) and `strict: true`. Custom tags are rejected with the
+  library's `TAG_RESOLVE_FAILED` warning surfaced as a source-mapped error;
+  multiple documents in one file are a `MULTIPLE_DOCS` error.
+- **Hard limits: 1 MiB source, 64 nesting levels.** Depth is measured on the
+  parsed node path (the document's own structure), so a maliciously deep
+  `with:` value or list is caught with a position. Document size is bounded
+  because YAML 1.2's merge/alias machinery and our recursive normalisers are
+  the only paths that could grow — aliases are already gone, so the size cap
+  is belt-and-braces.
+- **Unknown-field errors name the block and suggest the closest valid field
+  via Levenshtein** (edits ≤ max(2, len/3)). Error messages are actionable:
+  `step "confused": a step is exactly one kind — found conflicting keys:
+  agent, command`; `input "budget": required and default are mutually
+  exclusive`; `unknown field "promt" — did you mean "prompt"?`.
+- **"Required xor default" for inputs is enforced in the parser**, matching
+  `InputDef`'s structure: a node with both, or neither, is a positioned
+  parse error (the docs' "enforced by construction" note). `required: false`
+  is likewise rejected — an optional input declares a default.
+- **`on` triggers keep the GHA sugar.** `on: [manual]`, `manual` in a list,
+  and the mapping forms `{ schedule: { cron, missedFire } }` /
+  `{ event: <name> }` are the only trigger shapes. `on` defaults to `[]` when
+  omitted. `schedule` requires both `cron` and `missedFire`; event names are
+  any string (vocabulary validation, no ingress yet).
+- **Step-kind resolution:** a step is exactly one of `agent`/`command`/
+  `action`/`human`, so the kind's block carries no `type:` field (the IR's
+  `type` is a parser artifact). `human` is fieldless — `human:` and
+  `human: {}` both work, anything else is a positioned error. `action.uses`
+  is parsed as an opaque string (registry resolution is section 3).
+- **Routes and retry are strict about their discriminated-union shape.** A
+  route mapping has exactly one of `goto`/`rerun`; `rerun` carries the scope's
+  matching id list (`stepIds` xor `jobIds`); a constant backoff rejects
+  exponential fields and vice versa. `retry` without `backoff` is a parse
+  error (the IR has no `{strategy:"backoff"}` without one). The parser checks
+  types and integer-ness (`maxAttempts`, `maxRounds`, `delay`, `initial`,
+  `max`, `timeoutMs`) and `timeoutMs ≥ 1`; the *value ranges* the shape
+  requires (`maxAttempts ≥ 1`, `maxRounds ≥ 1`, backoff parameter ranges)
+  are part of the semantic invariants, so they live with the other
+  structural checks in `validate.ts` (`validateRetry`/`validateBackoff`/
+  `validateRerunTarget`). `maxElapsed` ISO-8601 format is likewise checked in
+  `validate.ts`.
+- **`with:` values are preserved generically** (strings/numbers/booleans/
+  lists/maps, `null` for empty values) because action inputs are an opaque
+  payload until the registry lands; everything else in the dialect is typed.
+  Expression validation still reaches into string `with:` values.
+
 ### Graph interpretation
 
 Jobs are DAG nodes; ordered steps remain linear subgraphs by default. The pure

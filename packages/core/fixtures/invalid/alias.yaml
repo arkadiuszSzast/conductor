@@ -1,0 +1,13 @@
+name: alias
+
+roles:
+  implementer: &role { agent: build }
+  reviewer: *role
+
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "work"

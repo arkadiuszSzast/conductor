@@ -1,0 +1,14 @@
+name: mixed-step-kinds
+
+roles:
+  implementer: { agent: build }
+
+jobs:
+  main:
+    steps:
+      - id: confused
+        agent:
+          role: implementer
+          prompt: "work"
+        command:
+          run: ["echo hi"]
