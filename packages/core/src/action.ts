@@ -245,7 +245,7 @@ function formatVersionRef(ref: readonly number[]): string {
 }
 
 function formatAvailableVersions(entries: readonly ActionRegistryEntry[]): string {
-  const byMajor = new Map<number, string[]>()
+  const byMajor = new Map<number, (readonly number[])[]>()
   for (const entry of entries) {
     const version = parseManifestVersion(entry.manifest.version)
     if (version === undefined) continue
@@ -255,11 +255,12 @@ function formatAvailableVersions(entries: readonly ActionRegistryEntry[]): strin
       list = []
       byMajor.set(major, list)
     }
-    list.push(version.join("."))
+    list.push(version)
   }
   const lines: string[] = []
   for (const [major, versions] of [...byMajor.entries()].sort((a, b) => a[0] - b[0])) {
-    lines.push(`v${major} (${[...versions].sort().join(", ")})`)
+    const formatted = [...versions].sort(compareVersions).map(version => version.join("."))
+    lines.push(`v${major} (${formatted.join(", ")})`)
   }
   return lines.length > 0 ? lines.join("; ") : "none"
 }
@@ -425,7 +426,7 @@ export function matchesInputType(value: unknown, type: ActionInputType): boolean
 
 function isScalarArray(value: unknown, kind: "string" | "number" | "boolean"): boolean {
   if (!Array.isArray(value)) return false
-  return value.every(item => typeof item === kind)
+  return value.every(item => typeof item === kind && (kind !== "number" || Number.isFinite(item)))
 }
 
 /** Validate a step's `with:` payload against the manifest's typed inputs.

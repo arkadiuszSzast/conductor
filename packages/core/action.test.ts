@@ -178,12 +178,16 @@ describe("resolveAction", () => {
   })
 
   it("names the searched paths and available versions when the version is missing", () => {
-    const result = resolveAction("git/push@v2", pushV1Registry("bundled:git/push"))
+    const registry = buildActionRegistry([
+      entry(manifest({ version: "1.10.0" }), "bundled:git/push"),
+      ...Object.values(pushV1Registry("bundled:git/push")).flat(),
+    ])
+    const result = resolveAction("git/push@v2", registry)
     expect(result.ok).toBe(false)
     if (!result.ok) {
       expect(result.error).toContain('"git/push" has no v2')
       expect(result.error).toContain("searched paths: bundled:git/push")
-      expect(result.error).toContain("available: v1 (1.0.0, 1.0.1, 1.2.0)")
+      expect(result.error).toContain("available: v1 (1.0.0, 1.0.1, 1.2.0, 1.10.0)")
     }
   })
 
@@ -322,6 +326,17 @@ describe("validateActionInputs", () => {
   it("rejects an explicit null as a type mismatch", () => {
     const errors = validateActionInputs(push, { remote: null })
     expect(errors.join("\n")).toContain('input "remote" must be a string — got null')
+  })
+
+  it("rejects non-finite numbers in scalar and array inputs", () => {
+    const numeric = manifest({
+      inputs: {
+        count: { type: "number", presence: "required" },
+        values: { type: "number[]", presence: "required" },
+      },
+    })
+    expect(validateActionInputs(numeric, { count: Number.NaN, values: [1] }).join("\n")).toContain('input "count" must be a number')
+    expect(validateActionInputs(numeric, { count: 1, values: [Number.POSITIVE_INFINITY] }).join("\n")).toContain('input "values" must be a number[]')
   })
 
   it("defers the type check of a template value", () => {
