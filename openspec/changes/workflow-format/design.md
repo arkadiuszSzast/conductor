@@ -254,7 +254,9 @@ all conflicting manifests.
   order for `action.yaml` and `action.yml`. Missing/unreadable paths and files,
   malformed YAML, semantic manifest errors, and same-precedence duplicates are
   aggregated and sorted by source location. A failed load yields no partial
-  registry. Every accepted entry carries its absolute manifest `sourcePath`.
+  registry. Symlinks inside a registry root are rejected with a diagnostic so
+  traversal stays finite and entries are never silently skipped. Every accepted
+  entry carries its absolute manifest `sourcePath`.
 - **Pre-start reservation check.** `checkWorkflowReservation` walks every
   action step in workflow/job declaration order, calls core `resolveAction`,
   then `validateActionInputs`, and returns all useful diagnostics before a run

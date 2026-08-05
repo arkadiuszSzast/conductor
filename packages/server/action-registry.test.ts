@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test"
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { loadActionRegistry } from "./src/action-registry.ts"
@@ -125,6 +125,23 @@ describe("loadActionRegistry", () => {
     expect(result.diagnostics.map(diagnostic => diagnostic.sourcePath)).toEqual([malformed, missing])
     expect(result.diagnostics[0]?.message).toContain("duplicate mapping key")
     expect(result.diagnostics[1]?.message).toContain("cannot access registry search path")
+  })
+
+  it("reports symbolic links instead of silently skipping registry entries", async () => {
+    const root = await temporaryRegistry()
+    const target = await temporaryRegistry()
+    await mkdir(join(root, "bundled"), { recursive: true })
+    await writeManifest(target, "shared", manifest("git/push", "1.0.0"))
+    const link = join(root, "bundled", "shared")
+    await symlink(join(target, "shared"), link)
+    const result = await loadActionRegistry({ baseDir: root, bundledPath: "bundled" })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.diagnostics).toEqual([{
+      sourcePath: link,
+      message: "symbolic links are not allowed in action registry paths",
+    }])
   })
 
   it("rejects duplicate manifests at the same precedence deterministically", async () => {

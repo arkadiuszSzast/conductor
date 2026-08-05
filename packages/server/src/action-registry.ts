@@ -128,7 +128,9 @@ async function walk(
   entries.sort((left, right) => compareText(left.name, right.name))
   for (const entry of entries) {
     const path = join(directory, entry.name)
-    if (entry.isDirectory()) {
+    if (entry.isSymbolicLink()) {
+      diagnostics.push({ sourcePath: path, message: "symbolic links are not allowed in action registry paths" })
+    } else if (entry.isDirectory()) {
       await walk(path, files, diagnostics)
     } else if (entry.isFile() && (entry.name === "action.yaml" || entry.name === "action.yml")) {
       files.push(path)
