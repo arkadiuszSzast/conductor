@@ -13,7 +13,7 @@ Conventions used below:
   collections are always present (possibly empty); optionality survives only
   where absence means something an empty value cannot express.
 - **(planned)** — semantics decided and representable in the IR, but the
-  resolving code (expression evaluator, action registry) has not landed yet.
+  resolving code (action registry) has not landed yet.
 
 ---
 
@@ -120,14 +120,16 @@ succeeded". Currently recognised conditions:
 | `always()` | Run when dependencies are terminal, regardless of how they ended. |
 | `failure()` | Run **only** when at least one dependency failed or was skipped; skipped when all succeeded. |
 
-General boolean expressions over contexts are **(planned)** with the
-expression evaluator.
+General boolean expressions over these contexts are validated now and
+evaluated engine-side with the same grammar (see
+[expressions.md](expressions.md)); the interpreter still special-cases
+`always()`/`failure()` for skip decisions.
 
 ### `jobs.<id>.outputs`
 
 `map<string, expression>`. Default: `{}` — the job publishes nothing.
-Named values this job exposes to dependent jobs, as expressions over its own
-steps' outputs:
+Named values this job exposes to dependent jobs, as template expressions over
+its own steps' outputs:
 
 ```yaml
 outputs:
@@ -136,9 +138,11 @@ outputs:
 ```
 
 Step outputs are the job's private implementation detail; `outputs` is its
-published contract. References to `needs.<job>.outputs.<name>` are validated
-against these declarations. **(planned)** — resolution requires the
-expression evaluator; the declarations are part of the stable IR today.
+published contract. Each value is a `{{ ... }}` template and renders to a
+string when the job succeeds. References to `needs.<job>.outputs.<name>` are
+validated against these declarations. A declared output that fails to
+evaluate (for example a missing earlier step output) resolves to `null`
+rather than failing the job, so consumers see an explicit empty value.
 
 ### `jobs.<id>.steps`
 
@@ -408,13 +412,21 @@ Validation checks (implemented in `packages/core/src/validate.ts`):
   its edges is rejected ("route the loop through rerun with maxRounds");
 - retry policy invariants: `maxAttempts ≥ 1`, ISO-8601 `maxElapsed`, backoff
   parameter ranges (`delay/initial/max ≥ 0`, `multiplier ≥ 1`);
-- shape errors: empty `run` list, empty `uses`.
+- shape errors: empty `run` list, empty `uses`;
+- expression syntax and type errors in `if`, agent `prompt` and job `outputs`
+  (unknown contexts, unknown functions, number/boolean misuse);
+- `steps.*` references resolve to **earlier** steps of the same job and to a
+  known output name — `report` on agent steps, `notes` on human steps;
+  command/action step outputs are dynamic and any name passes;
+- `needs.<job>.outputs.<name>` requires `<job>` in `needs` **and** `<name>` in
+  that job's declared `outputs`;
+- `feedback.jobs[J][S]` in job X requires a `rerun` route targeting X, with J
+  one of that rerun's targets or its routing job (S the routing step).
 
 "Required xor default" for inputs is enforced by construction — the IR
 cannot represent an input that is both or neither; the parser rejects the
-YAML. Planned with the evaluator: expression syntax/type checks, `needs.*`
-references against declared `outputs`, `feedback.*` references against
-`rerun` routes.
+YAML. General boolean `if:` conditions are validated but evaluated engine-side
+(see [expressions.md](expressions.md)).
 
 ---
 

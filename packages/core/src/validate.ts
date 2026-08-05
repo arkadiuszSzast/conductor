@@ -14,6 +14,9 @@
  * process. Presets encode our recommendations instead.
  */
 
+import { collectPaths, formatPath, parseExpression, typecheckExpression } from "./expression.ts"
+import type { ExprType } from "./expression.ts"
+import { extractExpressions } from "./template.ts"
 import type { AgentStep, BackoffDef, JobDef, RerunTarget, RetryPolicy, Route, StepDef, WorkflowDef } from "./types.ts"
 
 export interface ValidationResult {
@@ -35,6 +38,8 @@ export function validateWorkflow(def: WorkflowDef): ValidationResult {
   for (const [jobId, job] of Object.entries(def.jobs)) {
     validateJob(jobId, job, def, errors, warnings)
   }
+
+  validateExpressions(def, errors)
 
   return { errors, warnings }
 }
@@ -352,3 +357,360 @@ function findUncountedCycles(steps: readonly StepDef[]): string[][] {
 
   return cycles
 }
+
+// ---------------------------------------------------------------------------
+// Expression validation
+// ---------------------------------------------------------------------------
+
+interface ValidatedRefs {
+  readonly stepOutputs: Readonly<Record<string, Readonly<Record<string, StepOutputModel>>>>
+  readonly jobOutputs: Readonly<Record<string, Readonly<Record<string, ExprType>>>>
+}
+
+/** Static output contract of one step: `agent` publishes exactly `report`,
+ *  `human` exactly `notes`; `command`/`action` publish whatever the runner
+ *  or action manifest decides, so any output name is possible and untyped. */
+type StepOutputModel =
+  | { readonly kind: "fixed"; readonly outputs: Readonly<Record<string, ExprType>> }
+  | { readonly kind: "dynamic" }
+
+function stepOutputType(model: StepOutputModel, name: string): ExprType | undefined {
+  if (model.kind === "dynamic") return "unknown"
+  return model.outputs[name]
+}
+
+/** Expression context: the declared outputs every job/step published. */
+function collectRefs(def: WorkflowDef): ValidatedRefs {
+  const stepOutputs: Record<string, Record<string, StepOutputModel>> = {}
+  const jobOutputs: Record<string, Record<string, ExprType>> = {}
+
+  for (const [jobId, job] of Object.entries(def.jobs)) {
+    stepOutputs[jobId] = {}
+    for (const step of job.steps) {
+      stepOutputs[jobId]![step.id] = step.type === "agent"
+        ? { kind: "fixed", outputs: { report: "string" } }
+        : step.type === "human"
+          ? { kind: "fixed", outputs: { notes: "string" } }
+          : { kind: "dynamic" }
+    }
+    jobOutputs[jobId] = {}
+    for (const [name] of Object.entries(job.outputs)) {
+      // Job outputs are templates that render to strings; consumers read
+      // them through `needs.<job>.outputs.<name>` as strings.
+      jobOutputs[jobId]![name] = "string"
+    }
+  }
+
+  return { stepOutputs, jobOutputs }
+}
+
+interface RerunRoute {
+  readonly routingJob: string
+  readonly routingStep: string
+  readonly target: RerunTarget
+}
+
+/** Every rerun route in the workflow, with where it is declared. */
+function collectRerunRoutes(def: WorkflowDef): readonly RerunRoute[] {
+  const routes: RerunRoute[] = []
+  for (const [jobId, job] of Object.entries(def.jobs)) {
+    for (const step of job.steps) {
+      for (const route of Object.values(step.outcomes)) {
+        if (route.kind === "rerun") routes.push({ routingJob: jobId, routingStep: step.id, target: route.target })
+      }
+      if (step.onFail?.kind === "rerun") {
+        routes.push({ routingJob: jobId, routingStep: step.id, target: step.onFail.target })
+      }
+    }
+  }
+  return routes
+}
+
+function validateExpressions(def: WorkflowDef, errors: string[]): void {
+  const refs = collectRefs(def)
+  const rerunRoutes = collectRerunRoutes(def)
+
+  for (const [jobId, job] of Object.entries(def.jobs)) {
+    if (job.if !== undefined) {
+      validateExpression(job.if, {
+        where: `job "${jobId}": if`,
+        typeOfPath: path => typeOfJobIfPath(path, jobId, job, def, refs),
+        allowedRoots: new Set(["inputs", "needs", "feedback"]),
+        feedbackRoot: jobId,
+        rerunRoutes,
+        def,
+        errors,
+      })
+    }
+
+    for (const [name, expression] of Object.entries(job.outputs)) {
+      const where = `job "${jobId}" outputs["${name}"]`
+      const sources = extractExpressions(expression)
+      if (sources.length === 0) continue
+      for (const source of sources) {
+        validateExpression(source, {
+          where,
+          typeOfPath: path => typeOfJobPath(path, jobId, job, def, refs),
+          allowedRoots: new Set(["inputs", "steps", "feedback"]),
+          feedbackRoot: jobId,
+          rerunRoutes,
+          def,
+          errors,
+        })
+      }
+    }
+
+    for (const [index, step] of job.steps.entries()) {
+      const where = `job "${jobId}" step "${step.id}"`
+
+      if (step.if !== undefined) {
+        validateExpression(step.if, {
+          where: `${where}: if`,
+          typeOfPath: path => typeOfStepPath(path, index, jobId, job, def, refs),
+          allowedRoots: new Set(["inputs", "steps", "needs", "feedback"]),
+          feedbackRoot: jobId,
+          rerunRoutes,
+          def,
+          errors,
+        })
+      }
+
+      if (step.type === "agent") {
+        for (const expression of extractExpressions(step.prompt)) {
+          validateExpression(expression, {
+            where: `${where}: prompt`,
+            typeOfPath: path => typeOfStepPath(path, index, jobId, job, def, refs),
+            allowedRoots: new Set(["inputs", "steps", "needs", "feedback"]),
+            feedbackRoot: jobId,
+            rerunRoutes,
+            def,
+            errors,
+          })
+        }
+      }
+
+      if (step.type === "command") {
+        for (const [lineIndex, line] of step.run.entries()) {
+          for (const expression of extractExpressions(line)) {
+            validateExpression(expression, {
+              where: `${where}: run[${lineIndex}]`,
+              typeOfPath: path => typeOfStepPath(path, index, jobId, job, def, refs),
+              allowedRoots: new Set(["inputs", "steps", "needs", "feedback"]),
+              feedbackRoot: jobId,
+              rerunRoutes,
+              def,
+              errors,
+            })
+          }
+        }
+      }
+
+      if (step.type === "action") {
+        for (const [key, value] of Object.entries(step.with)) {
+          if (typeof value !== "string") continue
+          for (const expression of extractExpressions(value)) {
+            validateExpression(expression, {
+              where: `${where}: with["${key}"]`,
+              typeOfPath: path => typeOfStepPath(path, index, jobId, job, def, refs),
+              allowedRoots: new Set(["inputs", "steps", "needs", "feedback"]),
+              feedbackRoot: jobId,
+              rerunRoutes,
+              def,
+              errors,
+            })
+          }
+        }
+      }
+    }
+  }
+}
+
+interface ExpressionCheck {
+  readonly where: string
+  readonly typeOfPath: (segments: readonly string[]) => ExprType | undefined
+  readonly allowedRoots: Set<string>
+  readonly feedbackRoot: string
+  readonly rerunRoutes: readonly RerunRoute[]
+  readonly def: WorkflowDef
+  readonly errors: string[]
+}
+
+function validateExpression(expression: string, check: ExpressionCheck): void {
+  const parsed = parseExpression(expression)
+  if (!parsed.ok) {
+    check.errors.push(`${check.where}: ${parsed.error}`)
+    return
+  }
+
+  const { where, errors } = check
+
+  for (const segments of collectPaths(parsed.expr)) {
+    const root = segments[0]
+    if (root === undefined) continue
+    if (!check.allowedRoots.has(root)) {
+      errors.push(`${where}: unknown context "${root}" — available: ${[...check.allowedRoots].sort().join(", ")}`)
+      continue
+    }
+    if (root === "feedback") {
+      validateFeedbackPath(segments, check)
+      continue
+    }
+    const known = check.typeOfPath(segments)
+    if (known === undefined) {
+      errors.push(`${where}: "${formatPath(segments)}" is not a known value`)
+    }
+  }
+
+  const typecheck = typecheckExpression(parsed.expr, check.typeOfPath)
+  for (const typeError of typecheck.errors) {
+    errors.push(`${where}: ${typeError}`)
+  }
+}
+
+/** Static types for a path read inside job `jobId` at step position
+ *  `stepIndex`. Only earlier steps are readable — declaration order is the
+ *  existence guarantee. */
+function typeOfStepPath(
+  segments: readonly string[],
+  stepIndex: number,
+  jobId: string,
+  job: JobDef,
+  def: WorkflowDef,
+  refs: ValidatedRefs,
+): ExprType | undefined {
+  if (segments[0] === "inputs") {
+    const name = segments[1]
+    return name !== undefined ? def.inputs[name]?.type : undefined
+  }
+  if (segments[0] === "steps") {
+    const stepId = segments[1]
+    const name = segments[3]
+    if (stepId === undefined || segments[2] !== "outputs" || name === undefined) return undefined
+    const referencedIndex = job.steps.findIndex(step => step.id === stepId)
+    if (referencedIndex === -1 || referencedIndex >= stepIndex) return undefined
+    const model = refs.stepOutputs[jobId]?.[stepId]
+    return model === undefined ? undefined : stepOutputType(model, name)
+  }
+  if (segments[0] === "needs") {
+    const dependencyId = segments[1]
+    const name = segments[3]
+    if (dependencyId === undefined || segments[2] !== "outputs" || name === undefined) return undefined
+    if (!job.needs.includes(dependencyId)) return undefined
+    return refs.jobOutputs[dependencyId]?.[name]
+  }
+  return undefined
+}
+
+/** Static types for a path read in a job's own `if` condition: no `steps`
+ *  (the job has not run yet), but dependency outputs are readable. */
+function typeOfJobIfPath(
+  segments: readonly string[],
+  jobId: string,
+  job: JobDef,
+  def: WorkflowDef,
+  refs: ValidatedRefs,
+): ExprType | undefined {
+  return typeOfStepPath(segments, 0, jobId, job, def, refs)
+}
+
+/** Static types for a path read inside job `jobId`'s own `outputs` block. */
+function typeOfJobPath(
+  segments: readonly string[],
+  jobId: string,
+  job: JobDef,
+  def: WorkflowDef,
+  refs: ValidatedRefs,
+): ExprType | undefined {
+  if (segments[0] === "inputs") {
+    const name = segments[1]
+    return name !== undefined ? def.inputs[name]?.type : undefined
+  }
+  if (segments[0] === "steps") {
+    const stepId = segments[1]
+    const name = segments[3]
+    if (stepId === undefined || segments[2] !== "outputs" || name === undefined) return undefined
+    if (!job.steps.some(step => step.id === stepId)) return undefined
+    const model = refs.stepOutputs[jobId]?.[stepId]
+    return model === undefined ? undefined : stepOutputType(model, name)
+  }
+  return undefined
+}
+
+/**
+ * `feedback.jobs[J][S]` in job X is legal iff some rerun route targets X
+ *  (job-scope: J is one of the rerun's targets or its routing job; step-scope:
+ *  J is the routing job itself) and S is a step the rerun snapshots. The
+ *  reference resolves at runtime from the rerun's pre-reset snapshot — the
+ *  DAG edge is the rerun route itself, never `needs`.
+ */
+function validateFeedbackPath(segments: readonly string[], check: ExpressionCheck): void {
+  const { where, errors } = check
+  if (segments.length === 1) {
+    errors.push(`${where}: "feedback" alone is not a value — read "feedback.message" or feedback.jobs["<job>"]["<step>"]["<output>"]`)
+    return
+  }
+  if (segments[1] === "message") {
+    if (segments.length > 2) errors.push(`${where}: feedback.message has no further fields`)
+    return
+  }
+  if (segments[1] !== "jobs") {
+    errors.push(`${where}: feedback has no field "${segments[1]}"`)
+    return
+  }
+  const jobId = segments[2]
+  const stepId = segments[3]
+  const name = segments[4]
+  if (jobId === undefined || stepId === undefined || name === undefined) {
+    errors.push(`${where}: feedback.jobs needs the form feedback.jobs["<job>"]["<step>"]["<output>"]`)
+    return
+  }
+  if (segments.length > 5) {
+    errors.push(`${where}: feedback.jobs goes too deep — feedback.jobs["<job>"]["<step>"]["<output>"] is the full path`)
+    return
+  }
+
+  const relevant = check.rerunRoutes.filter(route =>
+    route.target.scope === "jobs"
+      ? route.target.jobIds.includes(check.feedbackRoot)
+      : route.routingJob === check.feedbackRoot,
+  )
+  if (relevant.length === 0) {
+    errors.push(
+      `${where}: feedback.jobs["${jobId}"] is not readable here — feedback requires a rerun that targets job "${check.feedbackRoot}"`,
+    )
+    return
+  }
+
+  const stepExistsIn = (job: string, step: string): boolean =>
+    check.def.jobs[job]?.steps.some(candidate => candidate.id === step) ?? false
+
+  const legal = relevant.some(route => {
+    if (route.target.scope === "jobs") {
+      if (jobId === route.routingJob) return stepId === route.routingStep
+      if (route.target.jobIds.includes(jobId)) return stepExistsIn(jobId, stepId)
+      return false
+    }
+    return jobId === route.routingJob && stepExistsIn(jobId, stepId)
+  })
+
+  if (!legal) {
+    errors.push(
+      `${where}: feedback.jobs["${jobId}"]["${stepId}"] is not readable here — ` +
+        `this job's rerun snapshots: ${describeFeedbackRefs(relevant)}`,
+    )
+  }
+}
+
+function describeFeedbackRefs(routes: readonly RerunRoute[]): string {
+  const refs = new Set<string>()
+  for (const route of routes) {
+    if (route.target.scope === "jobs") {
+      for (const jobId of route.target.jobIds) refs.add(`"${jobId}"`)
+      refs.add(`"${route.routingJob}" at "${route.routingStep}"`)
+    } else {
+      refs.add(`"${route.routingJob}"`)
+    }
+  }
+  return [...refs].join(", ")
+}
+

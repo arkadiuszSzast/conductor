@@ -14,6 +14,7 @@
  */
 
 import { DEFAULT_OUTCOME } from "./types.ts"
+import { resolveJobOutputs } from "./template.ts"
 import type {
   Decision,
   FeatureState,
@@ -104,8 +105,10 @@ function enterStep(
   state: FeatureState,
   jobId: string,
   stepId: string | null,
+  completedStepId?: string,
+  completedOutputs?: Readonly<Record<string, string>>,
 ): Transition {
-  if (stepId === null) return onJobComplete(workflow, state, jobId)
+  if (stepId === null) return onJobComplete(workflow, state, jobId, completedStepId ?? "", completedOutputs)
 
   const job = findJob(workflow, jobId)
   if (!job) {
@@ -471,7 +474,7 @@ function applyRoute(
 
   switch (route.kind) {
     case "next": {
-      const entry = enterStep(workflow, state, jobId, nextStepId(job, step))
+      const entry = enterStep(workflow, state, jobId, nextStepId(job, step), step.id, outputs)
       return buildTransition(entry.decisions as Decision[], mergePatches(basePatch, entry.patch))
     }
     case "goto": {
@@ -784,9 +787,12 @@ function onJobComplete(
   workflow: WorkflowDef,
   state: FeatureState,
   completedJobId: string,
+  completedStepId: string,
+  completedOutputs?: Readonly<Record<string, string>>,
 ): Transition {
+  const resolvedOutputs = resolveJobOutputs(workflow, state, completedJobId, completedStepId, completedOutputs)
   const completedPatch: Patch = {
-    jobs: { [completedJobId]: { status: "succeeded", currentStep: null } },
+    jobs: { [completedJobId]: { status: "succeeded", currentStep: null, outputs: resolvedOutputs } },
   }
 
   const cascade = propagate(workflow, state, completedJobId, "succeeded")

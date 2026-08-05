@@ -49,9 +49,9 @@ export interface JobDef {
   /** Named outputs published to dependent jobs, as expressions over step
    *  outputs. Empty means the job publishes nothing.
    *
-   *  NOT YET EVALUATED: the interpreter does not resolve these — that needs
-   *  the expression evaluator (`workflow-format` task 2.3). Declared here so
-   *  the IR is stable; `JobRuntime.outputs` stays empty until it lands. */
+   *  Resolved when the job succeeds (`resolveJobOutputs` in `template.ts`);
+   *  a declared output that fails to evaluate resolves to `null`. Values are
+   *  live — after a `rerun` the consumer re-reads the new round's values. */
   readonly outputs: Readonly<Record<string, string>>
 }
 
@@ -232,8 +232,8 @@ export interface JobRuntime {
   readonly attempts: Readonly<Record<string, number>>
   /** Per-routing-step rerun loop counter (survives closure reset). */
   readonly reruns: Readonly<Record<string, number>>
-  /** Resolved values of `JobDef.outputs`. Always empty today — see the note
-   *  on `JobDef.outputs`; step results live in `steps[].output`. */
+  /** Resolved values of `JobDef.outputs`, computed when the job succeeds;
+   *  empty until then. Step results live in `steps[].outputs`. */
   readonly outputs: Readonly<Record<string, unknown>>
   readonly steps: Readonly<Record<string, StepRuntime>>
 }
@@ -303,9 +303,7 @@ export interface Transition {
   readonly feedback?: Feedback
 }
 
-/** Job → step → named outputs, snapshotted before the rerun reset. Once the
- *  expression evaluator resolves `JobDef.outputs`, declared job outputs will
- *  join this shape; today only step outputs exist. */
+/** Job → step → named outputs, snapshotted before the rerun reset. */
 export interface Feedback {
   readonly jobs: Readonly<Record<string, Readonly<Record<string, Readonly<Record<string, string>>>>>>
   readonly message: string
