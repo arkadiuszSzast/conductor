@@ -1,0 +1,4 @@
+name: git/push
+version: 1.2.0
+capablities: [git]
+run: [bun, run, main.ts]

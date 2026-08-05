@@ -1,0 +1,11 @@
+name: git/push
+version: 1.2.0
+description: Push commits to a remote over git.
+inputs:
+  remote: { type: string, default: origin }
+  force:  { type: boolean, default: false }
+outputs:
+  sha: { type: string }
+  url:  { type: string }
+capabilities: [git]
+run: [bun, run, main.ts]
