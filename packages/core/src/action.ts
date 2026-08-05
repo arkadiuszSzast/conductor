@@ -94,16 +94,15 @@ export type ActionRegistry = Readonly<Record<string, readonly ActionRegistryEntr
 /** Group entries by their manifest's name — the registry key a `uses`
  *  reference is resolved against. Keeps key ↔ manifest.name consistent. */
 export function buildActionRegistry(entries: readonly ActionRegistryEntry[]): ActionRegistry {
-  const registry: Record<string, ActionRegistryEntry[]> = {}
+  const registry = new Map<string, ActionRegistryEntry[]>()
   for (const entry of entries) {
-    let list = registry[entry.manifest.name]
-    if (list === undefined) {
-      list = []
-      registry[entry.manifest.name] = list
-    }
-    list.push(entry)
+    const list = registry.get(entry.manifest.name)
+    if (list === undefined) registry.set(entry.manifest.name, [entry])
+    else list.push(entry)
   }
-  return registry
+  return Object.freeze(Object.fromEntries(
+    [...registry.entries()].map(([name, grouped]) => [name, Object.freeze(grouped)]),
+  ))
 }
 
 // ---------------------------------------------------------------------------
