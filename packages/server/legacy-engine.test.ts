@@ -275,6 +275,7 @@ describe("LegacyEngine: reaper — TTL and idle/nudge/missing-session behaviour"
     await engine.dispatch(feature.id, { kind: "feature.start" })
     const run = store.getActiveRun(feature.id)
     if (!run?.sessionId) throw new Error("no active agent run")
+    clock.current = run.timeStarted
     return { engine, feature, run, sessionId: run.sessionId }
   }
 
