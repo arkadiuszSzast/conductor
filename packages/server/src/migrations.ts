@@ -152,6 +152,15 @@ export const migrations: readonly Migration[] = [
       addColumn(db, "feature", "description", "TEXT")
     },
   },
+  {
+    id: "0007_step_run_completion_event",
+    up(db) {
+      // Durable completion event and decision outbox for atomic transition recovery.
+      addColumn(db, "step_run", "completion_event", "TEXT")
+      addColumn(db, "step_run", "completion_decision", "TEXT")
+      addColumn(db, "step_run", "action_handled", "INTEGER NOT NULL DEFAULT 0")
+    },
+  },
 ]
 
 function validateMigrations(ordered: readonly Migration[]): void {

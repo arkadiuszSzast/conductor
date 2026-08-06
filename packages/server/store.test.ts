@@ -100,6 +100,116 @@ describe("step runs", () => {
     store.finishRun(runId, "succeeded", { output: "Squash-merge please", reason: "human approved" })
     expect(store.getLastHumanNotes(feature.id, "merge")).toBe("Squash-merge please")
   })
+
+  it("sets a run's session id while it is still running", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p" })
+    const runId = store.startRun({ featureId: feature.id, stepId: "implement", stepType: "agent", attempt: 1 })
+    expect(store.setRunSession(runId, "session-123")).toBe(true)
+    expect(store.getActiveRun(feature.id)?.sessionId).toBe("session-123")
+  })
+
+  it("setRunSession is a no-op once the run has concluded", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p" })
+    const runId = store.startRun({ featureId: feature.id, stepId: "implement", stepType: "agent", attempt: 1 })
+    store.finishRun(runId, "reaped", { reason: "TTL" })
+    expect(store.setRunSession(runId, "session-late")).toBe(false)
+    expect(store.getRunById(runId)?.output).toBeNull()
+  })
+})
+
+describe("concludeRun", () => {
+  it("atomically concludes the run and applies the feature transition", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p" })
+    const runId = store.startRun({ featureId: feature.id, stepId: "implement", stepType: "agent", attempt: 1 })
+    const event = { kind: "step.succeeded", stepId: "implement", output: "done" } as const
+    const ok = store.concludeRun(runId, "succeeded", { output: "done" }, event, {
+      decision: { kind: "execute", stepId: "review" },
+      patch: { status: "running", currentStep: "review" },
+    })
+    expect(ok).toBe(true)
+    expect(store.getRunById(runId)).toMatchObject({ status: "succeeded", output: "done", completionEvent: JSON.stringify(event) })
+    expect(store.getFeature(feature.id)?.currentStep).toBe("review")
+    const log = store.getTransitions(feature.id)
+    expect(log).toHaveLength(1)
+    expect(log[0]?.decision).toBe("execute")
+  })
+
+  it("returns false and applies no transition when the run is already concluded", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p" })
+    const runId = store.startRun({ featureId: feature.id, stepId: "implement", stepType: "agent", attempt: 1 })
+    const event = { kind: "step.succeeded", stepId: "implement", output: "done" } as const
+    const transition = {
+      decision: { kind: "execute", stepId: "review" },
+      patch: { status: "running", currentStep: "review" },
+    } as const
+    expect(store.concludeRun(runId, "succeeded", { output: "done" }, event, transition)).toBe(true)
+
+    const duplicate = store.concludeRun(runId, "succeeded", { output: "duplicate report" }, event, {
+      decision: { kind: "execute", stepId: "merge" },
+      patch: { status: "running", currentStep: "merge" },
+    })
+    expect(duplicate).toBe(false)
+    expect(store.getFeature(feature.id)?.currentStep).toBe("review")
+    expect(store.getTransitions(feature.id)).toHaveLength(1)
+    expect(store.getRunById(runId)?.output).toBe("done")
+  })
+
+  it("rolls back the run conclusion when the transition audit insert fails", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p" })
+    const runId = store.startRun({ featureId: feature.id, stepId: "implement", stepType: "agent", attempt: 1 })
+    connection.db.run(`
+      CREATE TRIGGER reject_conclude_transition BEFORE INSERT ON transition_log
+      BEGIN SELECT RAISE(ABORT, 'audit rejected'); END
+    `)
+    const event = { kind: "step.succeeded", stepId: "implement", output: "done" } as const
+    expect(() => store.concludeRun(runId, "succeeded", { output: "done" }, event, {
+      decision: { kind: "execute", stepId: "review" },
+      patch: { status: "running", currentStep: "review" },
+    })).toThrow("audit rejected")
+    expect(store.getRunById(runId)).toMatchObject({ status: "running", output: null, completionEvent: null })
+    expect(store.getFeature(feature.id)?.currentStep).toBeNull()
+    expect(store.getTransitions(feature.id)).toEqual([])
+  })
+})
+
+describe("pending run action (crash-recovery outbox)", () => {
+  it("concludeRun leaves the decision pending until markRunActionHandled claims it", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p" })
+    const runId = store.startRun({ featureId: feature.id, stepId: "implement", stepType: "agent", attempt: 1 })
+    const event = { kind: "step.succeeded", stepId: "implement", output: "done" } as const
+    store.concludeRun(runId, "succeeded", { output: "done" }, event, {
+      decision: { kind: "execute", stepId: "review" },
+      patch: { status: "running", currentStep: "review" },
+    })
+    expect(store.getPendingRunAction(feature.id)).toEqual({ runId, decision: { kind: "execute", stepId: "review" } })
+
+    expect(store.markRunActionHandled(runId)).toBe(true)
+    expect(store.getPendingRunAction(feature.id)).toBeNull()
+  })
+
+  it("markRunActionHandled is a one-shot atomic claim — a second call returns false", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p" })
+    const runId = store.startRun({ featureId: feature.id, stepId: "implement", stepType: "agent", attempt: 1 })
+    const event = { kind: "step.succeeded", stepId: "implement", output: "done" } as const
+    store.concludeRun(runId, "succeeded", { output: "done" }, event, {
+      decision: { kind: "finish" },
+      patch: { status: "done", currentStep: null },
+    })
+    expect(store.markRunActionHandled(runId)).toBe(true)
+    expect(store.markRunActionHandled(runId)).toBe(false)
+  })
+
+  it("getPendingRunAction returns null for a feature with no concluded runs", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p" })
+    expect(store.getPendingRunAction(feature.id)).toBeNull()
+  })
+
+  it("a plain finishRun (no feature transition) never becomes a pending action", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p" })
+    const runId = store.startRun({ featureId: feature.id, stepId: "await_ci", stepType: "builtin", attempt: 1 })
+    store.finishRun(runId, "reaped", { reason: "pending — will re-check" })
+    expect(store.getPendingRunAction(feature.id)).toBeNull()
+  })
 })
 
 describe("findings and review threads", () => {

@@ -74,10 +74,107 @@ findings and `description`. Existing tables and columns are neither renamed nor
 rebuilt, and the workflow-format job/step graph schema remains deferred.
 
 Until the graph persistence task lands, `@conductor/server` exports explicit
-`LegacyFeatureState`/transition types for the extracted store. This avoids
+`FeatureState`/transition types for the extracted store. This avoids
 misrepresenting the seed's single `current_step` and attempts/rounds maps as the
 new core graph state while preserving the store's observable semantics for the
 engine extraction.
+
+### Pipeline engine execution model
+
+`@conductor/server` now hosts opencode-conductor's engine/reconciler/builtins/
+GitHub client/findings-publication as an isolated `engine/` module
+(`Engine`, `builtins`, `RealGh`, `makePublishReview`),
+deliberately separate from `@conductor/core`'s graph workflow IR
+(`WorkflowDef`/`JobDef`). It runs the seed's single-`current_step`
+pipeline/attempts/rounds model against the extracted SQLite store while the
+graph engine is built out under the `workflow-format` change; nothing in
+`engine/` may grow DAG/graph concepts.
+
+Every side effect crosses an injected port: `StorePort` (a structural
+interface `Store` satisfies, so tests and a future backing store can
+substitute), a `Clock` (`now()`, defaulting to `systemClock`) used for
+recovery and TTL/reap timing, `SessionClient` as a runtime-neutral
+session runner (no opencode SDK type crosses this boundary — opencode today,
+other runners later implement it against their own client), `GhClient` as
+the GitHub port (`RealGh` implements it over `ProcessRunner`), `ProcessRunner`
+for all filesystem/process/git execution (`exec` for argv, `shell` for
+`command` pipeline steps — never a bare `spawn`, never an implicit
+`process.cwd()`), a `Logger`, `ConfigResolver` as the per-project config
+resolver (`projectDir → EngineConfig | null`; one engine serves every project
+sharing the DB, each feature runs under its own project's pipeline/roles/
+limits), and an injectable `PublishReview` (defaults to the gh-backed
+`makePublishReview`, override-able in tests).
+
+`Engine` owns no singleton, timer or daemon lifecycle: it holds no
+`setInterval`/`setTimeout` and starts nothing on construction. `reconcile()`
+is a plain async method the daemon calls on an interval and after startup
+recovery (daemon lifecycle, task 3) — the engine has no opinion on when or
+how often it runs.
+
+The confirmation-of-effect rule is exact and unchanged from the seed: an
+agent step only concludes through the daemon's `report()` path — never
+because a session merely went idle. Idle sessions are debounced
+(`nudgeIdleCycles` consecutive idle reconcile cycles before a nudge), nudged
+up to `maxNudges` times, then reaped; a session reported `"missing"` (gone —
+server restart, deletion) is reaped immediately without nudging; runs that
+exceed `runTtlMs` with no reported effect are reaped regardless of session
+status. Every reap feeds a `step.failed` event back through the same
+interpreter path as a real failure.
+
+Review findings persist to SQLite as the source of truth before any GitHub
+call; publishing (`postReview`/`postComment`) is a best-effort projection
+that never blocks the pipeline — a failed publish is recorded as a status
+line, not a stall. `findings.sync`/resolution updates follow the same order:
+DB row first, GitHub thread projection second.
+
+Deterministic builtins (`worktree.create`, `git.push`, `pr.create`, …) run
+fixed git subcommands as argv through `ProcessRunner.exec`, never
+interpolated into a shell string; refs are validated with
+`git check-ref-format` before they are ever placed in an argv position.
+`command`-type pipeline steps are the one path that legitimately renders a
+shell string, via `ProcessRunner.shell`.
+
+**Accepted risk — untrusted text in `command` step templates:** template
+rendering does no shell-escaping, and the template context includes values
+that are not purely project-config-controlled: `{{human.<step>}}` (free-text
+human gate notes), `{{steps.<id>.output}}` (agent-reported text, which can
+itself echo untrusted repo/PR content back via prompt injection), and
+`{{findings.*}}` (finding bodies extracted from a PR diff/comment). A
+`command` step's `run:` entries interpolating any of these into shell syntax
+(e.g. `` echo "{{steps.review.output}}" | some-tool ``) lets a crafted
+finding body, human note, or agent note containing shell metacharacters
+(`` ` ``, `$()`, `;`) execute as command injection in the feature's
+worktree. This is preserved, not fixed, by this extraction: `command` steps
+are authored by the project (trusted `run:` shell text), but the *values*
+substituted into that text are not all trusted. Config authors must not
+interpolate `{{human.*}}`, `{{steps.*.output}}`, or `{{findings.*}}` into
+shell syntax in a `command` step's `run:`; prefer a deterministic `builtin`
+argv action (or pass the value via an env var / file, never inline shell
+text) wherever the value may contain untrusted content.
+
+`Store.applyTransition` still writes the feature-state update and transition
+audit inside one transaction. Run completion paths additionally use
+`Store.concludeRun`: a conditional `status = 'running'` claim, the durable
+completion event, feature transition and audit are committed together. This
+closes both duplicate-report races and the restart window where a concluded run
+could otherwise remain on its old current step. Agent runs are inserted before
+session setup begins, so a concurrent reconcile pass observes the in-flight run
+instead of dispatching the step twice.
+
+This task does not touch `ActionRegistry`/graph-reservation
+(`workflow-reservation.ts`, `action-registry.ts`): that machinery belongs to
+`@conductor/core`'s graph workflow IR and is claimed by a separate task; the
+pipeline engine and the graph reservation model are not unified here and must
+not be conflated.
+
+**Known inherited boundary:** the idle-cycle debounce counter
+(`idleCycles: Map<runId, count>`) is in-memory only, inherited unchanged from
+the seed. A daemon restart resets it to zero for any in-flight agent run —
+the safe direction of error (an extra idle cycle before a nudge, never a
+missed reap) — but it means idle-debounce state does not survive restart the
+way `runTtlMs`-based reaping does. This is a known seed characteristic
+carried forward, not a gap introduced by the extraction; a durable idle-cycle
+store is out of scope for this task.
 
 ### Reconciler ownership
 

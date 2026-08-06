@@ -1,16 +1,16 @@
 import { randomUUID } from "node:crypto"
 import type { Database } from "./database.ts"
 
-export type LegacyFeatureStatus = "running" | "paused" | "waiting_human" | "escalated" | "done" | "abandoned"
+export type FeatureStatus = "running" | "paused" | "waiting_human" | "escalated" | "done" | "abandoned"
 
-export interface LegacyFeatureState {
+export interface FeatureState {
   readonly id: string
   readonly title: string
   readonly slug: string
   readonly projectDir: string
   readonly workflow: string | null
   readonly description: string | null
-  readonly status: LegacyFeatureStatus
+  readonly status: FeatureStatus
   readonly currentStep: string | null
   readonly sessionId: string | null
   readonly worktree: string | null
@@ -21,7 +21,7 @@ export interface LegacyFeatureState {
   readonly escalation: string | null
 }
 
-export type LegacyPipelineEvent =
+export type PipelineEvent =
   | { readonly kind: "feature.start" }
   | { readonly kind: "step.succeeded"; readonly stepId: string; readonly output?: string }
   | { readonly kind: "step.failed"; readonly stepId: string; readonly reason: string }
@@ -32,7 +32,7 @@ export type LegacyPipelineEvent =
   | { readonly kind: "human.resumed" }
   | { readonly kind: "human.abandoned" }
 
-export type LegacyDecision =
+export type Decision =
   | { readonly kind: "execute"; readonly stepId: string }
   | { readonly kind: "wait_human"; readonly stepId: string }
   | { readonly kind: "escalate"; readonly reason: string }
@@ -41,10 +41,10 @@ export type LegacyDecision =
   | { readonly kind: "abandon" }
   | { readonly kind: "noop"; readonly reason: string }
 
-export interface LegacyTransition {
-  readonly decision: LegacyDecision
+export interface Transition {
+  readonly decision: Decision
   readonly patch: Partial<{
-    status: LegacyFeatureStatus
+    status: FeatureStatus
     currentStep: string | null
     attempts: Readonly<Record<string, number>>
     rounds: Readonly<Record<string, number>>
@@ -57,7 +57,7 @@ interface FeatureRow {
   title: string
   slug: string
   project_dir: string
-  status: LegacyFeatureStatus
+  status: FeatureStatus
   current_step: string | null
   workflow: string | null
   description: string | null
@@ -70,7 +70,7 @@ interface FeatureRow {
   escalation: string | null
 }
 
-function toState(row: FeatureRow): LegacyFeatureState {
+function toState(row: FeatureRow): FeatureState {
   return {
     id: row.id,
     title: row.title,
@@ -99,7 +99,7 @@ export class Store {
     projectDir: string
     workflow?: string
     description?: string
-  }): LegacyFeatureState {
+  }): FeatureState {
     const now = Date.now()
     const id = randomUUID()
     this.db.run(
@@ -112,12 +112,12 @@ export class Store {
     return state
   }
 
-  getFeature(id: string): LegacyFeatureState | null {
+  getFeature(id: string): FeatureState | null {
     const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(id) as FeatureRow | null
     return row ? toState(row) : null
   }
 
-  listFeatures(filter?: { activeOnly?: boolean; projectDir?: string }): LegacyFeatureState[] {
+  listFeatures(filter?: { activeOnly?: boolean; projectDir?: string }): FeatureState[] {
     const clauses: string[] = []
     const params: (string | number)[] = []
     if (filter?.activeOnly) clauses.push("status IN ('running','paused','waiting_human','escalated')")
@@ -130,47 +130,49 @@ export class Store {
     return rows.map(toState)
   }
 
-  findFeatureByPr(pr: number): LegacyFeatureState | null {
+  findFeatureByPr(pr: number): FeatureState | null {
     const row = this.db.query("SELECT * FROM feature WHERE pr = ? AND status NOT IN ('done','abandoned')").get(pr) as FeatureRow | null
     return row ? toState(row) : null
   }
 
-  applyTransition(featureId: string, event: LegacyPipelineEvent, transition: LegacyTransition): void {
+  applyTransition(featureId: string, event: PipelineEvent, transition: Transition): void {
+    this.db.transaction(() => this.applyTransitionTx(featureId, event, transition))()
+  }
+
+  private applyTransitionTx(featureId: string, event: PipelineEvent, transition: Transition): void {
     const { patch, decision } = transition
-    this.db.transaction(() => {
-      const sets: string[] = ["time_updated = ?"]
-      const params: (string | number | null)[] = [Date.now()]
-      if (patch.status !== undefined) {
-        sets.push("status = ?")
-        params.push(patch.status)
-      }
-      if (patch.currentStep !== undefined) {
-        sets.push("current_step = ?")
-        params.push(patch.currentStep)
-      }
-      if (patch.attempts !== undefined) {
-        sets.push("attempts = ?")
-        params.push(JSON.stringify(patch.attempts))
-      }
-      if (patch.rounds !== undefined) {
-        sets.push("rounds = ?")
-        params.push(JSON.stringify(patch.rounds))
-      }
-      if (patch.escalation !== undefined) {
-        sets.push("escalation = ?")
-        params.push(patch.escalation)
-      } else if (decision.kind === "escalate") {
-        sets.push("escalation = ?")
-        params.push(decision.reason)
-      }
-      params.push(featureId)
-      this.db.run(`UPDATE feature SET ${sets.join(", ")} WHERE id = ?`, params as never)
-      this.db.run(
-        `INSERT INTO transition_log (feature_id, event, decision, detail, time_created)
-         VALUES (?, ?, ?, ?, ?)`,
-        [featureId, JSON.stringify(event), decision.kind, decisionDetail(decision), Date.now()],
-      )
-    })()
+    const sets: string[] = ["time_updated = ?"]
+    const params: (string | number | null)[] = [Date.now()]
+    if (patch.status !== undefined) {
+      sets.push("status = ?")
+      params.push(patch.status)
+    }
+    if (patch.currentStep !== undefined) {
+      sets.push("current_step = ?")
+      params.push(patch.currentStep)
+    }
+    if (patch.attempts !== undefined) {
+      sets.push("attempts = ?")
+      params.push(JSON.stringify(patch.attempts))
+    }
+    if (patch.rounds !== undefined) {
+      sets.push("rounds = ?")
+      params.push(JSON.stringify(patch.rounds))
+    }
+    if (patch.escalation !== undefined) {
+      sets.push("escalation = ?")
+      params.push(patch.escalation)
+    } else if (decision.kind === "escalate") {
+      sets.push("escalation = ?")
+      params.push(decision.reason)
+    }
+    params.push(featureId)
+    this.db.run(`UPDATE feature SET ${sets.join(", ")} WHERE id = ?`, params as never)
+    this.db.run(
+      `INSERT INTO transition_log (feature_id, event, decision, detail, time_created)
+       VALUES (?, ?, ?, ?, ?)`,
+      [featureId, JSON.stringify(event), decision.kind, decisionDetail(decision), Date.now()],
+    )
   }
 
   setFeatureFields(id: string, fields: Partial<{
@@ -226,6 +228,90 @@ export class Store {
     )
   }
 
+  /**
+   * Claims a run's session id — only while the run is still 'running'. A
+   * run can be reaped (TTL, missing session) by the reconciler WHILE an
+   * `executeAgent` call is still awaiting session creation for it; when
+   * that stale call finally resolves, this guard makes the claim a no-op
+   * (0 rows affected → false) instead of writing a session id onto an
+   * already-concluded run row. Callers MUST check the return value and
+   * skip prompting when it is false — otherwise a session nobody is
+   * tracking anymore gets prompted into doing work for a run that has
+   * already moved on (a retry run may already be in flight for the same
+   * step).
+   */
+  setRunSession(runId: string, sessionId: string, featureSessionId?: string): boolean {
+    return this.db.transaction(() => {
+      const row = this.db.query(
+        "SELECT feature_id FROM step_run WHERE id = ? AND status = 'running'",
+      ).get(runId) as { feature_id: string } | null
+      if (!row) return false
+      this.db.run("UPDATE step_run SET session_id = ? WHERE id = ?", [sessionId, runId])
+      if (featureSessionId !== undefined) {
+        this.db.run("UPDATE feature SET session_id = ?, time_updated = ? WHERE id = ?", [featureSessionId, Date.now(), row.feature_id])
+      }
+      return true
+    })()
+  }
+
+  /**
+   * Atomically concludes a run and applies the feature transition it
+   * triggers: closes the crash window between "run finished" and "feature
+   * advanced" by making both writes one transaction. The `WHERE status =
+   * 'running'` guard also makes this the single point where a duplicate
+   * report (e.g. an agent retries `report()` after a timeout) is caught —
+   * the second call sees zero rows affected and returns false without
+   * touching the feature or its transition log.
+   *
+   * Also persists `transition.decision` as `completion_decision` with
+   * `action_handled = 0` — a durable outbox row. If the process crashes
+   * between this commit and the engine acting on that decision (the next
+   * `dispatch`/notify), `getPendingRunAction` lets a restarted reconciler
+   * find and finish exactly that decision instead of leaving the feature
+   * stuck on its old current step forever.
+   */
+  concludeRun(
+    runId: string,
+    status: "succeeded" | "failed" | "reaped",
+    detail: { output?: string; reason?: string } | undefined,
+    event: PipelineEvent,
+    transition: Transition,
+  ): boolean {
+    return this.db.transaction(() => {
+      const result = this.db.run(
+        `UPDATE step_run SET status = ?, output = ?, reason = ?, completion_event = ?, completion_decision = ?, action_handled = 0, time_finished = ?
+         WHERE id = ? AND status = 'running'`,
+        [status, detail?.output ?? null, detail?.reason ?? null, JSON.stringify(event), JSON.stringify(transition.decision), Date.now(), runId],
+      )
+      if (result.changes === 0) return false
+      const run = this.db.query("SELECT feature_id FROM step_run WHERE id = ?").get(runId) as { feature_id: string } | null
+      if (!run) return false
+      this.applyTransitionTx(run.feature_id, event, transition)
+      return true
+    })()
+  }
+
+  /**
+   * The latest concluded-but-unacted-on decision for a feature — the
+   * durable pending-action outbox `concludeRun` writes. Null once
+   * `markRunActionHandled` closes it out (the normal, no-crash path) or
+   * when nothing has ever concluded via `concludeRun` for this feature.
+   */
+  getPendingRunAction(featureId: string): { runId: string; decision: Decision } | null {
+    const row = this.db.query(
+      `SELECT id, completion_decision FROM step_run
+       WHERE feature_id = ? AND action_handled = 0 AND completion_decision IS NOT NULL
+       ORDER BY time_finished DESC LIMIT 1`,
+    ).get(featureId) as { id: string; completion_decision: string } | null
+    if (!row) return null
+    return { runId: row.id, decision: JSON.parse(row.completion_decision) as Decision }
+  }
+
+  /** Atomic 0→1 claim: false if the run was never pending or is already handled. */
+  markRunActionHandled(runId: string): boolean {
+    return this.db.run("UPDATE step_run SET action_handled = 1 WHERE id = ? AND action_handled = 0", [runId]).changes > 0
+  }
+
   getActiveRun(featureId: string): {
     id: string
     stepId: string
@@ -271,15 +357,32 @@ export class Store {
     status: string
     role: string | null
     attempt: number
+    output: string | null
+    reason: string | null
+    completionEvent: string | null
   } | null {
-    const row = this.db.query("SELECT feature_id, step_id, status, role, attempt FROM step_run WHERE id = ?").get(runId) as {
+    const row = this.db.query(
+      "SELECT feature_id, step_id, status, role, attempt, output, reason, completion_event FROM step_run WHERE id = ?",
+    ).get(runId) as {
       feature_id: string
       step_id: string
       status: string
       role: string | null
       attempt: number
+      output: string | null
+      reason: string | null
+      completion_event: string | null
     } | null
-    return row ? { featureId: row.feature_id, stepId: row.step_id, status: row.status, role: row.role, attempt: row.attempt } : null
+    return row ? {
+      featureId: row.feature_id,
+      stepId: row.step_id,
+      status: row.status,
+      role: row.role,
+      attempt: row.attempt,
+      output: row.output,
+      reason: row.reason,
+      completionEvent: row.completion_event,
+    } : null
   }
 
   getLastHumanNotes(featureId: string, stepId: string): string | null {
@@ -444,7 +547,7 @@ export class Store {
   }
 }
 
-function decisionDetail(decision: LegacyDecision): string | null {
+function decisionDetail(decision: Decision): string | null {
   switch (decision.kind) {
     case "execute":
     case "wait_human":
