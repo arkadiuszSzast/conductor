@@ -79,6 +79,81 @@ misrepresenting the seed's single `current_step` and attempts/rounds maps as the
 new core graph state while preserving the store's observable semantics for the
 engine extraction.
 
+### Legacy compatibility execution model
+
+`@conductor/server` now hosts opencode-conductor's engine/reconciler/builtins/
+GitHub client/findings-publication as an isolated `legacy/` module
+(`LegacyEngine`, `legacyBuiltins`, `RealGh`, `makePublishReviewLegacy`),
+deliberately separate from `@conductor/core`'s graph workflow IR
+(`WorkflowDef`/`JobDef`). It runs the seed's single-`current_step`
+pipeline/attempts/rounds model against the extracted SQLite store while the
+graph engine is built out under the `workflow-format` change; nothing in
+`legacy/` may grow DAG/graph concepts.
+
+Every side effect crosses an injected port: `LegacyStorePort` (a structural
+interface `Store` satisfies, so tests and a future backing store can
+substitute), a `Clock` (`now()`, defaulting to `systemClock`) used for
+recovery and TTL/reap timing, `LegacySessionClient` as a runtime-neutral
+session runner (no opencode SDK type crosses this boundary — opencode today,
+other runners later implement it against their own client), `LegacyGh` as
+the GitHub port (`RealGh` implements it over `ProcessRunner`), `ProcessRunner`
+for all filesystem/process/git execution (`exec` for argv, `shell` for
+`command` pipeline steps — never a bare `spawn`, never an implicit
+`process.cwd()`), a `Logger`, `LegacyConfigResolver` as the per-project config
+resolver (`projectDir → LegacyConfig | null`; one engine serves every project
+sharing the DB, each feature runs under its own project's pipeline/roles/
+limits), and an injectable `LegacyPublishReview` (defaults to the gh-backed
+`makePublishReviewLegacy`, override-able in tests).
+
+`LegacyEngine` owns no singleton, timer or daemon lifecycle: it holds no
+`setInterval`/`setTimeout` and starts nothing on construction. `reconcile()`
+is a plain async method the daemon calls on an interval and after startup
+recovery (daemon lifecycle, task 3) — the engine has no opinion on when or
+how often it runs.
+
+The confirmation-of-effect rule is exact and unchanged from the seed: an
+agent step only concludes through the daemon's `report()` path — never
+because a session merely went idle. Idle sessions are debounced
+(`nudgeIdleCycles` consecutive idle reconcile cycles before a nudge), nudged
+up to `maxNudges` times, then reaped; a session reported `"missing"` (gone —
+server restart, deletion) is reaped immediately without nudging; runs that
+exceed `runTtlMs` with no reported effect are reaped regardless of session
+status. Every reap feeds a `step.failed` event back through the same
+interpreter path as a real failure.
+
+Review findings persist to SQLite as the source of truth before any GitHub
+call; publishing (`postReview`/`postComment`) is a best-effort projection
+that never blocks the pipeline — a failed publish is recorded as a status
+line, not a stall. `findings.sync`/resolution updates follow the same order:
+DB row first, GitHub thread projection second.
+
+Deterministic builtins (`worktree.create`, `git.push`, `pr.create`, …) run
+fixed git subcommands as argv through `ProcessRunner.exec`, never
+interpolated into a shell string; refs are validated with
+`git check-ref-format` before they are ever placed in an argv position.
+`command`-type pipeline steps are the one path that legitimately renders a
+shell string, via `ProcessRunner.shell`.
+
+`Store.applyTransition` is unchanged by this extraction: it still writes the
+feature-state UPDATE and the transition-log INSERT inside one
+`db.transaction`, so decision and audit remain atomic (see "Durability,
+concurrency and observability" below).
+
+This task does not touch `ActionRegistry`/graph-reservation
+(`workflow-reservation.ts`, `action-registry.ts`): that machinery belongs to
+`@conductor/core`'s graph workflow IR and is claimed by a separate task; the
+legacy engine and the graph reservation model are not unified here and must
+not be conflated.
+
+**Known inherited boundary:** the idle-cycle debounce counter
+(`idleCycles: Map<runId, count>`) is in-memory only, inherited unchanged from
+the seed. A daemon restart resets it to zero for any in-flight agent run —
+the safe direction of error (an extra idle cycle before a nudge, never a
+missed reap) — but it means idle-debounce state does not survive restart the
+way `runTtlMs`-based reaping does. This is a known seed characteristic
+carried forward, not a gap introduced by the extraction; a durable idle-cycle
+store is out of scope for this task.
+
 ### Reconciler ownership
 
 The daemon owns one lifecycle-managed reconciler. The existing confirmation of
