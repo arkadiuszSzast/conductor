@@ -74,7 +74,24 @@ export interface LegacyBuiltinStep extends LegacyStepBase {
 
 export interface LegacyCommandStep extends LegacyStepBase {
   readonly type: "command"
-  /** Shell commands run sequentially; first non-zero exit fails the step. */
+  /**
+   * Shell commands run sequentially; first non-zero exit fails the step.
+   * Rendered with raw string substitution (no shell-escaping) and passed
+   * straight to `bash -lc` — this is the one step type that legitimately
+   * renders a shell string.
+   *
+   * WARNING: the template context includes text that is NOT purely
+   * project-config-controlled — `{{human.<step>}}` (free-text human gate
+   * notes), `{{steps.<id>.output}}` (agent-reported text, itself capable
+   * of echoing untrusted repo/PR content via prompt injection), and
+   * `{{findings.*}}` (finding bodies extracted from a PR diff/comment).
+   * Interpolating any of these into shell syntax here (e.g.
+   * `echo "{{steps.review.output}}" | some-tool`) lets a crafted finding
+   * body, human note, or agent note become command injection. Do not
+   * interpolate untrusted values into shell syntax in `run:`; prefer a
+   * deterministic `builtin` argv action, or pass the value via env var /
+   * file rather than inline shell text.
+   */
   readonly run: readonly string[]
   /** Working directory (template-rendered). Defaults to feature worktree. */
   readonly cwd?: string

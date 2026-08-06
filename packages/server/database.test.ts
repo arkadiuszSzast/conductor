@@ -34,7 +34,9 @@ describe("database lifecycle and migrations", () => {
       "feature", "finding", "pr_head", "review_thread", "schema_migration", "step_run", "transition_log",
     ]))
     expect(columnNames(connection.db, "feature")).toEqual(expect.arrayContaining(["workflow", "description"]))
-    expect(columnNames(connection.db, "step_run")).toContain("nudges")
+    expect(columnNames(connection.db, "step_run")).toEqual(expect.arrayContaining([
+      "nudges", "completion_event", "completion_decision", "action_handled",
+    ]))
     const ledger = connection.db.query("SELECT id FROM schema_migration ORDER BY position").all() as Array<{ id: string }>
     expect(ledger.map(row => row.id)).toEqual(migrations.map(migration => migration.id))
     connection.close()

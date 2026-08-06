@@ -4,9 +4,21 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { openMigratedDatabase, type DatabaseConnection } from "./src/database.ts"
 import { Store } from "./src/store.ts"
-import { LegacyEngine } from "./src/legacy/engine.ts"
-import type { LegacyGh, LegacyCheckSummary, LegacyPrView, LegacySessionClient, ProcessExecOptions, ProcessExecResult, ProcessRunner } from "./src/legacy/ports.ts"
+import { LegacyEngine, type LegacyEngineDeps } from "./src/legacy/engine.ts"
+import { interpretLegacy } from "./src/legacy/interpret.ts"
+import type { LegacyGh, LegacyCheckSummary, LegacyPrView, LegacyPublishReview, LegacySessionClient, ProcessExecOptions, ProcessExecResult, ProcessRunner } from "./src/legacy/ports.ts"
 import type { LegacyConfig, LegacyPipelineDef } from "./src/legacy/types.ts"
+
+/** A promise plus its resolve/reject, for tests that need to control interleaving explicitly. */
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (err: unknown) => void } {
+  let resolve!: (value: T) => void
+  let reject!: (err: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
 
 // ---------------------------------------------------------------- fakes
 
@@ -54,8 +66,23 @@ class FakeSessions implements LegacySessionClient {
   statuses = new Map<string, "busy" | "idle" | "retry">()
   notes: Array<{ sessionID: string; text: string }> = []
   private counter = 0
+  /**
+   * When set, the NEXT `createSession` call awaits this before resolving,
+   * then consumes (nulls) it — lets a test pause `executeAgent` mid-setup
+   * to deterministically interleave a concurrent `reconcile()` cycle.
+   * `onCreatePause` fires synchronously right before the await, so a test
+   * can await it instead of guessing a microtask-tick count.
+   */
+  nextCreatePause: Promise<void> | null = null
+  onCreatePause?: () => void
 
   async createSession(input: { title: string; directory: string; parentID?: string }): Promise<{ id: string }> {
+    if (this.nextCreatePause) {
+      const pause = this.nextCreatePause
+      this.nextCreatePause = null
+      this.onCreatePause?.()
+      await pause
+    }
     const id = `ses-${++this.counter}`
     this.created.push(id)
     this.liveSessions.add(id)
@@ -115,6 +142,7 @@ const def: LegacyPipelineDef = {
       role: "reviewer_external",
       then: "merge",
       on_verdict: { approved: { next: true }, changes_requested: { goto: "external_review" } },
+      publish: { mode: "comment-only" },
     },
     { id: "merge", type: "builtin", action: "pr.merge", requires_human: true },
   ],
@@ -157,7 +185,7 @@ afterEach(() => {
   rmSync(directory, { recursive: true, force: true })
 })
 
-function makeEngine(config: LegacyConfig): LegacyEngine {
+function makeEngine(config: LegacyConfig, overrides: Partial<LegacyEngineDeps> = {}): LegacyEngine {
   return new LegacyEngine({
     store,
     resolveConfig: () => config,
@@ -166,6 +194,7 @@ function makeEngine(config: LegacyConfig): LegacyEngine {
     process: process_,
     clock,
     log: { log: () => {} },
+    ...overrides,
   })
 }
 
@@ -187,6 +216,107 @@ describe("LegacyEngine: dispatch drives builtin polling into an agent step", () 
     expect(state?.currentStep).toBe("external_review")
     expect(sessions.prompts).toHaveLength(1)
     expect(sessions.prompts[0]?.agent).toBe("review-agent")
+  })
+})
+
+describe("LegacyEngine: executeAgent claims its run before any await — no reconcile double-dispatch", () => {
+  it("a reconcile() interleaved mid-session-setup sees the claimed run and does not re-execute", async () => {
+    const config = makeConfig()
+    const engine = makeEngine(config)
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/tmp/p" })
+    store.setFeatureFields(feature.id, { pr: 7 })
+    gh.checks = { allConcluded: true, anyFailed: false, failedNames: [] }
+
+    const pause = deferred<void>()
+    const reached = deferred<void>()
+    sessions.nextCreatePause = pause.promise
+    sessions.onCreatePause = () => reached.resolve()
+
+    // dispatch(feature.start) walks await_ci → external_review (agent) in
+    // one synchronous call chain; executeAgent's FIRST createSession call
+    // (the parent session) is where it now blocks.
+    const dispatchPromise = engine.dispatch(feature.id, { kind: "feature.start" })
+    await reached.promise
+
+    // `store.startRun` for the "external_review" agent step already ran
+    // (synchronously, before the paused await) — reconcile must see it as
+    // the active run and do nothing, not treat "no session id yet" as
+    // "no run for this step" and re-execute.
+    const activeDuringPause = store.getActiveRun(feature.id)
+    expect(activeDuringPause?.stepId).toBe("external_review")
+    expect(activeDuringPause?.sessionId).toBeNull()
+
+    await engine.reconcile()
+    expect(sessions.created).toHaveLength(0) // still blocked on the very first createSession call
+    expect(sessions.prompts).toHaveLength(0)
+
+    pause.resolve()
+    await dispatchPromise
+
+    // Exactly one session pair (parent + child) and one prompt — the race
+    // window did not produce a duplicate run/session for the same step.
+    expect(sessions.created).toHaveLength(2)
+    expect(sessions.prompts).toHaveLength(1)
+    const active = store.getActiveRun(feature.id)
+    expect(active?.stepId).toBe("external_review")
+    expect(active?.sessionId).toBe(sessions.created[1])
+  })
+
+  it("does not prompt stale session setup after TTL recovery owns the retry", async () => {
+    const config = makeConfig({ runTtlMs: 1 })
+    const engine = makeEngine(config)
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/tmp/p" })
+    store.setFeatureFields(feature.id, { pr: 7 })
+    gh.checks = { allConcluded: true, anyFailed: false, failedNames: [] }
+    const pause = deferred<void>()
+    const paused = deferred<void>()
+    sessions.nextCreatePause = pause.promise
+    sessions.onCreatePause = () => paused.resolve()
+
+    const dispatchPromise = engine.dispatch(feature.id, { kind: "feature.start" })
+    await paused.promise
+    const original = store.getActiveRun(feature.id)
+    if (!original) throw new Error("missing claimed run")
+    clock.current = original.timeStarted + 5
+
+    await engine.reconcile()
+    expect(sessions.prompts).toHaveLength(1)
+    const retry = store.getActiveRun(feature.id)
+    expect(retry?.id).not.toBe(original.id)
+
+    pause.resolve()
+    await dispatchPromise
+    expect(sessions.prompts).toHaveLength(1)
+    expect(sessions.prompts[0]?.sessionID).toBe(retry?.sessionId ?? undefined)
+    expect(store.getFeature(feature.id)?.sessionId).toBe(sessions.parents.get(retry?.sessionId ?? ""))
+  })
+})
+
+describe("LegacyEngine: durable action recovery", () => {
+  it("replays a persisted same-step verdict decision once after restart", async () => {
+    const config = makeConfig()
+    const engine = makeEngine(config)
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/tmp/p" })
+    store.setFeatureFields(feature.id, { pr: 7 })
+    gh.checks = { allConcluded: true, anyFailed: false, failedNames: [] }
+    await engine.dispatch(feature.id, { kind: "feature.start" })
+
+    const run = store.getActiveRun(feature.id)
+    const state = store.getFeature(feature.id)
+    if (!run || !state) throw new Error("missing active review run")
+    const event = { kind: "step.verdict", stepId: "external_review", verdict: "changes_requested" } as const
+    const transition = interpretLegacy(def, state, event)
+    expect(store.concludeRun(run.id, "succeeded", { output: "changes requested" }, event, transition)).toBe(true)
+    expect(store.getPendingRunAction(feature.id)?.decision).toEqual({ kind: "execute", stepId: "external_review" })
+
+    const restarted = makeEngine(config)
+    await restarted.reconcile()
+    expect(store.getActiveRun(feature.id)?.stepId).toBe("external_review")
+    expect(store.getPendingRunAction(feature.id)).toBeNull()
+    const promptCount = sessions.prompts.length
+
+    await restarted.reconcile()
+    expect(sessions.prompts).toHaveLength(promptCount)
   })
 })
 
@@ -228,6 +358,85 @@ describe("LegacyEngine: report — explicit-report-only completion", () => {
     const engine = makeEngine(makeConfig())
     const reply = await engine.report({ runId: "does-not-exist", outcome: "succeeded" })
     expect(reply).toContain("Unknown run_id")
+  })
+
+  it("atomic report: feature transition is durable before publish resolves; next agent dispatch waits for it", async () => {
+    let publishReached = false
+    const publishGate = deferred<string>()
+    const publishReview: LegacyPublishReview = async () => {
+      publishReached = true
+      return publishGate.promise
+    }
+    const config = makeConfig()
+    const engine = makeEngine(config, { publishReview })
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/tmp/p" })
+    store.setFeatureFields(feature.id, { pr: 7 })
+    gh.checks = { allConcluded: true, anyFailed: false, failedNames: [] }
+    await engine.dispatch(feature.id, { kind: "feature.start" })
+    const run = store.getActiveRun(feature.id)
+    expect(run).not.toBeNull()
+    const runId = run?.id ?? ""
+    expect(sessions.prompts).toHaveLength(1)
+    expect(sessions.created).toHaveLength(2) // parent + first child session
+
+    const notes = '{"summary":"one nit","findings":[{"path":"a.ts","line":1,"body":"nit","severity":"nit"}]}'
+    const reportPromise = engine.report({ runId, verdict: "changes_requested", notes })
+
+    // Let report() run its synchronous prefix (atomic conclude+transition,
+    // finding insert) up to the point it blocks on the injected publisher.
+    while (!publishReached) await Promise.resolve()
+
+    // The run conclusion and feature transition are ALREADY durable —
+    // this is the crash-recovery property: if the process died right
+    // here (mid-publish network call), the feature would still have
+    // advanced. The old ordering applied the transition only AFTER
+    // publish, leaving a stuck feature on a crash in this exact window.
+    expect(store.getRunById(runId)).toMatchObject({ status: "succeeded" })
+    expect(store.getFeature(feature.id)?.currentStep).toBe("external_review")
+    expect(store.listFindings(feature.id)).toHaveLength(1)
+
+    // But acting on the decision (dispatching the retried agent step) has
+    // NOT happened yet — no new session/prompt until publish resolves.
+    expect(sessions.prompts).toHaveLength(1)
+    expect(sessions.created).toHaveLength(2)
+
+    publishGate.resolve("publish: comment posted")
+    const reply = await reportPromise
+    expect(reply).toContain("changes_requested")
+
+    // Now the next agent dispatch has happened, after publish.
+    expect(sessions.prompts).toHaveLength(2)
+    expect(sessions.created).toHaveLength(3)
+  })
+
+  it("concurrent duplicate verdict reports (Promise.all) claim exactly once: one finding, one publish, one transition", async () => {
+    let publishCalls = 0
+    const publishReview: LegacyPublishReview = async () => {
+      publishCalls++
+      return "publish: comment posted"
+    }
+    const config = makeConfig()
+    const engine = makeEngine(config, { publishReview })
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/tmp/p" })
+    store.setFeatureFields(feature.id, { pr: 7 })
+    gh.checks = { allConcluded: true, anyFailed: false, failedNames: [] }
+    await engine.dispatch(feature.id, { kind: "feature.start" })
+    const run = store.getActiveRun(feature.id)
+    const runId = run?.id ?? ""
+    const transitionsBefore = store.getTransitions(feature.id).length
+
+    const notes = '{"summary":"one nit","findings":[{"path":"a.ts","line":1,"body":"nit","severity":"nit"}]}'
+    const [first, second] = await Promise.all([
+      engine.report({ runId, verdict: "changes_requested", notes }),
+      engine.report({ runId, verdict: "changes_requested", notes }),
+    ])
+    const replies = [first, second]
+    expect(replies.filter(r => r.includes("already concluded"))).toHaveLength(1)
+    expect(replies.filter(r => r.includes("changes_requested"))).toHaveLength(1)
+    expect(store.listFindings(feature.id)).toHaveLength(1)
+    expect(publishCalls).toBe(1)
+    expect(store.getTransitions(feature.id)).toHaveLength(transitionsBefore + 1)
+    expect(store.getFeature(feature.id)?.currentStep).toBe("external_review")
   })
 })
 

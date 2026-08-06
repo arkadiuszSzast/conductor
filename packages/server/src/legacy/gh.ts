@@ -8,6 +8,13 @@
  * for every call that needs one (PR creation runs inside the feature's
  * worktree); calls that only touch the GitHub API (checks, views,
  * GraphQL) run from an explicit neutral directory the caller provides.
+ *
+ * `postComment`/`postReview` failure text is captured `gh` stdout/stderr
+ * tail — this can echo the bot-identity token passed via `opts.token`
+ * (`gh` sometimes reprints its own invocation/env on error) or another
+ * credential the command happened to print. `sanitizeGhErrorOutput`
+ * strips the exact token and common credential shapes before the error
+ * ever reaches a returned status, a timeline note, or the daemon log.
  */
 
 import type {
@@ -21,6 +28,35 @@ import type {
 
 const PENDING = new Set(["PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", ""])
 const FAILED = new Set(["FAILURE", "ACTION_REQUIRED", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE"])
+
+const ERROR_TAIL_MAX_CHARS = 300
+const REDACTED = "[REDACTED]"
+
+/**
+ * Common GitHub/OAuth credential shapes that must never reach a pipeline
+ * timeline note or the daemon log — neither is a secret store. Covers
+ * classic PATs (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`), fine-grained PATs
+ * (`github_pat_`), and `Authorization: Bearer <token>`-style headers that
+ * `gh` sometimes echoes back in verbose/curl-style error output.
+ */
+const CREDENTIAL_PATTERNS: readonly RegExp[] = [
+  /gh[pousr]_[A-Za-z0-9]{20,}/g,
+  /github_pat_[A-Za-z0-9_]{20,}/g,
+  /Bearer\s+[A-Za-z0-9._~+/-]{10,}=*/gi,
+]
+
+/**
+ * Strips the exact token used for this call (if any) and any recognisable
+ * credential pattern from `gh` output before it is ever returned as an
+ * error string. Runs over the FULL captured text and only caps the length
+ * afterwards, so a credential that straddles the cap boundary can never
+ * leak a fragment.
+ */
+function sanitizeGhErrorOutput(text: string, token: string | undefined): string {
+  let sanitized = token && token.length > 0 ? text.split(token).join(REDACTED) : text
+  for (const pattern of CREDENTIAL_PATTERNS) sanitized = sanitized.replace(pattern, REDACTED)
+  return sanitized.slice(-ERROR_TAIL_MAX_CHARS)
+}
 
 export class RealGh implements LegacyGh {
   constructor(
@@ -207,7 +243,9 @@ export class RealGh implements LegacyGh {
       opts.cwd,
       { stdin: body, ...(opts.token !== undefined ? { token: opts.token } : {}) },
     )
-    return result.code === 0 ? { ok: true } : { ok: false, error: result.stdout.slice(-300) || result.stderr.slice(-300) }
+    if (result.code === 0) return { ok: true }
+    const tail = result.stdout || result.stderr
+    return { ok: false, error: sanitizeGhErrorOutput(tail, opts.token) }
   }
 
   async postReview(
@@ -221,6 +259,8 @@ export class RealGh implements LegacyGh {
       opts.cwd,
       { stdin: JSON.stringify(payload), ...(opts.token !== undefined ? { token: opts.token } : {}) },
     )
-    return result.code === 0 ? { ok: true } : { ok: false, error: result.stdout.slice(-300) || result.stderr.slice(-300) }
+    if (result.code === 0) return { ok: true }
+    const tail = result.stdout || result.stderr
+    return { ok: false, error: sanitizeGhErrorOutput(tail, opts.token) }
   }
 }

@@ -136,41 +136,43 @@ export class Store {
   }
 
   applyTransition(featureId: string, event: LegacyPipelineEvent, transition: LegacyTransition): void {
+    this.db.transaction(() => this.applyTransitionTx(featureId, event, transition))()
+  }
+
+  private applyTransitionTx(featureId: string, event: LegacyPipelineEvent, transition: LegacyTransition): void {
     const { patch, decision } = transition
-    this.db.transaction(() => {
-      const sets: string[] = ["time_updated = ?"]
-      const params: (string | number | null)[] = [Date.now()]
-      if (patch.status !== undefined) {
-        sets.push("status = ?")
-        params.push(patch.status)
-      }
-      if (patch.currentStep !== undefined) {
-        sets.push("current_step = ?")
-        params.push(patch.currentStep)
-      }
-      if (patch.attempts !== undefined) {
-        sets.push("attempts = ?")
-        params.push(JSON.stringify(patch.attempts))
-      }
-      if (patch.rounds !== undefined) {
-        sets.push("rounds = ?")
-        params.push(JSON.stringify(patch.rounds))
-      }
-      if (patch.escalation !== undefined) {
-        sets.push("escalation = ?")
-        params.push(patch.escalation)
-      } else if (decision.kind === "escalate") {
-        sets.push("escalation = ?")
-        params.push(decision.reason)
-      }
-      params.push(featureId)
-      this.db.run(`UPDATE feature SET ${sets.join(", ")} WHERE id = ?`, params as never)
-      this.db.run(
-        `INSERT INTO transition_log (feature_id, event, decision, detail, time_created)
-         VALUES (?, ?, ?, ?, ?)`,
-        [featureId, JSON.stringify(event), decision.kind, decisionDetail(decision), Date.now()],
-      )
-    })()
+    const sets: string[] = ["time_updated = ?"]
+    const params: (string | number | null)[] = [Date.now()]
+    if (patch.status !== undefined) {
+      sets.push("status = ?")
+      params.push(patch.status)
+    }
+    if (patch.currentStep !== undefined) {
+      sets.push("current_step = ?")
+      params.push(patch.currentStep)
+    }
+    if (patch.attempts !== undefined) {
+      sets.push("attempts = ?")
+      params.push(JSON.stringify(patch.attempts))
+    }
+    if (patch.rounds !== undefined) {
+      sets.push("rounds = ?")
+      params.push(JSON.stringify(patch.rounds))
+    }
+    if (patch.escalation !== undefined) {
+      sets.push("escalation = ?")
+      params.push(patch.escalation)
+    } else if (decision.kind === "escalate") {
+      sets.push("escalation = ?")
+      params.push(decision.reason)
+    }
+    params.push(featureId)
+    this.db.run(`UPDATE feature SET ${sets.join(", ")} WHERE id = ?`, params as never)
+    this.db.run(
+      `INSERT INTO transition_log (feature_id, event, decision, detail, time_created)
+       VALUES (?, ?, ?, ?, ?)`,
+      [featureId, JSON.stringify(event), decision.kind, decisionDetail(decision), Date.now()],
+    )
   }
 
   setFeatureFields(id: string, fields: Partial<{
@@ -226,6 +228,90 @@ export class Store {
     )
   }
 
+  /**
+   * Claims a run's session id — only while the run is still 'running'. A
+   * run can be reaped (TTL, missing session) by the reconciler WHILE an
+   * `executeAgent` call is still awaiting session creation for it; when
+   * that stale call finally resolves, this guard makes the claim a no-op
+   * (0 rows affected → false) instead of writing a session id onto an
+   * already-concluded run row. Callers MUST check the return value and
+   * skip prompting when it is false — otherwise a session nobody is
+   * tracking anymore gets prompted into doing work for a run that has
+   * already moved on (a retry run may already be in flight for the same
+   * step).
+   */
+  setRunSession(runId: string, sessionId: string, featureSessionId?: string): boolean {
+    return this.db.transaction(() => {
+      const row = this.db.query(
+        "SELECT feature_id FROM step_run WHERE id = ? AND status = 'running'",
+      ).get(runId) as { feature_id: string } | null
+      if (!row) return false
+      this.db.run("UPDATE step_run SET session_id = ? WHERE id = ?", [sessionId, runId])
+      if (featureSessionId !== undefined) {
+        this.db.run("UPDATE feature SET session_id = ?, time_updated = ? WHERE id = ?", [featureSessionId, Date.now(), row.feature_id])
+      }
+      return true
+    })()
+  }
+
+  /**
+   * Atomically concludes a run and applies the feature transition it
+   * triggers: closes the crash window between "run finished" and "feature
+   * advanced" by making both writes one transaction. The `WHERE status =
+   * 'running'` guard also makes this the single point where a duplicate
+   * report (e.g. an agent retries `report()` after a timeout) is caught —
+   * the second call sees zero rows affected and returns false without
+   * touching the feature or its transition log.
+   *
+   * Also persists `transition.decision` as `completion_decision` with
+   * `action_handled = 0` — a durable outbox row. If the process crashes
+   * between this commit and the engine acting on that decision (the next
+   * `dispatch`/notify), `getPendingRunAction` lets a restarted reconciler
+   * find and finish exactly that decision instead of leaving the feature
+   * stuck on its old current step forever.
+   */
+  concludeRun(
+    runId: string,
+    status: "succeeded" | "failed" | "reaped",
+    detail: { output?: string; reason?: string } | undefined,
+    event: LegacyPipelineEvent,
+    transition: LegacyTransition,
+  ): boolean {
+    return this.db.transaction(() => {
+      const result = this.db.run(
+        `UPDATE step_run SET status = ?, output = ?, reason = ?, completion_event = ?, completion_decision = ?, action_handled = 0, time_finished = ?
+         WHERE id = ? AND status = 'running'`,
+        [status, detail?.output ?? null, detail?.reason ?? null, JSON.stringify(event), JSON.stringify(transition.decision), Date.now(), runId],
+      )
+      if (result.changes === 0) return false
+      const run = this.db.query("SELECT feature_id FROM step_run WHERE id = ?").get(runId) as { feature_id: string } | null
+      if (!run) return false
+      this.applyTransitionTx(run.feature_id, event, transition)
+      return true
+    })()
+  }
+
+  /**
+   * The latest concluded-but-unacted-on decision for a feature — the
+   * durable pending-action outbox `concludeRun` writes. Null once
+   * `markRunActionHandled` closes it out (the normal, no-crash path) or
+   * when nothing has ever concluded via `concludeRun` for this feature.
+   */
+  getPendingRunAction(featureId: string): { runId: string; decision: LegacyDecision } | null {
+    const row = this.db.query(
+      `SELECT id, completion_decision FROM step_run
+       WHERE feature_id = ? AND action_handled = 0 AND completion_decision IS NOT NULL
+       ORDER BY time_finished DESC LIMIT 1`,
+    ).get(featureId) as { id: string; completion_decision: string } | null
+    if (!row) return null
+    return { runId: row.id, decision: JSON.parse(row.completion_decision) as LegacyDecision }
+  }
+
+  /** Atomic 0→1 claim: false if the run was never pending or is already handled. */
+  markRunActionHandled(runId: string): boolean {
+    return this.db.run("UPDATE step_run SET action_handled = 1 WHERE id = ? AND action_handled = 0", [runId]).changes > 0
+  }
+
   getActiveRun(featureId: string): {
     id: string
     stepId: string
@@ -271,15 +357,32 @@ export class Store {
     status: string
     role: string | null
     attempt: number
+    output: string | null
+    reason: string | null
+    completionEvent: string | null
   } | null {
-    const row = this.db.query("SELECT feature_id, step_id, status, role, attempt FROM step_run WHERE id = ?").get(runId) as {
+    const row = this.db.query(
+      "SELECT feature_id, step_id, status, role, attempt, output, reason, completion_event FROM step_run WHERE id = ?",
+    ).get(runId) as {
       feature_id: string
       step_id: string
       status: string
       role: string | null
       attempt: number
+      output: string | null
+      reason: string | null
+      completion_event: string | null
     } | null
-    return row ? { featureId: row.feature_id, stepId: row.step_id, status: row.status, role: row.role, attempt: row.attempt } : null
+    return row ? {
+      featureId: row.feature_id,
+      stepId: row.step_id,
+      status: row.status,
+      role: row.role,
+      attempt: row.attempt,
+      output: row.output,
+      reason: row.reason,
+      completionEvent: row.completion_event,
+    } : null
   }
 
   getLastHumanNotes(featureId: string, stepId: string): string | null {

@@ -42,7 +42,7 @@ import type {
   ProcessRunner,
 } from "./ports.ts"
 import type { LegacyAgentStep, LegacyCommandStep, LegacyConfig, LegacyStepDef } from "./types.ts"
-import type { LegacyDecision, LegacyFeatureState } from "../store.ts"
+import type { LegacyDecision, LegacyFeatureState, LegacyPipelineEvent } from "../store.ts"
 
 export interface LegacyEngineDeps {
   readonly store: LegacyStorePort
@@ -163,6 +163,113 @@ export class LegacyEngine {
     }
   }
 
+  /**
+   * Atomically concludes a run and applies the feature transition it
+   * triggers — the single call site every run-completion path (builtin,
+   * command, agent prompt failure, reaper, `report()`) goes through.
+   *
+   * Loads state/config/def, interprets the event against them, then
+   * hands the run status + transition to `store.concludeRun` in ONE
+   * database transaction: there is no window between "run finished" and
+   * "feature advanced" for a crash (or a concurrent duplicate report) to
+   * land in. `concludeRun`'s `WHERE status = 'running'` guard is what
+   * makes `claimed` false for a loser of that race — the caller MUST
+   * check `claimed` and skip any further side effect (note, publish,
+   * `act`) when it is false: nothing happened, the feature was not
+   * touched.
+   *
+   * Deliberately does NOT call `act()` itself — callers interleave a
+   * best-effort timeline note (and, for `report()`, findings/publish)
+   * between the atomic conclusion and acting on the decision, to keep
+   * the seed's observable ordering (note before the next step fires).
+   */
+  private concludeAndTransition(
+    featureId: string,
+    runId: string,
+    status: "succeeded" | "failed" | "reaped",
+    detail: { output?: string; reason?: string } | undefined,
+    event: LegacyPipelineEvent,
+  ): { claimed: boolean; decision: LegacyDecision } {
+    const { store, log } = this.deps
+    const state = store.getFeature(featureId)
+    if (!state) return { claimed: false, decision: { kind: "noop", reason: "feature not found" } }
+    const config = this.configFor(state)
+    if (!config) return { claimed: false, decision: { kind: "noop", reason: "no valid conductor config" } }
+    const def = this.defFor(state, config)
+    if (!def) return { claimed: false, decision: { kind: "noop", reason: "unknown workflow" } }
+    const transition = interpretLegacy(def, state, event)
+    const claimed = store.concludeRun(runId, status, detail, event, transition)
+    if (claimed) {
+      log.log(
+        `feature=${state.slug} event=${event.kind} → ${transition.decision.kind}` +
+          (transition.decision.kind === "execute" ? `:${transition.decision.stepId}` : ""),
+      )
+    }
+    return { claimed, decision: transition.decision }
+  }
+
+  /**
+   * Claims the run's outbox entry (atomic `action_handled` 0→1), then
+   * acts on the decision — the ONLY way a pending decision is ever acted
+   * on, normal-path (report/builtin/command/reaper) or recovered on
+   * restart. EVERY post-conclusion call site routes through this.
+   *
+   * Claims BEFORE acting, not after: this is what makes the helper safe
+   * to call from two racing paths for the SAME run — the loser of the
+   * claim returns immediately without calling `act()` a second time.
+   * That race is real: a `report()` call can be parked on a slow
+   * best-effort projection (GitHub publish) for a while AFTER
+   * `concludeAndTransition` already committed the decision, and a
+   * reconcile pass on a differently-instantiated engine sharing the same
+   * store (a restart) can run `recoverPendingAction` in that window. The
+   * accepted trade-off: if the process dies in the narrow gap between
+   * winning the claim and `act()` finishing, the decision is now marked
+   * handled but was never (fully) acted on, and no future reconcile will
+   * retry it — for the `execute` decisions this actually dispatches,
+   * that gap is a single synchronous `store.startRun` call with no
+   * `await` before it (see `executeAgent`'s comment), so the run row
+   * exists before any crash-inducing await; for every other decision
+   * kind `act()` is a best-effort `notify()` or a no-op, so losing it is
+   * not a stuck feature. A true lease/heartbeat scheme would close this
+   * fully but is not needed while restarts, not concurrent live
+   * processes, are the assumption.
+   */
+  private async actAndMarkHandled(featureId: string, runId: string, decision: LegacyDecision): Promise<void> {
+    if (!this.deps.store.markRunActionHandled(runId)) return
+    await this.act(featureId, decision)
+  }
+
+  /**
+   * Restart recovery: replays a decision `concludeRun` persisted but that
+   * never got acted on before the process died (or was killed) between
+   * that commit and the `act()` call that normally follows it. Runs
+   * FIRST in `reconcileFeature`, before any other reconcile logic — a
+   * feature stuck at its post-crash current step self-heals on the next
+   * reconcile pass with no human intervention.
+   *
+   * `execute` is special-cased: `executeAgent`/`executeBuiltin`/
+   * `executeCommand` all call `store.startRun` synchronously as their
+   * first act, so if an active run already exists for this feature, the
+   * crash happened AFTER `act()` started dispatching the decision — a
+   * second dispatch would double-run the step. Every other decision kind
+   * (escalate/wait_human/finish/pause/abandon/noop) has no run-creating
+   * side effect, so replaying it is always safe: it is either a pure
+   * `notify()` or a no-op.
+   */
+  private async recoverPendingAction(feature: LegacyFeatureState): Promise<void> {
+    const { store, log } = this.deps
+    const pending = store.getPendingRunAction(feature.id)
+    if (!pending) return
+    const { runId, decision } = pending
+    if (decision.kind === "execute" && store.getActiveRun(feature.id)) {
+      log.log(`reconcile ${feature.slug}: pending "${decision.stepId}" already dispatched before restart — marking handled`)
+      store.markRunActionHandled(runId)
+      return
+    }
+    log.log(`reconcile ${feature.slug}: recovering pending "${decision.kind}" from run ${runId} after restart`)
+    await this.actAndMarkHandled(feature.id, runId, decision)
+  }
+
   // ------------------------------------------------------------- execution
 
   private async executeStep(state: LegacyFeatureState, step: LegacyStepDef): Promise<void> {
@@ -279,20 +386,26 @@ export class LegacyEngine {
     if (outcome.kind === "pending") {
       // Still waiting (e.g. CI running). Leave the run open; the
       // reconciler re-executes this builtin next cycle. Close this
-      // run as reaped-neutral so runs don't pile up.
+      // run as reaped-neutral so runs don't pile up. No feature
+      // transition follows a pending outcome, so this stays a plain
+      // finishRun — there is nothing to atomically claim.
       store.finishRun(runId, "reaped", { reason: "pending — will re-check" })
       log.log(`builtin ${action}: pending (feature=${fresh.slug})`)
       return
     }
     if (outcome.kind === "succeeded") {
-      store.finishRun(runId, "succeeded", { output: outcome.output ?? "" })
+      const event: LegacyPipelineEvent = { kind: "step.succeeded", stepId, output: outcome.output ?? "" }
+      const { claimed, decision } = this.concludeAndTransition(state.id, runId, "succeeded", { output: outcome.output ?? "" }, event)
+      if (!claimed) return
       const detail = outcome.output ? ` — ${LegacyEngine.clip(outcome.output, 200)}` : ""
       await this.noteParent(state.id, `[conductor] ✓ ${stepId}${detail}`)
-      await this.dispatch(state.id, { kind: "step.succeeded", stepId, output: outcome.output ?? "" })
+      await this.actAndMarkHandled(state.id, runId, decision)
     } else {
-      store.finishRun(runId, "failed", { output: outcome.output ?? "", reason: outcome.reason })
+      const event: LegacyPipelineEvent = { kind: "step.failed", stepId, reason: outcome.reason }
+      const { claimed, decision } = this.concludeAndTransition(state.id, runId, "failed", { output: outcome.output ?? "", reason: outcome.reason }, event)
+      if (!claimed) return
       await this.noteParent(state.id, `[conductor] ✗ ${stepId} failed — ${LegacyEngine.clip(outcome.reason, 300)}`)
-      await this.dispatch(state.id, { kind: "step.failed", stepId, reason: outcome.reason })
+      await this.actAndMarkHandled(state.id, runId, decision)
     }
   }
 
@@ -314,15 +427,20 @@ export class LegacyEngine {
       })
       if (result.code !== 0) {
         const tail = result.output.slice(-4000)
-        store.finishRun(runId, "failed", { output: tail, reason: `"${command}" exited ${result.code}` })
-        await this.noteParent(state.id, `[conductor] ✗ ${step.id} failed — "${command}" exited ${result.code}`)
-        await this.dispatch(state.id, { kind: "step.failed", stepId: step.id, reason: `"${command}" exited ${result.code}` })
+        const reason = `"${command}" exited ${result.code}`
+        const event: LegacyPipelineEvent = { kind: "step.failed", stepId: step.id, reason }
+        const { claimed, decision } = this.concludeAndTransition(state.id, runId, "failed", { output: tail, reason }, event)
+        if (!claimed) return
+        await this.noteParent(state.id, `[conductor] ✗ ${step.id} failed — ${reason}`)
+        await this.actAndMarkHandled(state.id, runId, decision)
         return
       }
     }
-    store.finishRun(runId, "succeeded")
+    const event: LegacyPipelineEvent = { kind: "step.succeeded", stepId: step.id }
+    const { claimed, decision } = this.concludeAndTransition(state.id, runId, "succeeded", undefined, event)
+    if (!claimed) return
     await this.noteParent(state.id, `[conductor] ✓ ${step.id} (command)`)
-    await this.dispatch(state.id, { kind: "step.succeeded", stepId: step.id })
+    await this.actAndMarkHandled(state.id, runId, decision)
   }
 
   private async executeAgent(state: LegacyFeatureState, step: LegacyAgentStep, attempt: number): Promise<void> {
@@ -342,36 +460,13 @@ export class LegacyEngine {
       log.log(`step ${step.id}: template variable "${missing}" is empty`)
     }
 
-    // Feature parent session: the grouping anchor for this feature's work.
-    // In "fresh" mode (default) it is never prompted — each step run gets
-    // its own child session beneath it (subagent-style: clean context per
-    // step). In "feature" mode the parent itself is prompted, carrying
-    // context across steps for roles that deliberately want continuity.
-    let parentId = state.sessionId
-    if (parentId && !(await sessions.sessionExists(parentId))) {
-      log.log(`feature=${state.slug}: stored session ${parentId} is gone — creating a new one`)
-      parentId = null
-    }
-    if (!parentId) {
-      const created = await sessions.createSession({
-        title: `[conductor] ${state.title}`,
-        directory: state.worktree ?? state.projectDir,
-      })
-      parentId = created.id
-      store.setFeatureFields(state.id, { sessionId: parentId })
-    }
-
-    const isolation = role.session ?? "fresh"
-    const sessionId = isolation === "feature"
-      ? parentId
-      : (
-          await sessions.createSession({
-            title: `[${role.agent}] ${state.title}${attempt > 1 ? ` (attempt ${attempt})` : ""}`,
-            directory: state.worktree ?? state.projectDir,
-            parentID: parentId,
-          })
-        ).id
-
+    // Claim the run synchronously, BEFORE any await: this is what closes
+    // the reconcile race a live daemon can hit — `getActiveRun()` would
+    // otherwise see nothing for this step while session setup below is
+    // still in flight, and re-execute it (a second session for one
+    // logical step). The session isn't known yet, so it starts null;
+    // `setRunSession` fills it in once the final child/feature session
+    // is created, below.
     const runId = store.startRun({
       featureId: state.id,
       stepId: step.id,
@@ -379,15 +474,57 @@ export class LegacyEngine {
       attempt,
       role: step.role,
       ...(role.model !== undefined ? { model: role.model } : {}),
-      sessionId,
     })
 
-    const header =
-      `[conductor] Step "${step.id}" (attempt ${attempt}) — run ${runId}.\n` +
-      `When this step is complete you MUST report run_id="${runId}" ` +
-      `and outcome (succeeded/failed${step.on_verdict ? " or a verdict: " + Object.keys(step.on_verdict).join("/") : ""}).\n\n`
-
     try {
+      // Feature parent session: the grouping anchor for this feature's
+      // work. In "fresh" mode (default) it is never prompted — each step
+      // run gets its own child session beneath it (subagent-style: clean
+      // context per step). In "feature" mode the parent itself is
+      // prompted, carrying context across steps for roles that
+      // deliberately want continuity.
+      let parentId = state.sessionId
+      let createdParent = false
+      if (parentId && !(await sessions.sessionExists(parentId))) {
+        log.log(`feature=${state.slug}: stored session ${parentId} is gone — creating a new one`)
+        parentId = null
+      }
+      if (!parentId) {
+        const created = await sessions.createSession({
+          title: `[conductor] ${state.title}`,
+          directory: state.worktree ?? state.projectDir,
+        })
+        parentId = created.id
+        createdParent = true
+      }
+
+      const isolation = role.session ?? "fresh"
+      const sessionId = isolation === "feature"
+        ? parentId
+        : (
+            await sessions.createSession({
+              title: `[${role.agent}] ${state.title}${attempt > 1 ? ` (attempt ${attempt})` : ""}`,
+              directory: state.worktree ?? state.projectDir,
+              parentID: parentId,
+            })
+          ).id
+
+      // The run may have already been reaped (TTL, missing parent
+      // session, restart recovery) while session creation above was
+      // in flight — `setRunSession`'s `WHERE status = 'running'` guard
+      // catches that: a false return means nobody owns this session
+      // anymore, and prompting it would dispatch a retry run's step to
+      // an orphan session no one is tracking. Bail without prompting.
+      if (!store.setRunSession(runId, sessionId, createdParent ? parentId : undefined)) {
+        log.log(`feature=${state.slug}: run ${runId} concluded before its session was ready — not prompting`)
+        return
+      }
+
+      const header =
+        `[conductor] Step "${step.id}" (attempt ${attempt}) — run ${runId}.\n` +
+        `When this step is complete you MUST report run_id="${runId}" ` +
+        `and outcome (succeeded/failed${step.on_verdict ? " or a verdict: " + Object.keys(step.on_verdict).join("/") : ""}).\n\n`
+
       await sessions.prompt({
         sessionID: sessionId,
         text: header + rendered.text,
@@ -402,12 +539,12 @@ export class LegacyEngine {
         )
       }
     } catch (err) {
-      store.finishRun(runId, "failed", { reason: `prompt failed: ${err instanceof Error ? err.message : String(err)}` })
-      await this.dispatch(state.id, {
-        kind: "step.failed",
-        stepId: step.id,
-        reason: `failed to prompt session: ${err instanceof Error ? err.message : String(err)}`,
-      })
+      const message = err instanceof Error ? err.message : String(err)
+      const reason = `failed to prompt session: ${message}`
+      const event: LegacyPipelineEvent = { kind: "step.failed", stepId: step.id, reason }
+      const { claimed, decision } = this.concludeAndTransition(state.id, runId, "failed", { reason: `prompt failed: ${message}` }, event)
+      if (!claimed) return
+      await this.actAndMarkHandled(state.id, runId, decision)
     }
   }
 
@@ -429,8 +566,18 @@ export class LegacyEngine {
     }
   }
 
-  private async reconcileFeature(feature: LegacyFeatureState): Promise<void> {
+  private async reconcileFeature(input: LegacyFeatureState): Promise<void> {
     const { store, log } = this.deps
+
+    // Restart recovery runs FIRST, unconditionally: a decision committed
+    // by `concludeRun` but never acted on (process died in the gap) can
+    // leave the feature at ANY of running/waiting_human/escalated — all
+    // three are in `activeOnly`, so every one of them reaches here. The
+    // normal current-step logic below must see the POST-recovery state,
+    // not the snapshot `reconcile()` listed before recovery ran.
+    await this.recoverPendingAction(input)
+    const feature = store.getFeature(input.id) ?? input
+
     if (feature.status !== "running") return
     if (feature.currentStep === null) return
     const config = this.configFor(feature)
@@ -461,8 +608,9 @@ export class LegacyEngine {
       return
     }
 
-    // No run for the current step at all → the execute decision was made
-    // but the process died before the run started. Re-execute.
+    // No run for the current step means the process died before dispatch
+    // created one. Completed transitions are recovered from the durable
+    // decision outbox before this fallback is reached.
     if (!active) {
       const lastOutput = store.getLastOutput(feature.id, step.id)
       if (lastOutput === null) {
@@ -483,9 +631,12 @@ export class LegacyEngine {
       if (sessionStatus === "missing") {
         log.log(`reconcile ${feature.slug}: run ${active.id} session is gone — reaping immediately`)
         this.idleCycles.delete(active.id)
-        store.finishRun(active.id, "reaped", { reason: "session disappeared (server restart?)" })
+        const reason = "session disappeared before reporting"
+        const event: LegacyPipelineEvent = { kind: "step.failed", stepId: active.stepId, reason }
+        const { claimed, decision } = this.concludeAndTransition(feature.id, active.id, "reaped", { reason: "session disappeared (server restart?)" }, event)
+        if (!claimed) return
         await this.noteParent(feature.id, `[conductor] ⚠ ${active.stepId} reaped — session disappeared before reporting`)
-        await this.dispatch(feature.id, { kind: "step.failed", stepId: active.stepId, reason: "session disappeared before reporting" })
+        await this.actAndMarkHandled(feature.id, active.id, decision)
         return
       }
       if (sessionStatus === "busy" || sessionStatus === "retry") {
@@ -512,13 +663,20 @@ export class LegacyEngine {
             return
           }
           log.log(`reconcile ${feature.slug}: run ${active.id} idle after ${config.maxNudges} nudges — reaping`)
-          store.finishRun(active.id, "reaped", { reason: `idle without report after ${active.nudges} nudge(s)` })
-          await this.noteParent(feature.id, `[conductor] ⚠ ${active.stepId} reaped — idle without report after ${active.nudges} nudge(s)`)
-          await this.dispatch(feature.id, {
-            kind: "step.failed",
-            stepId: active.stepId,
-            reason: `run reaped: session idle without report after ${active.nudges} nudge(s)`,
-          })
+          {
+            const reason = `run reaped: session idle without report after ${active.nudges} nudge(s)`
+            const event: LegacyPipelineEvent = { kind: "step.failed", stepId: active.stepId, reason }
+            const { claimed, decision } = this.concludeAndTransition(
+              feature.id,
+              active.id,
+              "reaped",
+              { reason: `idle without report after ${active.nudges} nudge(s)` },
+              event,
+            )
+            if (!claimed) return
+            await this.noteParent(feature.id, `[conductor] ⚠ ${active.stepId} reaped — idle without report after ${active.nudges} nudge(s)`)
+            await this.actAndMarkHandled(feature.id, active.id, decision)
+          }
           return
         }
       }
@@ -529,13 +687,19 @@ export class LegacyEngine {
     if (age > config.runTtlMs) {
       log.log(`reconcile ${feature.slug}: run ${active.id} (step ${active.stepId}) exceeded TTL — reaping`)
       this.idleCycles.delete(active.id)
-      store.finishRun(active.id, "reaped", { reason: `no effect after ${Math.round(age / 60000)} min` })
-      await this.noteParent(feature.id, `[conductor] ⚠ ${active.stepId} reaped — no report after ${Math.round(age / 60000)} min`)
-      await this.dispatch(feature.id, {
-        kind: "step.failed",
-        stepId: active.stepId,
-        reason: `run reaped after ${Math.round(age / 60000)} min without a report`,
-      })
+      const reason = `run reaped after ${Math.round(age / 60000)} min without a report`
+      const event: LegacyPipelineEvent = { kind: "step.failed", stepId: active.stepId, reason }
+      const { claimed, decision } = this.concludeAndTransition(
+        feature.id,
+        active.id,
+        "reaped",
+        { reason: `no effect after ${Math.round(age / 60000)} min` },
+        event,
+      )
+      if (claimed) {
+        await this.noteParent(feature.id, `[conductor] ⚠ ${active.stepId} reaped — no report after ${Math.round(age / 60000)} min`)
+        await this.actAndMarkHandled(feature.id, active.id, decision)
+      }
     }
   }
 
@@ -591,6 +755,15 @@ export class LegacyEngine {
   /**
    * Called by the daemon's report endpoint from inside agent sessions.
    * The ONLY path by which an agent step concludes.
+   *
+   * Claims the run and persists the resulting feature transition
+   * atomically (`concludeAndTransition`) BEFORE any finding insertion,
+   * GitHub publish, or timeline note — those are all best-effort
+   * projections of state that is already durable the moment `claimed`
+   * comes back true. A duplicate/concurrent `report()` for the same run
+   * (e.g. an agent retries after a client-side timeout) loses the atomic
+   * claim and returns "already concluded" without inserting a finding,
+   * publishing, or leaving a timeline note twice.
    */
   async report(input: {
     runId: string
@@ -605,15 +778,29 @@ export class LegacyEngine {
 
     const who = run.role ?? run.stepId
     const attemptTag = run.attempt > 1 ? ` (attempt ${run.attempt})` : ""
+    const alreadyConcluded = (): string => {
+      const status = store.getRunById(input.runId)?.status ?? run.status
+      return `Run ${input.runId} already concluded (${status}).`
+    }
 
     if (input.verdict !== undefined) {
-      store.finishRun(input.runId, "succeeded", { output: input.notes ?? input.verdict })
-      // Publish the review to the PR BEFORE routing the verdict: when the
-      // verdict sends a fixer in, the PR threads it must reply to already
-      // exist. Best-effort — a failed projection never blocks the
-      // pipeline. Persist findings as DB rows FIRST — the database is the
-      // source of truth for review state; GitHub is a projection synced
-      // from it.
+      const event: LegacyPipelineEvent = { kind: "step.verdict", stepId: run.stepId, verdict: input.verdict }
+      const { claimed, decision } = this.concludeAndTransition(
+        run.featureId,
+        input.runId,
+        "succeeded",
+        { output: input.notes ?? input.verdict },
+        event,
+      )
+      if (!claimed) return alreadyConcluded()
+
+      // Persist findings as DB rows FIRST — the database is the source of
+      // truth for review state; GitHub is a projection synced from it.
+      // Publish the review to the PR BEFORE routing the verdict (`act`):
+      // when the verdict sends a fixer in, the PR threads it must reply
+      // to already exist. Best-effort — a failed projection never blocks
+      // the pipeline; the feature transition above is already durable
+      // regardless of what happens here.
       const review = input.notes ? parseFindingsLegacy(input.notes) : null
       let findingIds: string[] = []
       if (review && review.findings.length > 0) {
@@ -631,12 +818,21 @@ export class LegacyEngine {
           (publishStatus ? ` · ${publishStatus}` : "") +
           (digest ? `\n${digest}` : ""),
       )
-      await this.dispatch(run.featureId, { kind: "step.verdict", stepId: run.stepId, verdict: input.verdict })
+      await this.actAndMarkHandled(run.featureId, input.runId, decision)
       return `Verdict "${input.verdict}" recorded for step "${run.stepId}".`
     }
 
     if (input.outcome === "succeeded") {
-      store.finishRun(input.runId, "succeeded", { output: input.notes ?? "" })
+      const event: LegacyPipelineEvent = { kind: "step.succeeded", stepId: run.stepId, output: input.notes ?? "" }
+      const { claimed, decision } = this.concludeAndTransition(
+        run.featureId,
+        input.runId,
+        "succeeded",
+        { output: input.notes ?? "" },
+        event,
+      )
+      if (!claimed) return alreadyConcluded()
+
       // Fixer resolutions: {"resolutions":[{"id":"F3","status":"fixed","note":"..."}]}
       // update the DB source of truth; findings.sync projects to GitHub
       // later.
@@ -652,16 +848,19 @@ export class LegacyEngine {
           (applied.length > 0 ? ` · findings: ${applied.join(", ")}` : "") +
           (input.notes ? `\n${LegacyEngine.clip(input.notes)}` : ""),
       )
-      await this.dispatch(run.featureId, { kind: "step.succeeded", stepId: run.stepId, output: input.notes ?? "" })
+      await this.actAndMarkHandled(run.featureId, input.runId, decision)
       return `Step "${run.stepId}" marked succeeded.`
     }
 
-    store.finishRun(input.runId, "failed", { reason: input.notes ?? "reported failed" })
+    const reason = input.notes ?? "reported failed"
+    const event: LegacyPipelineEvent = { kind: "step.failed", stepId: run.stepId, reason }
+    const { claimed, decision } = this.concludeAndTransition(run.featureId, input.runId, "failed", { reason }, event)
+    if (!claimed) return alreadyConcluded()
     await this.noteParent(
       run.featureId,
       `[conductor] ${who} · ${run.stepId}${attemptTag} → failed` + (input.notes ? `\n${LegacyEngine.clip(input.notes)}` : ""),
     )
-    await this.dispatch(run.featureId, { kind: "step.failed", stepId: run.stepId, reason: input.notes ?? "reported failed" })
+    await this.actAndMarkHandled(run.featureId, input.runId, decision)
     return `Step "${run.stepId}" marked failed.`
   }
 

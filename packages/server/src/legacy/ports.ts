@@ -9,7 +9,7 @@
  * a real daemon without touching engine/builtin code.
  */
 
-import type { LegacyFeatureState, LegacyPipelineEvent, LegacyTransition } from "../store.ts"
+import type { LegacyDecision, LegacyFeatureState, LegacyPipelineEvent, LegacyTransition } from "../store.ts"
 import type { LegacyConfig } from "./types.ts"
 
 // --------------------------------------------------------------- clock
@@ -204,6 +204,16 @@ export interface LegacyStorePort {
     sessionId?: string
   }): string
   finishRun(runId: string, status: "succeeded" | "failed" | "reaped", detail?: { output?: string; reason?: string }): void
+  setRunSession(runId: string, sessionId: string, featureSessionId?: string): boolean
+  concludeRun(
+    runId: string,
+    status: "succeeded" | "failed" | "reaped",
+    detail: { output?: string; reason?: string } | undefined,
+    event: LegacyPipelineEvent,
+    transition: LegacyTransition,
+  ): boolean
+  getPendingRunAction(featureId: string): { runId: string; decision: LegacyDecision } | null
+  markRunActionHandled(runId: string): boolean
   getActiveRun(featureId: string): {
     id: string
     stepId: string
@@ -220,6 +230,9 @@ export interface LegacyStorePort {
     status: string
     role: string | null
     attempt: number
+    output: string | null
+    reason: string | null
+    completionEvent: string | null
   } | null
   getLastHumanNotes(featureId: string, stepId: string): string | null
   getLastOutput(featureId: string, stepId: string): string | null

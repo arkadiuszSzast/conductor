@@ -134,10 +134,32 @@ interpolated into a shell string; refs are validated with
 `command`-type pipeline steps are the one path that legitimately renders a
 shell string, via `ProcessRunner.shell`.
 
-`Store.applyTransition` is unchanged by this extraction: it still writes the
-feature-state UPDATE and the transition-log INSERT inside one
-`db.transaction`, so decision and audit remain atomic (see "Durability,
-concurrency and observability" below).
+**Accepted risk — untrusted text in `command` step templates:** template
+rendering does no shell-escaping, and the template context includes values
+that are not purely project-config-controlled: `{{human.<step>}}` (free-text
+human gate notes), `{{steps.<id>.output}}` (agent-reported text, which can
+itself echo untrusted repo/PR content back via prompt injection), and
+`{{findings.*}}` (finding bodies extracted from a PR diff/comment). A
+`command` step's `run:` entries interpolating any of these into shell syntax
+(e.g. `` echo "{{steps.review.output}}" | some-tool ``) lets a crafted
+finding body, human note, or agent note containing shell metacharacters
+(`` ` ``, `$()`, `;`) execute as command injection in the feature's
+worktree. This is preserved, not fixed, by this extraction: `command` steps
+are authored by the project (trusted `run:` shell text), but the *values*
+substituted into that text are not all trusted. Config authors must not
+interpolate `{{human.*}}`, `{{steps.*.output}}`, or `{{findings.*}}` into
+shell syntax in a `command` step's `run:`; prefer a deterministic `builtin`
+argv action (or pass the value via an env var / file, never inline shell
+text) wherever the value may contain untrusted content.
+
+`Store.applyTransition` still writes the feature-state update and transition
+audit inside one transaction. Run completion paths additionally use
+`Store.concludeRun`: a conditional `status = 'running'` claim, the durable
+completion event, feature transition and audit are committed together. This
+closes both duplicate-report races and the restart window where a concluded run
+could otherwise remain on its old current step. Agent runs are inserted before
+session setup begins, so a concurrent reconcile pass observes the in-flight run
+instead of dispatching the step twice.
 
 This task does not touch `ActionRegistry`/graph-reservation
 (`workflow-reservation.ts`, `action-registry.ts`): that machinery belongs to
