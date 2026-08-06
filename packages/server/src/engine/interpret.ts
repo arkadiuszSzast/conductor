@@ -1,9 +1,9 @@
 /**
- * The legacy pipeline interpreter — a pure function.
+ * The pipeline interpreter — a pure function.
  *
  *   (pipeline definition, feature state, event) → transition
  *
- * No I/O, no clock, no randomness. `LegacyEngine` owns all side effects;
+ * No I/O, no clock, no randomness. `Engine` owns all side effects;
  * this module owns ALL routing decisions, ported unchanged from
  * opencode-conductor's `src/pipeline/interpret.ts`. Kept pure so every
  * pipeline shape is unit-testable without a database, a git repo, or an
@@ -11,21 +11,21 @@
  */
 
 import type {
-  LegacyDecision,
-  LegacyFeatureState,
-  LegacyPipelineEvent,
-  LegacyTransition,
+  Decision,
+  FeatureState,
+  PipelineEvent,
+  Transition,
 } from "../store.ts"
-import type { LegacyAgentStep, LegacyPipelineDef, LegacyStepDef } from "./types.ts"
+import type { AgentStep, PipelineDef, StepDef } from "./types.ts"
 
 const DEFAULT_MAX_ATTEMPTS = 1
 const DEFAULT_MAX_ROUNDS = 3
 
-export function interpretLegacy(
-  def: LegacyPipelineDef,
-  state: LegacyFeatureState,
-  event: LegacyPipelineEvent,
-): LegacyTransition {
+export function interpret(
+  def: PipelineDef,
+  state: FeatureState,
+  event: PipelineEvent,
+): Transition {
   switch (event.kind) {
     case "feature.start":
       return enter(def, state, firstRunnableStep(def))
@@ -50,19 +50,19 @@ export function interpretLegacy(
 
 // ---------------------------------------------------------------------------
 
-function stepById(def: LegacyPipelineDef, id: string): LegacyStepDef | undefined {
+function stepById(def: PipelineDef, id: string): StepDef | undefined {
   return def.pipeline.find(s => s.id === id)
 }
 
-function stepIndex(def: LegacyPipelineDef, id: string): number {
+function stepIndex(def: PipelineDef, id: string): number {
   return def.pipeline.findIndex(s => s.id === id)
 }
 
-function firstRunnableStep(def: LegacyPipelineDef): string | null {
+function firstRunnableStep(def: PipelineDef): string | null {
   return def.pipeline[0]?.id ?? null
 }
 
-function nextStepId(def: LegacyPipelineDef, current: LegacyStepDef): string | null {
+function nextStepId(def: PipelineDef, current: StepDef): string | null {
   if (current.then !== undefined) return current.then
   // A rounds_with partner (the fix step of a review loop) is not part of
   // the linear flow — entering it only makes sense via an explicit goto.
@@ -76,7 +76,7 @@ function nextStepId(def: LegacyPipelineDef, current: LegacyStepDef): string | nu
 }
 
 /** Enter a step (or finish when there is none left). */
-function enter(def: LegacyPipelineDef, state: LegacyFeatureState, stepId: string | null): LegacyTransition {
+function enter(def: PipelineDef, state: FeatureState, stepId: string | null): Transition {
   if (stepId === null) {
     return { decision: { kind: "finish" }, patch: { status: "done", currentStep: null } }
   }
@@ -99,7 +99,7 @@ function enter(def: LegacyPipelineDef, state: LegacyFeatureState, stepId: string
   }
 }
 
-function onSucceeded(def: LegacyPipelineDef, state: LegacyFeatureState, stepId: string): LegacyTransition {
+function onSucceeded(def: PipelineDef, state: FeatureState, stepId: string): Transition {
   const step = stepById(def, stepId)
   if (!step) {
     return {
@@ -117,11 +117,11 @@ function onSucceeded(def: LegacyPipelineDef, state: LegacyFeatureState, stepId: 
 }
 
 function onFailed(
-  def: LegacyPipelineDef,
-  state: LegacyFeatureState,
+  def: PipelineDef,
+  state: FeatureState,
   stepId: string,
   reason: string,
-): LegacyTransition {
+): Transition {
   const step = stepById(def, stepId)
   if (!step) {
     return {
@@ -171,11 +171,11 @@ function onFailed(
 }
 
 function onVerdict(
-  def: LegacyPipelineDef,
-  state: LegacyFeatureState,
+  def: PipelineDef,
+  state: FeatureState,
   stepId: string,
   verdict: string,
-): LegacyTransition {
+): Transition {
   const step = stepById(def, stepId)
   if (!step || step.type !== "agent") {
     return {
@@ -229,7 +229,7 @@ function onVerdict(
   return { decision: target.decision, patch: { ...target.patch, rounds } }
 }
 
-function onHumanApproved(state: LegacyFeatureState, stepId: string): LegacyTransition {
+function onHumanApproved(state: FeatureState, stepId: string): Transition {
   if (state.status !== "waiting_human" || state.currentStep !== stepId) {
     return {
       decision: { kind: "noop", reason: `no pending human approval for "${stepId}"` },
@@ -249,7 +249,7 @@ function onHumanApproved(state: LegacyFeatureState, stepId: string): LegacyTrans
  * dispatching, so downstream prompts can template them in. A gate
  * without on_reject escalates — rejection always has an effect.
  */
-function onHumanRejected(def: LegacyPipelineDef, state: LegacyFeatureState, stepId: string): LegacyTransition {
+function onHumanRejected(def: PipelineDef, state: FeatureState, stepId: string): Transition {
   if (state.status !== "waiting_human" || state.currentStep !== stepId) {
     return {
       decision: { kind: "noop", reason: `no pending human approval for "${stepId}"` },
@@ -272,7 +272,7 @@ function onHumanRejected(def: LegacyPipelineDef, state: LegacyFeatureState, step
   }
 }
 
-function onResumed(def: LegacyPipelineDef, state: LegacyFeatureState): LegacyTransition {
+function onResumed(def: PipelineDef, state: FeatureState): Transition {
   if (state.status !== "paused" && state.status !== "escalated") {
     return { decision: { kind: "noop", reason: "feature is not paused or escalated" }, patch: {} }
   }
@@ -316,8 +316,8 @@ function onResumed(def: LegacyPipelineDef, state: LegacyFeatureState): LegacyTra
 }
 
 /** Convenience for tests and the engine: is this decision terminal? */
-export function isTerminalLegacy(decision: LegacyDecision): boolean {
+export function isTerminal(decision: Decision): boolean {
   return decision.kind === "finish" || decision.kind === "abandon" || decision.kind === "escalate"
 }
 
-export type { LegacyAgentStep }
+export type { AgentStep }

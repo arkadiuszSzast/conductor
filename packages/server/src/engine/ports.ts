@@ -1,16 +1,16 @@
 /**
- * Explicit dependency interfaces for the legacy compatibility engine.
+ * Explicit dependency interfaces for the pipeline engine.
  *
- * Nothing in `legacy/` reaches for an opencode SDK import, a process-wide
+ * Nothing in `engine/` reaches for an opencode SDK import, a process-wide
  * global, `Date.now()`, `process.cwd()`, or a hardcoded model gateway —
  * every side effect the engine or its builtins need crosses one of these
  * ports, injected by the caller (daemon wiring or tests). This is what
- * lets the legacy engine be tested with fakes and later re-hosted behind
+ * lets the engine be tested with fakes and later re-hosted behind
  * a real daemon without touching engine/builtin code.
  */
 
-import type { LegacyDecision, LegacyFeatureState, LegacyPipelineEvent, LegacyTransition } from "../store.ts"
-import type { LegacyConfig } from "./types.ts"
+import type { Decision, FeatureState, PipelineEvent, Transition } from "../store.ts"
+import type { EngineConfig } from "./types.ts"
 
 // --------------------------------------------------------------- clock
 
@@ -67,11 +67,11 @@ export interface ProcessRunner {
 // ------------------------------------------------------------ sessions
 
 /**
- * Minimal, runtime-agnostic surface the legacy engine needs from an
+ * Minimal, runtime-agnostic surface the engine needs from an
  * agent runner. No opencode SDK types leak through this port — runners
  * (opencode today, others later) implement it against their own client.
  */
-export interface LegacySessionClient {
+export interface SessionClient {
   createSession(input: { title: string; directory: string; parentID?: string }): Promise<{ id: string }>
   prompt(input: {
     sessionID: string
@@ -96,13 +96,13 @@ export interface LegacySessionClient {
 
 // ----------------------------------------------------------------- gh
 
-export interface LegacyCheckSummary {
+export interface CheckSummary {
   readonly allConcluded: boolean
   readonly anyFailed: boolean
   readonly failedNames: readonly string[]
 }
 
-export interface LegacyReviewThread {
+export interface ReviewThread {
   /** GraphQL node id — the handle for resolveReviewThread. */
   readonly id: string
   /** Login of the FIRST comment's author (the reviewer who opened it). */
@@ -116,7 +116,7 @@ export interface LegacyReviewThread {
   readonly path: string
 }
 
-export interface LegacyPrView {
+export interface PrView {
   readonly number: number
   readonly headSha: string
   readonly state: "OPEN" | "MERGED" | "CLOSED"
@@ -128,9 +128,9 @@ export interface LegacyPrView {
  * implements it over an injected `ProcessRunner` — no bare `spawn`, no
  * `process.cwd()` fallback.
  */
-export interface LegacyGh {
-  prChecks(repo: string, pr: number): Promise<LegacyCheckSummary>
-  prView(repo: string, pr: number): Promise<LegacyPrView>
+export interface GhClient {
+  prChecks(repo: string, pr: number): Promise<CheckSummary>
+  prView(repo: string, pr: number): Promise<PrView>
   prCreate(repo: string, opts: {
     title: string
     body: string
@@ -141,7 +141,7 @@ export interface LegacyGh {
   prMerge(repo: string, pr: number): Promise<void>
   unresolvedThreadCount(repo: string, pr: number): Promise<number>
   /** Unresolved review threads with enough detail to decide auto-resolution. */
-  unresolvedThreads(repo: string, pr: number): Promise<readonly LegacyReviewThread[]>
+  unresolvedThreads(repo: string, pr: number): Promise<readonly ReviewThread[]>
   /** Resolve a review thread (GraphQL resolveReviewThread mutation). */
   resolveThread(threadId: string): Promise<void>
   /** Reply inside a review thread (before resolving it). */
@@ -159,35 +159,35 @@ export interface LegacyGh {
    * REST reviews endpoint. Returns the raw failure text on error so
    * callers can apply the seed's degrade-and-retry heuristics.
    */
-  postReview(repo: string, pr: number, payload: LegacyReviewPayload, opts: { cwd: string; token?: string }): Promise<{ ok: true } | { ok: false; error: string }>
+  postReview(repo: string, pr: number, payload: ReviewPayload, opts: { cwd: string; token?: string }): Promise<{ ok: true } | { ok: false; error: string }>
 }
 
-export interface LegacyReviewComment {
+export interface ReviewComment {
   readonly path: string
   readonly line: number
   readonly side: "LEFT" | "RIGHT"
   readonly body: string
 }
 
-export interface LegacyReviewPayload {
+export interface ReviewPayload {
   readonly event: string
   readonly body: string
-  readonly comments?: readonly LegacyReviewComment[]
+  readonly comments?: readonly ReviewComment[]
 }
 
 // -------------------------------------------------------------- store
 
 /**
- * Store port the legacy engine depends on. `Store` (`../store.ts`)
+ * Store port the engine depends on. `Store` (`../store.ts`)
  * satisfies this structurally; the engine and builtins are written
  * against the interface, not the concrete class, so a different backing
  * store can be substituted in tests or a future migration.
  */
-export interface LegacyStorePort {
-  getFeature(id: string): LegacyFeatureState | null
-  listFeatures(filter?: { activeOnly?: boolean; projectDir?: string }): LegacyFeatureState[]
-  findFeatureByPr(pr: number): LegacyFeatureState | null
-  applyTransition(featureId: string, event: LegacyPipelineEvent, transition: LegacyTransition): void
+export interface StorePort {
+  getFeature(id: string): FeatureState | null
+  listFeatures(filter?: { activeOnly?: boolean; projectDir?: string }): FeatureState[]
+  findFeatureByPr(pr: number): FeatureState | null
+  applyTransition(featureId: string, event: PipelineEvent, transition: Transition): void
   setFeatureFields(id: string, fields: Partial<{
     sessionId: string | null
     worktree: string | null
@@ -209,10 +209,10 @@ export interface LegacyStorePort {
     runId: string,
     status: "succeeded" | "failed" | "reaped",
     detail: { output?: string; reason?: string } | undefined,
-    event: LegacyPipelineEvent,
-    transition: LegacyTransition,
+    event: PipelineEvent,
+    transition: Transition,
   ): boolean
-  getPendingRunAction(featureId: string): { runId: string; decision: LegacyDecision } | null
+  getPendingRunAction(featureId: string): { runId: string; decision: Decision } | null
   markRunActionHandled(runId: string): boolean
   getActiveRun(featureId: string): {
     id: string
@@ -278,21 +278,21 @@ export interface LegacyStorePort {
 // --------------------------------------------------------- config resolver
 
 /**
- * Resolves the legacy config for a project directory. ONE engine serves
+ * Resolves the engine config for a project directory. ONE engine serves
  * every project sharing the DB; each feature is interpreted under ITS
  * OWN project's pipeline/roles/limits. Returns null when the project has
  * no (valid) config — its features are skipped, never guessed at.
  */
-export type LegacyConfigResolver = (projectDir: string) => LegacyConfig | null
+export type ConfigResolver = (projectDir: string) => EngineConfig | null
 
 // -------------------------------------------------------------- publish
 
-export interface LegacyPublishInput {
+export interface PublishInput {
   readonly repo: string
   readonly pr: number
   readonly verdict: string
   readonly notes: string
-  readonly publish: import("./types.ts").LegacyPublishDef
+  readonly publish: import("./types.ts").PublishDef
   readonly cwd: string
   /**
    * Stable finding ids (same order as the parsed findings). Embedded in
@@ -303,4 +303,4 @@ export interface LegacyPublishInput {
 }
 
 /** Review-projection port: publish a reported review to the PR. */
-export type LegacyPublishReview = (input: LegacyPublishInput) => Promise<string>
+export type PublishReview = (input: PublishInput) => Promise<string>

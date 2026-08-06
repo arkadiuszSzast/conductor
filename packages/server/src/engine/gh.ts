@@ -1,7 +1,7 @@
 /**
- * `gh` CLI implementation of the `LegacyGh` port. All GitHub interaction
+ * `gh` CLI implementation of the `GhClient` port. All GitHub interaction
  * goes through here so builtins stay declarative and the reconciler
- * stays testable (inject a fake `LegacyGh` in tests).
+ * stays testable (inject a fake `GhClient` in tests).
  *
  * Every `gh` invocation runs through the injected `ProcessRunner` — no
  * bare `spawn`, no `process.cwd()` fallback. The caller supplies `cwd`
@@ -18,11 +18,11 @@
  */
 
 import type {
-  LegacyCheckSummary,
-  LegacyGh,
-  LegacyPrView,
-  LegacyReviewPayload,
-  LegacyReviewThread,
+  CheckSummary,
+  GhClient,
+  PrView,
+  ReviewPayload,
+  ReviewThread,
   ProcessRunner,
 } from "./ports.ts"
 
@@ -58,7 +58,7 @@ function sanitizeGhErrorOutput(text: string, token: string | undefined): string 
   return sanitized.slice(-ERROR_TAIL_MAX_CHARS)
 }
 
-export class RealGh implements LegacyGh {
+export class RealGh implements GhClient {
   constructor(
     private readonly process: ProcessRunner,
     /** Working directory for calls that do not carry their own `cwd`. */
@@ -77,7 +77,7 @@ export class RealGh implements LegacyGh {
     })
   }
 
-  async prChecks(repo: string, pr: number): Promise<LegacyCheckSummary> {
+  async prChecks(repo: string, pr: number): Promise<CheckSummary> {
     const result = await this.exec(["pr", "checks", String(pr), "--repo", repo, "--json", "name,state"])
     if (result.code !== 0) {
       // No checks reported yet is not a failure state.
@@ -93,13 +93,13 @@ export class RealGh implements LegacyGh {
     return { allConcluded, anyFailed: failed.length > 0, failedNames: failed.map(c => c.name) }
   }
 
-  async prView(repo: string, pr: number): Promise<LegacyPrView> {
+  async prView(repo: string, pr: number): Promise<PrView> {
     const result = await this.exec(["pr", "view", String(pr), "--repo", repo, "--json", "number,headRefOid,state,mergeable"])
     if (result.code !== 0) throw new Error(`gh pr view failed: ${result.stderr.trim()}`)
     const parsed = JSON.parse(result.stdout) as {
       number: number
       headRefOid: string
-      state: LegacyPrView["state"]
+      state: PrView["state"]
       mergeable: string
     }
     return { number: parsed.number, headSha: parsed.headRefOid, state: parsed.state, mergeable: parsed.mergeable }
@@ -143,7 +143,7 @@ export class RealGh implements LegacyGh {
     return parsed.data.repository.pullRequest.reviewThreads.nodes.filter(n => !n.isResolved).length
   }
 
-  async unresolvedThreads(repo: string, pr: number): Promise<readonly LegacyReviewThread[]> {
+  async unresolvedThreads(repo: string, pr: number): Promise<readonly ReviewThread[]> {
     const [owner, name] = repo.split("/")
     const query = `
       query($owner: String!, $name: String!, $pr: Int!) {
@@ -251,7 +251,7 @@ export class RealGh implements LegacyGh {
   async postReview(
     repo: string,
     pr: number,
-    payload: LegacyReviewPayload,
+    payload: ReviewPayload,
     opts: { cwd: string; token?: string },
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     const result = await this.exec(

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test"
-import { RealGh } from "./src/legacy/gh.ts"
-import type { ProcessExecOptions, ProcessExecResult, ProcessRunner } from "./src/legacy/ports.ts"
+import { RealGh } from "./src/engine/gh.ts"
+import type { ProcessExecOptions, ProcessExecResult, ProcessRunner } from "./src/engine/ports.ts"
 
 function fakeProcess(handler: (command: readonly string[], options: ProcessExecOptions) => ProcessExecResult): ProcessRunner {
   return {

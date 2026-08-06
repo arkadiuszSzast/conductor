@@ -1,5 +1,5 @@
 /**
- * Minimal {{path.to.value}} template rendering for legacy step prompts and
+ * Minimal {{path.to.value}} template rendering for pipeline step prompts and
  * params. Ported unchanged from opencode-conductor's
  * `src/pipeline/template.ts`. Deliberately tiny: no conditionals, no
  * loops, no escaping directives. Unknown variables render as an empty
@@ -7,7 +7,7 @@
  * instead of silently producing a half-empty prompt.
  */
 
-export interface LegacyRenderResult {
+export interface RenderResult {
   readonly text: string
   /** Variables referenced by the template but absent from the context. */
   readonly missing: readonly string[]
@@ -15,7 +15,7 @@ export interface LegacyRenderResult {
 
 const VAR_PATTERN = /\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g
 
-export function renderLegacy(template: string, context: Record<string, unknown>): LegacyRenderResult {
+export function renderTemplate(template: string, context: Record<string, unknown>): RenderResult {
   const missing: string[] = []
   const text = template.replace(VAR_PATTERN, (_match, path: string) => {
     const value = lookup(context, path)

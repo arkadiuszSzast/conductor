@@ -4,10 +4,10 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { openMigratedDatabase, type DatabaseConnection } from "./src/database.ts"
 import { Store } from "./src/store.ts"
-import { LegacyEngine, type LegacyEngineDeps } from "./src/legacy/engine.ts"
-import { interpretLegacy } from "./src/legacy/interpret.ts"
-import type { LegacyGh, LegacyCheckSummary, LegacyPrView, LegacyPublishReview, LegacySessionClient, ProcessExecOptions, ProcessExecResult, ProcessRunner } from "./src/legacy/ports.ts"
-import type { LegacyConfig, LegacyPipelineDef } from "./src/legacy/types.ts"
+import { Engine, type EngineDeps } from "./src/engine/engine.ts"
+import { interpret } from "./src/engine/interpret.ts"
+import type { GhClient, CheckSummary, PrView, PublishReview, SessionClient, ProcessExecOptions, ProcessExecResult, ProcessRunner } from "./src/engine/ports.ts"
+import type { EngineConfig, PipelineDef } from "./src/engine/types.ts"
 
 /** A promise plus its resolve/reject, for tests that need to control interleaving explicitly. */
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (err: unknown) => void } {
@@ -22,14 +22,14 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reje
 
 // ---------------------------------------------------------------- fakes
 
-class FakeGh implements LegacyGh {
-  checks: LegacyCheckSummary = { allConcluded: false, anyFailed: false, failedNames: [] }
-  view: LegacyPrView = { number: 7, headSha: "sha-1", state: "OPEN", mergeable: "MERGEABLE" }
+class FakeGh implements GhClient {
+  checks: CheckSummary = { allConcluded: false, anyFailed: false, failedNames: [] }
+  view: PrView = { number: 7, headSha: "sha-1", state: "OPEN", mergeable: "MERGEABLE" }
   merged: number[] = []
-  async prChecks(): Promise<LegacyCheckSummary> {
+  async prChecks(): Promise<CheckSummary> {
     return this.checks
   }
-  async prView(): Promise<LegacyPrView> {
+  async prView(): Promise<PrView> {
     return this.view
   }
   async prCreate(): Promise<number> {
@@ -58,7 +58,7 @@ class FakeGh implements LegacyGh {
   }
 }
 
-class FakeSessions implements LegacySessionClient {
+class FakeSessions implements SessionClient {
   prompts: Array<{ sessionID: string; text: string; agent?: string; model?: string }> = []
   created: string[] = []
   parents = new Map<string, string>()
@@ -128,7 +128,7 @@ class FakeClock {
 }
 
 /** A minimal review pipeline: await_ci (builtin, polls) → external_review (agent) → merge (human gate). */
-const def: LegacyPipelineDef = {
+const def: PipelineDef = {
   roles: {
     reviewer_external: { agent: "review-agent", model: "prov/review" },
     fixer: { agent: "fix-agent", model: "prov/impl" },
@@ -148,7 +148,7 @@ const def: LegacyPipelineDef = {
   ],
 }
 
-function makeConfig(over: Partial<LegacyConfig> = {}): LegacyConfig {
+function makeConfig(over: Partial<EngineConfig> = {}): EngineConfig {
   return {
     pipeline: def.pipeline,
     roles: def.roles,
@@ -185,8 +185,8 @@ afterEach(() => {
   rmSync(directory, { recursive: true, force: true })
 })
 
-function makeEngine(config: LegacyConfig, overrides: Partial<LegacyEngineDeps> = {}): LegacyEngine {
-  return new LegacyEngine({
+function makeEngine(config: EngineConfig, overrides: Partial<EngineDeps> = {}): Engine {
+  return new Engine({
     store,
     resolveConfig: () => config,
     gh,
@@ -198,7 +198,7 @@ function makeEngine(config: LegacyConfig, overrides: Partial<LegacyEngineDeps> =
   })
 }
 
-describe("LegacyEngine: dispatch drives builtin polling into an agent step", () => {
+describe("Engine: dispatch drives builtin polling into an agent step", () => {
   it("await_ci pending leaves the run open; green CI advances to external_review", async () => {
     const config = makeConfig()
     const engine = makeEngine(config)
@@ -219,7 +219,7 @@ describe("LegacyEngine: dispatch drives builtin polling into an agent step", () 
   })
 })
 
-describe("LegacyEngine: executeAgent claims its run before any await — no reconcile double-dispatch", () => {
+describe("Engine: executeAgent claims its run before any await — no reconcile double-dispatch", () => {
   it("a reconcile() interleaved mid-session-setup sees the claimed run and does not re-execute", async () => {
     const config = makeConfig()
     const engine = makeEngine(config)
@@ -292,7 +292,7 @@ describe("LegacyEngine: executeAgent claims its run before any await — no reco
   })
 })
 
-describe("LegacyEngine: durable action recovery", () => {
+describe("Engine: durable action recovery", () => {
   it("replays a persisted same-step verdict decision once after restart", async () => {
     const config = makeConfig()
     const engine = makeEngine(config)
@@ -305,7 +305,7 @@ describe("LegacyEngine: durable action recovery", () => {
     const state = store.getFeature(feature.id)
     if (!run || !state) throw new Error("missing active review run")
     const event = { kind: "step.verdict", stepId: "external_review", verdict: "changes_requested" } as const
-    const transition = interpretLegacy(def, state, event)
+    const transition = interpret(def, state, event)
     expect(store.concludeRun(run.id, "succeeded", { output: "changes requested" }, event, transition)).toBe(true)
     expect(store.getPendingRunAction(feature.id)?.decision).toEqual({ kind: "execute", stepId: "external_review" })
 
@@ -320,7 +320,7 @@ describe("LegacyEngine: durable action recovery", () => {
   })
 })
 
-describe("LegacyEngine: report — explicit-report-only completion", () => {
+describe("Engine: report — explicit-report-only completion", () => {
   it("verdict report advances via on_verdict and records findings as DB source of truth", async () => {
     const config = makeConfig()
     const engine = makeEngine(config)
@@ -363,7 +363,7 @@ describe("LegacyEngine: report — explicit-report-only completion", () => {
   it("atomic report: feature transition is durable before publish resolves; next agent dispatch waits for it", async () => {
     let publishReached = false
     const publishGate = deferred<string>()
-    const publishReview: LegacyPublishReview = async () => {
+    const publishReview: PublishReview = async () => {
       publishReached = true
       return publishGate.promise
     }
@@ -411,7 +411,7 @@ describe("LegacyEngine: report — explicit-report-only completion", () => {
 
   it("concurrent duplicate verdict reports (Promise.all) claim exactly once: one finding, one publish, one transition", async () => {
     let publishCalls = 0
-    const publishReview: LegacyPublishReview = async () => {
+    const publishReview: PublishReview = async () => {
       publishCalls++
       return "publish: comment posted"
     }
@@ -440,7 +440,7 @@ describe("LegacyEngine: report — explicit-report-only completion", () => {
   })
 })
 
-describe("LegacyEngine: human gates", () => {
+describe("Engine: human gates", () => {
   it("approve executes the gated step; requestChanges without on_reject escalates", async () => {
     const config = makeConfig()
     const engine = makeEngine(config)
@@ -474,8 +474,8 @@ describe("LegacyEngine: human gates", () => {
   })
 })
 
-describe("LegacyEngine: reaper — TTL and idle/nudge/missing-session behaviour", () => {
-  async function startReview(over: Partial<LegacyConfig> = {}) {
+describe("Engine: reaper — TTL and idle/nudge/missing-session behaviour", () => {
+  async function startReview(over: Partial<EngineConfig> = {}) {
     const config = makeConfig(over)
     const engine = makeEngine(config)
     const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/tmp/p" })
@@ -550,7 +550,7 @@ describe("LegacyEngine: reaper — TTL and idle/nudge/missing-session behaviour"
   })
 })
 
-describe("LegacyEngine: escalation when a step vanishes from a live pipeline", () => {
+describe("Engine: escalation when a step vanishes from a live pipeline", () => {
   it("act() escalates loudly instead of soft-bricking the feature", async () => {
     const config = makeConfig()
     const engine = makeEngine(config)

@@ -1,6 +1,6 @@
 /**
  * Built-in deterministic actions. Zero LLM involvement — plain code,
- * fully repeatable, testable with a fake `LegacyGh` + fake
+ * fully repeatable, testable with a fake `GhClient` + fake
  * `ProcessRunner`. Ported from opencode-conductor's
  * `src/steps/builtins.ts`; two behavioural changes from the seed:
  *  - git/shell execution crosses the injected `ProcessRunner` port
@@ -12,7 +12,7 @@
  *    `ctx.feature.branch`/`ctx.params.branch`/`ctx.config.baseBranch`
  *    are config/DB-controlled, not literal shell text.
  *
- * Every builtin returns a `LegacyStepOutcome`; the engine converts it into
+ * Every builtin returns a `StepOutcome`; the engine converts it into
  * a pipeline event (step.succeeded / step.failed) and feeds the
  * interpreter. `pending` means "not finished yet — check again next
  * reconcile cycle" (used by pr.await_checks): the step stays running
@@ -20,9 +20,9 @@
  */
 
 import path from "node:path"
-import type { LegacyFeatureState } from "../store.ts"
-import type { LegacyGh, LegacyStorePort, ProcessRunner } from "./ports.ts"
-import type { LegacyConfig } from "./types.ts"
+import type { FeatureState } from "../store.ts"
+import type { GhClient, StorePort, ProcessRunner } from "./ports.ts"
+import type { EngineConfig } from "./types.ts"
 
 /**
  * Validate a git ref (branch name) via `git check-ref-format
@@ -43,7 +43,7 @@ async function validateRef(process: ProcessRunner, cwd: string, ref: string): Pr
  * necessarily trustworthy input, and must never be able to walk the
  * computed path outside the directory worktrees are supposed to live in.
  */
-function resolveWorktreePath(feature: LegacyFeatureState, config: LegacyConfig): { path: string; root: string } | { error: string } {
+function resolveWorktreePath(feature: FeatureState, config: EngineConfig): { path: string; root: string } | { error: string } {
   const template = config.worktreeDir ?? ".."
   const root = path.resolve(feature.projectDir, template.replace("{project}", path.basename(feature.projectDir)))
   const worktreePath = path.join(
@@ -57,25 +57,25 @@ function resolveWorktreePath(feature: LegacyFeatureState, config: LegacyConfig):
   return { path: worktreePath, root }
 }
 
-export type LegacyStepOutcome =
+export type StepOutcome =
   | { readonly kind: "succeeded"; readonly output?: string }
   | { readonly kind: "failed"; readonly reason: string; readonly output?: string }
   | { readonly kind: "pending" }
 
-export interface LegacyBuiltinContext {
-  readonly feature: LegacyFeatureState
+export interface BuiltinContext {
+  readonly feature: FeatureState
   /** Id of the pipeline step this builtin runs as (attempt-counter key). */
   readonly stepId: string
-  readonly config: LegacyConfig
-  readonly store: LegacyStorePort
-  readonly gh: LegacyGh
+  readonly config: EngineConfig
+  readonly store: StorePort
+  readonly gh: GhClient
   readonly process: ProcessRunner
   readonly params: Readonly<Record<string, string>>
 }
 
-type LegacyBuiltinFn = (ctx: LegacyBuiltinContext) => Promise<LegacyStepOutcome>
+type BuiltinFn = (ctx: BuiltinContext) => Promise<StepOutcome>
 
-export const legacyBuiltins: Record<string, LegacyBuiltinFn> = {
+export const builtins: Record<string, BuiltinFn> = {
   "worktree.create": async ctx => {
     const branch = ctx.params.branch ?? `feat/${ctx.feature.slug}`
     const base = ctx.config.baseBranch

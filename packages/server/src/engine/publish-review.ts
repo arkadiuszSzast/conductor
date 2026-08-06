@@ -4,7 +4,7 @@
  * The agent reports STRUCTURED findings via the report port (notes as
  * JSON); the conductor-side output ({{steps.<id>.output}}) is ALWAYS the
  * source of truth for downstream steps. This module PROJECTS those
- * findings onto the PR through the injected `LegacyGh` port — never a
+ * findings onto the PR through the injected `GhClient` port — never a
  * hand-built shell command — optionally under a bot identity minted by
  * `tokenCommand` (run through the injected `ProcessRunner`, never the
  * engine's ambient shell).
@@ -16,37 +16,37 @@
  * is a bug.
  */
 
-import type { LegacyGh, LegacyPublishInput, LegacyReviewComment, ProcessRunner } from "./ports.ts"
+import type { GhClient, PublishInput, ReviewComment, ProcessRunner } from "./ports.ts"
 
 /**
  * Finding severity. Optional in agent output; unknown or missing values
  * default to "major" — an unclassified finding must never silently
  * become ignorable.
  */
-export type LegacySeverity = "blocker" | "major" | "minor" | "nit"
+export type Severity = "blocker" | "major" | "minor" | "nit"
 
-const SEVERITIES: readonly LegacySeverity[] = ["blocker", "major", "minor", "nit"]
-export const DEFAULT_SEVERITY: LegacySeverity = "major"
+const SEVERITIES: readonly Severity[] = ["blocker", "major", "minor", "nit"]
+export const DEFAULT_SEVERITY: Severity = "major"
 
-export interface LegacyFinding {
+export interface Finding {
   readonly path: string
   readonly line: number
   readonly side?: "LEFT" | "RIGHT"
-  readonly severity: LegacySeverity
+  readonly severity: Severity
   /** Free-form labels (e.g. correctness, tests, style, security, scope). */
   readonly tags: readonly string[]
   readonly body: string
 }
 
 /** Structured review payload expected in report notes. */
-export interface LegacyReviewFindings {
+export interface ReviewFindings {
   readonly summary: string
-  readonly findings: readonly LegacyFinding[]
+  readonly findings: readonly Finding[]
 }
 
-function toSeverity(value: unknown): LegacySeverity {
+function toSeverity(value: unknown): Severity {
   return typeof value === "string" && (SEVERITIES as readonly string[]).includes(value)
-    ? (value as LegacySeverity)
+    ? (value as Severity)
     : DEFAULT_SEVERITY
 }
 
@@ -59,7 +59,7 @@ function toTags(value: unknown): readonly string[] {
  * plain-text notes (no JSON, broken JSON, wrong shape) degrade to a
  * summary-only review — the text still reaches the PR body.
  */
-export function parseFindingsLegacy(notes: string): LegacyReviewFindings {
+export function parseFindings(notes: string): ReviewFindings {
   const trimmed = notes.trim()
   const fenced = /```(?:json)?\s*(\{[\s\S]*\})\s*```/.exec(trimmed)
   const candidate = fenced?.[1] ?? (trimmed.startsWith("{") ? trimmed : null)
@@ -77,7 +77,7 @@ export function parseFindingsLegacy(notes: string): LegacyReviewFindings {
                 typeof (f as { line?: unknown }).line === "number" &&
                 typeof (f as { body?: unknown }).body === "string",
             )
-            .map((f): LegacyFinding => ({
+            .map((f): Finding => ({
               path: f.path as string,
               line: f.line as number,
               ...(f.side === "LEFT" || f.side === "RIGHT" ? { side: f.side } : {}),
@@ -98,8 +98,8 @@ export function parseFindingsLegacy(notes: string): LegacyReviewFindings {
  * Aggregate severity counts, ordered blocker → nit, zero-counts omitted.
  * "1 blocker, 2 minor" — for timeline notes and dashboards.
  */
-export function severitySummaryLegacy(findings: readonly LegacyFinding[]): string {
-  const counts = new Map<LegacySeverity, number>()
+export function severitySummary(findings: readonly Finding[]): string {
+  const counts = new Map<Severity, number>()
   for (const f of findings) counts.set(f.severity, (counts.get(f.severity) ?? 0) + 1)
   const parts = SEVERITIES.filter(s => counts.has(s)).map(
     s => `${counts.get(s)} ${s}${(counts.get(s) ?? 0) > 1 && s !== "nit" ? "s" : ""}`,
@@ -108,14 +108,14 @@ export function severitySummaryLegacy(findings: readonly LegacyFinding[]): strin
 }
 
 /** Inline-comment body: id marker + severity prefix + tag badges + text. */
-function findingBody(f: LegacyFinding, id?: string): string {
+function findingBody(f: Finding, id?: string): string {
   const marker = id !== undefined ? `\`${id}\` ` : ""
   const tags = f.tags.length > 0 ? " " + f.tags.map(t => `\`${t}\``).join(" ") : ""
   return `${marker}**[${f.severity}]**${tags} ${f.body}`
 }
 
 /** A fixer's disposition of one finding, reported via the report port. */
-export interface LegacyResolution {
+export interface Resolution {
   readonly id: string
   readonly status: "fixed" | "dismissed" | "reopened"
   readonly note?: string
@@ -123,10 +123,10 @@ export interface LegacyResolution {
 
 /**
  * Parse fixer notes for finding resolutions. Same tolerance as
- * `parseFindingsLegacy`: bare JSON or fenced; anything else → no
+ * `parseFindings`: bare JSON or fenced; anything else → no
  * resolutions.
  */
-export function parseResolutionsLegacy(notes: string): readonly LegacyResolution[] {
+export function parseResolutions(notes: string): readonly Resolution[] {
   const trimmed = notes.trim()
   const fenced = /```(?:json)?\s*(\{[\s\S]*\})\s*```/.exec(trimmed)
   const candidate = fenced?.[1] ?? (trimmed.startsWith("{") ? trimmed : null)
@@ -135,7 +135,7 @@ export function parseResolutionsLegacy(notes: string): readonly LegacyResolution
     const parsed = JSON.parse(candidate) as { resolutions?: unknown }
     if (!Array.isArray(parsed.resolutions)) return []
     return parsed.resolutions.filter(
-      (r): r is LegacyResolution =>
+      (r): r is Resolution =>
         typeof r === "object" &&
         r !== null &&
         typeof (r as { id?: unknown }).id === "string" &&
@@ -152,7 +152,7 @@ const VERDICT_EVENT: Record<string, string> = {
 }
 
 /** Render findings as a markdown list (body-only fallback / comment mode). */
-function findingsAsMarkdown(review: LegacyReviewFindings, ids?: readonly string[]): string {
+function findingsAsMarkdown(review: ReviewFindings, ids?: readonly string[]): string {
   if (review.findings.length === 0) return review.summary
   const list = review.findings
     .map((f, i) => `${i + 1}. \`${f.path}:${f.line}\` — ${findingBody(f, ids?.[i])}`)
@@ -182,16 +182,16 @@ async function mintToken(
 }
 
 /**
- * Publish a reported review to the PR through the injected `LegacyGh`
+ * Publish a reported review to the PR through the injected `GhClient`
  * port. Returns a human-readable status line (for the timeline note);
  * never throws — every failure path degrades to a returned status.
  */
-export function makePublishReviewLegacy(gh: LegacyGh, process: ProcessRunner) {
-  return async function publishReviewLegacy(input: LegacyPublishInput): Promise<string> {
+export function makePublishReview(gh: GhClient, process: ProcessRunner) {
+  return async function publishReview(input: PublishInput): Promise<string> {
     const { publish } = input
     if (publish.mode === "none") return "publish: none"
 
-    const review = parseFindingsLegacy(input.notes)
+    const review = parseFindings(input.notes)
     let token: string | undefined
     try {
       token = await mintToken(publish.tokenCommand, process, input.cwd)
@@ -209,7 +209,7 @@ export function makePublishReviewLegacy(gh: LegacyGh, process: ProcessRunner) {
     const event = VERDICT_EVENT[input.verdict]
     if (!event) return `publish skipped: verdict "${input.verdict}" has no GitHub review event`
 
-    const comments: LegacyReviewComment[] = review.findings.map((f, i) => ({
+    const comments: ReviewComment[] = review.findings.map((f, i) => ({
       path: f.path,
       line: f.line,
       side: f.side ?? "RIGHT",
@@ -223,7 +223,7 @@ export function makePublishReviewLegacy(gh: LegacyGh, process: ProcessRunner) {
     )
     if (first.ok) {
       return review.findings.length > 0
-        ? `publish: review posted (${severitySummaryLegacy(review.findings)})`
+        ? `publish: review posted (${severitySummary(review.findings)})`
         : "publish: review posted"
     }
 

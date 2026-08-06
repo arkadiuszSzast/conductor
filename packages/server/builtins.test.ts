@@ -2,13 +2,13 @@ import { describe, expect, it } from "bun:test"
 import { existsSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { legacyBuiltins } from "./src/legacy/builtins.ts"
-import { realProcessRunner } from "./src/legacy/process.ts"
-import type { LegacyFeatureState } from "./src/store.ts"
-import type { LegacyGh, LegacyStorePort, ProcessExecOptions, ProcessExecResult, ProcessRunner } from "./src/legacy/ports.ts"
-import type { LegacyConfig } from "./src/legacy/types.ts"
+import { builtins } from "./src/engine/builtins.ts"
+import { realProcessRunner } from "./src/engine/process.ts"
+import type { FeatureState } from "./src/store.ts"
+import type { GhClient, StorePort, ProcessExecOptions, ProcessExecResult, ProcessRunner } from "./src/engine/ports.ts"
+import type { EngineConfig } from "./src/engine/types.ts"
 
-function feature(over: Partial<LegacyFeatureState> = {}): LegacyFeatureState {
+function feature(over: Partial<FeatureState> = {}): FeatureState {
   return {
     id: "f1",
     title: "F",
@@ -29,7 +29,7 @@ function feature(over: Partial<LegacyFeatureState> = {}): LegacyFeatureState {
   }
 }
 
-function config(over: Partial<LegacyConfig> = {}): LegacyConfig {
+function config(over: Partial<EngineConfig> = {}): EngineConfig {
   return {
     pipeline: [],
     roles: {},
@@ -67,7 +67,7 @@ class FakeProcessRunner implements ProcessRunner {
   }
 }
 
-class FakeStore implements Partial<LegacyStorePort> {
+class FakeStore implements Partial<StorePort> {
   worktreeSet: { worktree: string | null; branch?: string | null } | null = null
   findings: Array<{ id: string; stepId: string; path: string; line: number; severity: string; tags: string[]; body: string; status: "new" | "fixed" | "dismissed" | "reopened"; resolution: string | null; threadId: string | null; synced: boolean }> = []
   prHeads = new Map<string, string>()
@@ -90,7 +90,7 @@ class FakeStore implements Partial<LegacyStorePort> {
   }
 }
 
-function fakeGh(over: Partial<LegacyGh> = {}): LegacyGh {
+function fakeGh(over: Partial<GhClient> = {}): GhClient {
   return {
     prChecks: async () => ({ allConcluded: true, anyFailed: false, failedNames: [] }),
     prView: async () => ({ number: 1, headSha: "sha", state: "OPEN", mergeable: "MERGEABLE" }),
@@ -107,7 +107,7 @@ function fakeGh(over: Partial<LegacyGh> = {}): LegacyGh {
   }
 }
 
-describe("legacyBuiltins: worktree.create", () => {
+describe("builtins: worktree.create", () => {
   it("branches from origin/<base> and records worktree/branch on the store", async () => {
     const process = new FakeProcessRunner()
     process.script("exec", "git fetch origin main", { code: 0, stdout: "", stderr: "" })
@@ -115,11 +115,11 @@ describe("legacyBuiltins: worktree.create", () => {
     process.script("exec", "git rev-parse --quiet --verify --end-of-options origin/main", { code: 0, stdout: "abc\n", stderr: "" })
     const store = new FakeStore()
 
-    const result = await legacyBuiltins["worktree.create"]!({
+    const result = await builtins["worktree.create"]!({
       feature: feature(),
       stepId: "worktree",
       config: config(),
-      store: store as unknown as LegacyStorePort,
+      store: store as unknown as StorePort,
       gh: fakeGh(),
       process,
       params: {},
@@ -138,11 +138,11 @@ describe("legacyBuiltins: worktree.create", () => {
     process.script("exec", "git fetch origin main", { code: 1, stdout: "", stderr: "network unreachable" })
     const store = new FakeStore()
 
-    const result = await legacyBuiltins["worktree.create"]!({
+    const result = await builtins["worktree.create"]!({
       feature: feature(),
       stepId: "worktree",
       config: config(),
-      store: store as unknown as LegacyStorePort,
+      store: store as unknown as StorePort,
       gh: fakeGh(),
       process,
       params: {},
@@ -156,11 +156,11 @@ describe("legacyBuiltins: worktree.create", () => {
     const process = new FakeProcessRunner()
     const store = new FakeStore()
 
-    const result = await legacyBuiltins["worktree.create"]!({
+    const result = await builtins["worktree.create"]!({
       feature: feature(),
       stepId: "worktree",
       config: config(),
-      store: store as unknown as LegacyStorePort,
+      store: store as unknown as StorePort,
       gh: fakeGh(),
       process,
       params: { branch: "--upload-pack=evil" },
@@ -178,11 +178,11 @@ describe("legacyBuiltins: worktree.create", () => {
     process.script("exec", 'git check-ref-format --allow-onelevel main; touch pwned', { code: 1, stdout: "", stderr: "" })
     const store = new FakeStore()
 
-    const result = await legacyBuiltins["worktree.create"]!({
+    const result = await builtins["worktree.create"]!({
       feature: feature(),
       stepId: "worktree",
       config: config({ baseBranch: "main; touch pwned" }),
-      store: store as unknown as LegacyStorePort,
+      store: store as unknown as StorePort,
       gh: fakeGh(),
       process,
       params: {},
@@ -198,11 +198,11 @@ describe("legacyBuiltins: worktree.create", () => {
     const process = new FakeProcessRunner()
     const store = new FakeStore()
 
-    const result = await legacyBuiltins["worktree.create"]!({
+    const result = await builtins["worktree.create"]!({
       feature: feature({ slug: "../../../etc/evil" }),
       stepId: "worktree",
       config: config(),
-      store: store as unknown as LegacyStorePort,
+      store: store as unknown as StorePort,
       gh: fakeGh(),
       process,
       params: {},
@@ -221,11 +221,11 @@ describe("legacyBuiltins: worktree.create", () => {
       await realProcessRunner.exec(["git", "commit", "--allow-empty", "-q", "-m", "init"], { cwd: projectDir })
       await realProcessRunner.exec(["git", "branch", "-M", "main"], { cwd: projectDir })
 
-      const result = await legacyBuiltins["worktree.create"]!({
+      const result = await builtins["worktree.create"]!({
         feature: feature({ projectDir, slug: "f", worktree: null, branch: null }),
         stepId: "worktree",
         config: config({ baseBranch: `main;touch ${marker}` }),
-        store: { setFeatureFields: () => {} } as unknown as LegacyStorePort,
+        store: { setFeatureFields: () => {} } as unknown as StorePort,
         gh: fakeGh(),
         process: realProcessRunner,
         params: {},
@@ -240,14 +240,14 @@ describe("legacyBuiltins: worktree.create", () => {
   })
 })
 
-describe("legacyBuiltins: worktree.remove / git.push argv safety", () => {
+describe("builtins: worktree.remove / git.push argv safety", () => {
   it("git.push validates the branch via check-ref-format and never touches the shell", async () => {
     const process = new FakeProcessRunner()
-    const result = await legacyBuiltins["git.push"]!({
+    const result = await builtins["git.push"]!({
       feature: feature({ branch: "feat/f; rm -rf /" }),
       stepId: "push",
       config: config(),
-      store: new FakeStore() as unknown as LegacyStorePort,
+      store: new FakeStore() as unknown as StorePort,
       gh: fakeGh(),
       process,
       params: {},
@@ -261,11 +261,11 @@ describe("legacyBuiltins: worktree.remove / git.push argv safety", () => {
   })
 
   it("realProcessRunner rejects a branch containing shell metacharacters as an invalid ref (never executes them)", async () => {
-    const result = await legacyBuiltins["git.push"]!({
+    const result = await builtins["git.push"]!({
       feature: feature({ branch: "feat/f; touch /tmp/conductor-pwn-test", projectDir: "/tmp" }),
       stepId: "push",
       config: config(),
-      store: new FakeStore() as unknown as LegacyStorePort,
+      store: new FakeStore() as unknown as StorePort,
       gh: fakeGh(),
       process: realProcessRunner,
       params: {},
@@ -277,11 +277,11 @@ describe("legacyBuiltins: worktree.remove / git.push argv safety", () => {
   it("worktree.remove passes the stored worktree path through -- as argv, never a shell string", async () => {
     const process = new FakeProcessRunner()
     process.script("exec", 'git worktree remove --force -- /tmp/proj-f; rm -rf /', { code: 0, stdout: "", stderr: "" })
-    const result = await legacyBuiltins["worktree.remove"]!({
+    const result = await builtins["worktree.remove"]!({
       feature: feature({ worktree: "/tmp/proj-f; rm -rf /" }),
       stepId: "cleanup",
       config: config(),
-      store: new FakeStore() as unknown as LegacyStorePort,
+      store: new FakeStore() as unknown as StorePort,
       gh: fakeGh(),
       process,
       params: {},
@@ -291,13 +291,13 @@ describe("legacyBuiltins: worktree.remove / git.push argv safety", () => {
   })
 })
 
-describe("legacyBuiltins: pr.await_checks", () => {
+describe("builtins: pr.await_checks", () => {
   it("returns pending while checks have not all concluded", async () => {
-    const outcome = await legacyBuiltins["pr.await_checks"]!({
+    const outcome = await builtins["pr.await_checks"]!({
       feature: feature({ pr: 7 }),
       stepId: "await_ci",
       config: config({ repo: "o/r" }),
-      store: new FakeStore() as unknown as LegacyStorePort,
+      store: new FakeStore() as unknown as StorePort,
       gh: fakeGh({ prChecks: async () => ({ allConcluded: false, anyFailed: false, failedNames: [] }) }),
       process: new FakeProcessRunner(),
       params: {},
@@ -306,11 +306,11 @@ describe("legacyBuiltins: pr.await_checks", () => {
   })
 
   it("fails loudly on a conflicting PR instead of polling forever", async () => {
-    const outcome = await legacyBuiltins["pr.await_checks"]!({
+    const outcome = await builtins["pr.await_checks"]!({
       feature: feature({ pr: 7 }),
       stepId: "await_ci",
       config: config({ repo: "o/r" }),
-      store: new FakeStore() as unknown as LegacyStorePort,
+      store: new FakeStore() as unknown as StorePort,
       gh: fakeGh({ prView: async () => ({ number: 7, headSha: "sha", state: "OPEN", mergeable: "CONFLICTING" }) }),
       process: new FakeProcessRunner(),
       params: {},
@@ -320,15 +320,15 @@ describe("legacyBuiltins: pr.await_checks", () => {
   })
 })
 
-describe("legacyBuiltins: findings.check", () => {
+describe("builtins: findings.check", () => {
   it("blocks on any open finding during the polish round", async () => {
     const store = new FakeStore()
     store.findings = [{ id: "F1", stepId: "review", path: "a.ts", line: 1, severity: "nit", tags: [], body: "x", status: "new", resolution: null, threadId: null, synced: false }]
-    const outcome = await legacyBuiltins["findings.check"]!({
+    const outcome = await builtins["findings.check"]!({
       feature: feature({ attempts: {} }),
       stepId: "gate",
       config: config(),
-      store: store as unknown as LegacyStorePort,
+      store: store as unknown as StorePort,
       gh: fakeGh(),
       process: new FakeProcessRunner(),
       params: {},
@@ -339,11 +339,11 @@ describe("legacyBuiltins: findings.check", () => {
   it("after polish, only blocking severities count", async () => {
     const store = new FakeStore()
     store.findings = [{ id: "F1", stepId: "review", path: "a.ts", line: 1, severity: "nit", tags: [], body: "x", status: "new", resolution: null, threadId: null, synced: false }]
-    const outcome = await legacyBuiltins["findings.check"]!({
+    const outcome = await builtins["findings.check"]!({
       feature: feature({ attempts: { gate: 1 } }),
       stepId: "gate",
       config: config(),
-      store: store as unknown as LegacyStorePort,
+      store: store as unknown as StorePort,
       gh: fakeGh(),
       process: new FakeProcessRunner(),
       params: {},

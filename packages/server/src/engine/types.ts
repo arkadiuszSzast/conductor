@@ -1,5 +1,5 @@
 /**
- * Legacy pipeline definitions — the seed's (opencode-conductor) data model.
+ * Pipeline definitions — the seed's (opencode-conductor) data model.
  *
  * This is DELIBERATELY separate from `@conductor/core`'s workflow IR
  * (`WorkflowDef`/`JobDef`/graph steps). The seed's runtime state is a
@@ -16,7 +16,7 @@
  */
 
 /** Where a step can send the flow after it finishes. */
-export interface LegacyOnFail {
+export interface OnFail {
   /** Step id to jump to on failure (e.g. a fixer step). */
   readonly goto?: string
   /** Max failures of THIS step before the feature escalates (default 1). */
@@ -26,11 +26,11 @@ export interface LegacyOnFail {
 }
 
 /** Verdict routing for agent steps that produce a review-like outcome. */
-export interface LegacyOnVerdict {
+export interface OnVerdict {
   readonly [verdict: string]: { readonly goto?: string; readonly next?: boolean }
 }
 
-interface LegacyStepBase {
+interface StepBase {
   /** Unique step id within the pipeline. */
   readonly id: string
   /** Skippable per-feature via `skipSteps` or feature-level overrides. */
@@ -38,10 +38,10 @@ interface LegacyStepBase {
   /** Explicit next step id. Defaults to the next step in the list. */
   readonly then?: string
   /** Failure routing. */
-  readonly on_fail?: LegacyOnFail
+  readonly on_fail?: OnFail
   /**
    * Pause before executing this step until a human approves via
-   * `LegacyEngine.approve`/`requestChanges`.
+   * `Engine.approve`/`requestChanges`.
    */
   readonly requires_human?: boolean
   /**
@@ -54,7 +54,7 @@ interface LegacyStepBase {
 }
 
 /** Deterministic built-in actions. Implemented in `builtins.ts`. */
-export type LegacyBuiltinAction =
+export type BuiltinAction =
   | "worktree.create"
   | "worktree.remove"
   | "git.push"
@@ -65,14 +65,14 @@ export type LegacyBuiltinAction =
   | "findings.sync"
   | "findings.check"
 
-export interface LegacyBuiltinStep extends LegacyStepBase {
+export interface BuiltinStep extends StepBase {
   readonly type: "builtin"
-  readonly action: LegacyBuiltinAction
+  readonly action: BuiltinAction
   /** Action-specific parameters; values support {{template}} rendering. */
   readonly params?: Readonly<Record<string, string>>
 }
 
-export interface LegacyCommandStep extends LegacyStepBase {
+export interface CommandStep extends StepBase {
   readonly type: "command"
   /**
    * Shell commands run sequentially; first non-zero exit fails the step.
@@ -105,7 +105,7 @@ export interface LegacyCommandStep extends LegacyStepBase {
  * source of truth for downstream steps — publishing is a human-facing
  * projection and never blocks the pipeline.
  */
-export interface LegacyPublishDef {
+export interface PublishDef {
   /**
    * - "github-review": one atomic review call — verdict (APPROVE /
    *   REQUEST_CHANGES), body, and inline comments together.
@@ -124,16 +124,16 @@ export interface LegacyPublishDef {
   readonly tokenCommand?: string
 }
 
-export interface LegacyAgentStep extends LegacyStepBase {
+export interface AgentStep extends StepBase {
   readonly type: "agent"
   /** Role key — resolved to { agent, model } via the `roles` config map. */
   readonly role: string
   /** Prompt template with {{feature.*}} / {{steps.<id>.*}} variables. */
   readonly prompt?: string
   /** Verdict routing (reviews). Verdict is reported via the report port. */
-  readonly on_verdict?: LegacyOnVerdict
+  readonly on_verdict?: OnVerdict
   /** Publish the reported findings to the PR (reviews). Default: none. */
-  readonly publish?: LegacyPublishDef
+  readonly publish?: PublishDef
   /**
    * Review-loop shorthand: this step and the named fix step alternate;
    * each pass through this step counts as one round.
@@ -143,10 +143,10 @@ export interface LegacyAgentStep extends LegacyStepBase {
   readonly max_rounds?: number
 }
 
-export type LegacyStepDef = LegacyBuiltinStep | LegacyCommandStep | LegacyAgentStep
+export type StepDef = BuiltinStep | CommandStep | AgentStep
 
 /** Role → concrete runner agent + model. */
-export interface LegacyRoleDef {
+export interface RoleDef {
   readonly agent: string
   readonly model?: string
   /** Optional model variant (reasoning effort etc.). */
@@ -161,25 +161,25 @@ export interface LegacyRoleDef {
   readonly session?: "fresh" | "feature"
 }
 
-export interface LegacyPipelineDef {
-  readonly pipeline: readonly LegacyStepDef[]
-  readonly roles: Readonly<Record<string, LegacyRoleDef>>
+export interface PipelineDef {
+  readonly pipeline: readonly StepDef[]
+  readonly roles: Readonly<Record<string, RoleDef>>
 }
 
 /**
- * Fully-resolved per-project configuration the legacy engine runs under.
+ * Fully-resolved per-project configuration the engine runs under.
  * Loading/merging config files is the daemon's job (config registry,
  * standalone-daemon-extraction task 3) — this is the shape the engine
- * consumes, injected via `LegacyConfigResolver`.
+ * consumes, injected via `ConfigResolver`.
  */
-export interface LegacyConfig extends LegacyPipelineDef {
+export interface EngineConfig extends PipelineDef {
   /** Named alternative pipelines; `pipeline` is the default workflow. */
   readonly workflows?: Readonly<Record<string, {
     readonly extends?: string
-    readonly pipeline?: readonly LegacyStepDef[]
+    readonly pipeline?: readonly StepDef[]
   }>>
   /** Named workflows resolved to concrete step lists (extends applied). */
-  readonly resolvedWorkflows: Readonly<Record<string, readonly LegacyStepDef[]>>
+  readonly resolvedWorkflows: Readonly<Record<string, readonly StepDef[]>>
   /** `owner/repo` for GitHub operations. */
   readonly repo?: string
   readonly baseBranch: string
@@ -190,7 +190,7 @@ export interface LegacyConfig extends LegacyPipelineDef {
    */
   readonly worktreeDir?: string
   /** Project-wide defaults for review publishing; per-step wins. */
-  readonly reviewPublish?: Partial<LegacyPublishDef>
+  readonly reviewPublish?: Partial<PublishDef>
   /** Step ids skipped for every feature in this project. */
   readonly skipSteps?: readonly string[]
   /** TTL after which a running step with no observed effect is reaped. */
@@ -208,10 +208,10 @@ export interface LegacyConfig extends LegacyPipelineDef {
  * The step list a feature runs under: its named workflow, or the default
  * pipeline. Unknown workflow name → null (caller escalates, never guesses).
  */
-export function pipelineForLegacyWorkflow(
-  config: LegacyConfig,
+export function pipelineForWorkflow(
+  config: EngineConfig,
   workflow: string | null,
-): readonly LegacyStepDef[] | null {
+): readonly StepDef[] | null {
   if (workflow === null) return config.pipeline
   return config.resolvedWorkflows[workflow] ?? null
 }

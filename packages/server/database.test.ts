@@ -28,7 +28,7 @@ function columnNames(db: Database, table: string): string[] {
 }
 
 describe("database lifecycle and migrations", () => {
-  it("creates the complete legacy-compatible schema and migration ledger", () => {
+  it("creates the complete pipeline-compatible schema and migration ledger", () => {
     const connection = openMigratedDatabase({ path: temporaryPath() })
     expect(tableNames(connection.db)).toEqual(expect.arrayContaining([
       "feature", "finding", "pr_head", "review_thread", "schema_migration", "step_run", "transition_log",
@@ -109,7 +109,7 @@ describe("database lifecycle and migrations", () => {
   })
 })
 
-describe("legacy database adoption", () => {
+describe("seed database adoption", () => {
   it("adopts the populated initial seed schema without a ledger", () => {
     const path = temporaryPath()
     const legacy = new Database(path, { create: true })

@@ -1,13 +1,13 @@
 /**
- * The legacy compatibility engine: owns all side effects around the pure
- * legacy interpreter, preserving opencode-conductor's observable
+ * The pipeline engine: owns all side effects around the pure
+ * pipeline interpreter, preserving opencode-conductor's observable
  * semantics over the extracted SQLite store.
  *
  *  - executes decisions (builtin / command / agent steps)
  *  - reconciles reality (gh, sessions) with stored state on an interval
  *  - reaps stuck runs after runTtlMs and feeds failures back as events
  *  - keeps ONE logical orchestrator session per feature, woken via the
- *    injected `LegacySessionClient`; if the session died, a fresh one is
+ *    injected `SessionClient`; if the session died, a fresh one is
  *    created and the session_id updated — the feature never depends on a
  *    session surviving.
  *
@@ -17,60 +17,60 @@
  *
  * Every dependency (store, config resolver, GitHub, sessions, process
  * execution, clock, logger, review publisher) is injected via
- * `LegacyEngineDeps` — nothing here reaches for an opencode SDK import, a
+ * `EngineDeps` — nothing here reaches for an opencode SDK import, a
  * process-wide global, or `Date.now()` directly.
  */
 
-import { interpretLegacy } from "./interpret.ts"
-import { renderLegacy } from "./template.ts"
-import { legacyBuiltins } from "./builtins.ts"
+import { interpret } from "./interpret.ts"
+import { renderTemplate } from "./template.ts"
+import { builtins } from "./builtins.ts"
 import {
-  makePublishReviewLegacy,
-  parseFindingsLegacy,
-  parseResolutionsLegacy,
-  severitySummaryLegacy,
+  makePublishReview,
+  parseFindings,
+  parseResolutions,
+  severitySummary,
 } from "./publish-review.ts"
-import { pipelineForLegacyWorkflow } from "./types.ts"
+import { pipelineForWorkflow } from "./types.ts"
 import type {
   Clock,
-  LegacyConfigResolver,
-  LegacyGh,
-  LegacyPublishReview,
-  LegacySessionClient,
-  LegacyStorePort,
+  ConfigResolver,
+  GhClient,
+  PublishReview,
+  SessionClient,
+  StorePort,
   Logger,
   ProcessRunner,
 } from "./ports.ts"
-import type { LegacyAgentStep, LegacyCommandStep, LegacyConfig, LegacyStepDef } from "./types.ts"
-import type { LegacyDecision, LegacyFeatureState, LegacyPipelineEvent } from "../store.ts"
+import type { AgentStep, CommandStep, EngineConfig, StepDef } from "./types.ts"
+import type { Decision, FeatureState, PipelineEvent } from "../store.ts"
 
-export interface LegacyEngineDeps {
-  readonly store: LegacyStorePort
-  readonly resolveConfig: LegacyConfigResolver
-  readonly gh: LegacyGh
-  readonly sessions: LegacySessionClient
+export interface EngineDeps {
+  readonly store: StorePort
+  readonly resolveConfig: ConfigResolver
+  readonly gh: GhClient
+  readonly sessions: SessionClient
   readonly process: ProcessRunner
   readonly clock: Clock
   readonly log: Logger
   readonly notify?: (title: string, message: string) => void
   /** Review publisher (injectable for tests). Defaults to the gh-backed one. */
-  readonly publishReview?: LegacyPublishReview
+  readonly publishReview?: PublishReview
 }
 
-export class LegacyEngine {
+export class Engine {
   /**
    * Consecutive reconcile cycles each running agent run's session has been
    * idle (run id → count). In-memory by design: after a restart the
    * debounce restarts from zero — the safe direction of error.
    */
   private readonly idleCycles = new Map<string, number>()
-  private readonly publishReview: LegacyPublishReview
+  private readonly publishReview: PublishReview
 
-  constructor(private readonly deps: LegacyEngineDeps) {
-    this.publishReview = deps.publishReview ?? makePublishReviewLegacy(deps.gh, deps.process)
+  constructor(private readonly deps: EngineDeps) {
+    this.publishReview = deps.publishReview ?? makePublishReview(deps.gh, deps.process)
   }
 
-  private configFor(state: LegacyFeatureState): LegacyConfig | null {
+  private configFor(state: FeatureState): EngineConfig | null {
     const config = this.deps.resolveConfig(state.projectDir)
     if (!config) this.deps.log.log(`feature=${state.slug}: no valid conductor config for ${state.projectDir} — skipping`)
     return config
@@ -81,8 +81,8 @@ export class LegacyEngine {
    * workflow or the default pipeline. Unknown workflow → null (logged);
    * the feature is skipped, never run under a guessed pipeline.
    */
-  private defFor(state: LegacyFeatureState, config: LegacyConfig): { pipeline: readonly LegacyStepDef[]; roles: LegacyConfig["roles"] } | null {
-    const pipeline = pipelineForLegacyWorkflow(config, state.workflow)
+  private defFor(state: FeatureState, config: EngineConfig): { pipeline: readonly StepDef[]; roles: EngineConfig["roles"] } | null {
+    const pipeline = pipelineForWorkflow(config, state.workflow)
     if (!pipeline) {
       this.deps.log.log(`feature=${state.slug}: unknown workflow "${state.workflow}" — skipping`)
       return null
@@ -91,7 +91,7 @@ export class LegacyEngine {
   }
 
   /** Feed an event through the interpreter and act on the decision. */
-  async dispatch(featureId: string, event: Parameters<typeof interpretLegacy>[2]): Promise<void> {
+  async dispatch(featureId: string, event: Parameters<typeof interpret>[2]): Promise<void> {
     const { store, log } = this.deps
     const state = store.getFeature(featureId)
     if (!state) {
@@ -102,7 +102,7 @@ export class LegacyEngine {
     if (!config) return
     const def = this.defFor(state, config)
     if (!def) return
-    const transition = interpretLegacy(def, state, event)
+    const transition = interpret(def, state, event)
     store.applyTransition(featureId, event, transition)
     log.log(
       `feature=${state.slug} event=${event.kind} → ${transition.decision.kind}` +
@@ -111,7 +111,7 @@ export class LegacyEngine {
     await this.act(featureId, transition.decision)
   }
 
-  private async act(featureId: string, decision: LegacyDecision): Promise<void> {
+  private async act(featureId: string, decision: Decision): Promise<void> {
     const { store } = this.deps
     switch (decision.kind) {
       case "execute": {
@@ -188,8 +188,8 @@ export class LegacyEngine {
     runId: string,
     status: "succeeded" | "failed" | "reaped",
     detail: { output?: string; reason?: string } | undefined,
-    event: LegacyPipelineEvent,
-  ): { claimed: boolean; decision: LegacyDecision } {
+    event: PipelineEvent,
+  ): { claimed: boolean; decision: Decision } {
     const { store, log } = this.deps
     const state = store.getFeature(featureId)
     if (!state) return { claimed: false, decision: { kind: "noop", reason: "feature not found" } }
@@ -197,7 +197,7 @@ export class LegacyEngine {
     if (!config) return { claimed: false, decision: { kind: "noop", reason: "no valid conductor config" } }
     const def = this.defFor(state, config)
     if (!def) return { claimed: false, decision: { kind: "noop", reason: "unknown workflow" } }
-    const transition = interpretLegacy(def, state, event)
+    const transition = interpret(def, state, event)
     const claimed = store.concludeRun(runId, status, detail, event, transition)
     if (claimed) {
       log.log(
@@ -234,7 +234,7 @@ export class LegacyEngine {
    * fully but is not needed while restarts, not concurrent live
    * processes, are the assumption.
    */
-  private async actAndMarkHandled(featureId: string, runId: string, decision: LegacyDecision): Promise<void> {
+  private async actAndMarkHandled(featureId: string, runId: string, decision: Decision): Promise<void> {
     if (!this.deps.store.markRunActionHandled(runId)) return
     await this.act(featureId, decision)
   }
@@ -256,7 +256,7 @@ export class LegacyEngine {
    * side effect, so replaying it is always safe: it is either a pure
    * `notify()` or a no-op.
    */
-  private async recoverPendingAction(feature: LegacyFeatureState): Promise<void> {
+  private async recoverPendingAction(feature: FeatureState): Promise<void> {
     const { store, log } = this.deps
     const pending = store.getPendingRunAction(feature.id)
     if (!pending) return
@@ -272,7 +272,7 @@ export class LegacyEngine {
 
   // ------------------------------------------------------------- execution
 
-  private async executeStep(state: LegacyFeatureState, step: LegacyStepDef): Promise<void> {
+  private async executeStep(state: FeatureState, step: StepDef): Promise<void> {
     const attempt = (state.attempts[step.id] ?? 0) + 1
     switch (step.type) {
       case "builtin":
@@ -287,11 +287,11 @@ export class LegacyEngine {
     }
   }
 
-  private templateContext(state: LegacyFeatureState, config: LegacyConfig): Record<string, unknown> {
+  private templateContext(state: FeatureState, config: EngineConfig): Record<string, unknown> {
     const { store } = this.deps
     const steps: Record<string, { output: string | null }> = {}
     const human: Record<string, string | null> = {}
-    for (const s of pipelineForLegacyWorkflow(config, state.workflow) ?? config.pipeline) {
+    for (const s of pipelineForWorkflow(config, state.workflow) ?? config.pipeline) {
       steps[s.id] = { output: store.getLastOutput(state.id, s.id) }
       // {{human.<stepId>}} — the latest notes a human left at that gate
       // (approve-with-notes or request-changes), independent of step output.
@@ -330,7 +330,7 @@ export class LegacyEngine {
     }
   }
 
-  private latestHeadSha(state: LegacyFeatureState): string | null {
+  private latestHeadSha(state: FeatureState): string | null {
     if (state.pr === null) return null
     return this.deps.store.getLastOutput(state.id, "await_ci")
   }
@@ -361,7 +361,7 @@ export class LegacyEngine {
   }
 
   private async executeBuiltin(
-    state: LegacyFeatureState,
+    state: FeatureState,
     stepId: string,
     action: string,
     rawParams: Readonly<Record<string, string>>,
@@ -370,7 +370,7 @@ export class LegacyEngine {
     const { store, gh, process, log } = this.deps
     const config = this.configFor(state)
     if (!config) return
-    const fn = legacyBuiltins[action]
+    const fn = builtins[action]
     if (!fn) {
       await this.dispatch(state.id, { kind: "step.failed", stepId, reason: `unknown builtin action "${action}"` })
       return
@@ -378,7 +378,7 @@ export class LegacyEngine {
     const context = this.templateContext(state, config)
     const params: Record<string, string> = {}
     for (const [key, value] of Object.entries(rawParams)) {
-      params[key] = renderLegacy(value, context).text
+      params[key] = renderTemplate(value, context).text
     }
     const runId = store.startRun({ featureId: state.id, stepId, stepType: "builtin", attempt })
     const fresh = store.getFeature(state.id) ?? state
@@ -394,33 +394,33 @@ export class LegacyEngine {
       return
     }
     if (outcome.kind === "succeeded") {
-      const event: LegacyPipelineEvent = { kind: "step.succeeded", stepId, output: outcome.output ?? "" }
+      const event: PipelineEvent = { kind: "step.succeeded", stepId, output: outcome.output ?? "" }
       const { claimed, decision } = this.concludeAndTransition(state.id, runId, "succeeded", { output: outcome.output ?? "" }, event)
       if (!claimed) return
-      const detail = outcome.output ? ` — ${LegacyEngine.clip(outcome.output, 200)}` : ""
+      const detail = outcome.output ? ` — ${Engine.clip(outcome.output, 200)}` : ""
       await this.noteParent(state.id, `[conductor] ✓ ${stepId}${detail}`)
       await this.actAndMarkHandled(state.id, runId, decision)
     } else {
-      const event: LegacyPipelineEvent = { kind: "step.failed", stepId, reason: outcome.reason }
+      const event: PipelineEvent = { kind: "step.failed", stepId, reason: outcome.reason }
       const { claimed, decision } = this.concludeAndTransition(state.id, runId, "failed", { output: outcome.output ?? "", reason: outcome.reason }, event)
       if (!claimed) return
-      await this.noteParent(state.id, `[conductor] ✗ ${stepId} failed — ${LegacyEngine.clip(outcome.reason, 300)}`)
+      await this.noteParent(state.id, `[conductor] ✗ ${stepId} failed — ${Engine.clip(outcome.reason, 300)}`)
       await this.actAndMarkHandled(state.id, runId, decision)
     }
   }
 
-  private async executeCommand(state: LegacyFeatureState, step: LegacyCommandStep, attempt: number): Promise<void> {
+  private async executeCommand(state: FeatureState, step: CommandStep, attempt: number): Promise<void> {
     const { store, process } = this.deps
     const config = this.configFor(state)
     if (!config) return
     const context = this.templateContext(state, config)
     const cwd = step.cwd !== undefined
-      ? renderLegacy(step.cwd, context).text
+      ? renderTemplate(step.cwd, context).text
       : (state.worktree ?? state.projectDir)
 
     const runId = store.startRun({ featureId: state.id, stepId: step.id, stepType: "command", attempt })
     for (const raw of step.run) {
-      const command = renderLegacy(raw, context).text
+      const command = renderTemplate(raw, context).text
       const result = await process.shell(command, {
         cwd,
         ...(step.timeout_ms !== undefined ? { timeoutMs: step.timeout_ms } : {}),
@@ -428,7 +428,7 @@ export class LegacyEngine {
       if (result.code !== 0) {
         const tail = result.output.slice(-4000)
         const reason = `"${command}" exited ${result.code}`
-        const event: LegacyPipelineEvent = { kind: "step.failed", stepId: step.id, reason }
+        const event: PipelineEvent = { kind: "step.failed", stepId: step.id, reason }
         const { claimed, decision } = this.concludeAndTransition(state.id, runId, "failed", { output: tail, reason }, event)
         if (!claimed) return
         await this.noteParent(state.id, `[conductor] ✗ ${step.id} failed — ${reason}`)
@@ -436,14 +436,14 @@ export class LegacyEngine {
         return
       }
     }
-    const event: LegacyPipelineEvent = { kind: "step.succeeded", stepId: step.id }
+    const event: PipelineEvent = { kind: "step.succeeded", stepId: step.id }
     const { claimed, decision } = this.concludeAndTransition(state.id, runId, "succeeded", undefined, event)
     if (!claimed) return
     await this.noteParent(state.id, `[conductor] ✓ ${step.id} (command)`)
     await this.actAndMarkHandled(state.id, runId, decision)
   }
 
-  private async executeAgent(state: LegacyFeatureState, step: LegacyAgentStep, attempt: number): Promise<void> {
+  private async executeAgent(state: FeatureState, step: AgentStep, attempt: number): Promise<void> {
     const { store, sessions, log } = this.deps
     const config = this.configFor(state)
     if (!config) return
@@ -455,7 +455,7 @@ export class LegacyEngine {
 
     const context = this.templateContext(state, config)
     const promptTemplate = step.prompt ?? `Execute pipeline step "${step.id}" for feature: {{feature.title}}.`
-    const rendered = renderLegacy(promptTemplate, context)
+    const rendered = renderTemplate(promptTemplate, context)
     for (const missing of rendered.missing) {
       log.log(`step ${step.id}: template variable "${missing}" is empty`)
     }
@@ -541,7 +541,7 @@ export class LegacyEngine {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       const reason = `failed to prompt session: ${message}`
-      const event: LegacyPipelineEvent = { kind: "step.failed", stepId: step.id, reason }
+      const event: PipelineEvent = { kind: "step.failed", stepId: step.id, reason }
       const { claimed, decision } = this.concludeAndTransition(state.id, runId, "failed", { reason: `prompt failed: ${message}` }, event)
       if (!claimed) return
       await this.actAndMarkHandled(state.id, runId, decision)
@@ -566,7 +566,7 @@ export class LegacyEngine {
     }
   }
 
-  private async reconcileFeature(input: LegacyFeatureState): Promise<void> {
+  private async reconcileFeature(input: FeatureState): Promise<void> {
     const { store, log } = this.deps
 
     // Restart recovery runs FIRST, unconditionally: a decision committed
@@ -632,7 +632,7 @@ export class LegacyEngine {
         log.log(`reconcile ${feature.slug}: run ${active.id} session is gone — reaping immediately`)
         this.idleCycles.delete(active.id)
         const reason = "session disappeared before reporting"
-        const event: LegacyPipelineEvent = { kind: "step.failed", stepId: active.stepId, reason }
+        const event: PipelineEvent = { kind: "step.failed", stepId: active.stepId, reason }
         const { claimed, decision } = this.concludeAndTransition(feature.id, active.id, "reaped", { reason: "session disappeared (server restart?)" }, event)
         if (!claimed) return
         await this.noteParent(feature.id, `[conductor] ⚠ ${active.stepId} reaped — session disappeared before reporting`)
@@ -665,7 +665,7 @@ export class LegacyEngine {
           log.log(`reconcile ${feature.slug}: run ${active.id} idle after ${config.maxNudges} nudges — reaping`)
           {
             const reason = `run reaped: session idle without report after ${active.nudges} nudge(s)`
-            const event: LegacyPipelineEvent = { kind: "step.failed", stepId: active.stepId, reason }
+            const event: PipelineEvent = { kind: "step.failed", stepId: active.stepId, reason }
             const { claimed, decision } = this.concludeAndTransition(
               feature.id,
               active.id,
@@ -688,7 +688,7 @@ export class LegacyEngine {
       log.log(`reconcile ${feature.slug}: run ${active.id} (step ${active.stepId}) exceeded TTL — reaping`)
       this.idleCycles.delete(active.id)
       const reason = `run reaped after ${Math.round(age / 60000)} min without a report`
-      const event: LegacyPipelineEvent = { kind: "step.failed", stepId: active.stepId, reason }
+      const event: PipelineEvent = { kind: "step.failed", stepId: active.stepId, reason }
       const { claimed, decision } = this.concludeAndTransition(
         feature.id,
         active.id,
@@ -723,7 +723,7 @@ export class LegacyEngine {
     if (trimmed.length > 0) {
       const runId = store.startRun({ featureId, stepId, stepType: "builtin", attempt: (state.attempts[stepId] ?? 0) + 1 })
       store.finishRun(runId, "succeeded", { output: trimmed, reason: "human approved with notes" })
-      await this.noteParent(featureId, `[conductor] ✔ ${stepId} — approved by human with notes\n${LegacyEngine.clip(trimmed)}`)
+      await this.noteParent(featureId, `[conductor] ✔ ${stepId} — approved by human with notes\n${Engine.clip(trimmed)}`)
     }
     await this.dispatch(featureId, { kind: "human.approved", stepId })
     const after = store.getFeature(featureId)
@@ -746,7 +746,7 @@ export class LegacyEngine {
     const stepId = state.currentStep
     const runId = store.startRun({ featureId, stepId, stepType: "builtin", attempt: (state.attempts[stepId] ?? 0) + 1 })
     store.finishRun(runId, "failed", { output: notes, reason: "human requested changes" })
-    await this.noteParent(featureId, `[conductor] ✋ ${stepId} — changes requested by human\n${LegacyEngine.clip(notes)}`)
+    await this.noteParent(featureId, `[conductor] ✋ ${stepId} — changes requested by human\n${Engine.clip(notes)}`)
     await this.dispatch(featureId, { kind: "human.rejected", stepId, notes })
     const after = store.getFeature(featureId)
     return `Changes requested at "${stepId}". Feature is now: ${after?.status} (step: ${after?.currentStep ?? "-"}).`
@@ -784,7 +784,7 @@ export class LegacyEngine {
     }
 
     if (input.verdict !== undefined) {
-      const event: LegacyPipelineEvent = { kind: "step.verdict", stepId: run.stepId, verdict: input.verdict }
+      const event: PipelineEvent = { kind: "step.verdict", stepId: run.stepId, verdict: input.verdict }
       const { claimed, decision } = this.concludeAndTransition(
         run.featureId,
         input.runId,
@@ -801,7 +801,7 @@ export class LegacyEngine {
       // to already exist. Best-effort — a failed projection never blocks
       // the pipeline; the feature transition above is already durable
       // regardless of what happens here.
-      const review = input.notes ? parseFindingsLegacy(input.notes) : null
+      const review = input.notes ? parseFindings(input.notes) : null
       let findingIds: string[] = []
       if (review && review.findings.length > 0) {
         findingIds = store.insertFindings(run.featureId, run.stepId, review.findings)
@@ -810,8 +810,8 @@ export class LegacyEngine {
       const publishStatus = await this.publishIfConfigured(run, input.verdict, input.notes ?? "", findingIds)
       // Timeline: prefer a structured digest (severity counts + summary)
       // over dumping raw JSON notes into the parent session.
-      const counts = review && review.findings.length > 0 ? ` (${severitySummaryLegacy(review.findings)})` : ""
-      const digest = review ? LegacyEngine.clip(review.summary) : ""
+      const counts = review && review.findings.length > 0 ? ` (${severitySummary(review.findings)})` : ""
+      const digest = review ? Engine.clip(review.summary) : ""
       await this.noteParent(
         run.featureId,
         `[conductor] ${who} · ${run.stepId}${attemptTag} → verdict: ${input.verdict}${counts}` +
@@ -823,7 +823,7 @@ export class LegacyEngine {
     }
 
     if (input.outcome === "succeeded") {
-      const event: LegacyPipelineEvent = { kind: "step.succeeded", stepId: run.stepId, output: input.notes ?? "" }
+      const event: PipelineEvent = { kind: "step.succeeded", stepId: run.stepId, output: input.notes ?? "" }
       const { claimed, decision } = this.concludeAndTransition(
         run.featureId,
         input.runId,
@@ -836,7 +836,7 @@ export class LegacyEngine {
       // Fixer resolutions: {"resolutions":[{"id":"F3","status":"fixed","note":"..."}]}
       // update the DB source of truth; findings.sync projects to GitHub
       // later.
-      const resolutions = input.notes ? parseResolutionsLegacy(input.notes) : []
+      const resolutions = input.notes ? parseResolutions(input.notes) : []
       const applied: string[] = []
       for (const r of resolutions) {
         if (store.setFindingStatus(run.featureId, r.id, r.status, r.note)) applied.push(`${r.id}→${r.status}`)
@@ -846,19 +846,19 @@ export class LegacyEngine {
         run.featureId,
         `[conductor] ${who} · ${run.stepId}${attemptTag} → succeeded` +
           (applied.length > 0 ? ` · findings: ${applied.join(", ")}` : "") +
-          (input.notes ? `\n${LegacyEngine.clip(input.notes)}` : ""),
+          (input.notes ? `\n${Engine.clip(input.notes)}` : ""),
       )
       await this.actAndMarkHandled(run.featureId, input.runId, decision)
       return `Step "${run.stepId}" marked succeeded.`
     }
 
     const reason = input.notes ?? "reported failed"
-    const event: LegacyPipelineEvent = { kind: "step.failed", stepId: run.stepId, reason }
+    const event: PipelineEvent = { kind: "step.failed", stepId: run.stepId, reason }
     const { claimed, decision } = this.concludeAndTransition(run.featureId, input.runId, "failed", { reason }, event)
     if (!claimed) return alreadyConcluded()
     await this.noteParent(
       run.featureId,
-      `[conductor] ${who} · ${run.stepId}${attemptTag} → failed` + (input.notes ? `\n${LegacyEngine.clip(input.notes)}` : ""),
+      `[conductor] ${who} · ${run.stepId}${attemptTag} → failed` + (input.notes ? `\n${Engine.clip(input.notes)}` : ""),
     )
     await this.actAndMarkHandled(run.featureId, input.runId, decision)
     return `Step "${run.stepId}" marked failed.`

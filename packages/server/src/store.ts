@@ -1,16 +1,16 @@
 import { randomUUID } from "node:crypto"
 import type { Database } from "./database.ts"
 
-export type LegacyFeatureStatus = "running" | "paused" | "waiting_human" | "escalated" | "done" | "abandoned"
+export type FeatureStatus = "running" | "paused" | "waiting_human" | "escalated" | "done" | "abandoned"
 
-export interface LegacyFeatureState {
+export interface FeatureState {
   readonly id: string
   readonly title: string
   readonly slug: string
   readonly projectDir: string
   readonly workflow: string | null
   readonly description: string | null
-  readonly status: LegacyFeatureStatus
+  readonly status: FeatureStatus
   readonly currentStep: string | null
   readonly sessionId: string | null
   readonly worktree: string | null
@@ -21,7 +21,7 @@ export interface LegacyFeatureState {
   readonly escalation: string | null
 }
 
-export type LegacyPipelineEvent =
+export type PipelineEvent =
   | { readonly kind: "feature.start" }
   | { readonly kind: "step.succeeded"; readonly stepId: string; readonly output?: string }
   | { readonly kind: "step.failed"; readonly stepId: string; readonly reason: string }
@@ -32,7 +32,7 @@ export type LegacyPipelineEvent =
   | { readonly kind: "human.resumed" }
   | { readonly kind: "human.abandoned" }
 
-export type LegacyDecision =
+export type Decision =
   | { readonly kind: "execute"; readonly stepId: string }
   | { readonly kind: "wait_human"; readonly stepId: string }
   | { readonly kind: "escalate"; readonly reason: string }
@@ -41,10 +41,10 @@ export type LegacyDecision =
   | { readonly kind: "abandon" }
   | { readonly kind: "noop"; readonly reason: string }
 
-export interface LegacyTransition {
-  readonly decision: LegacyDecision
+export interface Transition {
+  readonly decision: Decision
   readonly patch: Partial<{
-    status: LegacyFeatureStatus
+    status: FeatureStatus
     currentStep: string | null
     attempts: Readonly<Record<string, number>>
     rounds: Readonly<Record<string, number>>
@@ -57,7 +57,7 @@ interface FeatureRow {
   title: string
   slug: string
   project_dir: string
-  status: LegacyFeatureStatus
+  status: FeatureStatus
   current_step: string | null
   workflow: string | null
   description: string | null
@@ -70,7 +70,7 @@ interface FeatureRow {
   escalation: string | null
 }
 
-function toState(row: FeatureRow): LegacyFeatureState {
+function toState(row: FeatureRow): FeatureState {
   return {
     id: row.id,
     title: row.title,
@@ -99,7 +99,7 @@ export class Store {
     projectDir: string
     workflow?: string
     description?: string
-  }): LegacyFeatureState {
+  }): FeatureState {
     const now = Date.now()
     const id = randomUUID()
     this.db.run(
@@ -112,12 +112,12 @@ export class Store {
     return state
   }
 
-  getFeature(id: string): LegacyFeatureState | null {
+  getFeature(id: string): FeatureState | null {
     const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(id) as FeatureRow | null
     return row ? toState(row) : null
   }
 
-  listFeatures(filter?: { activeOnly?: boolean; projectDir?: string }): LegacyFeatureState[] {
+  listFeatures(filter?: { activeOnly?: boolean; projectDir?: string }): FeatureState[] {
     const clauses: string[] = []
     const params: (string | number)[] = []
     if (filter?.activeOnly) clauses.push("status IN ('running','paused','waiting_human','escalated')")
@@ -130,16 +130,16 @@ export class Store {
     return rows.map(toState)
   }
 
-  findFeatureByPr(pr: number): LegacyFeatureState | null {
+  findFeatureByPr(pr: number): FeatureState | null {
     const row = this.db.query("SELECT * FROM feature WHERE pr = ? AND status NOT IN ('done','abandoned')").get(pr) as FeatureRow | null
     return row ? toState(row) : null
   }
 
-  applyTransition(featureId: string, event: LegacyPipelineEvent, transition: LegacyTransition): void {
+  applyTransition(featureId: string, event: PipelineEvent, transition: Transition): void {
     this.db.transaction(() => this.applyTransitionTx(featureId, event, transition))()
   }
 
-  private applyTransitionTx(featureId: string, event: LegacyPipelineEvent, transition: LegacyTransition): void {
+  private applyTransitionTx(featureId: string, event: PipelineEvent, transition: Transition): void {
     const { patch, decision } = transition
     const sets: string[] = ["time_updated = ?"]
     const params: (string | number | null)[] = [Date.now()]
@@ -274,8 +274,8 @@ export class Store {
     runId: string,
     status: "succeeded" | "failed" | "reaped",
     detail: { output?: string; reason?: string } | undefined,
-    event: LegacyPipelineEvent,
-    transition: LegacyTransition,
+    event: PipelineEvent,
+    transition: Transition,
   ): boolean {
     return this.db.transaction(() => {
       const result = this.db.run(
@@ -297,14 +297,14 @@ export class Store {
    * `markRunActionHandled` closes it out (the normal, no-crash path) or
    * when nothing has ever concluded via `concludeRun` for this feature.
    */
-  getPendingRunAction(featureId: string): { runId: string; decision: LegacyDecision } | null {
+  getPendingRunAction(featureId: string): { runId: string; decision: Decision } | null {
     const row = this.db.query(
       `SELECT id, completion_decision FROM step_run
        WHERE feature_id = ? AND action_handled = 0 AND completion_decision IS NOT NULL
        ORDER BY time_finished DESC LIMIT 1`,
     ).get(featureId) as { id: string; completion_decision: string } | null
     if (!row) return null
-    return { runId: row.id, decision: JSON.parse(row.completion_decision) as LegacyDecision }
+    return { runId: row.id, decision: JSON.parse(row.completion_decision) as Decision }
   }
 
   /** Atomic 0→1 claim: false if the run was never pending or is already handled. */
@@ -547,7 +547,7 @@ export class Store {
   }
 }
 
-function decisionDetail(decision: LegacyDecision): string | null {
+function decisionDetail(decision: Decision): string | null {
   switch (decision.kind) {
     case "execute":
     case "wait_human":

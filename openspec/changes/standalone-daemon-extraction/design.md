@@ -74,38 +74,38 @@ findings and `description`. Existing tables and columns are neither renamed nor
 rebuilt, and the workflow-format job/step graph schema remains deferred.
 
 Until the graph persistence task lands, `@conductor/server` exports explicit
-`LegacyFeatureState`/transition types for the extracted store. This avoids
+`FeatureState`/transition types for the extracted store. This avoids
 misrepresenting the seed's single `current_step` and attempts/rounds maps as the
 new core graph state while preserving the store's observable semantics for the
 engine extraction.
 
-### Legacy compatibility execution model
+### Pipeline engine execution model
 
 `@conductor/server` now hosts opencode-conductor's engine/reconciler/builtins/
-GitHub client/findings-publication as an isolated `legacy/` module
-(`LegacyEngine`, `legacyBuiltins`, `RealGh`, `makePublishReviewLegacy`),
+GitHub client/findings-publication as an isolated `engine/` module
+(`Engine`, `builtins`, `RealGh`, `makePublishReview`),
 deliberately separate from `@conductor/core`'s graph workflow IR
 (`WorkflowDef`/`JobDef`). It runs the seed's single-`current_step`
 pipeline/attempts/rounds model against the extracted SQLite store while the
 graph engine is built out under the `workflow-format` change; nothing in
-`legacy/` may grow DAG/graph concepts.
+`engine/` may grow DAG/graph concepts.
 
-Every side effect crosses an injected port: `LegacyStorePort` (a structural
+Every side effect crosses an injected port: `StorePort` (a structural
 interface `Store` satisfies, so tests and a future backing store can
 substitute), a `Clock` (`now()`, defaulting to `systemClock`) used for
-recovery and TTL/reap timing, `LegacySessionClient` as a runtime-neutral
+recovery and TTL/reap timing, `SessionClient` as a runtime-neutral
 session runner (no opencode SDK type crosses this boundary — opencode today,
-other runners later implement it against their own client), `LegacyGh` as
+other runners later implement it against their own client), `GhClient` as
 the GitHub port (`RealGh` implements it over `ProcessRunner`), `ProcessRunner`
 for all filesystem/process/git execution (`exec` for argv, `shell` for
 `command` pipeline steps — never a bare `spawn`, never an implicit
-`process.cwd()`), a `Logger`, `LegacyConfigResolver` as the per-project config
-resolver (`projectDir → LegacyConfig | null`; one engine serves every project
+`process.cwd()`), a `Logger`, `ConfigResolver` as the per-project config
+resolver (`projectDir → EngineConfig | null`; one engine serves every project
 sharing the DB, each feature runs under its own project's pipeline/roles/
-limits), and an injectable `LegacyPublishReview` (defaults to the gh-backed
-`makePublishReviewLegacy`, override-able in tests).
+limits), and an injectable `PublishReview` (defaults to the gh-backed
+`makePublishReview`, override-able in tests).
 
-`LegacyEngine` owns no singleton, timer or daemon lifecycle: it holds no
+`Engine` owns no singleton, timer or daemon lifecycle: it holds no
 `setInterval`/`setTimeout` and starts nothing on construction. `reconcile()`
 is a plain async method the daemon calls on an interval and after startup
 recovery (daemon lifecycle, task 3) — the engine has no opinion on when or
@@ -164,7 +164,7 @@ instead of dispatching the step twice.
 This task does not touch `ActionRegistry`/graph-reservation
 (`workflow-reservation.ts`, `action-registry.ts`): that machinery belongs to
 `@conductor/core`'s graph workflow IR and is claimed by a separate task; the
-legacy engine and the graph reservation model are not unified here and must
+pipeline engine and the graph reservation model are not unified here and must
 not be conflated.
 
 **Known inherited boundary:** the idle-cycle debounce counter

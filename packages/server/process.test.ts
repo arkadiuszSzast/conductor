@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { realProcessRunner } from "./src/legacy/process.ts"
+import { realProcessRunner } from "./src/engine/process.ts"
 
 describe("realProcessRunner: arrival-order parity with the seed's runShell", () => {
   it("interleaves stdout and stderr chronologically in `output`, matching the seed's single-buffer capture", async () => {
