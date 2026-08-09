@@ -56,6 +56,24 @@ describe("interpret: feature.start", () => {
   })
 })
 
+describe("interpret: step.succeeded", () => {
+  it("advances to the next step in list order", () => {
+    const t = interpret(def, state({ currentStep: "implement" }), { kind: "step.succeeded", stepId: "implement" })
+    expect(t.decision).toEqual({ kind: "execute", stepId: "gate" })
+  })
+
+  it("honours explicit then over list order", () => {
+    const t = interpret(def, state({ currentStep: "fix_gate" }), { kind: "step.succeeded", stepId: "fix_gate" })
+    expect(t.decision).toEqual({ kind: "execute", stepId: "gate" })
+  })
+
+  it("finishes after the last step", () => {
+    const t = interpret(def, state({ currentStep: "merge" }), { kind: "step.succeeded", stepId: "merge" })
+    expect(t.decision).toEqual({ kind: "finish" })
+    expect(t.patch.status).toBe("done")
+  })
+})
+
 describe("interpret: retry and escalation", () => {
   it("retries the same step until max_attempts, then escalates", () => {
     const s = state({ currentStep: "gate", attempts: { gate: 1 } })
@@ -75,6 +93,36 @@ describe("interpret: retry and escalation", () => {
     const t = interpret(def, s, { kind: "step.succeeded", stepId: "implement" })
     expect(t.decision.kind).toBe("noop")
     expect(t.patch).toEqual({})
+  })
+
+  it("retries the same step when on_fail has no goto", () => {
+    const localDef: PipelineDef = {
+      roles: def.roles,
+      pipeline: [{ id: "flaky", type: "command", run: ["true"], on_fail: { max_attempts: 3 } }],
+    }
+    const t = interpret(localDef, state({ currentStep: "flaky" }), { kind: "step.failed", stepId: "flaky", reason: "network" })
+    expect(t.decision).toEqual({ kind: "execute", stepId: "flaky" })
+    expect(t.patch.attempts).toEqual({ flaky: 1 })
+  })
+
+  it("escalates immediately when on_fail.escalate is set", () => {
+    const localDef: PipelineDef = {
+      roles: def.roles,
+      pipeline: [{ id: "critical", type: "command", run: ["true"], on_fail: { escalate: true } }],
+    }
+    const t = interpret(localDef, state({ currentStep: "critical" }), { kind: "step.failed", stepId: "critical", reason: "boom" })
+    expect(t.decision.kind).toBe("escalate")
+  })
+
+  it("defaults to a single attempt when on_fail is absent", () => {
+    const localDef: PipelineDef = {
+      roles: def.roles,
+      pipeline: [{ id: "solo", type: "command", run: ["true"] }],
+    }
+    const first = interpret(localDef, state({ currentStep: "solo" }), { kind: "step.failed", stepId: "solo", reason: "x" })
+    expect(first.decision).toEqual({ kind: "execute", stepId: "solo" })
+    const second = interpret(localDef, state({ currentStep: "solo", attempts: { solo: 1 } }), { kind: "step.failed", stepId: "solo", reason: "x" })
+    expect(second.decision.kind).toBe("escalate")
   })
 })
 
@@ -98,6 +146,16 @@ describe("interpret: verdict routing and rounds_with", () => {
     const t = interpret(def, s, { kind: "step.verdict", stepId: "review", verdict: "unknown" })
     expect(t.decision.kind).toBe("escalate")
   })
+
+  it("approved verdict proceeds past the loop", () => {
+    const t = interpret(def, state({ currentStep: "review", rounds: { review: 2 } }), { kind: "step.verdict", stepId: "review", verdict: "approved" })
+    expect(t.decision).toEqual({ kind: "wait_human", stepId: "merge" })
+  })
+
+  it("ignores a stale verdict for a step that is no longer current", () => {
+    const t = interpret(def, state({ currentStep: "gate" }), { kind: "step.verdict", stepId: "review", verdict: "approved" })
+    expect(t.decision.kind).toBe("noop")
+  })
 })
 
 describe("interpret: human gates", () => {
@@ -117,6 +175,11 @@ describe("interpret: human gates", () => {
     expect(t.decision).toEqual({ kind: "execute", stepId: "merge" })
   })
 
+  it("human.approved is a noop when nothing awaits approval", () => {
+    const t = interpret(def, state({ currentStep: "gate" }), { kind: "human.approved", stepId: "merge" })
+    expect(t.decision.kind).toBe("noop")
+  })
+
   it("escalates human.rejected without on_reject; noop when no gate is pending", () => {
     const s = state({ status: "waiting_human", currentStep: "merge" })
     const t = interpret(def, s, { kind: "human.rejected", stepId: "merge" })
@@ -125,6 +188,31 @@ describe("interpret: human gates", () => {
     const notPending = state({ status: "running", currentStep: "merge" })
     const noop = interpret(def, notPending, { kind: "human.rejected", stepId: "merge" })
     expect(noop.decision.kind).toBe("noop")
+  })
+})
+
+describe("interpret: pause and resume", () => {
+  it("pause and resume round-trip preserves the current step", () => {
+    const paused = interpret(def, state({ currentStep: "gate" }), { kind: "human.paused" })
+    expect(paused.patch.status).toBe("paused")
+    const resumed = interpret(def, state({ currentStep: "gate", status: "paused" }), { kind: "human.resumed" })
+    expect(resumed.decision).toEqual({ kind: "execute", stepId: "gate" })
+  })
+
+  it("resume at a requires_human step waits for the human again", () => {
+    const t = interpret(def, state({ currentStep: "merge", status: "paused" }), { kind: "human.resumed" })
+    expect(t.decision).toEqual({ kind: "wait_human", stepId: "merge" })
+  })
+
+  it("resume on a running feature stays a noop", () => {
+    const t = interpret(def, state({ currentStep: "gate", status: "running" }), { kind: "human.resumed" })
+    expect(t.decision.kind).toBe("noop")
+  })
+
+  it("human.abandoned abandons from any state", () => {
+    const t = interpret(def, state({ currentStep: "review" }), { kind: "human.abandoned" })
+    expect(t.decision.kind).toBe("abandon")
+    expect(t.patch.status).toBe("abandoned")
   })
 })
 
