@@ -205,6 +205,27 @@ publication test, while disk loading and hot reload are not implemented or
 claimed here. This is the only structural adaptation not exercised through the
 same package boundary; it does not leave an engine behavior untested.
 
+### Historical database contract fixture
+
+A sanitized synthetic fixture built from the findings-era seed schema is
+committed as
+`packages/server/fixtures/database/historical-seed-findings.sqlite`. Its
+catalog reproduces the historical `opencode-conductor` schema after findings
+and review threads were introduced and predates the standalone migration
+ledger, `feature.description` and the durable completion-decision outbox. Its
+deterministic rows contain no production data, credentials or host paths.
+Tests always migrate a temporary copy, never the immutable fixture.
+
+The fixture contains an in-flight feature waiting at the merge approval gate,
+with completed predecessor runs, nontrivial attempts and rounds, parent/child
+session references, worktree, branch, PR-head history, open and resolved
+findings, review-thread lifecycle state and a deterministic audit timeline. The
+contract proves additive migration defaults are safe, physical close/reopen
+preserves every row, repeated reconciliation performs no replay, approval runs
+only the gated merge once, and a second restart cannot duplicate the merge or
+timeline transitions. Migration identifiers remain unchanged; migration of the
+real gloam database remains a separate rollout task.
+
 ### Reconciler ownership
 
 The daemon owns one lifecycle-managed reconciler. The existing confirmation of
