@@ -11,7 +11,7 @@
 - [x] [db] Move SQLite DB, store and existing additive migrations into `@conductor/server`; introduce an atomic migration ledger without destructive renames.
 - [x] [server] Move engine, reconciler, actions, GitHub integration and findings publication behind explicit dependency interfaces.
 - [x] [test] Move engine, store, built-in, preset and review-publishing tests; preserve all observed battle-scar behaviours.
-- [ ] [test][db] Add contract fixtures copied from a legacy conductor DB and prove in-flight state survives migration and restart.
+- [x] [test][db] Add contract fixtures reproducing a historical conductor DB schema and prove in-flight state survives migration and restart.
 
 ## 3. Build the daemon API
 
