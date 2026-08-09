@@ -5,9 +5,9 @@
  * (`WorkflowDef`/`JobDef`/graph steps). The seed's runtime state is a
  * single explicit `current_step` string with `attempts`/`rounds` maps —
  * not the new graph model — and this module must not be conflated with
- * it. It exists so `@conductor/server` can host a legacy-compatible
- * engine over the existing SQLite schema (see `../store.ts`) while the
- * graph engine is built out separately (workflow-format tasks).
+ * it. It exists so `@conductor/server` can host the seed-compatible
+ * pipeline engine over the existing SQLite schema (see `../store.ts`)
+ * while the graph engine is built out separately (workflow-format tasks).
  *
  * Three step types, no LLM in two of them:
  *  - `builtin`  — deterministic actions (git/PR mechanics), no LLM.

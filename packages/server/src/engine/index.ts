@@ -3,8 +3,8 @@
  * builtins/GitHub integration/findings publication ported onto the
  * extracted SQLite store, behind explicit dependency interfaces.
  *
- * "Legacy" prefix removed — this is the seed's single-`current_step`
- * pipeline model, distinct from `@conductor/core`'s graph workflow IR
+ * This is the seed's single-`current_step` pipeline model, distinct
+ * from `@conductor/core`'s graph workflow IR
  * (`WorkflowDef`/`JobDef`). It exists so the daemon can run the seed's
  * battle-tested semantics today while the graph engine is built out
  * separately (workflow-format tasks). Do not extend this module with
@@ -75,3 +75,6 @@ export type {
   RoleDef,
   StepDef,
 } from "./types.ts"
+
+export { validatePipeline } from "./validate.ts"
+export type { ValidationResult } from "./validate.ts"

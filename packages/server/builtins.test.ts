@@ -240,6 +240,130 @@ describe("builtins: worktree.create", () => {
   })
 })
 
+describe("builtins: worktree.create against a real git repo (origin/divergence/layout)", () => {
+  let root: string
+  let originDir: string
+  let cloneDir: string
+
+  async function sh(cmd: string, cwd: string): Promise<string> {
+    const result = await realProcessRunner.shell(cmd, { cwd })
+    if (result.code !== 0) throw new Error(`${cmd} failed: ${result.output}`)
+    return result.output
+  }
+
+  async function initRepo(): Promise<void> {
+    root = mkdtempSync(path.join(tmpdir(), "conductor-git-"))
+    originDir = path.join(root, "origin.git")
+    cloneDir = path.join(root, "project")
+    await sh(`git init --bare -b main ${JSON.stringify(originDir)}`, root)
+    await sh(`git clone ${JSON.stringify(originDir)} ${JSON.stringify(cloneDir)}`, root)
+    await sh(`git -C ${JSON.stringify(cloneDir)} -c user.email=t@t -c user.name=t -c commit.gpgSign=false commit --allow-empty -m root`, root)
+    await sh(`git -C ${JSON.stringify(cloneDir)} push origin main`, root)
+  }
+
+  function cleanup(): void {
+    rmSync(root, { recursive: true, force: true })
+  }
+
+  it("bases the branch on origin/<base>, including commits merged there after the local clone went stale", async () => {
+    await initRepo()
+    try {
+      const otherClone = path.join(root, "other")
+      await sh(`git clone ${JSON.stringify(originDir)} ${JSON.stringify(otherClone)}`, root)
+      const { writeFileSync } = await import("node:fs")
+      writeFileSync(path.join(otherClone, "merged-on-origin.txt"), "new\n")
+      await sh(`git -C ${JSON.stringify(otherClone)} add . && git -C ${JSON.stringify(otherClone)} -c user.email=t@t -c user.name=t -c commit.gpgSign=false commit -m "merged PR"`, root)
+      await sh(`git -C ${JSON.stringify(otherClone)} push origin main`, root)
+
+      const result = await builtins["worktree.create"]!({
+        feature: feature({ projectDir: cloneDir, slug: "wt-fresh", worktree: null, branch: null }),
+        stepId: "worktree",
+        config: config(),
+        store: new FakeStore() as unknown as StorePort,
+        gh: fakeGh(),
+        process: realProcessRunner,
+        params: {},
+      })
+      expect(result.kind).toBe("succeeded")
+      const worktree = `${cloneDir}-wt-fresh`
+      const files = await sh("ls", worktree)
+      expect(files).toContain("merged-on-origin.txt")
+    } finally {
+      cleanup()
+    }
+  })
+
+  it("reports divergence when the local base has local-only commits (not included)", async () => {
+    await initRepo()
+    try {
+      const { writeFileSync } = await import("node:fs")
+      writeFileSync(path.join(cloneDir, "local-only.txt"), "local\n")
+      await sh(`git -C ${JSON.stringify(cloneDir)} add . && git -C ${JSON.stringify(cloneDir)} -c user.email=t@t -c user.name=t -c commit.gpgSign=false commit -m "local only"`, root)
+
+      const result = await builtins["worktree.create"]!({
+        feature: feature({ projectDir: cloneDir, slug: "wt-diverged", worktree: null, branch: null }),
+        stepId: "worktree",
+        config: config(),
+        store: new FakeStore() as unknown as StorePort,
+        gh: fakeGh(),
+        process: realProcessRunner,
+        params: {},
+      })
+      expect(result.kind).toBe("succeeded")
+      expect(result.kind === "succeeded" ? result.output : "").toContain("local-only commits are not included")
+
+      const worktree = `${cloneDir}-wt-diverged`
+      const files = await sh("ls", worktree)
+      expect(files).not.toContain("local-only.txt")
+    } finally {
+      cleanup()
+    }
+  })
+
+  it("places worktrees inside a configured worktreeDir as <slug>", async () => {
+    await initRepo()
+    try {
+      const store = new FakeStore()
+      const result = await builtins["worktree.create"]!({
+        feature: feature({ projectDir: cloneDir, slug: "wt-custom", worktree: null, branch: null }),
+        stepId: "worktree",
+        config: config({ worktreeDir: "../wt-farm/{project}" }),
+        store: store as unknown as StorePort,
+        gh: fakeGh(),
+        process: realProcessRunner,
+        params: {},
+      })
+      expect(result.kind).toBe("succeeded")
+      const expected = path.join(path.dirname(cloneDir), "wt-farm", path.basename(cloneDir), "wt-custom")
+      expect(store.worktreeSet?.worktree).toBe(expected)
+      expect(existsSync(expected)).toBe(true)
+    } finally {
+      cleanup()
+    }
+  })
+
+  it("default layout is unchanged: ../<project>-<slug>", async () => {
+    await initRepo()
+    try {
+      const store = new FakeStore()
+      const result = await builtins["worktree.create"]!({
+        feature: feature({ projectDir: cloneDir, slug: "wt-default", worktree: null, branch: null }),
+        stepId: "worktree",
+        config: config(),
+        store: store as unknown as StorePort,
+        gh: fakeGh(),
+        process: realProcessRunner,
+        params: {},
+      })
+      expect(result.kind).toBe("succeeded")
+      expect(store.worktreeSet?.worktree).toBe(`${cloneDir}-wt-default`)
+      expect(existsSync(`${cloneDir}-wt-default`)).toBe(true)
+    } finally {
+      cleanup()
+    }
+  })
+})
+
 describe("builtins: worktree.remove / git.push argv safety", () => {
   it("git.push validates the branch via check-ref-format and never touches the shell", async () => {
     const process = new FakeProcessRunner()
