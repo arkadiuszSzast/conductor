@@ -181,19 +181,19 @@ store is out of scope for this task.
 The seed inventory contains 100 tests: engine 42, interpreter 23, store 6,
 worktree built-ins 4, review publication/parsing 7, templates 5, structural
 validation 9 and presets 4. The extracted direct counterparts contain 146 tests:
-server engine 53, pipeline interpreter 25, store 18, built-ins 17, review
-publication 15, templates 5, pipeline validation 9 and presets 4. Additional
+server engine 50, pipeline interpreter 25, store 18, built-ins 17, review
+publication 18, templates 5, pipeline validation 9 and presets 4. Additional
 server tests cover database migrations, GitHub error redaction, process limits,
 action registries and architecture constraints; graph workflow-format tests in
 `@conductor/core` remain separate and are not counted as pipeline-engine parity.
 
 | Seed tests | Extracted counterpart | Parity |
 | --- | --- | --- |
-| `engine.test.ts` (42) | `packages/server/engine.test.ts` (53) | Same observable routing, sessions, reports, gates, recovery, findings, publication and reaping through injected `SessionClient`, `GhClient`, `Clock`, `ProcessRunner`, `PublishReview` and `ConfigResolver`; concurrency/outbox cases are stricter. |
+| `engine.test.ts` (42) | `packages/server/engine.test.ts` (50) | Same observable routing, sessions, reports, gates, recovery, findings, publication and reaping through injected `SessionClient`, `GhClient`, `Clock`, `ProcessRunner`, `PublishReview` and `ConfigResolver`; concurrency/outbox cases are stricter. |
 | `interpret.test.ts` (23) | `packages/server/interpret.test.ts` (25) | Direct single-current-step event/patch parity; graph interpreter tests are intentionally separate. |
 | `store.test.ts` (6) | `packages/server/store.test.ts` (18) | Direct parity plus rollback, atomic conclusion and durable action-outbox coverage. |
 | `builtins-worktree.test.ts` (4) | `packages/server/builtins.test.ts` (17) | Real local-git freshness/divergence/layout assertions preserved; other deterministic actions use injected argv execution and add injection checks. |
-| `publishReview.test.ts` (7) | `packages/server/publish-review.test.ts` (15) | Parser and severity assertions preserved; injected GitHub/process publication adds projection failure coverage. |
+| `publishReview.test.ts` (7) | `packages/server/publish-review.test.ts` (18) | Parser and severity assertions preserved; injected GitHub/process publication adds token and review-projection failure coverage. |
 | `template.test.ts` (5) | `packages/server/template.test.ts` (5) | Direct parity. |
 | `validate.test.ts` (9) | `packages/server/validate.test.ts` (9) | Pipeline structural validator extracted directly and remains separate from the graph validator. |
 | `presets.test.ts` (4) | `packages/server/presets.test.ts` (4) | Three seed JSON pipeline presets copied unchanged and validated; workflow-format conversion remains a later task. |

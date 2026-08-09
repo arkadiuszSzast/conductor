@@ -186,6 +186,54 @@ describe("makePublishReview", () => {
     })
     expect(tokenSeen).toBe("bot-token-123")
   })
+
+  it("returns a token failure without calling GitHub", async () => {
+    let called = false
+    const gh = fakeGh({ postComment: async () => { called = true; return { ok: true } } })
+    const publish = makePublishReview(gh, fakeProcess({ code: 1, stdout: "", stderr: "denied", output: "denied" }))
+    const result = await publish({ repo: "o/r", pr: 1, verdict: "approved", notes: "notes", publish: { mode: "comment-only", tokenCommand: "mint-token" }, cwd: "/tmp" })
+    expect(result).toBe("publish FAILED (token): tokenCommand exited 1")
+    expect(called).toBe(false)
+  })
+
+  it("retries a rejected inline review as a body-only review", async () => {
+    const payloads: ReviewPayload[] = []
+    const gh = fakeGh({
+      postReview: async (_repo, _pr, payload) => {
+        payloads.push(payload)
+        return payload.comments ? { ok: false, error: "line mapping failed" } : { ok: true }
+      },
+    })
+    const publish = makePublishReview(gh, fakeProcess())
+    const result = await publish({
+      repo: "o/r",
+      pr: 1,
+      verdict: "changes_requested",
+      notes: '{"summary":"needs work","findings":[{"path":"a.ts","line":1,"body":"bug"}]}',
+      publish: { mode: "github-review" },
+      cwd: "/tmp",
+      findingIds: ["F1"],
+    })
+    expect(result).toContain("inline comments degraded to body")
+    expect(payloads).toHaveLength(2)
+    expect(payloads[0]?.comments).toHaveLength(1)
+    expect(payloads[1]?.comments).toBeUndefined()
+    expect(payloads[1]?.body).toContain("F1")
+  })
+
+  it("returns the original review failure when the body-only retry also fails", async () => {
+    const gh = fakeGh({ postReview: async () => ({ ok: false, error: "review rejected" }) })
+    const publish = makePublishReview(gh, fakeProcess())
+    const result = await publish({
+      repo: "o/r",
+      pr: 1,
+      verdict: "changes_requested",
+      notes: '{"summary":"needs work","findings":[{"path":"a.ts","line":1,"body":"bug"}]}',
+      publish: { mode: "github-review" },
+      cwd: "/tmp",
+    })
+    expect(result).toBe("publish FAILED (review): review rejected")
+  })
 })
 
 function fakeGh(over: Partial<GhClient> = {}): GhClient {
