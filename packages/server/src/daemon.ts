@@ -231,11 +231,14 @@ export class Daemon {
   }
 
   /**
-   * Startup sequence: open + migrate the database (a migration failure
-   * fails the start), register projects (an invalid project logs
-   * diagnostics and does not block the rest), construct the engine, run
-   * one recovery pass, then arm the heartbeat. Not restartable: a
-   * stopped or failed daemon is discarded, not restarted in place.
+   * Startup sequence: open + migrate the database, register projects
+   * (an invalid project logs diagnostics and does not block the rest),
+   * construct the engine, run one recovery pass, then arm the
+   * heartbeat. Any thrown startup failure — migration or otherwise —
+   * closes the connection and fails the start; only a recovery-pass
+   * error is non-fatal (logged, retried by the next heartbeat). Not
+   * restartable: a stopped or failed daemon is discarded, not restarted
+   * in place.
    */
   async start(): Promise<void> {
     if (this.phase !== "created") {
@@ -243,29 +246,32 @@ export class Daemon {
     }
     this.phase = "starting"
     this.log("info", "daemon starting", { database: resolveDatabasePath({ path: this.config.databasePath }) })
-
     try {
-      const connection = openDatabase({
-        path: this.config.databasePath,
-        ...(this.config.createDatabaseDirectory !== undefined
-          ? { createParentDirectory: this.config.createDatabaseDirectory }
-          : {}),
-      })
-      this.connection = connection
-      try {
-        this.appliedNow = migrateDatabase(connection)
-      } catch (error) {
-        connection.close()
-        this.connection = null
-        throw error
-      }
-      for (const id of this.appliedNow) this.log("info", "migration applied", { migration: id })
-      this.storeInstance = new Store(connection.db)
+      await this.runStartupSequence()
     } catch (error) {
+      // ANY startup failure — not just a failed migration — closes the
+      // connection and fails the start: a daemon that threw mid-startup
+      // must never linger "alive" with a leaked connection and no
+      // heartbeat.
       this.phase = "failed"
+      this.connection?.close()
+      this.connection = null
       this.log("error", `startup failed: ${message(error)}`)
       throw error
     }
+  }
+
+  private async runStartupSequence(): Promise<void> {
+    const connection = openDatabase({
+      path: this.config.databasePath,
+      ...(this.config.createDatabaseDirectory !== undefined
+        ? { createParentDirectory: this.config.createDatabaseDirectory }
+        : {}),
+    })
+    this.connection = connection
+    this.appliedNow = migrateDatabase(connection)
+    for (const id of this.appliedNow) this.log("info", "migration applied", { migration: id })
+    this.storeInstance = new Store(connection.db)
 
     this.registryInstance = new ProjectConfigRegistry({
       ...(this.config.globalConfigPath !== undefined ? { globalConfigPath: this.config.globalConfigPath } : {}),

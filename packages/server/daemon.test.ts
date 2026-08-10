@@ -161,6 +161,35 @@ describe("Daemon: startup", () => {
     expect(health.phase).toBe("failed")
   })
 
+  it("a failure after migration still fails the start and closes the database", async () => {
+    const scheduler = new ManualScheduler()
+    const logger = new CollectingLogger()
+    const deps: DaemonDeps = { scheduler, logger, sessions: new FakeSessions() }
+    // A dependency accessed during engine wiring (after the DB is open
+    // and migrated) that throws — the whole startup must fail closed.
+    Object.defineProperty(deps, "process", {
+      get() {
+        throw new Error("broken dependency wiring")
+      },
+    })
+    const daemon = new Daemon(
+      {
+        databasePath: join(tempDir("conductor-daemon-latefail-"), "state.db"),
+        projects: [],
+        heartbeatIntervalMs: 1000,
+      },
+      deps,
+    )
+    daemonsToStop.push(daemon)
+    await expect(daemon.start()).rejects.toThrow("broken dependency wiring")
+    const health = daemon.health()
+    expect(health.phase).toBe("failed")
+    expect(health.alive).toBe(false)
+    expect(scheduler.callback).toBeNull()
+    expect(() => daemon.store.listFeatures()).toThrow()
+    expect(logger.messages().some(m => m.includes("startup failed"))).toBe(true)
+  })
+
   it("start is not re-entrant: a second start() rejects", async () => {
     const { daemon } = makeDaemon({})
     await daemon.start()
