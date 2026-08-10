@@ -266,6 +266,10 @@ describe("onChange", () => {
     expect(changes).toContainEqual({ kind: "finding", featureId: feature.id })
 
     changes.length = 0
+    store.setFeatureFields(feature.id, { sessionId: "ses_parent" })
+    expect(changes).toContainEqual({ kind: "feature", featureId: feature.id })
+
+    changes.length = 0
     unsubscribe()
     store.finishRun(runId, "succeeded", { outputs: {} })
     expect(changes).toEqual([])

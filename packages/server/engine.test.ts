@@ -495,6 +495,47 @@ describe("Engine: restart recovery", () => {
     // the recovered decision (execute verify, a command step) ran synchronously
     expect(store.getFeature(feature.id)?.jobs["main"]?.currentStep).toBe("gate")
   })
+
+  it("a crash mid-replay leaves the batch pending; the next pass retries it whole", async () => {
+    // implement → gate: the pending batch is a wait_human notification,
+    // the decision kind with no state to self-heal from if dropped.
+    const gateWorkflow: WorkflowDef = workflow(
+      {
+        main: job([
+          agentStep("implement", "implementer", "go"),
+          humanStep("gate", { outcomes: { approved: next, rejected: rerunSteps(["implement"], 3) } }),
+        ]),
+      },
+      roles,
+      "gate",
+    )
+    const engine1 = makeEngine(gateWorkflow)
+    const feature = await startedFeature(engine1)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    const { interpret } = await import("@conductor/core")
+    const state = store.getFeature(feature.id)!
+    const event = { kind: "step.completed", jobId: "main", stepId: "implement", outcome: "done", outputs: { report: "x" } } as const
+    const transition = interpret(gateWorkflow, state, event)
+    store.concludeRun(run.id, "succeeded", { outputs: { report: "x" } }, event, transition)
+    expect(store.getPendingRunAction(feature.id)).not.toBeNull()
+
+    // First recovery attempt dies mid-replay (notify throws): the batch
+    // must stay pending — replay-then-mark, never mark-then-replay.
+    const crashing = makeEngine(gateWorkflow, {}, {
+      notify: () => {
+        throw new Error("crash mid-replay")
+      },
+    })
+    await crashing.reconcile()
+    expect(store.getPendingRunAction(feature.id)).not.toBeNull()
+
+    const notifications: string[] = []
+    const engine2 = makeEngine(gateWorkflow, {}, { notify: title => notifications.push(title) })
+    await engine2.reconcile()
+    expect(store.getPendingRunAction(feature.id)).toBeNull()
+    expect(notifications).toHaveLength(1)
+    expect(store.getFeature(feature.id)?.status).toBe("waiting_human")
+  })
 })
 
 describe("Engine: startFeature", () => {

@@ -475,12 +475,14 @@ export class Engine {
     // Restart recovery runs FIRST, unconditionally: decisions committed
     // by `concludeRun` but never acted on (process died in the gap) must
     // be replayed before the normal per-job reconciliation below sees
-    // the post-recovery state. Claim the whole batch atomically (0→1);
-    // each `execute_step` decision whose run already exists (dispatch
-    // completed before the crash) is skipped — every other decision
-    // kind is a pure notify/no-op and safe to replay unconditionally.
+    // the post-recovery state. Replay, THEN mark handled — the same
+    // dispatch-then-mark invariant as `concludeAndDispatch`: a second
+    // crash mid-replay leaves the entry pending so the next pass retries
+    // the WHOLE batch. Retry is safe: each `execute_step` whose run
+    // already exists (dispatch completed before the crash) is skipped,
+    // and every other decision kind is a pure notify/no-op.
     const pending = store.getPendingRunAction(input.id)
-    if (pending && store.markRunActionHandled(pending.runId)) {
+    if (pending) {
       log.log(`reconcile ${input.slug}: recovering ${pending.decisions.length} pending decision(s) from run ${pending.runId} after restart`)
       for (const decision of pending.decisions) {
         if (decision.kind === "execute_step" && store.getActiveRunForStep(input.id, decision.jobId, decision.stepId)) {
@@ -489,6 +491,7 @@ export class Engine {
         }
         await this.actDecision(input.id, snapshot, decision)
       }
+      store.markRunActionHandled(pending.runId)
     }
 
     const feature = store.getFeature(input.id) ?? input

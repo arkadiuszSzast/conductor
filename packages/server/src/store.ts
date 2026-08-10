@@ -253,6 +253,7 @@ export class Store {
     }
     params.push(id)
     this.db.run(`UPDATE feature SET ${sets.join(", ")} WHERE id = ?`, params as never)
+    this.emit({ kind: "feature", featureId: id })
   }
 
   insertRun(input: {

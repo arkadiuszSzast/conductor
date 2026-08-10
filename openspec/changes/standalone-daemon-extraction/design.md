@@ -150,22 +150,22 @@ interpolated into a shell string; refs are validated with
 shell string, via `ProcessRunner.shell`.
 
 **Accepted risk — untrusted text in `command` step templates:** template
-rendering does no shell-escaping, and the template context includes values
-that are not purely project-config-controlled: `{{human.<step>}}` (free-text
-human gate notes), `{{steps.<id>.output}}` (agent-reported text, which can
-itself echo untrusted repo/PR content back via prompt injection), and
-`{{findings.*}}` (finding bodies extracted from a PR diff/comment). A
-`command` step's `run:` entries interpolating any of these into shell syntax
-(e.g. `` echo "{{steps.review.output}}" | some-tool ``) lets a crafted
-finding body, human note, or agent note containing shell metacharacters
-(`` ` ``, `$()`, `;`) execute as command injection in the feature's
-worktree. This is preserved, not fixed, by this extraction: `command` steps
-are authored by the project (trusted `run:` shell text), but the *values*
-substituted into that text are not all trusted. Config authors must not
-interpolate `{{human.*}}`, `{{steps.*.output}}`, or `{{findings.*}}` into
-shell syntax in a `command` step's `run:`; prefer a deterministic `builtin`
-argv action (or pass the value via an env var / file, never inline shell
-text) wherever the value may contain untrusted content.
+rendering does no shell-escaping, and the `conductor.yaml` expression
+contexts include values that are not purely workflow-author-controlled:
+`{{ steps.<id>.outputs.report }}` (agent-reported text, which can itself
+echo untrusted repo/PR content back via prompt injection),
+`{{ steps.<id>.outputs.notes }}` (free-text human gate notes), and
+`{{ feedback.* }}` (previous-round snapshots of the same). A `command`
+step's `run:` entries interpolating any of these into shell syntax lets
+crafted text containing shell metacharacters (`` ` ``, `$()`, `;`) execute
+as command injection in the feature's worktree. The same caution applies to
+a `command` step's `cwd:` field: it is rendered through the same contexts
+and used verbatim as the child process working directory, so interpolating
+untrusted values there redirects execution (working-directory confusion /
+path traversal) even without shell interpolation. Workflow authors must not
+interpolate agent reports, human notes or feedback into shell syntax or
+`cwd:`; prefer versioned `action` steps (argv, no shell) or pass such
+values via env/file wherever they may contain untrusted content.
 
 `Store.applyTransition` still writes the feature-state update and transition
 audit inside one transaction. Run completion paths additionally use
