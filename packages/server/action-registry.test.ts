@@ -8,6 +8,7 @@ import {
   checkWorkflowReservation,
 } from "./src/workflow-reservation.ts"
 import type { LoadedActionRegistry } from "./src/action-registry.ts"
+import { resolveAction } from "@conductor/core"
 import type { ActionStep, WorkflowDef } from "@conductor/core"
 
 const temporaryDirectories: string[] = []
@@ -213,5 +214,33 @@ describe("checkWorkflowReservation", () => {
     expect(result.diagnostics.map(diagnostic => diagnostic.message).join("\n")).toContain('input "remote" must be a string')
     expect(result.diagnostics.map(diagnostic => diagnostic.message).join("\n")).toContain('input "remote" is required')
     expect(result.diagnostics.map(diagnostic => diagnostic.message).join("\n")).toContain('no entry named "git/worktree"')
+  })
+})
+
+describe("loadActionRegistry: the bundled actions directory", () => {
+  it("finds and validates all six bundled actions", async () => {
+    const result = await loadActionRegistry({ baseDir: import.meta.dirname, bundledPath: "actions" })
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error(result.diagnostics.map(d => `${d.sourcePath}: ${d.message}`).join("\n"))
+    expect(Object.keys(result.value.registry).sort()).toEqual([
+      "git/push",
+      "git/worktree",
+      "git/worktree-remove",
+      "github/await-checks",
+      "github/pr-create",
+      "github/pr-merge",
+    ])
+  })
+
+  it("resolves git/worktree@v1 against the bundled registry", async () => {
+    const result = await loadActionRegistry({ baseDir: import.meta.dirname, bundledPath: "actions" })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const resolved = resolveAction("git/worktree@v1", result.value.registry)
+    expect(resolved.ok).toBe(true)
+    if (!resolved.ok) return
+    expect(resolved.manifest.name).toBe("git/worktree")
+    expect(resolved.manifest.run).toEqual({ kind: "inprocess", handler: "git/worktree" })
+    expect(resolved.digest).toMatch(/^[0-9a-f]{64}$/)
   })
 })

@@ -25,11 +25,15 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { DEFAULT_OUTCOME, buildEvalContext, interpret, renderTemplate } from "@conductor/core"
+import { DEFAULT_OUTCOME, buildEvalContext, extractExpressions, interpret, renderTemplate } from "@conductor/core"
 import type {
+  ActionInputType,
+  ActionManifest,
+  ActionStep,
   AgentStep,
   CommandStep,
   Decision,
+  EvalContext,
   FeatureState,
   PipelineEvent,
   StepDef,
@@ -38,6 +42,8 @@ import type {
 import type { Store } from "./store.ts"
 import type { WorkflowResolver, WorkflowSnapshot } from "./workflow-registry.ts"
 import type { Clock, Logger, ProcessRunner, SessionClient } from "./ports.ts"
+import type { ActionExecutor } from "./action-host.ts"
+import { actionBindingsForReconciler } from "./workflow-reservation.ts"
 
 const DEFAULT_RUN_TTL_MS = 3_600_000
 const DEFAULT_NUDGE_IDLE_CYCLES = 2
@@ -50,6 +56,7 @@ export interface EngineDeps {
   readonly process: ProcessRunner
   readonly clock: Clock
   readonly log: Logger
+  readonly actions: ActionExecutor
   readonly notify?: (title: string, message: string) => void
 }
 
@@ -162,14 +169,15 @@ export class Engine {
         }
         if (step.type === "agent") return this.executeAgent(featureId, snapshot, decision.jobId, step)
         if (step.type === "command") return this.executeCommand(featureId, snapshot, decision.jobId, step)
-        // "action" steps are registry-invalid at load, so a workflow with
-        // one never publishes a snapshot — this branch should be
-        // unreachable. Escalate loudly rather than silently dispatching.
+        if (step.type === "action") return this.executeAction(featureId, snapshot, decision.jobId, step)
+        // A "human" step never produces an execute_step decision (it
+        // produces wait_human) — unreachable, but escalate loudly rather
+        // than silently dispatching if the interpreter's invariant ever breaks.
         await this.dispatch(featureId, {
           kind: "step.failed",
           jobId: decision.jobId,
           stepId: decision.stepId,
-          reason: "action steps require a configured action registry (unreachable: workflow should have failed validation at load)",
+          reason: `execute_step targeted a "${step.type}" step (unreachable: only agent/command/action steps dispatch this way)`,
         })
         return
       }
@@ -320,6 +328,59 @@ export class Engine {
     } finally {
       await rm(outputDir, { recursive: true, force: true })
     }
+  }
+
+  private async executeAction(featureId: string, snapshot: WorkflowSnapshot, jobId: string, step: ActionStep): Promise<void> {
+    const { store, actions, log } = this.deps
+    const state = store.getFeature(featureId)
+    if (!state) return
+    const attempt = (state.jobs[jobId]?.attempts[step.id] ?? 0) + 1
+
+    const binding = actionBindingsForReconciler(snapshot.actionBindings).get(jobId, step.id)
+    if (!binding) {
+      const reason = `action "${step.uses}" has no resolved binding for job "${jobId}" step "${step.id}" (workflow changed since load?)`
+      await this.dispatch(featureId, { kind: "step.failed", jobId, stepId: step.id, reason })
+      return
+    }
+
+    const feedback = store.getFeedback(featureId) ?? undefined
+    const context = buildEvalContext(snapshot.workflow, state, jobId, feedback)
+
+    const runId = store.insertRun({
+      featureId, jobId, stepId: step.id, stepType: "action", attempt,
+      metadata: { uses: step.uses, version: binding.manifest.version, digest: binding.digest },
+    })
+
+    const coerced = coerceActionInputs(step.with, binding.manifest, context, log)
+    if (!coerced.ok) {
+      await this.concludeAndDispatch(
+        featureId, runId, "failed", { reason: coerced.error },
+        { kind: "step.failed", jobId, stepId: step.id, reason: coerced.error },
+      )
+      return
+    }
+
+    const result = await actions.execute(binding, {
+      featureId,
+      jobId,
+      stepId: step.id,
+      workdir: state.worktree ?? state.projectDir,
+      inputs: coerced.inputs,
+      capabilities: binding.manifest.capabilities,
+    })
+
+    if (!result.ok) {
+      await this.concludeAndDispatch(
+        featureId, runId, "failed", { reason: result.error },
+        { kind: "step.failed", jobId, stepId: step.id, reason: result.error },
+      )
+      return
+    }
+    const outputs = stringifyOutputs(result.outputs)
+    await this.concludeAndDispatch(
+      featureId, runId, "succeeded", { outputs },
+      { kind: "step.completed", jobId, stepId: step.id, outcome: DEFAULT_OUTCOME, outputs },
+    )
   }
 
   // ------------------------------------------------------------ conclusion
@@ -608,6 +669,73 @@ export class Engine {
 
 function findStep(workflow: WorkflowDef, jobId: string, stepId: string): StepDef | undefined {
   return workflow.jobs[jobId]?.steps.find(step => step.id === stepId)
+}
+
+type CoerceActionInputsResult =
+  | { readonly ok: true; readonly inputs: Readonly<Record<string, unknown>> }
+  | { readonly ok: false; readonly error: string }
+
+/**
+ * Renders each `with:` value through the template evaluator, applies the
+ * manifest's default for values the step omitted, and coerces a rendered
+ * template's string result to the manifest's declared type (validation at
+ * reservation time deferred exactly this check for template values — a
+ * literal has already been type-checked and passes through unchanged).
+ */
+function coerceActionInputs(
+  values: Readonly<Record<string, unknown>>,
+  manifest: ActionManifest,
+  context: EvalContext,
+  log: Logger,
+): CoerceActionInputsResult {
+  const inputs: Record<string, unknown> = {}
+  for (const [name, def] of Object.entries(manifest.inputs)) {
+    const raw = values[name] ?? (def.presence === "optional" ? def.default : undefined)
+    if (raw === undefined) continue // required-but-missing is caught at reservation
+
+    if (typeof raw === "string" && extractExpressions(raw).length > 0) {
+      const rendered = renderTemplate(raw, context)
+      for (const error of rendered.errors) log.log(`action input "${name}": ${error}`)
+      if (rendered.errors.length > 0) {
+        return { ok: false, error: `action input "${name}" failed to render: ${rendered.errors.join("; ")}` }
+      }
+      const coerced = coerceInputValue(rendered.text, def.type)
+      if (coerced === undefined) {
+        return { ok: false, error: `action input "${name}" rendered "${rendered.text}" which is not a valid ${def.type}` }
+      }
+      inputs[name] = coerced
+      continue
+    }
+    inputs[name] = raw
+  }
+  return { ok: true, inputs }
+}
+
+function coerceInputValue(text: string, type: ActionInputType): unknown {
+  switch (type) {
+    case "string":
+      return text
+    case "number": {
+      const n = Number(text)
+      return Number.isFinite(n) ? n : undefined
+    }
+    case "boolean":
+      if (text === "true") return true
+      if (text === "false") return false
+      return undefined
+    default:
+      // Array-typed inputs are not rendered from a single template string;
+      // a template value for one is out of scope for v1.
+      return undefined
+  }
+}
+
+function stringifyOutputs(outputs: Readonly<Record<string, unknown>>): Record<string, string> {
+  const result: Record<string, string> = {}
+  for (const [name, value] of Object.entries(outputs)) {
+    result[name] = value === null || value === undefined ? "" : typeof value === "string" ? value : String(value)
+  }
+  return result
 }
 
 function waitingHumanSteps(state: FeatureState): Array<{ jobId: string; stepId: string }> {

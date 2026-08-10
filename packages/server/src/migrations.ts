@@ -227,6 +227,50 @@ export const migrations: readonly Migration[] = [
       db.run("CREATE INDEX IF NOT EXISTS idx_transition_feature ON transition_log(feature_id, time_created)")
     },
   },
+  {
+    id: "0009_run_action_metadata",
+    up(db) {
+      // `action` joins `agent`/`command` as a step type, and an action run
+      // records its resolved identity (uses, manifest version, content
+      // digest) as JSON metadata. SQLite cannot ALTER a CHECK constraint in
+      // place, so the table is rebuilt — same technique as 0008, this time
+      // preserving any existing rows.
+      db.run("ALTER TABLE run RENAME TO run_old")
+      db.run(`
+        CREATE TABLE run (
+          id                    TEXT PRIMARY KEY,
+          feature_id            TEXT NOT NULL REFERENCES feature(id) ON DELETE CASCADE,
+          job_id                TEXT NOT NULL,
+          step_id               TEXT NOT NULL,
+          step_type             TEXT NOT NULL CHECK(step_type IN ('agent','command','action')),
+          attempt               INTEGER NOT NULL DEFAULT 1,
+          status                TEXT NOT NULL DEFAULT 'running'
+                                  CHECK(status IN ('running','succeeded','failed','reaped')),
+          session_id            TEXT,
+          outputs               TEXT NOT NULL DEFAULT '{}',
+          reason                TEXT,
+          nudges                INTEGER NOT NULL DEFAULT 0,
+          completion_event      TEXT,
+          completion_decisions  TEXT,
+          action_handled        INTEGER NOT NULL DEFAULT 0,
+          metadata              TEXT,
+          time_started          INTEGER NOT NULL,
+          time_finished         INTEGER
+        )
+      `)
+      db.run(`
+        INSERT INTO run (id, feature_id, job_id, step_id, step_type, attempt, status, session_id,
+                          outputs, reason, nudges, completion_event, completion_decisions, action_handled,
+                          time_started, time_finished)
+        SELECT id, feature_id, job_id, step_id, step_type, attempt, status, session_id,
+               outputs, reason, nudges, completion_event, completion_decisions, action_handled,
+               time_started, time_finished
+        FROM run_old
+      `)
+      db.run("DROP TABLE run_old")
+      db.run("CREATE INDEX IF NOT EXISTS idx_run_feature ON run(feature_id, time_started)")
+    },
+  },
 ]
 
 function validateMigrations(ordered: readonly Migration[]): void {

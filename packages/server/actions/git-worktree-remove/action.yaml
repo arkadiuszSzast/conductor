@@ -1,0 +1,10 @@
+name: git/worktree-remove
+version: 1.0.0
+description: Remove a git worktree, idempotently.
+inputs:
+  path:  { type: string, required: true }
+  force: { type: boolean, default: false }
+outputs:
+  removed: { type: boolean }
+capabilities: [filesystem, process, git]
+run: { handler: git/worktree-remove }

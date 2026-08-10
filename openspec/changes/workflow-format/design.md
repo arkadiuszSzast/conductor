@@ -300,11 +300,19 @@ it only submits durable trigger events.
 
 ## Migration
 
-The converter maps a legacy ordered pipeline to one job, preserving step IDs,
-explicit routes, roles/models, prompts, gates and params. Builtin names map to
-bundled actions. It refuses unsupported/ambiguous shapes rather than guessing.
-Converted files are validated and a semantic test runs representative legacy
-events through both interpreters until parity is established.
+**Superseded.** The legacy JSON → v1 YAML converter described below was never
+built and is now void: `standalone-daemon-extraction` deleted the seed
+pipeline format outright (greenfield, no users, no in-flight data to
+migrate). Section 5's two conversion tasks in `tasks.md` are marked void for
+the same reason. The seed's builtin mechanics live on only as bundled `@v1`
+actions (task 3.4) — behavioural parity, not format compatibility.
+
+~~The converter maps a legacy ordered pipeline to one job, preserving step
+IDs, explicit routes, roles/models, prompts, gates and params. Builtin names
+map to bundled actions. It refuses unsupported/ambiguous shapes rather than
+guessing. Converted files are validated and a semantic test runs
+representative legacy events through both interpreters until parity is
+established.~~
 
 ## Confirmed: canonical IR shape
 

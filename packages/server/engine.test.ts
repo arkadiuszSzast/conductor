@@ -7,6 +7,8 @@ import { Store } from "./src/store.ts"
 import { Engine, type EngineDeps, type EngineOptions } from "./src/engine.ts"
 import type { ProcessExecOptions, ProcessExecResult, ProcessRunner, SessionClient } from "./src/ports.ts"
 import type { WorkflowSnapshot } from "./src/workflow-registry.ts"
+import type { ActionExecutor, ActionHostExecuteResult } from "./src/action-host.ts"
+import type { ResolvedActionBinding, ResolvedActionBindings } from "./src/workflow-reservation.ts"
 import {
   agentStep,
   commandStep,
@@ -17,7 +19,8 @@ import {
   backoff,
   workflow,
 } from "@conductor/core/testing.ts"
-import type { WorkflowDef } from "@conductor/core"
+import type { ActionManifest, ActionRunContext, ActionStep, WorkflowDef } from "@conductor/core"
+import { computeActionDigest } from "@conductor/core"
 
 // ---------------------------------------------------------------- fakes
 
@@ -78,6 +81,60 @@ class FakeClock {
   }
   advance(ms: number): void {
     this.current += ms
+  }
+}
+
+class FakeActionHost implements ActionExecutor {
+  calls: Array<{ binding: ResolvedActionBinding; ctx: ActionRunContext }> = []
+  handler: ((binding: ResolvedActionBinding, ctx: ActionRunContext) => ActionHostExecuteResult) | null = null
+  async execute(binding: ResolvedActionBinding, ctx: ActionRunContext): Promise<ActionHostExecuteResult> {
+    this.calls.push({ binding, ctx })
+    if (this.handler) return this.handler(binding, ctx)
+    return { ok: true, outputs: {} }
+  }
+}
+
+function actionManifest(overrides: Partial<ActionManifest> = {}): ActionManifest {
+  return {
+    name: "test/action",
+    version: "1.0.0",
+    inputs: {},
+    outputs: {},
+    capabilities: [],
+    run: { kind: "inprocess", handler: "test/action" },
+    ...overrides,
+  }
+}
+
+function actionBindings(bindings: ReadonlyArray<{
+  jobId: string
+  stepId: string
+  uses: string
+  manifest: ActionManifest
+  sourcePath?: string
+}>): ResolvedActionBindings {
+  const result: Record<string, ResolvedActionBinding> = {}
+  for (const binding of bindings) {
+    result[JSON.stringify([binding.jobId, binding.stepId])] = {
+      jobId: binding.jobId,
+      stepId: binding.stepId,
+      uses: binding.uses,
+      manifest: binding.manifest,
+      digest: computeActionDigest(binding.manifest),
+      sourcePath: binding.sourcePath ?? "/bundled/test-action/action.yaml",
+    }
+  }
+  return result
+}
+
+function actionStepDef(id: string, uses: string, withValues: Readonly<Record<string, unknown>> = {}): ActionStep {
+  return {
+    id,
+    type: "action",
+    uses,
+    with: withValues,
+    outcomes: {},
+    retry: { strategy: "none" },
   }
 }
 
@@ -145,14 +202,14 @@ const fanInWorkflow: WorkflowDef = workflow(
   "fan-in",
 )
 
-function snapshotOf(def: WorkflowDef): WorkflowSnapshot {
+function snapshotOf(def: WorkflowDef, actionBindings: ResolvedActionBindings = {}): WorkflowSnapshot {
   return {
     projectDir: "/tmp/project",
     workflow: def,
     source: "/tmp/project/conductor.yaml",
     warnings: [],
     loadedAt: Date.now(),
-    actionBindings: {},
+    actionBindings,
   }
 }
 
@@ -162,6 +219,7 @@ let store: Store
 let sessions: FakeSessions
 let process_: FakeProcess
 let clock: FakeClock
+let actions: FakeActionHost
 
 beforeEach(() => {
   directory = mkdtempSync(join(tmpdir(), "conductor-engine-"))
@@ -170,6 +228,7 @@ beforeEach(() => {
   sessions = new FakeSessions()
   process_ = new FakeProcess()
   clock = new FakeClock()
+  actions = new FakeActionHost()
 })
 
 afterEach(() => {
@@ -177,8 +236,13 @@ afterEach(() => {
   rmSync(directory, { recursive: true, force: true })
 })
 
-function makeEngine(def: WorkflowDef, options: EngineOptions = {}, overrides: Partial<EngineDeps> = {}): Engine {
-  const snapshot = snapshotOf(def)
+function makeEngine(
+  def: WorkflowDef,
+  options: EngineOptions = {},
+  overrides: Partial<EngineDeps> = {},
+  actionBindings: ResolvedActionBindings = {},
+): Engine {
+  const snapshot = snapshotOf(def, actionBindings)
   return new Engine(
     {
       store,
@@ -187,6 +251,7 @@ function makeEngine(def: WorkflowDef, options: EngineOptions = {}, overrides: Pa
       process: process_,
       clock,
       log: { log: () => {} },
+      actions,
       ...overrides,
     },
     options,
@@ -538,6 +603,138 @@ describe("Engine: restart recovery", () => {
   })
 })
 
+describe("Engine: action steps", () => {
+  const worktreeManifest = actionManifest({
+    name: "git/worktree",
+    inputs: {
+      branch: { type: "string", presence: "required" },
+      retries: { type: "number", presence: "optional", default: 1 },
+    },
+    outputs: { path: "string" },
+    capabilities: ["filesystem"],
+  })
+
+  const actionWorkflow: WorkflowDef = workflow(
+    {
+      main: job([
+        actionStepDef("worktree", "git/worktree@v1", { branch: "feat/x", retries: "{{ 3 }}" }),
+        agentStep("implement", "implementer", "go, using {{ steps.worktree.outputs.path }}"),
+      ]),
+    },
+    roles,
+    "action-flow",
+  )
+
+  function bindingsFor(manifest: ActionManifest) {
+    return actionBindings([{ jobId: "main", stepId: "worktree", uses: "git/worktree@v1", manifest }])
+  }
+
+  it("dispatches through registry→reservation→host, and downstream steps see its outputs via {{ steps }}", async () => {
+    actions.handler = () => ({ ok: true, outputs: { path: "/repo-worktrees/feat-x" } })
+    const engine = makeEngine(actionWorkflow, {}, {}, bindingsFor(worktreeManifest))
+    const feature = await engine.startFeature("/tmp/project", { title: "Ship it" })
+    if (!feature.ok) throw new Error(feature.message)
+
+    // the action step ran synchronously to completion during dispatch
+    const worktreeRun = store.listRuns(feature.feature.id).find(r => r.stepId === "worktree")!
+    expect(worktreeRun.status).toBe("succeeded")
+    expect(worktreeRun.stepType).toBe("action")
+    expect(worktreeRun.outputs).toEqual({ path: "/repo-worktrees/feat-x" })
+    expect(actions.calls).toHaveLength(1)
+    expect(actions.calls[0]!.ctx.capabilities).toEqual(["filesystem"])
+
+    // downstream agent prompt template resolved the action's output
+    expect(sessions.prompts.at(-1)!.text).toContain("/repo-worktrees/feat-x")
+  })
+
+  it("records uses/version/digest metadata on the run", async () => {
+    actions.handler = () => ({ ok: true, outputs: { path: "/x" } })
+    const bindings = bindingsFor(worktreeManifest)
+    const engine = makeEngine(actionWorkflow, {}, {}, bindings)
+    const feature = await startedFeature(engine)
+    const run = store.listRuns(feature.id).find(r => r.stepId === "worktree")!
+
+    expect(run.metadata).toEqual({
+      uses: "git/worktree@v1",
+      version: worktreeManifest.version,
+      digest: bindings[JSON.stringify(["main", "worktree"])]!.digest,
+    })
+  })
+
+  it("coerces a rendered template number input from its string form", async () => {
+    let seenRetries: unknown
+    actions.handler = (_binding, ctx) => {
+      seenRetries = ctx.inputs.retries
+      return { ok: true, outputs: { path: "/x" } }
+    }
+    const engine = makeEngine(actionWorkflow, {}, {}, bindingsFor(worktreeManifest))
+    await engine.startFeature("/tmp/project", { title: "Ship it" })
+
+    expect(seenRetries).toBe(3)
+    expect(typeof seenRetries).toBe("number")
+  })
+
+  it("an action failure fails the step and escalates when there is no onFail route", async () => {
+    actions.handler = () => ({ ok: false, error: "boom" })
+    const engine = makeEngine(actionWorkflow, {}, {}, bindingsFor(worktreeManifest))
+    const feature = await startedFeature(engine)
+
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    const run = store.listRuns(feature.id).find(r => r.stepId === "worktree")!
+    expect(run.status).toBe("failed")
+    expect(run.reason).toBe("boom")
+  })
+
+  it("a missing binding fails the step instead of dispatching (workflow changed since load)", async () => {
+    const engine = makeEngine(actionWorkflow, {}, {}, {})
+    const feature = await startedFeature(engine)
+
+    expect(actions.calls).toHaveLength(0)
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    // no binding → no run row is ever inserted for the step
+    expect(store.listRuns(feature.id).some(r => r.stepId === "worktree")).toBe(false)
+  })
+
+  it("an unparseable rendered number input fails the step without calling the host", async () => {
+    const badWorkflow: WorkflowDef = workflow(
+      {
+        main: job([actionStepDef("worktree", "git/worktree@v1", { branch: "b", retries: "{{ 'not-a-number' }}" })]),
+      },
+      roles,
+      "action-bad-input",
+    )
+    const engine = makeEngine(badWorkflow, {}, {}, bindingsFor(worktreeManifest))
+    const feature = await startedFeature(engine)
+
+    expect(actions.calls).toHaveLength(0)
+    const run = store.listRuns(feature.id).find(r => r.stepId === "worktree")!
+    expect(run.status).toBe("failed")
+    expect(run.reason).toContain("not a valid number")
+  })
+
+  it("TTL reaps a hung action run just like a command run", async () => {
+    actions.calls = []
+    const pending = new Promise<never>(() => {}) // never resolves — simulates a hung host call
+    actions.handler = () => { throw new Error("unused") }
+    const originalExecute = actions.execute.bind(actions)
+    actions.execute = async (binding, ctx) => {
+      actions.calls.push({ binding, ctx })
+      return pending
+    }
+    const engine = makeEngine(actionWorkflow, { runTtlMs: 1000 }, { clock }, bindingsFor(worktreeManifest))
+    void engine.startFeature("/tmp/project", { title: "Ship it" })
+    // let the dispatch reach the (hung) host call before reconciling
+    await new Promise(resolve => setTimeout(resolve, 10))
+    const feature = store.listFeatures()[0]!
+    clock.advance(2000)
+    await engine.reconcile()
+
+    const run = store.listRuns(feature.id).find(r => r.stepId === "worktree")!
+    expect(run.status).toBe("reaped")
+    void originalExecute
+  })
+})
+
 describe("Engine: startFeature", () => {
   it("returns project_not_configured when no workflow is registered", async () => {
     const engine = new Engine({
@@ -547,6 +744,7 @@ describe("Engine: startFeature", () => {
       process: process_,
       clock,
       log: { log: () => {} },
+      actions,
     })
     const result = await engine.startFeature("/tmp/nowhere", { title: "T" })
     expect(result.ok).toBe(false)

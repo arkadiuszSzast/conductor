@@ -1,0 +1,11 @@
+name: github/pr-merge
+version: 1.0.0
+description: Merge a GitHub pull request.
+inputs:
+  pr:             { type: number, required: true }
+  method:         { type: string, default: squash }
+  delete_branch:  { type: boolean, default: true }
+outputs:
+  merged_sha: { type: string }
+capabilities: [process, network, credentials]
+run: { handler: github/pr-merge }

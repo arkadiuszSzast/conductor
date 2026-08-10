@@ -230,6 +230,74 @@ describe("Daemon: startup", () => {
     expect(daemon.health().runner).toBe("unavailable")
     expect(logger.messages().some(m => m.includes("no session runner"))).toBe(true)
   })
+
+  it("loads the bundled action registry by default, resolved relative to its own module — an action-step workflow is valid", async () => {
+    const project = writeProject(`
+name: with-action
+on: [manual]
+roles: {}
+jobs:
+  main:
+    steps:
+      - id: worktree
+        action:
+          uses: git/worktree@v1
+          with:
+            branch: feat/x
+`)
+    const scheduler = new ManualScheduler()
+    const logger = new CollectingLogger()
+    const daemon = new Daemon(
+      {
+        databasePath: join(tempDir("conductor-daemon-actions-"), "state.db"),
+        projects: [project],
+        heartbeatIntervalMs: 1000,
+      },
+      { scheduler, logger, sessions: new FakeSessions() },
+    )
+    daemonsToStop.push(daemon)
+    await daemon.start()
+
+    const health = daemon.health()
+    expect(health.ready).toBe(true)
+    const entry = health.projects.find(p => p.projectDir === project)
+    expect(entry?.state).toBe("valid")
+    expect(logger.messages().some(m => m.includes("action registry loaded"))).toBe(true)
+  })
+
+  it("a registry load failure logs diagnostics and still starts — an action-step workflow becomes invalid", async () => {
+    const project = writeProject(`
+name: with-action
+on: [manual]
+roles: {}
+jobs:
+  main:
+    steps:
+      - id: worktree
+        action:
+          uses: git/worktree@v1
+          with:
+            branch: feat/x
+`)
+    const scheduler = new ManualScheduler()
+    const logger = new CollectingLogger()
+    const daemon = new Daemon(
+      {
+        databasePath: join(tempDir("conductor-daemon-actions-missing-"), "state.db"),
+        projects: [project],
+        heartbeatIntervalMs: 1000,
+        actions: { bundledPath: join(tempDir("conductor-daemon-actions-empty-"), "does-not-exist") },
+      },
+      { scheduler, logger, sessions: new FakeSessions() },
+    )
+    daemonsToStop.push(daemon)
+    await daemon.start()
+
+    expect(daemon.health().ready).toBe(true)
+    const entry = daemon.health().projects.find(p => p.projectDir === project)
+    expect(entry?.state).toBe("invalid")
+    expect(logger.messages().some(m => m.includes("action registry invalid"))).toBe(true)
+  })
 })
 
 describe("Daemon: readiness and liveness", () => {

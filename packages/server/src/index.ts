@@ -10,7 +10,7 @@ export type { Database, DatabaseConfig, DatabaseConnection } from "./database.ts
 export { migrations, runMigrations } from "./migrations.ts"
 export type { Migration } from "./migrations.ts"
 export { Store } from "./store.ts"
-export type { FindingView, RunSummary, StoreChange, TransitionEntry } from "./store.ts"
+export type { FindingView, RunActionMetadata, RunSummary, StoreChange, TransitionEntry } from "./store.ts"
 
 export { applyPatch, initialFeatureState } from "./state.ts"
 export type { CreateFeatureInput, InitialFeatureStateInput } from "./state.ts"
@@ -48,6 +48,10 @@ export type {
 
 export { Engine } from "./engine.ts"
 export type { EngineDeps, EngineOptions, StartFeatureInput, StartFeatureResult } from "./engine.ts"
+
+export { ActionHost, CapabilityDeniedError, realSleep } from "./action-host.ts"
+export type { ActionHandler, ActionHostDeps, ActionHostExecuteResult } from "./action-host.ts"
+export { bundledHandlers } from "./actions/bundled.ts"
 
 export { realProcessRunner } from "./process.ts"
 export { systemClock } from "./ports.ts"

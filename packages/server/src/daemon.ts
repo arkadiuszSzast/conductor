@@ -33,11 +33,17 @@ import {
 import { migrations } from "./migrations.ts"
 import { Store } from "./store.ts"
 import { WorkflowRegistry, type WorkflowDiagnostic, type WorkflowStatus } from "./workflow-registry.ts"
-import type { LoadedActionRegistry } from "./action-registry.ts"
+import { loadActionRegistry, type ActionRegistryLoadDiagnostic, type LoadedActionRegistry } from "./action-registry.ts"
 import { Engine, type EngineOptions } from "./engine.ts"
+import { ActionHost } from "./action-host.ts"
+import { bundledHandlers } from "./actions/bundled.ts"
 import { realProcessRunner } from "./process.ts"
 import { systemClock } from "./ports.ts"
 import type { Clock, ProcessRunner, SessionClient } from "./ports.ts"
+
+/** `packages/server/actions` relative to this compiled file's own
+ *  directory — never `process.cwd()`, never a home directory. */
+const DEFAULT_BUNDLED_ACTIONS_PATH = "../actions"
 
 // ------------------------------------------------------------ structured log
 
@@ -102,6 +108,17 @@ export interface DaemonConfig {
   readonly heartbeatIntervalMs: number
   /** Engine tuning (runTtlMs, nudgeIdleCycles, maxNudges). Defaults match the seed's operational values. */
   readonly engine?: EngineOptions
+  /**
+   * Local action registry search paths. `bundledPath` defaults to the
+   * bundled `packages/server/actions` directory, resolved relative to this
+   * module's own location — never `process.cwd()`, never `$HOME`. A
+   * registry load failure is a startup diagnostic, not a fatal error:
+   * workflows with `action` steps become invalid, everything else starts.
+   */
+  readonly actions?: {
+    readonly bundledPath?: string
+    readonly localPaths?: readonly string[]
+  }
 }
 
 /** The one thing the daemon needs from a reconciler: one idempotent pass. */
@@ -276,8 +293,9 @@ export class Daemon {
     for (const id of this.appliedNow) this.log("info", "migration applied", { migration: id })
     this.storeInstance = new Store(connection.db)
 
+    const actionRegistry = this.deps.actionRegistry ?? (await this.loadActionRegistry())
     this.registryInstance = new WorkflowRegistry({
-      ...(this.deps.actionRegistry !== undefined ? { actionRegistry: this.deps.actionRegistry } : {}),
+      ...(actionRegistry !== undefined ? { actionRegistry } : {}),
     })
     for (const projectDir of this.config.projects) {
       const result = this.registryInstance.register(projectDir)
@@ -301,6 +319,7 @@ export class Daemon {
 
     const processRunner = this.deps.process ?? realProcessRunner
     const engineLogger = { log: (text: string) => this.log("info", text, { component: "engine" }) }
+    const actionHost = new ActionHost(bundledHandlers, { process: processRunner, log: engineLogger })
     this.engineInstance = new Engine(
       {
         store: this.storeInstance,
@@ -309,6 +328,7 @@ export class Daemon {
         process: processRunner,
         clock: this.clock,
         log: engineLogger,
+        actions: actionHost,
         ...(this.deps.notify !== undefined ? { notify: this.deps.notify } : {}),
       },
       this.config.engine ?? {},
@@ -335,6 +355,32 @@ export class Daemon {
     }, this.config.heartbeatIntervalMs)
     this.phase = "ready"
     this.log("info", "daemon ready", { heartbeatIntervalMs: this.config.heartbeatIntervalMs })
+  }
+
+  /**
+   * Loads the local action registry (bundled + configured local paths). A
+   * load failure logs diagnostics and returns `undefined` — the daemon
+   * still starts; every project whose workflow has `action` steps becomes
+   * `invalid` at registration instead (the same failure mode as a broken
+   * `conductor.yaml`).
+   */
+  private async loadActionRegistry(): Promise<LoadedActionRegistry | undefined> {
+    const bundledPath = this.config.actions?.bundledPath ?? DEFAULT_BUNDLED_ACTIONS_PATH
+    const result = await loadActionRegistry({
+      baseDir: import.meta.dirname,
+      bundledPath,
+      ...(this.config.actions?.localPaths !== undefined ? { localPaths: this.config.actions.localPaths } : {}),
+    })
+    if (result.ok) {
+      this.log("info", "action registry loaded", { actions: Object.keys(result.value.registry).length })
+      return result.value
+    }
+    for (const diagnostic of result.diagnostics) this.logActionRegistryDiagnostic(diagnostic)
+    return undefined
+  }
+
+  private logActionRegistryDiagnostic(diagnostic: ActionRegistryLoadDiagnostic): void {
+    this.log("warn", `action registry invalid: ${diagnostic.message}`, { source: diagnostic.sourcePath })
   }
 
   /**
