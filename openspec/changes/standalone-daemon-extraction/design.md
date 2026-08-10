@@ -395,6 +395,59 @@ concluding a run exactly once, the bearer-auth boundary on the wire
 and shutdown semantics (SSE streams end, the socket refuses new work,
 durable state survives an API-then-daemon stop order).
 
+### CLI client
+
+`@conductor/cli` is a thin client of API v1 — the spec's "CLI and API
+yield the same state transition" is upheld structurally: every command
+maps 1:1 onto one REST operation (`start` → `POST /v1/features`,
+`status` → `GET /v1/features[/:id]`, `approve`/`request-changes`/
+`pause`/`resume`/`abandon` → the feature command endpoints, `report` →
+`POST /v1/runs/:id/report`, `logs` → `GET /v1/features/:id/timeline`),
+so the CLI holds no pipeline logic and no privileged path. `ApiClient`
+(`packages/cli/src/client.ts`) is a typed wrapper over the wire
+contract: bearer auth, `x-request-id` propagation, and every non-2xx
+response raised as an `ApiError` carrying the envelope's
+machine-readable `code` — callers branch on codes, never on prose.
+The transport is an injectable `(Request) => Promise<Response>` (the
+same shape as the API's socketless handler), so CLI tests drive real
+commands against a real daemon through `createApi().handle` with no
+socket, network, GitHub or opencode.
+
+Connection configuration is explicit, mirroring the API's explicit
+bind: flags (`--url`/`--token`/`--config`) over env (`CONDUCTOR_URL`/
+`CONDUCTOR_TOKEN`/`CONDUCTOR_CONFIG`) over an optional JSON config
+file. There is NO default daemon address and no default config path —
+a missing address is a usage error (exit 2), never a guess at a
+well-known port or a home-directory file.
+
+Exit codes are stable for scripting: 0 ok, 1 failure, 2 usage,
+3 unauthorized, 4 not found, 5 conflict (wrong gate state / terminal
+feature), 6 duplicate report (`run_already_concluded` — distinct so
+agent wrappers can treat a retried report as success-already-recorded),
+7 daemon unreachable. `--json` prints the API payload verbatim on
+stdout (and the error envelope on stderr), keeping machine parsing on
+the wire contract rather than on formatted text. `--notes @file` reads
+the notes body from a file, curl-style, for multi-line agent reports.
+
+`conductor logs <feature-id>` is scoped to the feature's transition
+timeline (`GET /v1/features/:id/timeline`), rendered chronologically —
+not a daemon log stream. The daemon logs JSON lines through
+`DaemonLogger` to stderr, which the operator's supervisor already
+captures; streaming those over HTTP would need a new endpoint, buffer
+ownership and auth-scoped retention that nothing currently needs.
+The timeline IS the feature-scoped audit trail the seed's dashboard
+surfaced; if operator-grade log streaming is ever wanted it should
+arrive as its own proposal, not an ad-hoc API extension.
+
+`conductor init` is the one local command: it scaffolds
+`<dir>/.opencode/conductor.json` (the format the daemon's registry
+loads today) with the minimal two-step gated pipeline, refuses to
+overwrite without `--force`, and needs no daemon address. Emitting
+`conductor.yaml` belongs to the configuration-migration task once the
+workflow-format change specifies it. All process effects (fs, env,
+stdout/stderr, cwd, transport) enter through an injected `CliDeps`;
+`src/main.ts` is the only file touching the real environment.
+
 ### Configuration migration
 
 A converter reads `.opencode/conductor.json` and emits `conductor.yaml`. It
