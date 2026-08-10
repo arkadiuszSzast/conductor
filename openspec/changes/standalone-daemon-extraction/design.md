@@ -346,10 +346,18 @@ Resources and commands under `/v1`: `GET/POST /v1/features` (list/start),
 machine-readable error codes (`{error: {code, message, requestId}}`) and
 a request correlation ID (`x-request-id`, echoed when the caller provides
 one). Gate commands on a feature that is not `waiting_human` are 409
-`conflict`; a report for an already-concluded run is 409
-`run_already_concluded` — the engine's atomic conclusion claim remains
-the authority, the API only projects the duplicate rejection onto a
-status code (a concurrent loser of the claim maps to the same 409).
+`conflict` — pre-checked on a snapshot and re-validated against the
+engine's structured result prefix after the call, so a racer that loses
+the engine's own re-check maps to the same 409. `pause`/`abandon` on a
+`done`/`abandoned` feature are 409: the interpreter's `human.paused`/
+`human.abandoned` handlers are deliberately unconditional (seed
+semantics), so the API layer owns the guard that a terminal feature is
+never resurrected into an active status. A report for an
+already-concluded run is 409 `run_already_concluded` — the engine's
+atomic conclusion claim remains the authority; the API projects the
+duplicate rejection onto a status code by its exact `Run <id> already
+concluded` prefix (caller-controlled verdict text cannot spoof it), and
+a concurrent loser of the claim maps to the same 409.
 
 `GET /v1/events` is an SSE INVALIDATION stream, not a state carrier:
 `Store` gains a post-commit `onChange` listener (`StoreChange = {kind:

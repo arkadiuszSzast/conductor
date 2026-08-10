@@ -344,6 +344,58 @@ describe("API: human gates", () => {
     expect(reject.status).toBe(409)
   })
 
+  it("pause and abandon on a terminal feature return 409 and never resurrect it", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    expect((await request("POST", `/v1/runs/${run.id}/report`, { outcome: "succeeded" })).status).toBe(200)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("done")
+
+    const pause = await request("POST", `/v1/features/${feature.id}/pause`)
+    expect(pause.status).toBe(409)
+    expect(((await pause.json()) as { error: { code: string } }).error.code).toBe("conflict")
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("done")
+
+    const abandon = await request("POST", `/v1/features/${feature.id}/abandon`)
+    expect(abandon.status).toBe(409)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("done")
+
+    const other = await startFeature(request, project)
+    expect((await request("POST", `/v1/features/${other.id}/abandon`)).status).toBe(200)
+    expect(daemon.store.getFeature(other.id)?.status).toBe("abandoned")
+    expect((await request("POST", `/v1/features/${other.id}/pause`)).status).toBe(409)
+    expect((await request("POST", `/v1/features/${other.id}/abandon`)).status).toBe(409)
+    expect(daemon.store.getFeature(other.id)?.status).toBe("abandoned")
+  })
+
+  it("a gate command that loses the pre-check race still maps to 409 via the engine result", async () => {
+    const { api, request, project, daemon } = await makeApi({ config: gatedPipeline })
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    expect((await request("POST", `/v1/runs/${run.id}/report`, { outcome: "succeeded" })).status).toBe(200)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("waiting_human")
+
+    // Approve through the engine AFTER the API has read its snapshot:
+    // stall the body read so the status flips mid-request.
+    const stalledBody = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        await daemon.engine.approve(feature.id)
+        controller.enqueue(new TextEncoder().encode("{}"))
+        controller.close()
+      },
+    })
+    const raced = await api.handle(
+      new Request(`http://conductor.test/v1/features/${feature.id}/approve`, {
+        method: "POST",
+        body: stalledBody,
+        headers: { "content-type": "application/json" },
+      }),
+    )
+    expect(raced.status).toBe(409)
+    expect(((await raced.json()) as { error: { code: string } }).error.code).toBe("conflict")
+    expect(daemon.store.getTransitions(feature.id).filter(t => t.event.includes("human.approved"))).toHaveLength(1)
+  })
+
   it("pause, resume and abandon dispatch the same engine events", async () => {
     const { request, project, daemon } = await makeApi()
     const feature = await startFeature(request, project)
@@ -388,6 +440,26 @@ describe("API: run reports", () => {
     expect(((await duplicate.json()) as { error: { code: string } }).error.code).toBe("run_already_concluded")
     expect(daemon.store.getFeature(feature.id)).toEqual(stateAfterFirst)
     expect(daemon.store.getTransitions(feature.id).length).toBe(timelineAfterFirst)
+  })
+
+  it("a verdict whose text contains 'already concluded' is not misreported as a duplicate", async () => {
+    const trickyPipeline = {
+      roles: { reviewer: { agent: "review" } },
+      pipeline: [
+        {
+          id: "review",
+          type: "agent",
+          role: "reviewer",
+          on_verdict: { "already concluded": { next: true } },
+        },
+      ],
+    }
+    const { request, project, daemon } = await makeApi({ config: trickyPipeline })
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    const response = await request("POST", `/v1/runs/${run.id}/report`, { verdict: "already concluded" })
+    expect(response.status).toBe(200)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("done")
   })
 
   it("validates report bodies: unknown run, missing outcome/verdict, both at once", async () => {

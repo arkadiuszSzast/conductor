@@ -340,12 +340,19 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       return error(requestId, "invalid_request", "\"notes\" must be a string")
     }
 
+    // The pre-checks below read a snapshot taken before the body await;
+    // gate commands therefore ALSO re-validate the engine's structured
+    // result prefix after the call — the engine's own atomic re-check is
+    // the authority, and a racing loser maps to the same 409.
     switch (action) {
       case "approve": {
         if (feature.status !== "waiting_human") {
           return error(requestId, "conflict", `feature is not waiting for approval (status: ${feature.status})`)
         }
         const result = await engine.approve(featureId, notes)
+        if (!result.startsWith("Approved")) {
+          return error(requestId, "conflict", result)
+        }
         return json(200, { result, ...featurePayload(featureId) }, requestId)
       }
       case "request-changes": {
@@ -356,16 +363,26 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
           return error(requestId, "invalid_request", "\"notes\" (non-empty string) is required for request-changes")
         }
         const result = await engine.requestChanges(featureId, notes)
+        if (!result.startsWith("Changes requested")) {
+          return error(requestId, "conflict", result)
+        }
         return json(200, { result, ...featurePayload(featureId) }, requestId)
       }
+      // `human.paused`/`human.abandoned` are unconditional in the
+      // interpreter (seed semantics, preserved). The API guards terminal
+      // features here: pausing a `done` feature would flip it back into
+      // an ACTIVE status, and a later resume (currentStep is null after
+      // finish) would restart the whole pipeline from step one.
       case "pause":
-        await engine.dispatch(featureId, { kind: "human.paused" })
+      case "abandon": {
+        if (feature.status === "done" || feature.status === "abandoned") {
+          return error(requestId, "conflict", `feature is already ${feature.status}`)
+        }
+        await engine.dispatch(featureId, { kind: action === "pause" ? "human.paused" : "human.abandoned" })
         return json(200, featurePayload(featureId), requestId)
+      }
       case "resume":
         await engine.dispatch(featureId, { kind: "human.resumed" })
-        return json(200, featurePayload(featureId), requestId)
-      case "abandon":
-        await engine.dispatch(featureId, { kind: "human.abandoned" })
         return json(200, featurePayload(featureId), requestId)
       default:
         return error(requestId, "not_found", `no route for POST /v1/features/:id/${action}`)
@@ -406,8 +423,12 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       ...(notes !== undefined ? { notes } : {}),
     })
     // A concurrent report can still win the engine's atomic claim between
-    // the pre-check and this call — the loser maps to the same 409.
-    if (result.includes("already concluded")) {
+    // the pre-check and this call — the loser maps to the same 409. The
+    // duplicate message is matched by its exact prefix (`Run <uuid>
+    // already concluded`): success messages start with `Verdict "` /
+    // `Step "`, so caller-controlled verdict/notes text can never spoof
+    // the duplicate shape from inside a success message.
+    if (result.startsWith(`Run ${runId} already concluded`)) {
       return error(requestId, "run_already_concluded", result)
     }
     return json(200, { result, run: { id: runId, ...store.getRunById(runId) } }, requestId)
