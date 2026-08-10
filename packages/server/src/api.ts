@@ -114,6 +114,12 @@ export interface ConductorApi {
   readonly handle: ApiHandler
   /** Ends every open SSE stream and detaches the store listener. Idempotent. */
   close(): void
+  /**
+   * Resolves once every handler invocation accepted so far has settled.
+   * SSE responses do not count — their handler returns as soon as the
+   * stream Response is constructed; `close()` is what ends the streams.
+   */
+  drain(): Promise<void>
   /** Open SSE subscriber count (observability + shutdown tests). */
   readonly sseClientCount: number
 }
@@ -128,9 +134,18 @@ function slugify(title: string): string {
 
 const encoder = new TextEncoder()
 
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void
+  const promise = new Promise<void>(res => {
+    resolve = res
+  })
+  return { promise, resolve }
+}
+
 export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
   const { store, engine, health, resolveConfig, logger } = deps
   const sseClients = new Set<SseClient>()
+  const inFlight = new Set<Promise<void>>()
   let closed = false
 
   const unsubscribe = store.onChange((change: StoreChange) => {
@@ -186,6 +201,11 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     const path = url.pathname.replace(/\/+$/, "") || "/"
     const method = request.method.toUpperCase()
 
+    // Tracked so `drain()` can await every accepted handler before the
+    // process owner closes SQLite: a request whose socket is torn down
+    // by a force-stop still runs its store writes to completion.
+    const settled = deferred()
+    inFlight.add(settled.promise)
     try {
       const response = await route(request, method, path, url, requestId)
       logger?.log({
@@ -198,6 +218,9 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       const message = err instanceof Error ? err.message : String(err)
       logger?.log({ level: "error", message: `api request failed: ${message}`, fields: { method, path, requestId } })
       return error(requestId, "internal", "internal server error")
+    } finally {
+      inFlight.delete(settled.promise)
+      settled.resolve()
     }
   }
 
@@ -482,9 +505,16 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     sseClients.clear()
   }
 
+  async function drain(): Promise<void> {
+    while (inFlight.size > 0) {
+      await Promise.all([...inFlight])
+    }
+  }
+
   return {
     handle,
     close,
+    drain,
     get sseClientCount() {
       return sseClients.size
     },
@@ -503,13 +533,18 @@ export interface ApiServer {
 /**
  * Bind the API on the EXPLICIT host/port from `config.bind`. Graceful
  * shutdown order: end SSE streams first (so no response is left
- * hanging), then force-close the listener. Force, not graceful: a
- * graceful `server.stop()` keeps existing keep-alive connections open
- * and a pooled client can still push NEW requests through them after
- * "stop" — exactly the "accepting new work while SQLite is closing"
- * window shutdown must close. Every remaining request is a fast local
- * store read/write, so cutting the connections loses nothing durable.
- * The process owner composes this with `Daemon.stop()` — API first.
+ * hanging), force-close the listener, then drain in-flight handlers.
+ * Force, not graceful: a graceful `server.stop()` keeps existing
+ * keep-alive connections open and a pooled client can still push NEW
+ * requests through them after "stop" — exactly the "accepting new work
+ * while SQLite is closing" window shutdown must close. Force-close can
+ * tear down a socket whose request was legitimately mid-handler; the
+ * drain is what upholds the spec's "finishes persistence already in
+ * progress": every accepted handler runs its store writes to completion
+ * before `stop()` resolves, so the process owner's `Daemon.stop()`
+ * never closes SQLite under an in-flight request. The client whose
+ * socket was cut may not receive the response, but the write is durable
+ * and a retry is rejected idempotently.
  */
 export function startApiServer(config: ApiConfig, deps: ApiDeps): ApiServer {
   const api = createApi(config, deps)
@@ -535,6 +570,7 @@ export function startApiServer(config: ApiConfig, deps: ApiDeps): ApiServer {
       stopPromise = (async () => {
         api.close()
         await server.stop(true)
+        await api.drain()
         deps.logger?.log({ level: "info", message: "api stopped" })
       })()
       return stopPromise

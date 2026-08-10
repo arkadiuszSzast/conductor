@@ -410,4 +410,71 @@ describe("API integration: graceful shutdown", () => {
     await server.stop()
     await server.stop()
   })
+
+  it("a report in flight when stop() fires is fully persisted, never silently lost", async () => {
+    const project = writeProject()
+    const databasePath = join(tempDir("conductor-apiint-inflight-"), "state.db")
+    const { daemon, logger } = await startStack({ project, databasePath })
+
+    // Wrap the engine so the test can hold a report open mid-handler:
+    // entered resolves once the handler has reached engine.report (the
+    // request is accepted and past body parsing), gate blocks its
+    // completion until the test releases it.
+    let entered!: () => void
+    const enteredPromise = new Promise<void>(resolve => {
+      entered = resolve
+    })
+    let gate!: () => void
+    const gatePromise = new Promise<void>(resolve => {
+      gate = resolve
+    })
+    const gatedEngine = {
+      dispatch: daemon.engine.dispatch.bind(daemon.engine),
+      approve: daemon.engine.approve.bind(daemon.engine),
+      requestChanges: daemon.engine.requestChanges.bind(daemon.engine),
+      report: async (input: Parameters<typeof daemon.engine.report>[0]) => {
+        entered()
+        await gatePromise
+        return daemon.engine.report(input)
+      },
+    }
+    const server = startApiServer(
+      { bind: { host: "127.0.0.1", port: 0 }, auth: { mode: "none" } },
+      {
+        store: daemon.store,
+        engine: gatedEngine,
+        health: () => daemon.health(),
+        resolveConfig: daemon.registry.resolver,
+        logger,
+      },
+    )
+    serversToStop.push(server)
+    const base = `http://127.0.0.1:${server.port}`
+
+    const created = await post(base, "/v1/features", { title: "Inflight", project })
+    const { feature, activeRun } = (await created.json()) as { feature: { id: string }; activeRun: { id: string } }
+
+    // Fire the report and wait until the handler is INSIDE engine.report.
+    const reportPromise = post(base, `/v1/runs/${activeRun.id}/report`, { outcome: "succeeded" }).catch(() => null)
+    await enteredPromise
+
+    // stop() force-closes the socket but must NOT resolve until the
+    // in-flight handler has drained.
+    const stopPromise = server.stop()
+    let stopResolved = false
+    void stopPromise.then(() => {
+      stopResolved = true
+    })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(stopResolved).toBe(false)
+
+    gate()
+    await stopPromise
+    await reportPromise
+
+    // The write survived the shutdown even though the client's socket
+    // may have been cut: the run concluded and the feature advanced.
+    expect(daemon.store.getRunById(activeRun.id)?.status).toBe("succeeded")
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("waiting_human")
+  })
 })

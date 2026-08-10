@@ -373,11 +373,15 @@ an `auth` shape — `{mode: "none"}` is a written-down operator decision,
 probes. The request handler itself is a plain `(Request) =>
 Promise<Response>` function, contract-testable without a socket;
 `startApiServer` binds it with `Bun.serve` and owns shutdown: `stop()`
-closes every SSE stream first (no hanging responses), then force-closes
-the listener — a graceful close would let pooled keep-alive clients keep
+closes every SSE stream first (no hanging responses), force-closes the
+listener — a graceful close would let pooled keep-alive clients keep
 pushing new requests through existing connections, which is exactly the
-window shutdown must eliminate. It is composed by the process owner with
-`Daemon.stop()` — API first, so no new commands arrive while SQLite is
+window shutdown must eliminate — then drains in-flight handlers: every
+accepted request runs its store writes to completion before `stop()`
+resolves, so a request whose socket the force-close cut is persisted,
+never silently lost (the client retries and is rejected idempotently).
+It is composed by the process owner with `Daemon.stop()` — API first,
+so no new commands arrive and no handler is mid-write while SQLite is
 closing.
 
 Integration coverage (`api-integration.test.ts`) exercises a real daemon
