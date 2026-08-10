@@ -111,6 +111,10 @@ export function createRunnerSessionClient(deps: RunnerSessionClientDeps): Sessio
     async prompt(input) {
       const runners = deps.runners.list()
       if (runners.length === 0) throw new Error("no runner registered with the daemon")
+      // Writes fail LOUDLY on an unreachable runner (only a 404 — "not
+      // my session" — moves on to the next endpoint): a swallowed prompt
+      // would strand the run until TTL, whereas a thrown error flows into
+      // the engine's normal step-failure/retry path immediately.
       for (const runner of runners) {
         const response = await call(runner, "POST", `/v1/sessions/${encodeURIComponent(input.sessionID)}/prompt`, {
           text: input.text,

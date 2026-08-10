@@ -114,11 +114,13 @@ export class OpencodeRunnerHub {
    */
   async registerProject(directory: string, sessions: SessionClient): Promise<void> {
     if (this.stopped) throw new Error("runner hub is stopped")
-    this.projects.set(directory, sessions)
+    // Bind the listener BEFORE recording the project: a failed bind
+    // (port taken) must not leave a half-registered directory behind.
     if (!this.listener) {
       this.listener = this.listen(this.config.callbackHost, this.config.callbackPort, this.handle)
       this.log(`runner callback listening on ${this.listener.hostname}:${this.listener.port}`)
     }
+    this.projects.set(directory, sessions)
     await this.announce()
   }
 
