@@ -199,11 +199,10 @@ action registries and architecture constraints; graph workflow-format tests in
 | `presets.test.ts` (4) | `packages/server/presets.test.ts` (4) | Three seed JSON pipeline presets copied unchanged and validated; workflow-format conversion remains a later task. |
 
 The seed config-loader regression asserting that `reviewPublish.tokenCommand`
-survives file loading belongs to the explicitly deferred project/config registry
-task. Its engine-side merge semantics are covered by the injected-config
-publication test, while disk loading and hot reload are not implemented or
-claimed here. This is the only structural adaptation not exercised through the
-same package boundary; it does not leave an engine behavior untested.
+survives file loading is covered by the project configuration registry (see
+below): the registry's loader tests exercise the disk boundary directly, in
+addition to the engine-side merge semantics covered by the injected-config
+publication test.
 
 ### Historical database contract fixture
 
@@ -233,6 +232,40 @@ effect rule stays: decision and audit are atomic; external effect is retried or
 reconciled; success requires explicit report. Project configs are cached with
 safe reload: an invalid new config does not replace the last valid one for
 active work. A step removed under an active feature still escalates loudly.
+
+### Project configuration registry
+
+`ProjectConfigRegistry` (`packages/server/src/project-config-registry.ts`)
+owns disk loading for the seed's `.opencode/conductor.json` format and serves
+the engine through the existing `ConfigResolver` port. Registration and reload
+are explicit synchronous operations invoked by the lifecycle owner; the
+registry starts no watcher or timer and holds no process-wide singleton.
+Resolution is disk-free: `resolver` is one stable closure that reads the last
+published snapshot for the canonical (`realpath`-resolved) project directory,
+so path aliases collapse to one project and per-dispatch lookups never touch
+the filesystem. Aliases are recorded only at registration time, so the
+lifecycle owner must register the exact project paths stored on features; an
+unregistered alias resolves to `null` rather than triggering lookup-time I/O.
+
+Loading preserves the seed's layering exactly — optional explicit global file
+(never inferred from a home directory), project file, and one `extends` layer
+resolved from bundled `conductor:<name>` presets or a path relative to the
+declaring file; scalars override, `roles`/`workflows` merge per key, and
+`pipeline` replaces wholesale. Every field of the untrusted JSON is
+shape-validated before it is cast, then the assembled default pipeline and
+every resolved named workflow run through the extracted structural validator.
+A candidate is deep-frozen and published atomically only when it is complete
+and valid; nothing partial ever becomes visible.
+
+Status is explicit per project: `valid`, `stale` (last reload failed and the
+previous valid snapshot is deliberately still served), `invalid` (no valid
+load has ever succeeded — the resolver returns `null` and the engine skips the
+project's features), or `unregistered`. Diagnostics name the offending source
+file and reason for daemon logs and the future API; `reviewPublish.tokenCommand`
+survives loading (the deferred seed regression) and its output is never
+logged. A valid reload that removes a live feature's current step publishes
+normally — the engine's existing vanished-step escalation handles the feature
+loudly instead of guessing.
 
 ### Configuration migration
 

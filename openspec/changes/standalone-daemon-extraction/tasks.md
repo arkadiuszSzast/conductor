@@ -15,7 +15,7 @@
 
 ## 3. Build the daemon API
 
-- [ ] [server] Implement configuration/project registry with safe validation and reload semantics.
+- [x] [server] Implement configuration/project registry with safe validation and reload semantics.
 - [ ] [server] Implement daemon lifecycle: startup migration, reconciler heartbeat, readiness/liveness, graceful shutdown and structured logs.
 - [ ] [server] Implement versioned REST resources/commands for runs, reports, gates, findings and timeline plus SSE invalidation events.
 - [ ] [test] Add API contract, idempotency, authentication-boundary, recovery and graceful-shutdown integration tests.

@@ -39,6 +39,15 @@ export type {
   WorkflowReservationDiagnostic,
 } from "./workflow-reservation.ts"
 
+export { ProjectConfigRegistry } from "./project-config-registry.ts"
+export type {
+  LoadResult,
+  ProjectConfigDiagnostic,
+  ProjectConfigRegistryOptions,
+  ProjectConfigSnapshot,
+  ProjectConfigStatus,
+} from "./project-config-registry.ts"
+
 // ---------------------------------------------------------------------------
 // Pipeline engine (opencode-conductor's engine/reconciler/
 // builtins/GitHub integration/findings publication) — distinct from the
