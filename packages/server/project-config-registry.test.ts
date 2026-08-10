@@ -211,6 +211,34 @@ describe("ProjectConfigRegistry: merge semantics", () => {
     expect(registry.resolve(project)?.pipeline).toHaveLength(1)
   })
 
+  it("resolves a global-declared workflow's path-relative extends against the global config directory", () => {
+    const globalDir = tempDir("conductor-global-")
+    writeFileSync(join(globalDir, "hotfix.json"), JSON.stringify(minimalPipeline))
+    writeGlobalConfig(globalDir, { workflows: { hotfix: { extends: "./hotfix.json" } } })
+    const project = tempDir("conductor-globalwf-")
+    writeProjectConfig(project, minimalPipeline)
+    const registry = new ProjectConfigRegistry({ globalConfigPath: join(globalDir, "conductor.json") })
+    const result = registry.register(project)
+    expect(result.ok).toBe(true)
+    expect(registry.resolve(project)?.resolvedWorkflows.hotfix?.[0]?.id).toBe("implement")
+  })
+
+  it("does not stack a generic diagnostic on a workflow extends target that fails for a specific reason", () => {
+    const project = tempDir("conductor-wfbadjson-")
+    writeFileSync(join(project, "broken.json"), "{ nope")
+    writeProjectConfig(project, {
+      ...minimalPipeline,
+      workflows: { broken: { extends: "../broken.json" } },
+    })
+    const registry = new ProjectConfigRegistry({ globalConfigPath: join(tempDir("conductor-global-"), "conductor.json") })
+    const result = registry.register(project)
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.diagnostics).toHaveLength(1)
+      expect(result.diagnostics[0]?.message).toMatch(/cannot parse JSON/)
+    }
+  })
+
   it("resolves named workflows, merging global and project workflow maps", () => {
     const globalDir = tempDir("conductor-global-")
     writeGlobalConfig(globalDir, { workflows: { hotfix: { pipeline: [{ id: "h", type: "agent", role: "a" }] } } })

@@ -340,11 +340,16 @@ function loadProjectConfig(canonicalDir: string, globalConfigPath: string | null
       continue
     }
     if (spec.extends !== undefined) {
-      const file = resolvePresetSpec(spec.extends, dirname(projectFile), bundledPresetDir, diagnostics, projectFile)
+      const declaredInProject = project.workflows?.[name] !== undefined || globalConfigPath === null
+      const declaringFile = declaredInProject ? projectFile : globalConfigPath
+      const file = resolvePresetSpec(spec.extends, dirname(declaringFile), bundledPresetDir, diagnostics, declaringFile)
       if (file === undefined) continue
+      const before = diagnostics.length
       const loaded = readLayer(file, diagnostics, warnings)
       if (loaded?.pipeline === undefined) {
-        diagnostics.push({ sourcePath: file, message: `workflow "${name}" extends ${file} which has no pipeline` })
+        if (diagnostics.length === before) {
+          diagnostics.push({ sourcePath: file, message: `workflow "${name}" extends ${file} which has no pipeline` })
+        }
         continue
       }
       sources.push(file)
