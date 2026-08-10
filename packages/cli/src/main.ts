@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 /**
  * Process entry point — the ONLY file that touches the real
  * environment. Everything else takes injected dependencies so the CLI

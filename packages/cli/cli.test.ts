@@ -190,6 +190,16 @@ describe("CLI: connection configuration", () => {
     expect(connection).toEqual({ url: "http://cfg:4" })
   })
 
+  it("rejects a malformed daemon address as a usage error, not a generic failure", async () => {
+    const h = await makeHarness()
+    expect(await runCli(["status", "--url", "not a url"], h.deps)).toBe(EXIT.usage)
+    expect(h.err.join("\n")).toContain("not a valid URL")
+
+    h.err.length = 0
+    expect(await runCli(["status", "--url", "ftp://daemon:1"], h.deps)).toBe(EXIT.usage)
+    expect(h.err.join("\n")).toContain("must use http or https")
+  })
+
   it("rejects malformed config files with a usage error", () => {
     expect(() => resolveConnection({ flags: { config: "/tmp/c.json" }, env: {}, readFile: () => "not json" })).toThrow(UsageError)
     expect(() =>

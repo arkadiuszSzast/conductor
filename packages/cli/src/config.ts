@@ -69,6 +69,15 @@ export function resolveConnection(input: ConnectionInput): ApiConnection {
       "daemon address is required: pass --url, set CONDUCTOR_URL, or provide a config file (--config / CONDUCTOR_CONFIG)",
     )
   }
+  let parsedUrl: URL
+  try {
+    parsedUrl = new URL(url)
+  } catch {
+    throw new UsageError(`daemon address "${url}" is not a valid URL (expected e.g. http://<host>:<port>)`)
+  }
+  if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+    throw new UsageError(`daemon address "${url}" must use http or https`)
+  }
   const token = input.flags.token ?? input.env["CONDUCTOR_TOKEN"] ?? file.token
   return { url, ...(token !== undefined ? { token } : {}) }
 }
