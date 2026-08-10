@@ -10,14 +10,10 @@ export type { Database, DatabaseConfig, DatabaseConnection } from "./database.ts
 export { migrations, runMigrations } from "./migrations.ts"
 export type { Migration } from "./migrations.ts"
 export { Store } from "./store.ts"
-export type {
-  Decision,
-  FeatureState,
-  FeatureStatus,
-  PipelineEvent,
-  StoreChange,
-  Transition,
-} from "./store.ts"
+export type { FindingView, RunSummary, StoreChange, TransitionEntry } from "./store.ts"
+
+export { applyPatch, initialFeatureState } from "./state.ts"
+export type { CreateFeatureInput, InitialFeatureStateInput } from "./state.ts"
 
 export { loadActionRegistry } from "./action-registry.ts"
 export type {
@@ -39,6 +35,30 @@ export type {
   WorkflowReservation,
   WorkflowReservationDiagnostic,
 } from "./workflow-reservation.ts"
+
+export { WorkflowRegistry } from "./workflow-registry.ts"
+export type {
+  LoadResult,
+  WorkflowDiagnostic,
+  WorkflowRegistryOptions,
+  WorkflowResolver,
+  WorkflowSnapshot,
+  WorkflowStatus,
+} from "./workflow-registry.ts"
+
+export { Engine } from "./engine.ts"
+export type { EngineDeps, EngineOptions, StartFeatureInput, StartFeatureResult } from "./engine.ts"
+
+export { realProcessRunner } from "./process.ts"
+export { systemClock } from "./ports.ts"
+export type {
+  Clock,
+  Logger,
+  ProcessExecOptions,
+  ProcessExecResult,
+  ProcessRunner,
+  SessionClient,
+} from "./ports.ts"
 
 export { Daemon, jsonLineLogger, systemIntervalScheduler } from "./daemon.ts"
 export type {
@@ -77,70 +97,21 @@ export type {
 export { createRunnerSessionClient } from "./runner-transport.ts"
 export type { RunnerFetch, RunnerSessionClientDeps } from "./runner-transport.ts"
 
-export { ProjectConfigRegistry } from "./project-config-registry.ts"
+// Re-export the graph workflow IR types the server operates on, so
+// consumers (CLI, runner adapter) can depend on @conductor/server alone
+// for the runtime types they touch (FeatureState, PipelineEvent, …).
 export type {
-  LoadResult,
-  ProjectConfigDiagnostic,
-  ProjectConfigRegistryOptions,
-  ProjectConfigSnapshot,
-  ProjectConfigStatus,
-} from "./project-config-registry.ts"
-
-// ---------------------------------------------------------------------------
-// Pipeline engine (opencode-conductor's engine/reconciler/
-// builtins/GitHub integration/findings publication) — distinct from the
-// @conductor/core graph workflow model. See ./engine/index.ts.
-// ---------------------------------------------------------------------------
-export {
-  Engine,
-  interpret,
-  isTerminal,
-  renderTemplate,
-  builtins,
-  RealGh,
-  realProcessRunner,
-  makePublishReview,
-  parseFindings,
-  parseResolutions,
-  severitySummary,
-  DEFAULT_SEVERITY,
-  systemClock,
-  pipelineForWorkflow,
-} from "./engine/index.ts"
-export type {
-  EngineDeps,
-  RenderResult,
-  BuiltinContext,
-  StepOutcome,
-  Finding,
-  Resolution,
-  ReviewFindings,
-  Severity,
-  Clock,
-  Logger,
-  ConfigResolver,
-  GhClient,
-  CheckSummary,
-  PrView,
-  ReviewThread,
-  ReviewComment,
-  ReviewPayload,
-  PublishInput,
-  PublishReview,
-  SessionClient,
-  StorePort,
-  ProcessExecOptions,
-  ProcessExecResult,
-  ProcessRunner,
-  AgentStep,
-  BuiltinAction,
-  BuiltinStep,
-  CommandStep,
-  EngineConfig,
-  OnFail,
-  OnVerdict,
-  PipelineDef,
-  PublishDef,
-  RoleDef,
-  StepDef,
-} from "./engine/index.ts"
+  Decision,
+  FeatureState,
+  FeatureStatus,
+  Feedback,
+  JobPatch,
+  JobRuntime,
+  JobStatus,
+  Patch,
+  PipelineEvent,
+  StepPatch,
+  StepRuntime,
+  StepStatus,
+  Transition,
+} from "@conductor/core"

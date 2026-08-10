@@ -1,31 +1,29 @@
 /**
- * Daemon lifecycle — the process owner around the extracted pipeline
- * engine. It opens and migrates the SQLite database, registers projects
- * through `ProjectConfigRegistry`, constructs the `Engine` with
- * production adapters, runs the reconciler heartbeat, answers
- * readiness/liveness queries and shuts down gracefully.
+ * Daemon lifecycle — the process owner around the graph engine. It
+ * opens and migrates the SQLite database, registers projects through
+ * `WorkflowRegistry`, constructs the `Engine` with production adapters,
+ * runs the reconciler heartbeat, answers readiness/liveness queries and
+ * shuts down gracefully.
  *
  * Ownership boundaries, deliberately preserved from the extraction:
  *  - the TIMER lives here, never in `Engine` — `reconcile()` stays a
  *    plain async method the daemon calls after startup recovery and on
  *    every heartbeat tick;
  *  - all configuration is explicit (`DaemonConfig`): database path,
- *    project list, optional global config file, heartbeat interval.
- *    Nothing is inferred from a home directory or a hardcoded host;
+ *    project list, heartbeat interval. Nothing is inferred from a home
+ *    directory or a hardcoded host;
  *  - every dependency is injectable (`DaemonDeps`); the defaults are the
- *    production adapters (`RealGh`, `realProcessRunner`, `systemClock`).
- *    A daemon started without a `SessionClient` reports its runner as
- *    unavailable instead of failing to start — agent dispatch then flows
- *    through the engine's existing retry/escalation policy.
+ *    production adapters (`realProcessRunner`, `systemClock`). A daemon
+ *    started without a `SessionClient` reports its runner as unavailable
+ *    instead of failing to start — agent dispatch then flows through the
+ *    engine's existing step-failure path.
  *
  * Readiness vs liveness: `health().alive` means the daemon object has
  * not stopped or failed; `health().ready` additionally requires the
  * startup sequence to have completed — migrations applied, recovery
- * pass executed, heartbeat armed. The future HTTP API task exposes this
- * query over HTTP; nothing here opens a listener.
+ * pass executed, heartbeat armed.
  */
 
-import { dirname } from "node:path"
 import {
   migrateDatabase,
   openDatabase,
@@ -34,12 +32,12 @@ import {
 } from "./database.ts"
 import { migrations } from "./migrations.ts"
 import { Store } from "./store.ts"
-import { ProjectConfigRegistry, type ProjectConfigDiagnostic, type ProjectConfigStatus } from "./project-config-registry.ts"
-import { Engine } from "./engine/engine.ts"
-import { RealGh } from "./engine/gh.ts"
-import { realProcessRunner } from "./engine/process.ts"
-import { systemClock } from "./engine/ports.ts"
-import type { Clock, GhClient, ProcessRunner, PublishReview, SessionClient } from "./engine/ports.ts"
+import { WorkflowRegistry, type WorkflowDiagnostic, type WorkflowStatus } from "./workflow-registry.ts"
+import type { LoadedActionRegistry } from "./action-registry.ts"
+import { Engine, type EngineOptions } from "./engine.ts"
+import { realProcessRunner } from "./process.ts"
+import { systemClock } from "./ports.ts"
+import type { Clock, ProcessRunner, SessionClient } from "./ports.ts"
 
 // ------------------------------------------------------------ structured log
 
@@ -47,9 +45,7 @@ export type DaemonLogLevel = "info" | "warn" | "error"
 
 /**
  * One structured log entry. `fields` carries the correlation identifiers
- * (`project`, `feature`, `step`, `run`) where they apply — never secrets:
- * nothing in the daemon ever logs a token, a `tokenCommand` output, or a
- * config file's contents.
+ * (`project`, `feature`, `step`, `run`) where they apply — never secrets.
  */
 export interface DaemonLogEntry {
   readonly level: DaemonLogLevel
@@ -102,12 +98,10 @@ export interface DaemonConfig {
   readonly createDatabaseDirectory?: boolean
   /** Project directories to register at startup. Invalid projects get diagnostics, not a failed start. */
   readonly projects: readonly string[]
-  /** Optional global config file layered beneath every project config. */
-  readonly globalConfigPath?: string
-  /** Directory containing bundled `conductor:<name>` presets (registry default otherwise). */
-  readonly bundledPresetDir?: string
   /** Reconciler heartbeat interval in milliseconds. */
   readonly heartbeatIntervalMs: number
+  /** Engine tuning (runTtlMs, nudgeIdleCycles, maxNudges). Defaults match the seed's operational values. */
+  readonly engine?: EngineOptions
 }
 
 /** The one thing the daemon needs from a reconciler: one idempotent pass. */
@@ -127,13 +121,13 @@ export interface DaemonDeps {
    * static "was a SessionClient injected" answer.
    */
   readonly runnerAvailability?: () => boolean
-  readonly gh?: GhClient
   readonly process?: ProcessRunner
   readonly clock?: Clock
   readonly logger?: DaemonLogger
   readonly scheduler?: IntervalScheduler
-  readonly publishReview?: PublishReview
   readonly notify?: (title: string, message: string) => void
+  /** Loaded action registry for resolving workflow `action` steps. Absent → any workflow using `action` steps is invalid. */
+  readonly actionRegistry?: LoadedActionRegistry
   /** Reconciler override for lifecycle tests. Defaults to the constructed `Engine`. */
   readonly reconciler?: Reconciler
 }
@@ -144,8 +138,8 @@ export type DaemonPhase = "created" | "starting" | "ready" | "failed" | "stoppin
 
 export interface DaemonProjectHealth {
   readonly projectDir: string
-  readonly state: ProjectConfigStatus["state"]
-  readonly diagnostics: readonly ProjectConfigDiagnostic[]
+  readonly state: WorkflowStatus["state"]
+  readonly diagnostics: readonly WorkflowDiagnostic[]
 }
 
 export interface DaemonHealth {
@@ -208,7 +202,7 @@ export class Daemon {
   private phase: DaemonPhase = "created"
   private connection: DatabaseConnection | null = null
   private storeInstance: Store | null = null
-  private registryInstance: ProjectConfigRegistry | null = null
+  private registryInstance: WorkflowRegistry | null = null
   private engineInstance: Engine | null = null
   private reconciler: Reconciler | null = null
   private timerHandle: unknown = null
@@ -282,23 +276,22 @@ export class Daemon {
     for (const id of this.appliedNow) this.log("info", "migration applied", { migration: id })
     this.storeInstance = new Store(connection.db)
 
-    this.registryInstance = new ProjectConfigRegistry({
-      ...(this.config.globalConfigPath !== undefined ? { globalConfigPath: this.config.globalConfigPath } : {}),
-      ...(this.config.bundledPresetDir !== undefined ? { bundledPresetDir: this.config.bundledPresetDir } : {}),
+    this.registryInstance = new WorkflowRegistry({
+      ...(this.deps.actionRegistry !== undefined ? { actionRegistry: this.deps.actionRegistry } : {}),
     })
     for (const projectDir of this.config.projects) {
       const result = this.registryInstance.register(projectDir)
       if (result.ok) {
         this.log("info", "project registered", {
           project: result.snapshot.projectDir,
-          steps: result.snapshot.config.pipeline.length,
+          workflow: result.snapshot.workflow.name,
         })
         for (const warning of result.snapshot.warnings) {
-          this.log("warn", `config warning: ${warning}`, { project: result.snapshot.projectDir })
+          this.log("warn", `workflow warning: ${warning}`, { project: result.snapshot.projectDir })
         }
       } else {
         for (const diagnostic of result.diagnostics) {
-          this.log("warn", `project config invalid: ${diagnostic.message}`, {
+          this.log("warn", `workflow invalid: ${diagnostic.message}`, {
             project: projectDir,
             source: diagnostic.sourcePath,
           })
@@ -307,24 +300,19 @@ export class Daemon {
     }
 
     const processRunner = this.deps.process ?? realProcessRunner
-    // RealGh's default cwd is only used for API-only `gh` calls (checks,
-    // views, GraphQL) that need SOME existing directory; the database's
-    // parent directory is guaranteed to exist after open and is explicit
-    // daemon configuration, not a host assumption. Repo-touching calls
-    // always carry their own cwd from the builtin.
-    const gh = this.deps.gh ?? new RealGh(processRunner, dirname(resolveDatabasePath({ path: this.config.databasePath })))
     const engineLogger = { log: (text: string) => this.log("info", text, { component: "engine" }) }
-    this.engineInstance = new Engine({
-      store: this.storeInstance!,
-      resolveConfig: this.registryInstance.resolver,
-      gh,
-      sessions: this.deps.sessions ?? unavailableSessionClient(),
-      process: processRunner,
-      clock: this.clock,
-      log: engineLogger,
-      ...(this.deps.notify !== undefined ? { notify: this.deps.notify } : {}),
-      ...(this.deps.publishReview !== undefined ? { publishReview: this.deps.publishReview } : {}),
-    })
+    this.engineInstance = new Engine(
+      {
+        store: this.storeInstance,
+        workflows: this.registryInstance.resolver,
+        sessions: this.deps.sessions ?? unavailableSessionClient(),
+        process: processRunner,
+        clock: this.clock,
+        log: engineLogger,
+        ...(this.deps.notify !== undefined ? { notify: this.deps.notify } : {}),
+      },
+      this.config.engine ?? {},
+    )
     this.reconciler = this.deps.reconciler ?? this.engineInstance
 
     if (!this.runnerAvailable()) this.log("warn", "no session runner registered — runner reported unavailable")
@@ -409,8 +397,8 @@ export class Daemon {
   }
 
   /**
-   * Liveness/readiness query. The future HTTP API serves this verbatim;
-   * nothing here touches the network.
+   * Liveness/readiness query. The HTTP API serves this verbatim; nothing
+   * here touches the network.
    */
   health(): DaemonHealth {
     return {
@@ -454,8 +442,8 @@ export class Daemon {
     return this.engineInstance
   }
 
-  /** The daemon's project registry — available once `start()` has constructed it. */
-  get registry(): ProjectConfigRegistry {
+  /** The daemon's workflow registry — available once `start()` has constructed it. */
+  get registry(): WorkflowRegistry {
     if (!this.registryInstance) throw new Error("daemon has not started")
     return this.registryInstance
   }

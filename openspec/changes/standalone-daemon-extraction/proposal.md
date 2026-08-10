@@ -15,10 +15,19 @@ moves into the monorepo as `@conductor/core` and `@conductor/server`. What is
 opencode-specific shrinks into `@conductor/runner-opencode`.
 
 The acceptance bar is dogfooding, not refactoring: after this change the
-`gloam-idle` repo (and the `conductor-test` / `quotes-api` benches) run on the
-standalone daemon, their **in-flight conductor features survive** (the DB is
-adopted additively, sessions are disposable executors), and the old plugin's
-tool surface is re-exposed through the daemon's API plus a `conductor` CLI.
+standalone daemon drives real repos (the `conductor-test` / `quotes-api`
+benches, then this repo's own changes) end to end on `conductor.yaml`
+workflows, and the old plugin's tool surface is re-exposed through the
+daemon's API plus a `conductor` CLI.
+
+**Greenfield decision (recorded mid-change):** this project has no users and
+no deployed databases. The seed's `.opencode/conductor.json` pipeline format
+and the pipeline engine extracted from it were scaffolding for the
+extraction, not a product surface. Instead of converting the seed format to
+`conductor.yaml` (the original task 15), the seed format and its engine are
+**removed outright** and the daemon is rewired to execute `conductor.yaml`
+(the `@conductor/core` graph IR from the `workflow-format` change) natively.
+No converter, no compatibility layer, no DB adoption of seed databases.
 
 ## What Changes
 
@@ -35,12 +44,14 @@ tool surface is re-exposed through the daemon's API plus a `conductor` CLI.
 - `conductor` CLI: `init` (scaffold `conductor.yaml`), `start`, `status`,
   `approve`, `request-changes`, `report`, `pause`, `resume`, `abandon`,
   `logs`. The CLI is the report-back channel that works from any runtime.
-- The existing `~/.config/opencode/conductor.db` is adopted: additive schema
-  migration only; in-flight features (status, current step, attempts, rounds,
-  escalation, findings, threads) reconstruct exactly.
-- `gloam-idle` is migrated: `.opencode/conductor.json` is converted to the
-  new workflow format (see `workflow-format` change), the daemon drives it, the
-  plugin is turned off. Dogfooding from extraction day.
+- The seed pipeline engine (`packages/server/src/engine/`), the seed config
+  registry (`.opencode/conductor.json` loading, `extends`, `conductor:<name>`
+  presets) and the bundled seed presets are **deleted**. The daemon executes
+  `conductor.yaml` through `@conductor/core`'s graph interpreter; the engine
+  keeps the seed's operational behaviours (confirmation-of-effect,
+  nudge/reap, atomic run conclusion) on the new model.
+- The database schema is defined for the graph model directly (jobs, steps,
+  attempts, reruns, feedback snapshots). No seed database is ever adopted.
 
 ## Non-goals
 

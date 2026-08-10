@@ -23,7 +23,7 @@
  */
 
 import { ApiClient, ApiError } from "@conductor/cli"
-import type { FeatureState } from "@conductor/server"
+import type { FeatureView } from "@conductor/cli"
 
 export interface ConductorToolContext {
   readonly sessionID: string
@@ -65,8 +65,8 @@ function describeError(err: unknown): string {
 }
 
 export function createConductorTools(client: ApiClient, projectDir: string): ConductorTools {
-  const guardProject = async (featureId: string): Promise<{ feature: FeatureState } | { error: string }> => {
-    let feature: FeatureState
+  const guardProject = async (featureId: string): Promise<{ feature: FeatureView } | { error: string }> => {
+    let feature: FeatureView
     try {
       feature = (await client.getFeature(featureId)).feature
     } catch (err) {
@@ -104,9 +104,8 @@ export function createConductorTools(client: ApiClient, projectDir: string): Con
       } catch (err) {
         if (err instanceof ApiError && err.code === "project_not_configured") {
           return (
-            "No conductor pipeline configured for this project. Create .opencode/conductor.json " +
-            "(e.g. { \"extends\": \"conductor:pr-loop-only\", \"repo\": \"owner/repo\", \"roles\": { ... } }) " +
-            "and register the project with the daemon."
+            "No conductor.yaml configured for this project. Run `conductor init` to scaffold one, " +
+            "then register the project with the daemon."
           )
         }
         if (err instanceof ApiError && err.code === "unknown_workflow") return err.message

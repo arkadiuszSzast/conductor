@@ -16,11 +16,26 @@ registration order. The extraction must preserve their fixes.
 
 ## Goals / Non-goals
 
-**Goals:** standalone lifecycle, versioned API, additive DB adoption, thin
-opencode adapter, CLI client, test parity, same-day gloam dogfooding.
+**Goals:** standalone lifecycle, versioned API, thin opencode adapter, CLI
+client, native `conductor.yaml` execution, dogfooding on the benches and on
+this repo's own changes.
 
-**Non-goals:** changing workflow semantics, adding DAG scheduling, board UI,
-webhook ingress, distributed execution or replacing SQLite.
+**Non-goals:** board UI, webhook ingress, distributed execution or replacing
+SQLite.
+
+## Greenfield pivot (recorded decision)
+
+Mid-change, the project recorded the greenfield decision now written into
+AGENTS.md: there are no users, no deployed databases, no in-flight features.
+The seed's `.opencode/conductor.json` pipeline format, the pipeline engine
+extracted from it (`packages/server/src/engine/`), the seed config registry
+and the bundled seed presets were extraction scaffolding — they are removed
+in this change rather than converted or preserved. The original task 15
+(seed JSON → `conductor.yaml` converter) is void: a converter is a bridge to
+a format we are deleting. Sections below that describe the removed seed
+machinery are kept for history where they document behaviours that carry
+forward (confirmation-of-effect, nudge/reap, atomic conclusion), and are
+superseded where they describe the seed pipeline model itself.
 
 ## Decisions
 
@@ -135,22 +150,22 @@ interpolated into a shell string; refs are validated with
 shell string, via `ProcessRunner.shell`.
 
 **Accepted risk — untrusted text in `command` step templates:** template
-rendering does no shell-escaping, and the template context includes values
-that are not purely project-config-controlled: `{{human.<step>}}` (free-text
-human gate notes), `{{steps.<id>.output}}` (agent-reported text, which can
-itself echo untrusted repo/PR content back via prompt injection), and
-`{{findings.*}}` (finding bodies extracted from a PR diff/comment). A
-`command` step's `run:` entries interpolating any of these into shell syntax
-(e.g. `` echo "{{steps.review.output}}" | some-tool ``) lets a crafted
-finding body, human note, or agent note containing shell metacharacters
-(`` ` ``, `$()`, `;`) execute as command injection in the feature's
-worktree. This is preserved, not fixed, by this extraction: `command` steps
-are authored by the project (trusted `run:` shell text), but the *values*
-substituted into that text are not all trusted. Config authors must not
-interpolate `{{human.*}}`, `{{steps.*.output}}`, or `{{findings.*}}` into
-shell syntax in a `command` step's `run:`; prefer a deterministic `builtin`
-argv action (or pass the value via an env var / file, never inline shell
-text) wherever the value may contain untrusted content.
+rendering does no shell-escaping, and the `conductor.yaml` expression
+contexts include values that are not purely workflow-author-controlled:
+`{{ steps.<id>.outputs.report }}` (agent-reported text, which can itself
+echo untrusted repo/PR content back via prompt injection),
+`{{ steps.<id>.outputs.notes }}` (free-text human gate notes), and
+`{{ feedback.* }}` (previous-round snapshots of the same). A `command`
+step's `run:` entries interpolating any of these into shell syntax lets
+crafted text containing shell metacharacters (`` ` ``, `$()`, `;`) execute
+as command injection in the feature's worktree. The same caution applies to
+a `command` step's `cwd:` field: it is rendered through the same contexts
+and used verbatim as the child process working directory, so interpolating
+untrusted values there redirects execution (working-directory confusion /
+path traversal) even without shell interpolation. Workflow authors must not
+interpolate agent reports, human notes or feedback into shell syntax or
+`cwd:`; prefer versioned `action` steps (argv, no shell) or pass such
+values via env/file wherever they may contain untrusted content.
 
 `Store.applyTransition` still writes the feature-state update and transition
 audit inside one transaction. Run completion paths additionally use
@@ -520,13 +535,43 @@ duplicate report surfaces the daemon's `run_already_concluded` (409)
 envelope as the seed's "Run <id> already concluded" text so an agent's
 retry reads as already-recorded rather than a failure.
 
-### Configuration migration
+### Native `conductor.yaml` execution (supersedes "Configuration migration")
 
-A converter reads `.opencode/conductor.json` and emits `conductor.yaml`. It
-preserves step IDs, routing, roles/models, prompts, human gates, findings
-publishing and worktree settings. It validates both forms and emits a semantic
-diff/warnings; migration is opt-in and keeps the original file. Workflow YAML
-semantics are specified by the separate `workflow-format` change.
+There is no configuration migration: the seed format is deleted, not
+converted. The daemon executes `conductor.yaml` natively:
+
+- **Workflow loading.** A `WorkflowRegistry` replaces `ProjectConfigRegistry`:
+  it loads `<projectDir>/conductor.yaml` through `@conductor/core`'s
+  `parseWorkflow` + `validateWorkflow`, with the same operational semantics
+  the seed registry proved out — explicit synchronous register/reload, no
+  watcher, disk-free resolution from a published snapshot, canonical
+  (`realpath`) project keys, per-project `valid`/`stale`/`invalid` status
+  with diagnostics, last-valid-snapshot retention on failed reload, atomic
+  deep-frozen publication. The seed's layering (`extends`, `conductor:<name>`
+  presets, global file) is dropped — one file per project; composition
+  belongs to the workflow-format change if it is ever wanted.
+- **Graph engine.** The server's engine drives `@conductor/core`'s
+  `interpret()` (DAG-aware, multi-decision transitions) instead of the seed
+  interpreter. The operational layer carries forward on the new model:
+  confirmation-of-effect (agent steps conclude only through `report()`),
+  idle debounce/nudge/reap with `runTtlMs`, atomic run conclusion
+  (`concludeRun` claim + event + transition + audit in one transaction),
+  per-feature isolation, and the durable decision outbox.
+- **Step execution.** `agent` steps dispatch through `SessionClient` as
+  before. `command` steps run through `ProcessRunner.shell` with
+  `$CONDUCTOR_OUTPUT` collection. `human` steps map to `wait_human`.
+  `action` steps resolve through the action registry when it lands
+  (workflow-format section 3); until bundled actions exist, a workflow using
+  `action` steps fails validation at load with a clear diagnostic — no
+  silent builtin-name dispatch.
+- **Graph state persistence.** The store persists the graph `FeatureState`
+  (per-job status/currentStep/attempts/reruns/outputs, per-step
+  status/outputs, feedback snapshots) as JSON state columns on the feature
+  plus the existing run/transition/audit tables. The schema is defined for
+  the graph model directly; seed-era tables that only served the removed
+  pipeline model are dropped by a new migration. Migration IDs already
+  applied remain untouched (append-only ledger), but there is no seed-DB
+  adoption path and no compatibility fixture.
 
 ## Alternatives considered
 

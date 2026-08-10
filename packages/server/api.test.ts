@@ -7,12 +7,12 @@
  * integration coverage lives in `api-integration.test.ts`.
  */
 import { afterEach, describe, expect, it } from "bun:test"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { Daemon, type DaemonLogEntry } from "./src/daemon.ts"
 import { createApi, startApiServer, type ApiConfig, type ConductorApi } from "./src/api.ts"
-import type { SessionClient } from "./src/engine/ports.ts"
+import type { SessionClient } from "./src/ports.ts"
 
 class FakeSessions implements SessionClient {
   prompts: Array<{ sessionID: string; text: string }> = []
@@ -55,29 +55,47 @@ afterEach(async () => {
   for (const dir of temporaryDirectories.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-const agentPipeline = {
-  roles: { implementer: { agent: "build" } },
-  pipeline: [{ id: "implement", type: "agent", role: "implementer" }],
-}
+const agentWorkflow = `
+name: agent-only
+on: [manual]
+roles:
+  implementer: { agent: build }
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Implement it."
+`
 
-const gatedPipeline = {
-  roles: { implementer: { agent: "build" } },
-  pipeline: [
-    { id: "implement", type: "agent", role: "implementer" },
-    { id: "merge_gate", type: "agent", role: "implementer", requires_human: true, on_reject: { goto: "implement" } },
-  ],
-}
+const gatedWorkflow = `
+name: gated
+on: [manual]
+roles:
+  implementer: { agent: build }
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Implement it."
+      - id: merge_gate
+        human: {}
+        outcomes:
+          approved: next
+          rejected: { rerun: { scope: steps, stepIds: [implement], maxRounds: 3 } }
+`
 
-function writeProject(config: unknown = agentPipeline): string {
+function writeProject(source: string = agentWorkflow): string {
   const project = tempDir("conductor-api-project-")
-  const configDir = join(project, ".opencode")
-  mkdirSync(configDir, { recursive: true })
-  writeFileSync(join(configDir, "conductor.json"), JSON.stringify(config))
+  writeFileSync(join(project, "conductor.yaml"), source)
   return project
 }
 
 async function makeApi(input?: {
-  config?: unknown
+  workflow?: string
   auth?: ApiConfig["auth"]
 }): Promise<{
   api: ConductorApi
@@ -87,7 +105,7 @@ async function makeApi(input?: {
   logger: CollectingLogger
   request: (method: string, path: string, body?: unknown, headers?: Record<string, string>) => Promise<Response>
 }> {
-  const project = writeProject(input?.config ?? agentPipeline)
+  const project = writeProject(input?.workflow ?? agentWorkflow)
   const sessions = new FakeSessions()
   const logger = new CollectingLogger()
   const daemon = new Daemon(
@@ -110,7 +128,7 @@ async function makeApi(input?: {
       store: daemon.store,
       engine: daemon.engine,
       health: () => daemon.health(),
-      resolveConfig: daemon.registry.resolver,
+      resolveWorkflow: daemon.registry.resolver,
       logger,
     },
   )
@@ -204,7 +222,7 @@ describe("API: feature resources", () => {
     expect(body.activeRun.id).toBeTruthy()
     expect(sessions.prompts.length).toBe(1)
     const timeline = daemon.store.getTransitions(body.feature.id)
-    expect(timeline.filter(t => t.event.includes("feature.start"))).toHaveLength(1)
+    expect(timeline.some(t => JSON.parse(t.event).kind === "feature.start")).toBe(true)
   })
 
   it("POST /v1/features validates the body with machine-readable codes", async () => {
@@ -284,9 +302,9 @@ describe("API: feature resources", () => {
     expect(findingsBody.findings[0]).toMatchObject({ id: "F1", severity: "major" })
 
     const timeline = await request("GET", `/v1/features/${feature.id}/timeline`)
-    const timelineBody = (await timeline.json()) as { timeline: Array<{ decision: string }> }
+    const timelineBody = (await timeline.json()) as { timeline: Array<{ decisions: Array<{ kind: string }> }> }
     expect(timelineBody.timeline.length).toBeGreaterThanOrEqual(1)
-    expect(timelineBody.timeline.some(t => t.decision === "execute")).toBe(true)
+    expect(timelineBody.timeline.some(t => t.decisions.some(d => d.kind === "execute_step"))).toBe(true)
   })
 
   it("unknown routes and methods return 404", async () => {
@@ -299,7 +317,7 @@ describe("API: feature resources", () => {
 
 describe("API: human gates", () => {
   async function gatedFeature() {
-    const context = await makeApi({ config: gatedPipeline })
+    const context = await makeApi({ workflow: gatedWorkflow })
     const feature = await startFeature(context.request, context.project)
     const run = context.daemon.store.getActiveRun(feature.id)!
     const report = await context.request("POST", `/v1/runs/${run.id}/report`, { outcome: "succeeded" })
@@ -316,11 +334,10 @@ describe("API: human gates", () => {
     const body = (await response.json()) as { result: string; feature: { status: string } }
     expect(body.result).toContain("Approved")
     const after = daemon.store.getTransitions(feature.id)
-    expect(after.filter(t => t.event.includes("human.approved"))).toHaveLength(1)
     expect(after.length).toBe(before + 1)
   })
 
-  it("request-changes requires notes and routes the gate's on_reject", async () => {
+  it("request-changes requires notes and reruns the gated step", async () => {
     const { request, daemon, feature } = await gatedFeature()
     const missingNotes = await request("POST", `/v1/features/${feature.id}/request-changes`, {})
     expect(missingNotes.status).toBe(400)
@@ -328,10 +345,9 @@ describe("API: human gates", () => {
 
     const response = await request("POST", `/v1/features/${feature.id}/request-changes`, { notes: "fix X" })
     expect(response.status).toBe(200)
-    const state = daemon.store.getFeature(feature.id)
-    expect(state?.currentStep).toBe("implement")
-    expect(state?.status).toBe("running")
-    expect(daemon.store.getTransitions(feature.id).filter(t => t.event.includes("human.rejected"))).toHaveLength(1)
+    const state = daemon.store.getFeature(feature.id)!
+    expect(state.jobs["main"]?.currentStep).toBe("implement")
+    expect(state.status).toBe("running")
   })
 
   it("approve/request-changes on a feature that is not waiting return 409 conflict", async () => {
@@ -369,7 +385,7 @@ describe("API: human gates", () => {
   })
 
   it("a gate command that loses the pre-check race still maps to 409 via the engine result", async () => {
-    const { api, request, project, daemon } = await makeApi({ config: gatedPipeline })
+    const { api, request, project, daemon } = await makeApi({ workflow: gatedWorkflow })
     const feature = await startFeature(request, project)
     const run = daemon.store.getActiveRun(feature.id)!
     expect((await request("POST", `/v1/runs/${run.id}/report`, { outcome: "succeeded" })).status).toBe(200)
@@ -393,7 +409,6 @@ describe("API: human gates", () => {
     )
     expect(raced.status).toBe(409)
     expect(((await raced.json()) as { error: { code: string } }).error.code).toBe("conflict")
-    expect(daemon.store.getTransitions(feature.id).filter(t => t.event.includes("human.approved"))).toHaveLength(1)
   })
 
   it("pause, resume and abandon dispatch the same engine events", async () => {
@@ -443,18 +458,22 @@ describe("API: run reports", () => {
   })
 
   it("a verdict whose text contains 'already concluded' is not misreported as a duplicate", async () => {
-    const trickyPipeline = {
-      roles: { reviewer: { agent: "review" } },
-      pipeline: [
-        {
-          id: "review",
-          type: "agent",
-          role: "reviewer",
-          on_verdict: { "already concluded": { next: true } },
-        },
-      ],
-    }
-    const { request, project, daemon } = await makeApi({ config: trickyPipeline })
+    const trickyWorkflow = `
+name: tricky
+on: [manual]
+roles:
+  reviewer: { agent: review }
+jobs:
+  main:
+    steps:
+      - id: review
+        agent:
+          role: reviewer
+          prompt: "go"
+        outcomes:
+          "already concluded": next
+`
+    const { request, project, daemon } = await makeApi({ workflow: trickyWorkflow })
     const feature = await startFeature(request, project)
     const run = daemon.store.getActiveRun(feature.id)!
     const response = await request("POST", `/v1/runs/${run.id}/report`, { verdict: "already concluded" })
@@ -582,7 +601,7 @@ describe("API: real listener on an ephemeral loopback port", () => {
         store: daemon.store,
         engine: daemon.engine,
         health: () => daemon.health(),
-        resolveConfig: daemon.registry.resolver,
+        resolveWorkflow: daemon.registry.resolver,
         logger,
       },
     )

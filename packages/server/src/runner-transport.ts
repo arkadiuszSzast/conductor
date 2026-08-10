@@ -33,7 +33,7 @@
  * that return 404 for the session.
  */
 
-import type { SessionClient } from "./engine/ports.ts"
+import type { SessionClient } from "./ports.ts"
 import type { RunnerDirectory, RunnerRegistration } from "./runner-registry.ts"
 
 export type RunnerFetch = (request: Request) => Promise<Response>

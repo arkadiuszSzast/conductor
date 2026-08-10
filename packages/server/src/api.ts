@@ -3,13 +3,13 @@
  *
  * The API is a thin projection over the extracted `Store`/`Engine`/
  * `Daemon`: every command operation routes through the SAME engine
- * methods (`dispatch`/`report`/`approve`/`requestChanges`) the CLI, UI
- * and runners use — there is no privileged in-process path and no
- * pipeline logic duplicated here. State reads come straight from the
- * store; SSE (`/v1/events`) is an INVALIDATION stream: subscribers get
- * `{kind, featureId}` notifications after a transition/run/finding is
- * durable and refetch authoritative state over REST — the event itself
- * never carries state.
+ * methods (`startFeature`/`report`/`approve`/`requestChanges`/
+ * `pause`/`resume`/`abandon`) the CLI, UI and runners use — there is no
+ * privileged in-process path and no workflow logic duplicated here.
+ * State reads come straight from the store; SSE (`/v1/events`) is an
+ * INVALIDATION stream: subscribers get `{kind, featureId}` notifications
+ * after a transition/run/finding is durable and refetch authoritative
+ * state over REST — the event itself never carries state.
  *
  * Explicit configuration, even for localhost: `bind` (host+port) and
  * `auth` are required fields with no universal defaults. `auth.mode:
@@ -25,10 +25,10 @@
  */
 
 import { randomUUID, timingSafeEqual } from "node:crypto"
+import type { FeatureState } from "@conductor/core"
 import type { Store, StoreChange } from "./store.ts"
 import type { DaemonHealth, DaemonLogger } from "./daemon.ts"
-import type { ConfigResolver } from "./engine/ports.ts"
-import type { PipelineEvent } from "./store.ts"
+import type { WorkflowResolver } from "./workflow-registry.ts"
 import type { RunnerRegistry } from "./runner-registry.ts"
 
 // ------------------------------------------------------------ configuration
@@ -55,18 +55,27 @@ export interface ApiConfig {
  * every other client uses. `Engine` satisfies this structurally.
  */
 export interface EngineControl {
-  dispatch(featureId: string, event: PipelineEvent): Promise<void>
+  startFeature(
+    projectDir: string,
+    input: { title: string; description?: string; workflow?: string; pr?: number; sessionId?: string },
+  ): Promise<
+    | { readonly ok: true; readonly feature: FeatureState }
+    | { readonly ok: false; readonly code: "project_not_configured" | "unknown_workflow"; readonly message: string }
+  >
   report(input: { runId: string; outcome?: "succeeded" | "failed"; verdict?: string; notes?: string }): Promise<string>
   approve(featureId: string, notes?: string): Promise<string>
   requestChanges(featureId: string, notes: string): Promise<string>
+  pause(featureId: string): Promise<void>
+  resume(featureId: string): Promise<void>
+  abandon(featureId: string): Promise<void>
 }
 
 export interface ApiDeps {
   readonly store: Store
   readonly engine: EngineControl
   readonly health: () => DaemonHealth
-  /** Per-project config lookup — used to validate feature-start requests. */
-  readonly resolveConfig: ConfigResolver
+  /** Per-project workflow lookup — used to validate feature-start requests. */
+  readonly resolveWorkflow: WorkflowResolver
   /** Runner endpoint registration (`/v1/runners`). Absent → those routes 404. */
   readonly runners?: RunnerRegistry
   readonly logger?: DaemonLogger
@@ -127,14 +136,6 @@ export interface ConductorApi {
   readonly sseClientCount: number
 }
 
-function slugify(title: string): string {
-  return title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 48)
-}
-
 const encoder = new TextEncoder()
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -145,8 +146,25 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve }
 }
 
+/** currentStep: the single running/waiting step across every job, or null if zero or several are active. */
+function currentStepOf(feature: FeatureState): string | null {
+  const active: string[] = []
+  for (const jobRuntime of Object.values(feature.jobs)) {
+    if (jobRuntime.currentStep !== null && (jobRuntime.status === "running")) active.push(jobRuntime.currentStep)
+  }
+  return active.length === 1 ? active[0]! : null
+}
+
+function jobsSummary(feature: FeatureState): Readonly<Record<string, { status: string; currentStep: string | null }>> {
+  const summary: Record<string, { status: string; currentStep: string | null }> = {}
+  for (const [jobId, jobRuntime] of Object.entries(feature.jobs)) {
+    summary[jobId] = { status: jobRuntime.status, currentStep: jobRuntime.currentStep }
+  }
+  return summary
+}
+
 export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
-  const { store, engine, health, resolveConfig, runners, logger } = deps
+  const { store, engine, health, resolveWorkflow, runners, logger } = deps
   const sseClients = new Set<SseClient>()
   const inFlight = new Set<Promise<void>>()
   let closed = false
@@ -192,10 +210,18 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     }
   }
 
-  function featurePayload(featureId: string) {
+  function featurePayload(featureId: string): unknown {
     const feature = store.getFeature(featureId)
     if (!feature) return null
-    return { feature, activeRun: store.getActiveRun(featureId) }
+    return {
+      feature: {
+        ...feature,
+        escalation: store.getEscalation(featureId),
+        currentStep: currentStepOf(feature),
+        jobs: jobsSummary(feature),
+      },
+      activeRun: store.getActiveRun(featureId),
+    }
   }
 
   async function handle(request: Request): Promise<Response> {
@@ -247,7 +273,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
 
     if (method === "GET" && path === "/v1/events") {
       if (closed) return error(requestId, "conflict", "server is shutting down")
-      return sseResponse(request, requestId)
+      return sseResponse(requestId)
     }
 
     if (path === "/v1/features") {
@@ -258,7 +284,18 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
           ...(active ? { activeOnly: true } : {}),
           ...(project !== undefined ? { projectDir: project } : {}),
         })
-        return json(200, { features }, requestId)
+        return json(
+          200,
+          {
+            features: features.map(feature => ({
+              ...feature,
+              escalation: store.getEscalation(feature.id),
+              currentStep: currentStepOf(feature),
+              jobs: jobsSummary(feature),
+            })),
+          },
+          requestId,
+        )
       }
       if (method === "POST") return createFeature(request, requestId)
       return error(requestId, "not_found", `no route for ${method} ${path}`)
@@ -318,7 +355,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       if (action === undefined && method === "GET") {
         const run = store.getRunById(runId)
         if (!run) return error(requestId, "not_found", `unknown run "${runId}"`)
-        return json(200, { run: { id: runId, ...run } }, requestId)
+        return json(200, { run }, requestId)
       }
       if (action === "report" && method === "POST") return reportRun(request, runId, requestId)
       return error(requestId, "not_found", `no route for ${method} ${path}`)
@@ -391,37 +428,18 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     if (sessionId !== undefined && (typeof sessionId !== "string" || sessionId.trim() === "")) {
       return error(requestId, "invalid_request", "\"sessionId\" must be a non-empty string")
     }
-    const config = resolveConfig(project)
-    if (!config) {
-      return error(requestId, "project_not_configured", `no valid conductor config registered for "${project}"`)
+    if (resolveWorkflow(project) === null) {
+      return error(requestId, "project_not_configured", `no valid conductor.yaml registered for "${project}"`)
     }
-    if (workflow !== undefined && config.resolvedWorkflows[workflow] === undefined) {
-      const known = Object.keys(config.resolvedWorkflows)
-      return error(
-        requestId,
-        "unknown_workflow",
-        `unknown workflow "${workflow}"${known.length > 0 ? ` (available: ${known.join(", ")})` : ""}`,
-      )
-    }
-    const feature = store.createFeature({
+    const result = await engine.startFeature(project, {
       title,
-      slug: slugify(title),
-      projectDir: project,
-      ...(workflow !== undefined ? { workflow } : {}),
       ...(description !== undefined ? { description } : {}),
+      ...(workflow !== undefined ? { workflow } : {}),
+      ...(pr !== undefined ? { pr } : {}),
+      ...(sessionId !== undefined ? { sessionId } : {}),
     })
-    // `sessionId` adopts the CALLER's session as the feature's parent —
-    // the seed's "one feature, one session" behaviour: the session where
-    // the human asked for the feature becomes its home; timeline notes
-    // land there and step child sessions hang beneath it.
-    if (pr !== undefined || sessionId !== undefined) {
-      store.setFeatureFields(feature.id, {
-        ...(pr !== undefined ? { pr } : {}),
-        ...(sessionId !== undefined ? { sessionId } : {}),
-      })
-    }
-    await engine.dispatch(feature.id, { kind: "feature.start" })
-    return json(201, featurePayload(feature.id), requestId)
+    if (!result.ok) return error(requestId, result.code, result.message)
+    return json(201, featurePayload(result.feature.id), requestId)
   }
 
   function featureResource(featureId: string, resource: string, requestId: string): Response {
@@ -462,7 +480,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         if (!result.startsWith("Approved")) {
           return error(requestId, "conflict", result)
         }
-        return json(200, { result, ...featurePayload(featureId) }, requestId)
+        return json(200, { result, ...(featurePayload(featureId) as Record<string, unknown>) }, requestId)
       }
       case "request-changes": {
         if (feature.status !== "waiting_human") {
@@ -475,23 +493,23 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         if (!result.startsWith("Changes requested")) {
           return error(requestId, "conflict", result)
         }
-        return json(200, { result, ...featurePayload(featureId) }, requestId)
+        return json(200, { result, ...(featurePayload(featureId) as Record<string, unknown>) }, requestId)
       }
       // `human.paused`/`human.abandoned` are unconditional in the
       // interpreter (seed semantics, preserved). The API guards terminal
       // features here: pausing a `done` feature would flip it back into
-      // an ACTIVE status, and a later resume (currentStep is null after
-      // finish) would restart the whole pipeline from step one.
+      // an ACTIVE status, and a later resume would restart the DAG.
       case "pause":
       case "abandon": {
         if (feature.status === "done" || feature.status === "abandoned") {
           return error(requestId, "conflict", `feature is already ${feature.status}`)
         }
-        await engine.dispatch(featureId, { kind: action === "pause" ? "human.paused" : "human.abandoned" })
+        if (action === "pause") await engine.pause(featureId)
+        else await engine.abandon(featureId)
         return json(200, featurePayload(featureId), requestId)
       }
       case "resume":
-        await engine.dispatch(featureId, { kind: "human.resumed" })
+        await engine.resume(featureId)
         return json(200, featurePayload(featureId), requestId)
       default:
         return error(requestId, "not_found", `no route for POST /v1/features/:id/${action}`)
@@ -540,10 +558,10 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     if (result.startsWith(`Run ${runId} already concluded`)) {
       return error(requestId, "run_already_concluded", result)
     }
-    return json(200, { result, run: { id: runId, ...store.getRunById(runId) } }, requestId)
+    return json(200, { result, run: store.getRunById(runId) }, requestId)
   }
 
-  function sseResponse(request: Request, requestId: string): Response {
+  function sseResponse(requestId: string): Response {
     const client: { current: SseClient | null } = { current: null }
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -555,16 +573,6 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       cancel() {
         if (client.current) sseClients.delete(client.current)
       },
-    })
-    request.signal.addEventListener("abort", () => {
-      if (client.current) {
-        sseClients.delete(client.current)
-        try {
-          client.current.controller.close()
-        } catch {
-          // already closed
-        }
-      }
     })
     return new Response(stream, {
       status: 200,

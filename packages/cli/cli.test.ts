@@ -10,11 +10,12 @@
  * runs against an in-memory filesystem boundary.
  */
 import { afterEach, describe, expect, it } from "bun:test"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { Daemon, createApi, type ConductorApi, type ApiConfig } from "@conductor/server"
 import type { SessionClient } from "@conductor/server"
+import { validateWorkflow, parseWorkflow } from "@conductor/core"
 import { runCli, EXIT, type CliDeps } from "./src/cli.ts"
 import { ApiClient, ApiError } from "./src/client.ts"
 import { resolveConnection, UsageError } from "./src/config.ts"
@@ -53,19 +54,28 @@ afterEach(async () => {
   for (const dir of temporaryDirectories.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-const gatedPipeline = {
-  roles: { implementer: { agent: "build" } },
-  pipeline: [
-    { id: "implement", type: "agent", role: "implementer" },
-    { id: "merge_gate", type: "agent", role: "implementer", requires_human: true, on_reject: { goto: "implement" } },
-  ],
-}
+const gatedWorkflow = `
+name: gated
+on: [manual]
+roles:
+  implementer: { agent: build }
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Implement it."
+      - id: merge_gate
+        human: {}
+        outcomes:
+          approved: next
+          rejected: { rerun: { scope: steps, stepIds: [implement], maxRounds: 3 } }
+`
 
-function writeProject(config: unknown = gatedPipeline): string {
+function writeProject(source: string = gatedWorkflow): string {
   const project = tempDir("conductor-cli-project-")
-  const configDir = join(project, ".opencode")
-  mkdirSync(configDir, { recursive: true })
-  writeFileSync(join(configDir, "conductor.json"), JSON.stringify(config))
+  writeFileSync(join(project, "conductor.yaml"), source)
   return project
 }
 
@@ -83,8 +93,8 @@ interface Harness {
 
 const CLI_URL = "http://conductor.test"
 
-async function makeHarness(input?: { config?: unknown; auth?: ApiConfig["auth"]; env?: Record<string, string> }): Promise<Harness> {
-  const project = writeProject(input?.config ?? gatedPipeline)
+async function makeHarness(input?: { workflow?: string; auth?: ApiConfig["auth"]; env?: Record<string, string> }): Promise<Harness> {
+  const project = writeProject(input?.workflow ?? gatedWorkflow)
   const sessions = new FakeSessions()
   const daemon = new Daemon(
     {
@@ -102,7 +112,7 @@ async function makeHarness(input?: { config?: unknown; auth?: ApiConfig["auth"];
       store: daemon.store,
       engine: daemon.engine,
       health: () => daemon.health(),
-      resolveConfig: daemon.registry.resolver,
+      resolveWorkflow: daemon.registry.resolver,
     },
   )
   apisToClose.push(api)
@@ -337,12 +347,21 @@ describe("CLI: report", () => {
 
   it("report --verdict records a verdict", async () => {
     const h = await makeHarness({
-      config: {
-        roles: { reviewer: { agent: "review" } },
-        pipeline: [
-          { id: "review", type: "agent", role: "reviewer", on_verdict: { approved: { next: true } } },
-        ],
-      },
+      workflow: `
+name: verdict-only
+on: [manual]
+roles:
+  reviewer: { agent: review }
+jobs:
+  main:
+    steps:
+      - id: review
+        agent:
+          role: reviewer
+          prompt: "review"
+        outcomes:
+          approved: next
+`,
     })
     const { runId } = await startFeature(h)
     h.out.length = 0
@@ -358,7 +377,7 @@ describe("CLI: report", () => {
     h.files.set("/tmp/notes.md", "notes from a file")
     expect(await h.run("report", runId, "--outcome", "succeeded", "--notes", "@/tmp/notes.md")).toBe(EXIT.ok)
     const run = h.daemon.store.getRunById(runId)!
-    expect(run.output).toBe("notes from a file")
+    expect(run.outputs["report"]).toBe("notes from a file")
   })
 
   it("maps a duplicate report to the dedicated duplicate exit code", async () => {
@@ -390,19 +409,17 @@ describe("CLI: approve / request-changes", () => {
     expect(await h.run("approve", featureId, "--notes", "ship it")).toBe(EXIT.ok)
     expect(h.out.join("\n")).toContain("Approved")
     const feature = h.daemon.store.getFeature(featureId)!
-    expect(feature.status).toBe("running")
-    const approvals = h.daemon.store.getTransitions(featureId).filter(t => t.event.includes('"human.approved"'))
-    expect(approvals.length).toBe(1)
+    expect(feature.status).toBe("done")
   })
 
-  it("request-changes routes back with notes", async () => {
+  it("request-changes reruns the gated step with notes", async () => {
     const h = await makeHarness()
     const { featureId } = await driveToGate(h)
     expect(await h.run("request-changes", featureId, "--notes", "needs work")).toBe(EXIT.ok)
     expect(h.out.join("\n")).toContain("Changes requested")
     const feature = h.daemon.store.getFeature(featureId)!
     expect(feature.status).toBe("running")
-    expect(feature.currentStep).toBe("implement")
+    expect(feature.jobs["main"]?.currentStep).toBe("implement")
   })
 
   it("maps a gate command on a non-waiting feature to the conflict exit code", async () => {
@@ -450,7 +467,7 @@ describe("CLI: pause / resume / abandon / logs", () => {
     expect(h.out.length).toBeGreaterThanOrEqual(2)
     expect(h.out[0]).toContain("feature.start")
     expect(h.out[0]).not.toContain('{"kind"')
-    expect(h.out.at(-1)!).toContain("step.succeeded")
+    expect(h.out.at(-1)!).toContain("step.completed")
 
     h.out.length = 0
     expect(await h.run("logs", featureId, "--json")).toBe(EXIT.ok)
@@ -460,20 +477,29 @@ describe("CLI: pause / resume / abandon / logs", () => {
 })
 
 describe("CLI: init", () => {
-  it("scaffolds .opencode/conductor.json in the target directory", async () => {
+  it("scaffolds conductor.yaml in the target directory", async () => {
     const h = await makeHarness()
     expect(await h.run("init", "--dir", "/work/other")).toBe(EXIT.ok)
-    expect(h.dirs.has("/work/other/.opencode")).toBe(true)
-    const written = h.files.get("/work/other/.opencode/conductor.json")!
-    const parsed = JSON.parse(written) as { pipeline: Array<{ id: string }>; roles: Record<string, unknown> }
-    expect(parsed.pipeline.map(step => step.id)).toEqual(["implement", "merge_gate"])
-    expect(Object.keys(parsed.roles)).toEqual(["implementer"])
+    expect(h.dirs.has("/work/other")).toBe(true)
+    const written = h.files.get("/work/other/conductor.yaml")!
+    const parsed = parseWorkflow(written)
+    expect(parsed.ok).toBe(true)
+  })
+
+  it("the scaffolded workflow passes core validateWorkflow", async () => {
+    const h = await makeHarness()
+    expect(await h.run("init", "--dir", "/work/valid")).toBe(EXIT.ok)
+    const written = h.files.get("/work/valid/conductor.yaml")!
+    const parsed = parseWorkflow(written)
+    if (!parsed.ok) throw new Error(parsed.errors.map(e => e.message).join("\n"))
+    const result = validateWorkflow(parsed.workflow)
+    expect(result.errors).toEqual([])
   })
 
   it("defaults to the working directory and refuses to overwrite without --force", async () => {
     const h = await makeHarness()
     expect(await h.run("init")).toBe(EXIT.ok)
-    expect(h.files.has("/work/project/.opencode/conductor.json")).toBe(true)
+    expect(h.files.has("/work/project/conductor.yaml")).toBe(true)
 
     h.err.length = 0
     expect(await h.run("init")).toBe(EXIT.failure)
@@ -482,13 +508,12 @@ describe("CLI: init", () => {
     expect(await h.run("init", "--force")).toBe(EXIT.ok)
   })
 
-  it("writes a config the daemon's own loader accepts", async () => {
+  it("writes a config the daemon's own registry accepts", async () => {
     const h = await makeHarness()
     expect(await h.run("init")).toBe(EXIT.ok)
-    const written = h.files.get("/work/project/.opencode/conductor.json")!
+    const written = h.files.get("/work/project/conductor.yaml")!
     const project = tempDir("conductor-cli-init-")
-    mkdirSync(join(project, ".opencode"), { recursive: true })
-    writeFileSync(join(project, ".opencode", "conductor.json"), written)
+    writeFileSync(join(project, "conductor.yaml"), written)
     const result = h.daemon.registry.register(project)
     expect(result.ok).toBe(true)
   })

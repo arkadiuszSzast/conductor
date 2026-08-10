@@ -161,6 +161,72 @@ export const migrations: readonly Migration[] = [
       addColumn(db, "step_run", "action_handled", "INTEGER NOT NULL DEFAULT 0")
     },
   },
+  {
+    id: "0008_graph_state_schema",
+    up(db) {
+      // The seed pipeline model (single current_step, attempts/rounds maps,
+      // pr_head tracking) is deleted outright — greenfield, no data exists
+      // anywhere. `feature` and `step_run` are dropped and recreated for
+      // the @conductor/core graph FeatureState model; `transition_log`
+      // gains room for multi-decision (fan-out) transitions. `finding`
+      // and `review_thread` are untouched (kept read-only for now).
+      db.run("DROP TABLE IF EXISTS pr_head")
+      db.run("DROP TABLE IF EXISTS step_run")
+      db.run("DROP TABLE IF EXISTS transition_log")
+      db.run("DROP TABLE IF EXISTS feature")
+
+      db.run(`
+        CREATE TABLE feature (
+          id            TEXT PRIMARY KEY,
+          slug          TEXT NOT NULL,
+          project_dir   TEXT NOT NULL,
+          title         TEXT NOT NULL,
+          workflow      TEXT,
+          description   TEXT,
+          status        TEXT NOT NULL DEFAULT 'running'
+                          CHECK(status IN ('running','paused','waiting_human','escalated','done','abandoned')),
+          pr            INTEGER,
+          escalation    TEXT,
+          state         TEXT NOT NULL,
+          feedback      TEXT,
+          time_created  INTEGER NOT NULL,
+          time_updated  INTEGER NOT NULL
+        )
+      `)
+      db.run(`
+        CREATE TABLE run (
+          id                    TEXT PRIMARY KEY,
+          feature_id            TEXT NOT NULL REFERENCES feature(id) ON DELETE CASCADE,
+          job_id                TEXT NOT NULL,
+          step_id               TEXT NOT NULL,
+          step_type             TEXT NOT NULL CHECK(step_type IN ('agent','command')),
+          attempt               INTEGER NOT NULL DEFAULT 1,
+          status                TEXT NOT NULL DEFAULT 'running'
+                                  CHECK(status IN ('running','succeeded','failed','reaped')),
+          session_id            TEXT,
+          outputs               TEXT NOT NULL DEFAULT '{}',
+          reason                TEXT,
+          nudges                INTEGER NOT NULL DEFAULT 0,
+          completion_event      TEXT,
+          completion_decisions  TEXT,
+          action_handled        INTEGER NOT NULL DEFAULT 0,
+          time_started          INTEGER NOT NULL,
+          time_finished         INTEGER
+        )
+      `)
+      db.run(`
+        CREATE TABLE transition_log (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          feature_id    TEXT NOT NULL,
+          event         TEXT NOT NULL,
+          decisions     TEXT NOT NULL,
+          time_created  INTEGER NOT NULL
+        )
+      `)
+      db.run("CREATE INDEX IF NOT EXISTS idx_run_feature ON run(feature_id, time_started)")
+      db.run("CREATE INDEX IF NOT EXISTS idx_transition_feature ON transition_log(feature_id, time_created)")
+    },
+  },
 ]
 
 function validateMigrations(ordered: readonly Migration[]): void {
