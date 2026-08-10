@@ -6,6 +6,9 @@
   "type": "module",
   "main": "src/index.ts",
   "module": "src/index.ts",
+  "bin": {
+    "conductor": "src/main.ts"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
