@@ -16,11 +16,26 @@ registration order. The extraction must preserve their fixes.
 
 ## Goals / Non-goals
 
-**Goals:** standalone lifecycle, versioned API, additive DB adoption, thin
-opencode adapter, CLI client, test parity, same-day gloam dogfooding.
+**Goals:** standalone lifecycle, versioned API, thin opencode adapter, CLI
+client, native `conductor.yaml` execution, dogfooding on the benches and on
+this repo's own changes.
 
-**Non-goals:** changing workflow semantics, adding DAG scheduling, board UI,
-webhook ingress, distributed execution or replacing SQLite.
+**Non-goals:** board UI, webhook ingress, distributed execution or replacing
+SQLite.
+
+## Greenfield pivot (recorded decision)
+
+Mid-change, the project recorded the greenfield decision now written into
+AGENTS.md: there are no users, no deployed databases, no in-flight features.
+The seed's `.opencode/conductor.json` pipeline format, the pipeline engine
+extracted from it (`packages/server/src/engine/`), the seed config registry
+and the bundled seed presets were extraction scaffolding — they are removed
+in this change rather than converted or preserved. The original task 15
+(seed JSON → `conductor.yaml` converter) is void: a converter is a bridge to
+a format we are deleting. Sections below that describe the removed seed
+machinery are kept for history where they document behaviours that carry
+forward (confirmation-of-effect, nudge/reap, atomic conclusion), and are
+superseded where they describe the seed pipeline model itself.
 
 ## Decisions
 
@@ -520,13 +535,43 @@ duplicate report surfaces the daemon's `run_already_concluded` (409)
 envelope as the seed's "Run <id> already concluded" text so an agent's
 retry reads as already-recorded rather than a failure.
 
-### Configuration migration
+### Native `conductor.yaml` execution (supersedes "Configuration migration")
 
-A converter reads `.opencode/conductor.json` and emits `conductor.yaml`. It
-preserves step IDs, routing, roles/models, prompts, human gates, findings
-publishing and worktree settings. It validates both forms and emits a semantic
-diff/warnings; migration is opt-in and keeps the original file. Workflow YAML
-semantics are specified by the separate `workflow-format` change.
+There is no configuration migration: the seed format is deleted, not
+converted. The daemon executes `conductor.yaml` natively:
+
+- **Workflow loading.** A `WorkflowRegistry` replaces `ProjectConfigRegistry`:
+  it loads `<projectDir>/conductor.yaml` through `@conductor/core`'s
+  `parseWorkflow` + `validateWorkflow`, with the same operational semantics
+  the seed registry proved out — explicit synchronous register/reload, no
+  watcher, disk-free resolution from a published snapshot, canonical
+  (`realpath`) project keys, per-project `valid`/`stale`/`invalid` status
+  with diagnostics, last-valid-snapshot retention on failed reload, atomic
+  deep-frozen publication. The seed's layering (`extends`, `conductor:<name>`
+  presets, global file) is dropped — one file per project; composition
+  belongs to the workflow-format change if it is ever wanted.
+- **Graph engine.** The server's engine drives `@conductor/core`'s
+  `interpret()` (DAG-aware, multi-decision transitions) instead of the seed
+  interpreter. The operational layer carries forward on the new model:
+  confirmation-of-effect (agent steps conclude only through `report()`),
+  idle debounce/nudge/reap with `runTtlMs`, atomic run conclusion
+  (`concludeRun` claim + event + transition + audit in one transaction),
+  per-feature isolation, and the durable decision outbox.
+- **Step execution.** `agent` steps dispatch through `SessionClient` as
+  before. `command` steps run through `ProcessRunner.shell` with
+  `$CONDUCTOR_OUTPUT` collection. `human` steps map to `wait_human`.
+  `action` steps resolve through the action registry when it lands
+  (workflow-format section 3); until bundled actions exist, a workflow using
+  `action` steps fails validation at load with a clear diagnostic — no
+  silent builtin-name dispatch.
+- **Graph state persistence.** The store persists the graph `FeatureState`
+  (per-job status/currentStep/attempts/reruns/outputs, per-step
+  status/outputs, feedback snapshots) as JSON state columns on the feature
+  plus the existing run/transition/audit tables. The schema is defined for
+  the graph model directly; seed-era tables that only served the removed
+  pipeline model are dropped by a new migration. Migration IDs already
+  applied remain untouched (append-only ledger), but there is no seed-DB
+  adoption path and no compatibility fixture.
 
 ## Alternatives considered
 

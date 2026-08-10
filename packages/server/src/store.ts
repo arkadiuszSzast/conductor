@@ -1,56 +1,8 @@
 import { randomUUID } from "node:crypto"
 import type { Database } from "./database.ts"
-
-export type FeatureStatus = "running" | "paused" | "waiting_human" | "escalated" | "done" | "abandoned"
-
-export interface FeatureState {
-  readonly id: string
-  readonly title: string
-  readonly slug: string
-  readonly projectDir: string
-  readonly workflow: string | null
-  readonly description: string | null
-  readonly status: FeatureStatus
-  readonly currentStep: string | null
-  readonly sessionId: string | null
-  readonly worktree: string | null
-  readonly branch: string | null
-  readonly pr: number | null
-  readonly attempts: Readonly<Record<string, number>>
-  readonly rounds: Readonly<Record<string, number>>
-  readonly escalation: string | null
-}
-
-export type PipelineEvent =
-  | { readonly kind: "feature.start" }
-  | { readonly kind: "step.succeeded"; readonly stepId: string; readonly output?: string }
-  | { readonly kind: "step.failed"; readonly stepId: string; readonly reason: string }
-  | { readonly kind: "step.verdict"; readonly stepId: string; readonly verdict: string }
-  | { readonly kind: "human.approved"; readonly stepId: string }
-  | { readonly kind: "human.rejected"; readonly stepId: string; readonly notes?: string }
-  | { readonly kind: "human.paused" }
-  | { readonly kind: "human.resumed" }
-  | { readonly kind: "human.abandoned" }
-
-export type Decision =
-  | { readonly kind: "execute"; readonly stepId: string }
-  | { readonly kind: "wait_human"; readonly stepId: string }
-  | { readonly kind: "escalate"; readonly reason: string }
-  | { readonly kind: "finish" }
-  | { readonly kind: "pause" }
-  | { readonly kind: "abandon" }
-  | { readonly kind: "noop"; readonly reason: string }
-
-export interface Transition {
-  readonly decision: Decision
-  readonly patch: Partial<{
-    status: FeatureStatus
-    currentStep: string | null
-    attempts: Readonly<Record<string, number>>
-    rounds: Readonly<Record<string, number>>
-    escalation: string | null
-  }>
-}
+import { applyPatch, initialFeatureState } from "./state.ts"
+import type { CreateFeatureInput } from "./state.ts"
+import type { Decision, Feedback, FeatureState, FeatureStatus, PipelineEvent, Transition } from "@conductor/core"
 
 /**
  * Post-commit change notification — the invalidation signal the API's
@@ -69,36 +21,89 @@ interface FeatureRow {
   slug: string
   project_dir: string
   status: FeatureStatus
-  current_step: string | null
   workflow: string | null
   description: string | null
-  session_id: string | null
-  worktree: string | null
-  branch: string | null
   pr: number | null
-  attempts: string
-  rounds: string
   escalation: string | null
+  state: string
+  feedback: string | null
 }
 
-function toState(row: FeatureRow): FeatureState {
+function toFeatureState(row: FeatureRow): FeatureState {
+  return JSON.parse(row.state) as FeatureState
+}
+
+interface RunRow {
+  id: string
+  feature_id: string
+  job_id: string
+  step_id: string
+  step_type: "agent" | "command"
+  attempt: number
+  status: "running" | "succeeded" | "failed" | "reaped"
+  session_id: string | null
+  outputs: string
+  reason: string | null
+  nudges: number
+  completion_event: string | null
+  completion_decisions: string | null
+  action_handled: number
+  time_started: number
+  time_finished: number | null
+}
+
+export interface RunSummary {
+  readonly id: string
+  readonly featureId: string
+  readonly jobId: string
+  readonly stepId: string
+  readonly stepType: "agent" | "command"
+  readonly attempt: number
+  readonly status: "running" | "succeeded" | "failed" | "reaped"
+  readonly sessionId: string | null
+  readonly outputs: Readonly<Record<string, string>>
+  readonly reason: string | null
+  readonly nudges: number
+  readonly timeStarted: number
+  readonly timeFinished: number | null
+}
+
+function toRunSummary(row: RunRow): RunSummary {
   return {
     id: row.id,
-    title: row.title,
-    slug: row.slug,
-    projectDir: row.project_dir,
-    workflow: row.workflow,
-    description: row.description,
+    featureId: row.feature_id,
+    jobId: row.job_id,
+    stepId: row.step_id,
+    stepType: row.step_type,
+    attempt: row.attempt,
     status: row.status,
-    currentStep: row.current_step,
     sessionId: row.session_id,
-    worktree: row.worktree,
-    branch: row.branch,
-    pr: row.pr,
-    attempts: JSON.parse(row.attempts) as Record<string, number>,
-    rounds: JSON.parse(row.rounds) as Record<string, number>,
-    escalation: row.escalation,
+    outputs: JSON.parse(row.outputs) as Record<string, string>,
+    reason: row.reason,
+    nudges: row.nudges,
+    timeStarted: row.time_started,
+    timeFinished: row.time_finished,
   }
+}
+
+export interface TransitionEntry {
+  readonly event: string
+  readonly decisions: readonly Decision[]
+  readonly time: number
+}
+
+export interface FindingView {
+  readonly id: string
+  readonly stepId: string
+  readonly path: string
+  readonly line: number
+  readonly severity: string
+  readonly tags: string[]
+  readonly body: string
+  readonly status: "new" | "fixed" | "dismissed" | "reopened"
+  readonly resolution: string | null
+  readonly threadId: string | null
+  readonly synced: boolean
 }
 
 export class Store {
@@ -130,29 +135,41 @@ export class Store {
     }
   }
 
-  createFeature(input: {
-    title: string
-    slug: string
-    projectDir: string
-    workflow?: string
-    description?: string
-  }): FeatureState {
+  createFeature(input: CreateFeatureInput): FeatureState {
     const now = Date.now()
-    const id = randomUUID()
+    const state = initialFeatureState({ ...input, id: randomUUID() })
     this.db.run(
-      `INSERT INTO feature (id, title, slug, project_dir, workflow, description, time_created, time_updated)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, input.title, input.slug, input.projectDir, input.workflow ?? null, input.description ?? null, now, now],
+      `INSERT INTO feature (id, slug, project_dir, title, workflow, description, status, pr, escalation, state, feedback, time_created, time_updated)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        state.id,
+        state.slug,
+        state.projectDir,
+        state.title,
+        state.workflow,
+        state.description,
+        state.status,
+        state.pr,
+        null,
+        JSON.stringify(state),
+        null,
+        now,
+        now,
+      ],
     )
-    const state = this.getFeature(id)
-    if (!state) throw new Error(`conductor: feature ${id} vanished after insert`)
-    this.emit({ kind: "feature", featureId: id })
+    this.emit({ kind: "feature", featureId: state.id })
     return state
   }
 
   getFeature(id: string): FeatureState | null {
     const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(id) as FeatureRow | null
-    return row ? toState(row) : null
+    return row ? toFeatureState(row) : null
+  }
+
+  /** Feedback snapshot attached by the most recent rerun transition, if any. */
+  getFeedback(id: string): Feedback | null {
+    const row = this.db.query("SELECT feedback FROM feature WHERE id = ?").get(id) as { feedback: string | null } | null
+    return row?.feedback ? (JSON.parse(row.feedback) as Feedback) : null
   }
 
   listFeatures(filter?: { activeOnly?: boolean; projectDir?: string }): FeatureState[] {
@@ -165,169 +182,158 @@ export class Store {
     }
     const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""
     const rows = this.db.query(`SELECT * FROM feature ${where} ORDER BY time_created DESC`).all(...params) as FeatureRow[]
-    return rows.map(toState)
+    return rows.map(toFeatureState)
   }
 
   findFeatureByPr(pr: number): FeatureState | null {
     const row = this.db.query("SELECT * FROM feature WHERE pr = ? AND status NOT IN ('done','abandoned')").get(pr) as FeatureRow | null
-    return row ? toState(row) : null
+    return row ? toFeatureState(row) : null
   }
 
+  /** Escalation reason, tracked outside the core `FeatureState` shape. Null when not escalated. */
+  getEscalation(id: string): string | null {
+    const row = this.db.query("SELECT escalation FROM feature WHERE id = ?").get(id) as { escalation: string | null } | null
+    return row?.escalation ?? null
+  }
+
+  /**
+   * Applies a `Transition`'s patch to the feature's persisted graph
+   * state and appends the audit row in ONE transaction: the invariant
+   * every restart-recovery/duplicate-report guarantee depends on.
+   */
   applyTransition(featureId: string, event: PipelineEvent, transition: Transition): void {
     this.db.transaction(() => this.applyTransitionTx(featureId, event, transition))()
     this.emit({ kind: "transition", featureId })
   }
 
   private applyTransitionTx(featureId: string, event: PipelineEvent, transition: Transition): void {
-    const { patch, decision } = transition
-    const sets: string[] = ["time_updated = ?"]
-    const params: (string | number | null)[] = [Date.now()]
-    if (patch.status !== undefined) {
+    const current = this.getFeature(featureId)
+    if (!current) throw new Error(`conductor: feature ${featureId} not found`)
+    const next = applyPatch(current, transition.patch)
+    const escalation = transition.patch.status === "escalated"
+      ? escalationReason(transition.decisions)
+      : (transition.patch.status !== undefined ? null : undefined)
+
+    const sets: string[] = ["time_updated = ?", "state = ?"]
+    const params: (string | number | null)[] = [Date.now(), JSON.stringify(next)]
+    if (transition.patch.status !== undefined) {
       sets.push("status = ?")
-      params.push(patch.status)
+      params.push(next.status)
     }
-    if (patch.currentStep !== undefined) {
-      sets.push("current_step = ?")
-      params.push(patch.currentStep)
-    }
-    if (patch.attempts !== undefined) {
-      sets.push("attempts = ?")
-      params.push(JSON.stringify(patch.attempts))
-    }
-    if (patch.rounds !== undefined) {
-      sets.push("rounds = ?")
-      params.push(JSON.stringify(patch.rounds))
-    }
-    if (patch.escalation !== undefined) {
+    if (escalation !== undefined) {
       sets.push("escalation = ?")
-      params.push(patch.escalation)
-    } else if (decision.kind === "escalate") {
-      sets.push("escalation = ?")
-      params.push(decision.reason)
+      params.push(escalation)
+    }
+    if (transition.feedback !== undefined) {
+      sets.push("feedback = ?")
+      params.push(JSON.stringify(transition.feedback))
     }
     params.push(featureId)
     this.db.run(`UPDATE feature SET ${sets.join(", ")} WHERE id = ?`, params as never)
     this.db.run(
-      `INSERT INTO transition_log (feature_id, event, decision, detail, time_created)
-       VALUES (?, ?, ?, ?, ?)`,
-      [featureId, JSON.stringify(event), decision.kind, decisionDetail(decision), Date.now()],
+      `INSERT INTO transition_log (feature_id, event, decisions, time_created)
+       VALUES (?, ?, ?, ?)`,
+      [featureId, JSON.stringify(event), JSON.stringify(transition.decisions), Date.now()],
     )
   }
 
-  setFeatureFields(id: string, fields: Partial<{
-    sessionId: string | null
-    worktree: string | null
-    branch: string | null
-    pr: number | null
-  }>): void {
-    const sets: string[] = ["time_updated = ?"]
-    const params: (string | number | null)[] = [Date.now()]
-    if ("sessionId" in fields) {
-      sets.push("session_id = ?")
-      params.push(fields.sessionId ?? null)
+  setFeatureFields(id: string, fields: Partial<{ sessionId: string | null; pr: number | null }>): void {
+    const current = this.getFeature(id)
+    if (!current) return
+    const next: FeatureState = {
+      ...current,
+      ...("sessionId" in fields ? { sessionId: fields.sessionId ?? null } : {}),
+      ...("pr" in fields ? { pr: fields.pr ?? null } : {}),
     }
-    if ("worktree" in fields) {
-      sets.push("worktree = ?")
-      params.push(fields.worktree ?? null)
-    }
-    if ("branch" in fields) {
-      sets.push("branch = ?")
-      params.push(fields.branch ?? null)
-    }
+    const sets: string[] = ["time_updated = ?", "state = ?"]
+    const params: (string | number | null)[] = [Date.now(), JSON.stringify(next)]
     if ("pr" in fields) {
       sets.push("pr = ?")
-      params.push(fields.pr ?? null)
+      params.push(next.pr)
     }
     params.push(id)
     this.db.run(`UPDATE feature SET ${sets.join(", ")} WHERE id = ?`, params as never)
   }
 
-  startRun(input: {
+  insertRun(input: {
     featureId: string
+    jobId: string
     stepId: string
-    stepType: "builtin" | "command" | "agent"
+    stepType: "agent" | "command"
     attempt: number
-    role?: string
-    model?: string
     sessionId?: string
   }): string {
     const id = randomUUID()
     this.db.run(
-      `INSERT INTO step_run (id, feature_id, step_id, step_type, attempt, role, model, session_id, time_started)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, input.featureId, input.stepId, input.stepType, input.attempt, input.role ?? null, input.model ?? null, input.sessionId ?? null, Date.now()],
+      `INSERT INTO run (id, feature_id, job_id, step_id, step_type, attempt, session_id, time_started)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, input.featureId, input.jobId, input.stepId, input.stepType, input.attempt, input.sessionId ?? null, Date.now()],
     )
     this.emit({ kind: "run", featureId: input.featureId })
     return id
   }
 
-  finishRun(runId: string, status: "succeeded" | "failed" | "reaped", detail?: { output?: string; reason?: string }): void {
+  finishRun(runId: string, status: "succeeded" | "failed" | "reaped", detail?: { outputs?: Readonly<Record<string, string>>; reason?: string }): void {
     this.db.run(
-      "UPDATE step_run SET status = ?, output = ?, reason = ?, time_finished = ? WHERE id = ?",
-      [status, detail?.output ?? null, detail?.reason ?? null, Date.now(), runId],
+      "UPDATE run SET status = ?, outputs = ?, reason = ?, time_finished = ? WHERE id = ?",
+      [status, JSON.stringify(detail?.outputs ?? {}), detail?.reason ?? null, Date.now(), runId],
     )
-    const featureId = (this.db.query("SELECT feature_id FROM step_run WHERE id = ?").get(runId) as { feature_id: string } | null)?.feature_id
+    const featureId = (this.db.query("SELECT feature_id FROM run WHERE id = ?").get(runId) as { feature_id: string } | null)?.feature_id
     if (featureId) this.emit({ kind: "run", featureId })
   }
 
   /**
    * Claims a run's session id — only while the run is still 'running'. A
-   * run can be reaped (TTL, missing session) by the reconciler WHILE an
-   * `executeAgent` call is still awaiting session creation for it; when
-   * that stale call finally resolves, this guard makes the claim a no-op
-   * (0 rows affected → false) instead of writing a session id onto an
+   * run can be reaped (TTL, missing session) by the reconciler WHILE a
+   * dispatch call is still awaiting session creation for it; when that
+   * stale call finally resolves, this guard makes the claim a no-op (0
+   * rows affected → false) instead of writing a session id onto an
    * already-concluded run row. Callers MUST check the return value and
-   * skip prompting when it is false — otherwise a session nobody is
-   * tracking anymore gets prompted into doing work for a run that has
-   * already moved on (a retry run may already be in flight for the same
-   * step).
+   * skip prompting when it is false.
    */
-  setRunSession(runId: string, sessionId: string, featureSessionId?: string): boolean {
-    return this.db.transaction(() => {
-      const row = this.db.query(
-        "SELECT feature_id FROM step_run WHERE id = ? AND status = 'running'",
-      ).get(runId) as { feature_id: string } | null
-      if (!row) return false
-      this.db.run("UPDATE step_run SET session_id = ? WHERE id = ?", [sessionId, runId])
-      if (featureSessionId !== undefined) {
-        this.db.run("UPDATE feature SET session_id = ?, time_updated = ? WHERE id = ?", [featureSessionId, Date.now(), row.feature_id])
-      }
-      return true
-    })()
+  setRunSession(runId: string, sessionId: string): boolean {
+    return this.db.run("UPDATE run SET session_id = ? WHERE id = ? AND status = 'running'", [sessionId, runId]).changes > 0
   }
 
   /**
    * Atomically concludes a run and applies the feature transition it
-   * triggers: closes the crash window between "run finished" and "feature
-   * advanced" by making both writes one transaction. The `WHERE status =
-   * 'running'` guard also makes this the single point where a duplicate
-   * report (e.g. an agent retries `report()` after a timeout) is caught —
-   * the second call sees zero rows affected and returns false without
-   * touching the feature or its transition log.
+   * triggers: closes the crash window between "run finished" and
+   * "feature advanced" by making both writes one transaction. The
+   * `WHERE status = 'running'` guard is also the single point where a
+   * duplicate report (e.g. an agent retries `report()` after a timeout)
+   * is caught — the second call sees zero rows affected and returns
+   * false without touching the feature or its transition log.
    *
-   * Also persists `transition.decision` as `completion_decision` with
+   * Also persists `transition.decisions` as `completion_decisions` with
    * `action_handled = 0` — a durable outbox row. If the process crashes
-   * between this commit and the engine acting on that decision (the next
-   * `dispatch`/notify), `getPendingRunAction` lets a restarted reconciler
-   * find and finish exactly that decision instead of leaving the feature
-   * stuck on its old current step forever.
+   * between this commit and the engine acting on those decisions, a
+   * restarted reconciler can find and finish them instead of leaving the
+   * feature stuck on its old current step forever.
    */
   concludeRun(
     runId: string,
     status: "succeeded" | "failed" | "reaped",
-    detail: { output?: string; reason?: string } | undefined,
+    detail: { outputs?: Readonly<Record<string, string>>; reason?: string } | undefined,
     event: PipelineEvent,
     transition: Transition,
   ): boolean {
     let featureId: string | null = null
     const claimed = this.db.transaction(() => {
       const result = this.db.run(
-        `UPDATE step_run SET status = ?, output = ?, reason = ?, completion_event = ?, completion_decision = ?, action_handled = 0, time_finished = ?
+        `UPDATE run SET status = ?, outputs = ?, reason = ?, completion_event = ?, completion_decisions = ?, action_handled = 0, time_finished = ?
          WHERE id = ? AND status = 'running'`,
-        [status, detail?.output ?? null, detail?.reason ?? null, JSON.stringify(event), JSON.stringify(transition.decision), Date.now(), runId],
+        [
+          status,
+          JSON.stringify(detail?.outputs ?? {}),
+          detail?.reason ?? null,
+          JSON.stringify(event),
+          JSON.stringify(transition.decisions),
+          Date.now(),
+          runId,
+        ],
       )
       if (result.changes === 0) return false
-      const run = this.db.query("SELECT feature_id FROM step_run WHERE id = ?").get(runId) as { feature_id: string } | null
+      const run = this.db.query("SELECT feature_id FROM run WHERE id = ?").get(runId) as { feature_id: string } | null
       if (!run) return false
       this.applyTransitionTx(run.feature_id, event, transition)
       featureId = run.feature_id
@@ -338,207 +344,71 @@ export class Store {
   }
 
   /**
-   * The latest concluded-but-unacted-on decision for a feature — the
+   * The latest concluded-but-unacted-on decisions for a feature — the
    * durable pending-action outbox `concludeRun` writes. Null once
    * `markRunActionHandled` closes it out (the normal, no-crash path) or
    * when nothing has ever concluded via `concludeRun` for this feature.
    */
-  getPendingRunAction(featureId: string): { runId: string; decision: Decision } | null {
+  getPendingRunAction(featureId: string): { runId: string; decisions: readonly Decision[] } | null {
     const row = this.db.query(
-      `SELECT id, completion_decision FROM step_run
-       WHERE feature_id = ? AND action_handled = 0 AND completion_decision IS NOT NULL
+      `SELECT id, completion_decisions FROM run
+       WHERE feature_id = ? AND action_handled = 0 AND completion_decisions IS NOT NULL
        ORDER BY time_finished DESC LIMIT 1`,
-    ).get(featureId) as { id: string; completion_decision: string } | null
+    ).get(featureId) as { id: string; completion_decisions: string } | null
     if (!row) return null
-    return { runId: row.id, decision: JSON.parse(row.completion_decision) as Decision }
+    return { runId: row.id, decisions: JSON.parse(row.completion_decisions) as Decision[] }
   }
 
   /** Atomic 0→1 claim: false if the run was never pending or is already handled. */
   markRunActionHandled(runId: string): boolean {
-    return this.db.run("UPDATE step_run SET action_handled = 1 WHERE id = ? AND action_handled = 0", [runId]).changes > 0
+    return this.db.run("UPDATE run SET action_handled = 1 WHERE id = ? AND action_handled = 0", [runId]).changes > 0
   }
 
-  getActiveRun(featureId: string): {
-    id: string
-    stepId: string
-    stepType: string
-    attempt: number
-    sessionId: string | null
-    timeStarted: number
-    nudges: number
-  } | null {
+  getActiveRun(featureId: string): RunSummary | null {
     const row = this.db.query(
-      `SELECT id, step_id, step_type, attempt, session_id, time_started, nudges
-       FROM step_run WHERE feature_id = ? AND status = 'running'
-       ORDER BY time_started DESC LIMIT 1`,
-    ).get(featureId) as {
-      id: string
-      step_id: string
-      step_type: string
-      attempt: number
-      session_id: string | null
-      time_started: number
-      nudges: number
-    } | null
-    return row ? {
-      id: row.id,
-      stepId: row.step_id,
-      stepType: row.step_type,
-      attempt: row.attempt,
-      sessionId: row.session_id,
-      timeStarted: row.time_started,
-      nudges: row.nudges,
-    } : null
+      `SELECT * FROM run WHERE feature_id = ? AND status = 'running' ORDER BY time_started DESC LIMIT 1`,
+    ).get(featureId) as RunRow | null
+    return row ? toRunSummary(row) : null
   }
 
-  listRuns(featureId: string, limit = 100): Array<{
-    id: string
-    stepId: string
-    stepType: string
-    status: string
-    attempt: number
-    role: string | null
-    model: string | null
-    sessionId: string | null
-    nudges: number
-    output: string | null
-    reason: string | null
-    timeStarted: number
-    timeFinished: number | null
-  }> {
+  /** Every currently in-flight run for a feature — a DAG feature can have several at once (fan-out). */
+  listActiveRuns(featureId: string): RunSummary[] {
     const rows = this.db.query(
-      `SELECT id, step_id, step_type, status, attempt, role, model, session_id, nudges, output, reason, time_started, time_finished
-       FROM step_run WHERE feature_id = ? ORDER BY time_started DESC LIMIT ?`,
-    ).all(featureId, limit) as Array<{
-      id: string
-      step_id: string
-      step_type: string
-      status: string
-      attempt: number
-      role: string | null
-      model: string | null
-      session_id: string | null
-      nudges: number
-      output: string | null
-      reason: string | null
-      time_started: number
-      time_finished: number | null
-    }>
-    return rows.map(row => ({
-      id: row.id,
-      stepId: row.step_id,
-      stepType: row.step_type,
-      status: row.status,
-      attempt: row.attempt,
-      role: row.role,
-      model: row.model,
-      sessionId: row.session_id,
-      nudges: row.nudges,
-      output: row.output,
-      reason: row.reason,
-      timeStarted: row.time_started,
-      timeFinished: row.time_finished,
-    }))
+      `SELECT * FROM run WHERE feature_id = ? AND status = 'running' ORDER BY time_started ASC`,
+    ).all(featureId) as RunRow[]
+    return rows.map(toRunSummary)
+  }
+
+  /** The in-flight run (if any) for one exact job+step — used to detect a dispatch that never happened. */
+  getActiveRunForStep(featureId: string, jobId: string, stepId: string): RunSummary | null {
+    const row = this.db.query(
+      `SELECT * FROM run WHERE feature_id = ? AND job_id = ? AND step_id = ? AND status = 'running'
+       ORDER BY time_started DESC LIMIT 1`,
+    ).get(featureId, jobId, stepId) as RunRow | null
+    return row ? toRunSummary(row) : null
+  }
+
+  listRuns(featureId: string, limit = 100): RunSummary[] {
+    const rows = this.db.query(
+      `SELECT * FROM run WHERE feature_id = ? ORDER BY time_started DESC LIMIT ?`,
+    ).all(featureId, limit) as RunRow[]
+    return rows.map(toRunSummary)
   }
 
   incrementNudges(runId: string): number {
-    this.db.run("UPDATE step_run SET nudges = nudges + 1 WHERE id = ?", [runId])
-    const row = this.db.query("SELECT nudges FROM step_run WHERE id = ?").get(runId) as { nudges: number } | null
+    this.db.run("UPDATE run SET nudges = nudges + 1 WHERE id = ?", [runId])
+    const row = this.db.query("SELECT nudges FROM run WHERE id = ?").get(runId) as { nudges: number } | null
     return row?.nudges ?? 0
   }
 
-  getRunById(runId: string): {
-    featureId: string
-    stepId: string
-    status: string
-    role: string | null
-    attempt: number
-    output: string | null
-    reason: string | null
-    completionEvent: string | null
-  } | null {
-    const row = this.db.query(
-      "SELECT feature_id, step_id, status, role, attempt, output, reason, completion_event FROM step_run WHERE id = ?",
-    ).get(runId) as {
-      feature_id: string
-      step_id: string
-      status: string
-      role: string | null
-      attempt: number
-      output: string | null
-      reason: string | null
-      completion_event: string | null
-    } | null
-    return row ? {
-      featureId: row.feature_id,
-      stepId: row.step_id,
-      status: row.status,
-      role: row.role,
-      attempt: row.attempt,
-      output: row.output,
-      reason: row.reason,
-      completionEvent: row.completion_event,
-    } : null
+  getRunById(runId: string): RunSummary | null {
+    const row = this.db.query("SELECT * FROM run WHERE id = ?").get(runId) as RunRow | null
+    return row ? toRunSummary(row) : null
   }
 
-  getLastHumanNotes(featureId: string, stepId: string): string | null {
-    const row = this.db.query(
-      `SELECT output FROM step_run
-       WHERE feature_id = ? AND step_id = ? AND reason LIKE 'human %'
-         AND output IS NOT NULL AND output != ''
-       ORDER BY time_finished DESC LIMIT 1`,
-    ).get(featureId, stepId) as { output: string | null } | null
-    return row?.output ?? null
-  }
+  // ------------------------------------------------------------ findings
 
-  getLastOutput(featureId: string, stepId: string): string | null {
-    const row = this.db.query(
-      `SELECT output FROM step_run
-       WHERE feature_id = ? AND step_id = ? AND status IN ('succeeded','failed')
-       ORDER BY time_finished DESC LIMIT 1`,
-    ).get(featureId, stepId) as { output: string | null } | null
-    return row?.output ?? null
-  }
-
-  insertFindings(featureId: string, stepId: string, findings: ReadonlyArray<{
-    path: string
-    line: number
-    severity: string
-    tags: readonly string[]
-    body: string
-  }>): string[] {
-    const now = Date.now()
-    const row = this.db.query("SELECT COALESCE(MAX(seq), 0) AS maxSeq FROM finding WHERE feature_id = ?").get(featureId) as { maxSeq: number }
-    const ids: string[] = []
-    this.db.transaction(() => {
-      for (const [offset, finding] of findings.entries()) {
-        const seq = row.maxSeq + offset + 1
-        const id = `F${seq}`
-        this.db.run(
-          `INSERT INTO finding (id, feature_id, seq, step_id, path, line, severity, tags, body, time_created, time_updated)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [`${featureId}:${id}`, featureId, seq, stepId, finding.path, finding.line, finding.severity, JSON.stringify(finding.tags), finding.body, now, now],
-        )
-        ids.push(id)
-      }
-    })()
-    if (ids.length > 0) this.emit({ kind: "finding", featureId })
-    return ids
-  }
-
-  listFindings(featureId: string): Array<{
-    id: string
-    stepId: string
-    path: string
-    line: number
-    severity: string
-    tags: string[]
-    body: string
-    status: "new" | "fixed" | "dismissed" | "reopened"
-    resolution: string | null
-    threadId: string | null
-    synced: boolean
-  }> {
+  listFindings(featureId: string): FindingView[] {
     const rows = this.db.query("SELECT * FROM finding WHERE feature_id = ? ORDER BY seq").all(featureId) as Array<{
       id: string
       step_id: string
@@ -567,6 +437,32 @@ export class Store {
     }))
   }
 
+  insertFindings(featureId: string, stepId: string, findings: ReadonlyArray<{
+    path: string
+    line: number
+    severity: string
+    tags: readonly string[]
+    body: string
+  }>): string[] {
+    const now = Date.now()
+    const row = this.db.query("SELECT COALESCE(MAX(seq), 0) AS maxSeq FROM finding WHERE feature_id = ?").get(featureId) as { maxSeq: number }
+    const ids: string[] = []
+    this.db.transaction(() => {
+      for (const [offset, finding] of findings.entries()) {
+        const seq = row.maxSeq + offset + 1
+        const id = `F${seq}`
+        this.db.run(
+          `INSERT INTO finding (id, feature_id, seq, step_id, path, line, severity, tags, body, time_created, time_updated)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [`${featureId}:${id}`, featureId, seq, stepId, finding.path, finding.line, finding.severity, JSON.stringify(finding.tags), finding.body, now, now],
+        )
+        ids.push(id)
+      }
+    })()
+    if (ids.length > 0) this.emit({ kind: "finding", featureId })
+    return ids
+  }
+
   setFindingStatus(featureId: string, shortId: string, status: "new" | "fixed" | "dismissed" | "reopened", resolution?: string): boolean {
     const result = this.db.run(
       `UPDATE finding SET status = ?, resolution = COALESCE(?, resolution), synced = 0, time_updated = ?
@@ -577,83 +473,18 @@ export class Store {
     return result.changes > 0
   }
 
-  setFindingThread(featureId: string, shortId: string, threadId: string): void {
-    this.db.run("UPDATE finding SET thread_id = ?, time_updated = ? WHERE id = ?", [threadId, Date.now(), `${featureId}:${shortId}`])
-  }
+  // --------------------------------------------------------------- audit
 
-  markFindingSynced(featureId: string, shortId: string): void {
-    this.db.run("UPDATE finding SET synced = 1, time_updated = ? WHERE id = ?", [Date.now(), `${featureId}:${shortId}`])
-  }
-
-  upsertThread(input: {
-    threadId: string
-    featureId: string
-    pr: number
-    path: string
-    openedBy: string
-    lastReplyBy: string
-    lastReply: string
-  }): "open" | "auto_resolved" | "reopened" {
-    const now = Date.now()
-    const existing = this.db.query("SELECT status FROM review_thread WHERE thread_id = ?").get(input.threadId) as { status: string } | null
-    const status = existing?.status === "auto_resolved" ? "reopened" : (existing?.status ?? "open")
-    this.db.run(
-      `INSERT INTO review_thread (thread_id, feature_id, pr, path, opened_by, last_reply_by, last_reply, status, time_seen)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(thread_id) DO UPDATE SET
-         last_reply_by = excluded.last_reply_by,
-         last_reply = excluded.last_reply,
-         status = excluded.status,
-         time_seen = excluded.time_seen`,
-      [input.threadId, input.featureId, input.pr, input.path, input.openedBy, input.lastReplyBy, input.lastReply.slice(0, 2000), status, now],
-    )
-    return status as "open" | "auto_resolved" | "reopened"
-  }
-
-  markThreadResolved(threadId: string): void {
-    this.db.run("UPDATE review_thread SET status = 'auto_resolved', time_resolved = ? WHERE thread_id = ?", [Date.now(), threadId])
-  }
-
-  upsertPrHead(featureId: string, pr: number, headSha: string, status: string): void {
-    const now = Date.now()
-    this.db.run(
-      `INSERT INTO pr_head (feature_id, pr, head_sha, status, time_created, time_updated)
-       VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(pr, head_sha) DO UPDATE SET status = excluded.status, time_updated = excluded.time_updated`,
-      [featureId, pr, headSha, status, now, now],
-    )
-  }
-
-  supersedeOldHeads(pr: number, currentSha: string): number {
-    return this.db.run(
-      `UPDATE pr_head SET status = 'superseded', time_updated = ?
-       WHERE pr = ? AND head_sha != ? AND status NOT IN ('superseded','timed_out')`,
-      [Date.now(), pr, currentSha],
-    ).changes
-  }
-
-  getPrHead(pr: number, headSha: string): { status: string } | null {
-    return this.db.query("SELECT status FROM pr_head WHERE pr = ? AND head_sha = ?").get(pr, headSha) as { status: string } | null
-  }
-
-  getTransitions(featureId: string, limit = 50): Array<{ event: string; decision: string; detail: string | null; time: number }> {
+  getTransitions(featureId: string, limit = 50): TransitionEntry[] {
     const rows = this.db.query(
-      `SELECT event, decision, detail, time_created FROM transition_log
+      `SELECT event, decisions, time_created FROM transition_log
        WHERE feature_id = ? ORDER BY time_created DESC LIMIT ?`,
-    ).all(featureId, limit) as Array<{ event: string; decision: string; detail: string | null; time_created: number }>
-    return rows.map(row => ({ event: row.event, decision: row.decision, detail: row.detail, time: row.time_created }))
+    ).all(featureId, limit) as Array<{ event: string; decisions: string; time_created: number }>
+    return rows.map(row => ({ event: row.event, decisions: JSON.parse(row.decisions) as Decision[], time: row.time_created }))
   }
 }
 
-function decisionDetail(decision: Decision): string | null {
-  switch (decision.kind) {
-    case "execute":
-    case "wait_human":
-      return decision.stepId
-    case "escalate":
-    case "noop":
-      return decision.reason
-    default:
-      return null
-  }
+function escalationReason(decisions: readonly Decision[]): string | null {
+  const escalation = decisions.find((decision): decision is Extract<Decision, { kind: "escalate" }> => decision.kind === "escalate")
+  return escalation?.reason ?? null
 }

@@ -28,18 +28,25 @@ function columnNames(db: Database, table: string): string[] {
 }
 
 describe("database lifecycle and migrations", () => {
-  it("creates the complete pipeline-compatible schema and migration ledger", () => {
+  it("creates the graph-state schema and migration ledger", () => {
     const connection = openMigratedDatabase({ path: temporaryPath() })
     expect(tableNames(connection.db)).toEqual(expect.arrayContaining([
-      "feature", "finding", "pr_head", "review_thread", "schema_migration", "step_run", "transition_log",
+      "feature", "finding", "review_thread", "run", "schema_migration", "transition_log",
     ]))
-    expect(columnNames(connection.db, "feature")).toEqual(expect.arrayContaining(["workflow", "description"]))
-    expect(columnNames(connection.db, "step_run")).toEqual(expect.arrayContaining([
-      "nudges", "completion_event", "completion_decision", "action_handled",
+    expect(tableNames(connection.db)).not.toContain("pr_head")
+    expect(tableNames(connection.db)).not.toContain("step_run")
+    expect(columnNames(connection.db, "feature")).toEqual(expect.arrayContaining(["state", "feedback", "workflow", "description"]))
+    expect(columnNames(connection.db, "run")).toEqual(expect.arrayContaining([
+      "job_id", "step_id", "nudges", "completion_event", "completion_decisions", "action_handled",
     ]))
     const ledger = connection.db.query("SELECT id FROM schema_migration ORDER BY position").all() as Array<{ id: string }>
     expect(ledger.map(row => row.id)).toEqual(migrations.map(migration => migration.id))
     connection.close()
+  })
+
+  it("the ledger is an append-only exact prefix of the compiled migration list", () => {
+    expect(migrations[0]!.id).toBe("0001_legacy_pipeline_schema")
+    expect(migrations.map(m => m.id)).toContain("0008_graph_state_schema")
   })
 
   it("is idempotent and executes migrations monotonically in declaration order", () => {
@@ -109,150 +116,22 @@ describe("database lifecycle and migrations", () => {
   })
 })
 
-describe("seed database adoption", () => {
-  it("adopts the populated initial seed schema without a ledger", () => {
+describe("graph feature state round-trips through the store", () => {
+  it("persists and reads back a feature's full graph state across a close/reopen", () => {
     const path = temporaryPath()
-    const legacy = new Database(path, { create: true })
-    legacy.run(`
-      CREATE TABLE feature (
-        id TEXT PRIMARY KEY, title TEXT NOT NULL, slug TEXT NOT NULL, project_dir TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'running', current_step TEXT, session_id TEXT, worktree TEXT,
-        branch TEXT, pr INTEGER, attempts TEXT NOT NULL DEFAULT '{}', rounds TEXT NOT NULL DEFAULT '{}',
-        escalation TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
-      )
-    `)
-    legacy.run(`
-      CREATE TABLE step_run (
-        id TEXT PRIMARY KEY, feature_id TEXT NOT NULL REFERENCES feature(id) ON DELETE CASCADE,
-        step_id TEXT NOT NULL, step_type TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 1,
-        status TEXT NOT NULL DEFAULT 'running', role TEXT, model TEXT, session_id TEXT,
-        output TEXT, reason TEXT, time_started INTEGER NOT NULL, time_finished INTEGER
-      )
-    `)
-    legacy.run(
-      `INSERT INTO feature (id, title, slug, project_dir, status, current_step, attempts, rounds, escalation, time_created, time_updated)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ["initial-feature", "Initial", "initial", "/project", "escalated", "review", '{"review":4}', '{"review":2}', "budget exhausted", 1, 2],
-    )
-    legacy.run(
-      `INSERT INTO step_run (id, feature_id, step_id, step_type, attempt, status, time_started)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      ["initial-run", "initial-feature", "review", "agent", 4, "running", 1],
-    )
-    legacy.close()
-
-    const adopted = openMigratedDatabase({ path })
-    const store = new Store(adopted.db)
-    expect(store.getFeature("initial-feature")).toMatchObject({
-      status: "escalated",
-      currentStep: "review",
-      attempts: { review: 4 },
-      rounds: { review: 2 },
-      workflow: null,
-      description: null,
-      escalation: "budget exhausted",
+    const connection = openMigratedDatabase({ path })
+    const store = new Store(connection.db)
+    const feature = store.createFeature({ title: "Graph", slug: "graph", projectDir: "/p", workflow: "wf" })
+    store.applyTransition(feature.id, { kind: "feature.start" }, {
+      decisions: [{ kind: "execute_step", jobId: "main", stepId: "implement" }],
+      patch: { status: "running", jobs: { main: { status: "running", currentStep: "implement", steps: { implement: { status: "running" } } } } },
     })
-    expect(store.getActiveRun("initial-feature")).toMatchObject({ id: "initial-run", nudges: 0 })
-    adopted.close()
-  })
+    connection.close()
 
-  it("preserves in-flight feature, findings, review metadata, audit and restart state", () => {
-    const path = temporaryPath()
-    const legacy = new Database(path, { create: true })
-    legacy.run(`
-      CREATE TABLE feature (
-        id TEXT PRIMARY KEY, title TEXT NOT NULL, slug TEXT NOT NULL, project_dir TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'running', current_step TEXT, session_id TEXT, worktree TEXT,
-        branch TEXT, pr INTEGER, attempts TEXT NOT NULL DEFAULT '{}', rounds TEXT NOT NULL DEFAULT '{}',
-        escalation TEXT, workflow TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
-      )
-    `)
-    legacy.run(`
-      CREATE TABLE step_run (
-        id TEXT PRIMARY KEY, feature_id TEXT NOT NULL REFERENCES feature(id) ON DELETE CASCADE,
-        step_id TEXT NOT NULL, step_type TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 1,
-        status TEXT NOT NULL DEFAULT 'running', role TEXT, model TEXT, session_id TEXT, output TEXT,
-        reason TEXT, nudges INTEGER NOT NULL DEFAULT 0, time_started INTEGER NOT NULL, time_finished INTEGER
-      )
-    `)
-    legacy.run(`
-      CREATE TABLE finding (
-        id TEXT PRIMARY KEY, feature_id TEXT NOT NULL REFERENCES feature(id) ON DELETE CASCADE,
-        seq INTEGER NOT NULL, step_id TEXT NOT NULL, path TEXT NOT NULL, line INTEGER NOT NULL,
-        severity TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]', body TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'new', resolution TEXT, thread_id TEXT,
-        synced INTEGER NOT NULL DEFAULT 0, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
-      )
-    `)
-    legacy.run(`
-      CREATE TABLE review_thread (
-        thread_id TEXT PRIMARY KEY, feature_id TEXT NOT NULL REFERENCES feature(id) ON DELETE CASCADE,
-        pr INTEGER NOT NULL, path TEXT NOT NULL DEFAULT '', opened_by TEXT NOT NULL DEFAULT '',
-        last_reply_by TEXT NOT NULL DEFAULT '', last_reply TEXT NOT NULL DEFAULT '',
-        status TEXT NOT NULL DEFAULT 'open', time_seen INTEGER NOT NULL, time_resolved INTEGER
-      )
-    `)
-    legacy.run(`
-      CREATE TABLE transition_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, feature_id TEXT NOT NULL, event TEXT NOT NULL,
-        decision TEXT NOT NULL, detail TEXT, time_created INTEGER NOT NULL
-      )
-    `)
-    const now = 1_700_000_000_000
-    legacy.run(
-      `INSERT INTO feature (id, title, slug, project_dir, status, current_step, session_id, worktree, branch, pr, attempts, rounds, escalation, workflow, time_created, time_updated)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ["legacy-feature", "Legacy", "legacy", "/projects/example", "waiting_human", "merge", "session-1", "/worktrees/legacy", "feat/legacy", 42, '{"review":2}', '{"review":3}', null, "consensus", now, now],
-    )
-    legacy.run(
-      `INSERT INTO step_run (id, feature_id, step_id, step_type, attempt, status, role, session_id, output, reason, nudges, time_started)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ["run-1", "legacy-feature", "merge", "agent", 2, "running", "reviewer", "child-1", null, null, 1, now],
-    )
-    legacy.run(
-      `INSERT INTO finding (id, feature_id, seq, step_id, path, line, severity, tags, body, status, resolution, thread_id, synced, time_created, time_updated)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ["legacy-feature:F1", "legacy-feature", 1, "review", "src/app.ts", 12, "major", '["security"]', "Fix this", "reopened", "needs follow-up", "thread-1", 0, now, now],
-    )
-    legacy.run(
-      `INSERT INTO review_thread (thread_id, feature_id, pr, path, opened_by, last_reply_by, last_reply, status, time_seen, time_resolved)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ["thread-1", "legacy-feature", 42, "src/app.ts", "bot", "human", "still open", "reopened", now, null],
-    )
-    legacy.run(
-      "INSERT INTO transition_log (feature_id, event, decision, detail, time_created) VALUES (?, ?, ?, ?, ?)",
-      ["legacy-feature", '{"kind":"feature.start"}', "execute", "review", now],
-    )
-    legacy.close()
-
-    const adopted = openMigratedDatabase({ path })
-    const store = new Store(adopted.db)
-    expect(store.getFeature("legacy-feature")).toEqual({
-      id: "legacy-feature",
-      title: "Legacy",
-      slug: "legacy",
-      projectDir: "/projects/example",
-      workflow: "consensus",
-      description: null,
-      status: "waiting_human",
-      currentStep: "merge",
-      sessionId: "session-1",
-      worktree: "/worktrees/legacy",
-      branch: "feat/legacy",
-      pr: 42,
-      attempts: { review: 2 },
-      rounds: { review: 3 },
-      escalation: null,
-    })
-    expect(store.getActiveRun("legacy-feature")).toMatchObject({ id: "run-1", attempt: 2, nudges: 1 })
-    expect(store.listFindings("legacy-feature")).toEqual([expect.objectContaining({ id: "F1", status: "reopened", resolution: "needs follow-up", threadId: "thread-1", tags: ["security"] })])
-    expect(store.getTransitions("legacy-feature")).toEqual([expect.objectContaining({ decision: "execute", detail: "review" })])
-    expect((adopted.db.query("SELECT status, last_reply FROM review_thread WHERE thread_id = ?").get("thread-1") as { status: string; last_reply: string })).toEqual({ status: "reopened", last_reply: "still open" })
-    adopted.close()
-
-    const restarted = openMigratedDatabase({ path })
-    expect(new Store(restarted.db).getFeature("legacy-feature")?.currentStep).toBe("merge")
-    expect(restarted.db.query("SELECT COUNT(*) AS count FROM schema_migration").get()).toEqual({ count: migrations.length })
-    restarted.close()
+    const reopened = openMigratedDatabase({ path })
+    const reopenedStore = new Store(reopened.db)
+    const recovered = reopenedStore.getFeature(feature.id)
+    expect(recovered?.jobs["main"]).toMatchObject({ status: "running", currentStep: "implement" })
+    reopened.close()
   })
 })

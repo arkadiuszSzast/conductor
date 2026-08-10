@@ -1,10 +1,10 @@
 /**
  * Default `ProcessRunner`: real process execution via `node:child_process`.
  *
- * The engine and builtins never call `spawn`/`exec` directly — every
- * external command crosses `ProcessRunner`. This is the only file that
- * touches `child_process`, and it never falls back to `process.cwd()`;
- * callers must always provide an explicit `cwd`.
+ * The engine never calls `spawn`/`exec` directly — every external
+ * command crosses `ProcessRunner`. This is the only file that touches
+ * `child_process`, and it never falls back to `process.cwd()`; callers
+ * must always provide an explicit `cwd`.
  */
 
 import { spawn } from "node:child_process"
@@ -12,7 +12,7 @@ import type { ProcessExecOptions, ProcessExecResult, ProcessRunner } from "./por
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000
 const MAX_OUTPUT_BYTES = 256 * 1024
-/** Generous enough for a GitHub review payload (findings + inline comments); bounds a runaway/malicious stdin payload. */
+/** Generous enough for a large output payload; bounds a runaway/malicious stdin payload. */
 const MAX_STDIN_BYTES = 8 * 1024 * 1024
 
 function run(
@@ -45,13 +45,10 @@ function run(
     }
     const stdoutChunks: Buffer[] = []
     const stderrChunks: Buffer[] = []
-    // Combined, chronologically-interleaved capture: matches the seed's
-    // `runShell`, which pushes both streams into ONE buffer under ONE
-    // shared byte budget (so whichever stream writes first is kept
-    // first). Concatenating the separate stdout/stderr buffers instead
-    // would put all of stdout before all of stderr, losing arrival order
-    // for interleaved output (e.g. a command that prints progress on
-    // stdout and errors on stderr as it runs).
+    // Combined, chronologically-interleaved capture under ONE shared byte
+    // budget (so whichever stream writes first is kept first). Concatenating
+    // the separate stdout/stderr buffers instead would put all of stdout
+    // before all of stderr, losing arrival order for interleaved output.
     const combinedChunks: Buffer[] = []
     let stdoutBytes = 0
     let stderrBytes = 0

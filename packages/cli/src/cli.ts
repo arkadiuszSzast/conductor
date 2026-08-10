@@ -20,7 +20,7 @@
  *   7 daemon unreachable
  */
 
-import { ApiClient, ApiError, type FetchLike } from "./client.ts"
+import { ApiClient, ApiError, type FetchLike, type TransitionView } from "./client.ts"
 import { resolveConnection, UsageError } from "./config.ts"
 
 export interface CliDeps {
@@ -56,7 +56,7 @@ connection (required for every command except init; no default address):
 
 commands:
   init [--dir <path>] [--force]
-                       scaffold <dir>/.opencode/conductor.json (default: cwd)
+                       scaffold <dir>/conductor.yaml (default: cwd)
   start <title> --project <dir> [--description <text>] [--workflow <name>] [--pr <n>]
                        create a feature and start its pipeline
   status [<feature-id>] [--project <dir>] [--active]
@@ -155,22 +155,29 @@ function resolveNotes(raw: string | undefined, deps: CliDeps): string | undefine
   }
 }
 
-const INIT_TEMPLATE = {
-  $comment: "Conductor project configuration — loaded by the conductor daemon.",
-  roles: {
-    implementer: { agent: "build" },
-  },
-  pipeline: [
-    { id: "implement", type: "agent", role: "implementer" },
-    {
-      id: "merge_gate",
-      type: "agent",
-      role: "implementer",
-      requires_human: true,
-      on_reject: { goto: "implement" },
-    },
-  ],
-} as const
+const INIT_TEMPLATE = `name: default
+on: [manual]
+
+inputs:
+  feature: { type: string, required: true }
+
+roles:
+  implementer: { agent: build }
+
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Implement the feature: {{ inputs.feature }}."
+      - id: merge_gate
+        human: {}
+        outcomes:
+          approved: next
+          rejected:
+            rerun: { scope: steps, stepIds: [implement], maxRounds: 3 }
+`
 
 function joinPath(...parts: string[]): string {
   return parts.join("/").replace(/\/{2,}/g, "/")
@@ -275,14 +282,13 @@ function commandInit(parsed: Parsed, deps: CliDeps): number {
   requireFlags(parsed, ["dir", "force"])
   if (parsed.positionals.length > 0) throw new UsageError(`unexpected argument "${parsed.positionals[0]}"`)
   const dir = stringFlag(parsed, "dir") ?? deps.cwd()
-  const configDir = joinPath(dir, ".opencode")
-  const configPath = joinPath(configDir, "conductor.json")
+  const configPath = joinPath(dir, "conductor.yaml")
   if (deps.exists(configPath) && !parsed.flags.has("force")) {
     deps.stderr(`error: ${configPath} already exists (use --force to overwrite)`)
     return EXIT.failure
   }
-  deps.mkdir(configDir)
-  deps.writeFile(configPath, `${JSON.stringify(INIT_TEMPLATE, null, 2)}\n`)
+  deps.mkdir(dir)
+  deps.writeFile(configPath, INIT_TEMPLATE)
   deps.stdout(`Wrote ${configPath}`)
   deps.stdout("Register this project in the daemon's configuration, then: conductor start <title> --project <dir>")
   return EXIT.ok
@@ -292,7 +298,7 @@ function printFeature(
   deps: CliDeps,
   payload: {
     feature: { id: string; title: string; status: string; currentStep: string | null; workflow: string | null; pr: number | null; escalation: string | null }
-    activeRun: { id: string; stepId: string; attempt: number } | null
+    activeRun: { id: string; jobId: string; stepId: string; attempt: number } | null
   },
 ): void {
   const { feature, activeRun } = payload
@@ -457,11 +463,22 @@ async function commandLogs(parsed: Parsed, deps: CliDeps, client: ApiClient, jso
   }
   // The API returns newest-first; logs read chronologically.
   for (const entry of [...timeline].reverse()) {
-    deps.stdout(
-      `${formatTime(entry.time)}  ${eventLabel(entry.event)} → ${entry.decision}${entry.detail !== null ? ` (${entry.detail})` : ""}`,
-    )
+    deps.stdout(`${formatTime(entry.time)}  ${eventLabel(entry.event)} → ${decisionsLabel(entry.decisions)}`)
   }
   return EXIT.ok
+}
+
+function decisionsLabel(decisions: TransitionView["decisions"]): string {
+  return decisions
+    .map(decision => {
+      const detail = "jobId" in decision && "stepId" in decision
+        ? `:${String(decision["jobId"])}/${String(decision["stepId"])}`
+        : "reason" in decision
+          ? ` (${String(decision["reason"])})`
+          : ""
+      return `${decision.kind}${detail}`
+    })
+    .join(", ")
 }
 
 /** Timeline events are stored as JSON (`{"kind": "...", ...}`); show the kind. */

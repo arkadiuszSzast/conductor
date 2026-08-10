@@ -15,7 +15,7 @@
  * `ApiClient` over the same handler.
  */
 import { afterEach, describe, expect, it } from "bun:test"
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import {
@@ -120,18 +120,42 @@ afterEach(async () => {
   for (const dir of temporaryDirectories.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-const agentPipeline = {
-  roles: { implementer: { agent: "build" } },
-  pipeline: [{ id: "implement", type: "agent", role: "implementer" }],
-  maxNudges: 1,
-  nudgeIdleCycles: 1,
-}
+const agentWorkflow = `
+name: agent-only
+on: [manual]
+roles:
+  implementer: { agent: build }
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Implement it."
+`
 
-function writeProject(config: unknown = agentPipeline): string {
+const gatedWorkflow = `
+name: gated
+on: [manual]
+roles:
+  implementer: { agent: build }
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Implement it."
+      - id: merge_gate
+        human: {}
+        outcomes:
+          approved: next
+          rejected: { rerun: { scope: steps, stepIds: [implement], maxRounds: 3 } }
+`
+
+function writeProject(source: string = agentWorkflow): string {
   const project = tempDir("conductor-runner-project-")
-  const configDir = join(project, ".opencode")
-  mkdirSync(configDir, { recursive: true })
-  writeFileSync(join(configDir, "conductor.json"), JSON.stringify(config))
+  writeFileSync(join(project, "conductor.yaml"), source)
   return project
 }
 
@@ -179,6 +203,7 @@ async function makeHarness(input?: { projects?: string[] }): Promise<Harness> {
       databasePath: join(tempDir("conductor-runner-db-"), "state.db"),
       projects: input?.projects ?? [],
       heartbeatIntervalMs: 60_000,
+      engine: { nudgeIdleCycles: 1, maxNudges: 1 },
     },
     {
       sessions,
@@ -196,7 +221,7 @@ async function makeHarness(input?: { projects?: string[] }): Promise<Harness> {
       store: daemon.store,
       engine: daemon.engine,
       health: () => daemon.health(),
-      resolveConfig: daemon.registry.resolver,
+      resolveWorkflow: daemon.registry.resolver,
       runners: registry,
     },
   )
@@ -496,7 +521,23 @@ describe("session states drive the engine's idle/retry/missing policy", () => {
   }
 
   it("missing session is reaped immediately and the step retried", async () => {
-    const project = writeProject({ ...agentPipeline, pipeline: [{ id: "implement", type: "agent", role: "implementer", on_fail: { max_attempts: 2 } }] })
+    const retryWorkflow = `
+name: retryable
+on: [manual]
+roles:
+  implementer: { agent: build }
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Implement it."
+        retry:
+          maxAttempts: 2
+          backoff: { strategy: constant, delay: 10 }
+`
+    const project = writeProject(retryWorkflow)
     const h = await makeHarness({ projects: [project] })
     const opencode = new FakeOpencodeServer(project)
     const { featureId, runId, sessionId } = await startedRun(h, project, opencode)
@@ -634,14 +675,7 @@ describe("daemon-backed tools inside sessions", () => {
   })
 
   it("status and gates stay scoped to their project directory", async () => {
-    const gated = {
-      roles: { implementer: { agent: "build" } },
-      pipeline: [
-        { id: "implement", type: "agent", role: "implementer" },
-        { id: "merge_gate", type: "agent", role: "implementer", requires_human: true, on_reject: { goto: "implement" } },
-      ],
-    }
-    const projectA = writeProject(gated)
+    const projectA = writeProject(gatedWorkflow)
     const projectB = writeProject()
     const h = await makeHarness({ projects: [projectA, projectB] })
     const opencode = new FakeOpencodeServer(projectA)
@@ -664,18 +698,12 @@ describe("daemon-backed tools inside sessions", () => {
     expect(await toolsA.status()).toContain("Gated in A")
     const approved = await toolsA.approve({ feature_id: featureId, notes: "ship it" })
     expect(approved).toContain("Approved")
-    expect((await h.client.getFeature(featureId)).feature.status).toBe("running")
+    // merge_gate is the workflow's last step: approving finishes the job.
+    expect((await h.client.getFeature(featureId)).feature.status).toBe("done")
   })
 
   it("request-changes routes the feature back and hands notes to the fixer", async () => {
-    const gated = {
-      roles: { implementer: { agent: "build" } },
-      pipeline: [
-        { id: "implement", type: "agent", role: "implementer" },
-        { id: "merge_gate", type: "agent", role: "implementer", requires_human: true, on_reject: { goto: "implement" } },
-      ],
-    }
-    const project = writeProject(gated)
+    const project = writeProject(gatedWorkflow)
     const h = await makeHarness({ projects: [project] })
     const opencode = new FakeOpencodeServer(project)
     const hub = h.makeHub()

@@ -1,14 +1,13 @@
 import { afterEach, describe, expect, it } from "bun:test"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { Daemon, type DaemonDeps, type DaemonLogEntry, type IntervalScheduler } from "./src/daemon.ts"
 import { openMigratedDatabase } from "./src/database.ts"
 import { migrations } from "./src/migrations.ts"
 import { Store } from "./src/store.ts"
-import { interpret } from "./src/engine/interpret.ts"
-import type { PipelineDef } from "./src/engine/types.ts"
-import type { SessionClient } from "./src/engine/ports.ts"
+import type { SessionClient } from "./src/ports.ts"
+import { interpret } from "@conductor/core"
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (err: unknown) => void } {
   let resolve!: (value: T) => void
@@ -81,16 +80,23 @@ afterEach(async () => {
   for (const dir of temporaryDirectories.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-const minimalConfig = {
-  roles: { implementer: { agent: "build" } },
-  pipeline: [{ id: "implement", type: "agent", role: "implementer" }],
-}
+const MINIMAL_WORKFLOW = `
+name: minimal
+on: [manual]
+roles:
+  implementer: { agent: build }
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Implement it."
+`
 
-function writeProject(config: unknown = minimalConfig): string {
+function writeProject(source: string = MINIMAL_WORKFLOW): string {
   const project = tempDir("conductor-daemon-project-")
-  const configDir = join(project, ".opencode")
-  mkdirSync(configDir, { recursive: true })
-  writeFileSync(join(configDir, "conductor.json"), JSON.stringify(config))
+  writeFileSync(join(project, "conductor.yaml"), source)
   return project
 }
 
@@ -118,7 +124,7 @@ function makeDaemon(input: {
 describe("Daemon: startup", () => {
   it("starts with a mix of valid and invalid projects — invalid ones get diagnostics, valid ones register", async () => {
     const valid = writeProject()
-    const invalid = writeProject({ pipeline: "not-an-array" })
+    const invalid = writeProject("not: valid: yaml: [")
     const { daemon, logger } = makeDaemon({ projects: [valid, invalid] })
 
     await daemon.start()
@@ -132,7 +138,7 @@ describe("Daemon: startup", () => {
     expect(validEntry).toBeDefined()
     expect(invalidEntry).toBeDefined()
     expect(invalidEntry!.diagnostics.length).toBeGreaterThan(0)
-    expect(logger.messages().some(m => m.includes("project config invalid"))).toBe(true)
+    expect(logger.messages().some(m => m.includes("workflow invalid"))).toBe(true)
     expect(logger.messages().some(m => m === "daemon ready")).toBe(true)
   })
 
@@ -382,37 +388,45 @@ describe("Daemon: reconciler heartbeat", () => {
 
 describe("Daemon: recovery pass drives the durable action outbox", () => {
   it("replays a pending completion decision from a previous process before the first heartbeat", async () => {
-    const reviewPipeline = [
-      {
-        id: "review",
-        type: "agent",
-        role: "reviewer",
-        rounds_with: "review",
-        max_rounds: 3,
-        on_verdict: { approved: { next: true }, changes_requested: { goto: "review" } },
-      },
-    ]
-    const project = writeProject({ roles: { reviewer: { agent: "review-agent" } }, pipeline: reviewPipeline })
+    const wfSource = `
+name: review-loop
+on: [manual]
+roles:
+  reviewer: { agent: review-agent }
+jobs:
+  main:
+    steps:
+      - id: review
+        agent:
+          role: reviewer
+          prompt: "Review it."
+        outcomes:
+          approved: next
+          changes_requested: { rerun: { scope: steps, stepIds: [review], maxRounds: 3 } }
+`
+    const project = writeProject(wfSource)
     const databasePath = join(tempDir("conductor-daemon-outbox-"), "state.db")
 
     // First process: conclude a run with a persisted decision but crash
     // before acting on it (never markRunActionHandled).
+    let featureId: string
+    let pendingRunId: string
     {
       const connection = openMigratedDatabase({ path: databasePath })
       const store = new Store(connection.db)
-      const def: PipelineDef = {
-        roles: { reviewer: { agent: "review-agent" } },
-        pipeline: reviewPipeline as PipelineDef["pipeline"],
-      }
-      const feature = store.createFeature({ title: "F", slug: "f", projectDir: project })
-      const started = store.getFeature(feature.id)!
-      store.applyTransition(feature.id, { kind: "feature.start" }, interpret(def, started, { kind: "feature.start" }))
-      expect(store.getFeature(feature.id)?.currentStep).toBe("review")
-      const runId = store.startRun({ featureId: feature.id, stepId: "review", stepType: "agent", attempt: 1, role: "reviewer" })
+      const { parseWorkflow } = await import("@conductor/core")
+      const parsed = parseWorkflow(wfSource)
+      if (!parsed.ok) throw new Error("bad fixture workflow")
+      const feature = store.createFeature({ title: "F", slug: "f", projectDir: project, workflow: parsed.workflow.name })
+      featureId = feature.id
+      store.applyTransition(feature.id, { kind: "feature.start" }, interpret(parsed.workflow, feature, { kind: "feature.start" }))
+      expect(store.getFeature(feature.id)?.jobs["main"]?.currentStep).toBe("review")
+      const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "review", stepType: "agent", attempt: 1 })
+      pendingRunId = runId
       const state = store.getFeature(feature.id)!
-      const event = { kind: "step.verdict", stepId: "review", verdict: "changes_requested" } as const
-      const transition = interpret(def, state, event)
-      expect(store.concludeRun(runId, "succeeded", { output: "changes requested" }, event, transition)).toBe(true)
+      const event = { kind: "step.completed", jobId: "main", stepId: "review", outcome: "changes_requested", outputs: { report: "needs work" } } as const
+      const transition = interpret(parsed.workflow, state, event)
+      expect(store.concludeRun(runId, "succeeded", { outputs: { report: "needs work" } }, event, transition)).toBe(true)
       expect(store.getPendingRunAction(feature.id)).not.toBeNull()
       connection.close()
     }
@@ -424,11 +438,11 @@ describe("Daemon: recovery pass drives the durable action outbox", () => {
     // The recovery pass (before any heartbeat tick) replayed the pending
     // "execute review" decision: the outbox is drained and a fresh run
     // was dispatched for the retry round.
-    const features = daemon.store.listFeatures()
-    expect(features).toHaveLength(1)
-    const feature = features[0]!
+    const feature = daemon.store.getFeature(featureId)!
     expect(daemon.store.getPendingRunAction(feature.id)).toBeNull()
-    expect(daemon.store.getActiveRun(feature.id)?.stepId).toBe("review")
+    const active = daemon.store.getActiveRunForStep(feature.id, "main", "review")
+    expect(active).not.toBeNull()
+    expect(active!.id).not.toBe(pendingRunId)
     expect(sessions.prompts.length).toBeGreaterThanOrEqual(1)
   })
 })
@@ -511,16 +525,17 @@ describe("Daemon: graceful shutdown", () => {
 
     const first = makeDaemon({ projects: [project], databasePath })
     await first.daemon.start()
-    const feature = first.daemon.store.createFeature({ title: "F", slug: "f", projectDir: project })
-    await first.daemon.engine.dispatch(feature.id, { kind: "feature.start" })
+    const result = await first.daemon.engine.startFeature(project, { title: "F" })
+    if (!result.ok) throw new Error(result.message)
+    const feature = result.feature
     const beforeStop = first.daemon.store.getFeature(feature.id)
-    expect(beforeStop?.currentStep).toBe("implement")
+    expect(beforeStop?.jobs["main"]?.currentStep).toBe("implement")
     await first.daemon.stop()
 
     const second = makeDaemon({ projects: [project], databasePath })
     await second.daemon.start()
     const recovered = second.daemon.store.getFeature(feature.id)
-    expect(recovered?.currentStep).toBe("implement")
+    expect(recovered?.jobs["main"]?.currentStep).toBe("implement")
     expect(recovered?.status).toBe(beforeStop?.status)
     expect(second.daemon.health().database.appliedNow).toEqual([]) // already migrated
     expect(second.daemon.health().ready).toBe(true)
@@ -528,30 +543,23 @@ describe("Daemon: graceful shutdown", () => {
 })
 
 describe("Daemon: structured logs", () => {
-  it("project registration logs carry the project field and never config contents", async () => {
-    const secretToken = "shhh-token-value"
-    const project = writeProject({
-      ...minimalConfig,
-      reviewPublish: { mode: "github-review", tokenCommand: `echo ${secretToken}` },
-    })
+  it("project registration logs carry the project field", async () => {
+    const project = writeProject()
     const { daemon, logger } = makeDaemon({ projects: [project] })
     await daemon.start()
     const registered = logger.entries.find(e => e.message === "project registered")
     expect(registered).toBeDefined()
     expect(String(registered!.fields?.project)).toContain("conductor-daemon-project-")
-    for (const entry of logger.entries) {
-      expect(JSON.stringify(entry)).not.toContain(secretToken)
-    }
   })
 
   it("engine log lines are forwarded through the daemon logger with the engine component field", async () => {
     const project = writeProject()
     const { daemon, logger } = makeDaemon({ projects: [project] })
     await daemon.start()
-    const feature = daemon.store.createFeature({ title: "F", slug: "f", projectDir: project })
-    await daemon.engine.dispatch(feature.id, { kind: "feature.start" })
+    const result = await daemon.engine.startFeature(project, { title: "F" })
+    if (!result.ok) throw new Error(result.message)
     const engineEntry = logger.entries.find(e => e.fields?.component === "engine")
     expect(engineEntry).toBeDefined()
-    expect(engineEntry!.message).toContain("feature=f")
+    expect(engineEntry!.message).toContain(`feature=${result.feature.slug}`)
   })
 })

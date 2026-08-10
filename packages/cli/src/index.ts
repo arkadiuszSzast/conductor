@@ -6,6 +6,7 @@ export type {
   ApiConnection,
   CommandResult,
   FeaturePayload,
+  FeatureView,
   FetchLike,
   FindingView,
   ReportInput,

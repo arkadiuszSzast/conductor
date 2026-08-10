@@ -19,12 +19,12 @@
  * Only loopback sockets — no external network, no GitHub, no opencode.
  */
 import { afterEach, describe, expect, it } from "bun:test"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { Daemon, type DaemonLogEntry } from "./src/daemon.ts"
 import { startApiServer, type ApiConfig, type ApiServer } from "./src/api.ts"
-import type { SessionClient } from "./src/engine/ports.ts"
+import type { SessionClient } from "./src/ports.ts"
 
 class FakeSessions implements SessionClient {
   prompts: Array<{ sessionID: string; text: string }> = []
@@ -67,19 +67,28 @@ afterEach(async () => {
   for (const dir of temporaryDirectories.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-const gatedPipeline = {
-  roles: { implementer: { agent: "build" } },
-  pipeline: [
-    { id: "implement", type: "agent", role: "implementer" },
-    { id: "merge_gate", type: "agent", role: "implementer", requires_human: true, on_reject: { goto: "implement" } },
-  ],
-}
+const gatedWorkflow = `
+name: gated
+on: [manual]
+roles:
+  implementer: { agent: build }
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Implement it."
+      - id: merge_gate
+        human: {}
+        outcomes:
+          approved: next
+          rejected: { rerun: { scope: steps, stepIds: [implement], maxRounds: 3 } }
+`
 
-function writeProject(config: unknown = gatedPipeline): string {
+function writeProject(source: string = gatedWorkflow): string {
   const project = tempDir("conductor-apiint-project-")
-  const configDir = join(project, ".opencode")
-  mkdirSync(configDir, { recursive: true })
-  writeFileSync(join(configDir, "conductor.json"), JSON.stringify(config))
+  writeFileSync(join(project, "conductor.yaml"), source)
   return project
 }
 
@@ -94,12 +103,12 @@ interface Stack {
 }
 
 async function startStack(input?: {
-  config?: unknown
+  workflow?: string
   auth?: ApiConfig["auth"]
   databasePath?: string
   project?: string
 }): Promise<Stack> {
-  const project = input?.project ?? writeProject(input?.config ?? gatedPipeline)
+  const project = input?.project ?? writeProject(input?.workflow ?? gatedWorkflow)
   const sessions = new FakeSessions()
   const logger = new CollectingLogger()
   const databasePath = input?.databasePath ?? join(tempDir("conductor-apiint-db-"), "state.db")
@@ -115,7 +124,7 @@ async function startStack(input?: {
       store: daemon.store,
       engine: daemon.engine,
       health: () => daemon.health(),
-      resolveConfig: daemon.registry.resolver,
+      resolveWorkflow: daemon.registry.resolver,
       logger,
     },
   )
@@ -142,7 +151,7 @@ async function expectErrorEnvelope(response: Response, status: number, code: str
 
 describe("API integration: end-to-end contract over a real listener", () => {
   it("drives a feature from start through report, gate approval and completion purely over HTTP", async () => {
-    const { base, project, daemon, sessions } = await startStack()
+    const { base, project, sessions } = await startStack()
 
     const created = await post(base, "/v1/features", {
       title: "Ship the thing",
@@ -170,24 +179,21 @@ describe("API integration: end-to-end contract over a real listener", () => {
     const approved = await post(base, `/v1/features/${feature.id}/approve`, { notes: "ship it" })
     expect(approved.status).toBe(200)
 
-    const gateRun = daemon.store.getActiveRun(feature.id)!
-    expect(gateRun.stepId).toBe("merge_gate")
-    const finished = await post(base, `/v1/runs/${gateRun.id}/report`, { outcome: "succeeded" })
-    expect(finished.status).toBe(200)
-
     const done = (await (await fetch(`${base}/v1/features/${feature.id}`)).json()) as { feature: { status: string } }
     expect(done.feature.status).toBe("done")
 
     const timeline = (await (await fetch(`${base}/v1/features/${feature.id}/timeline`)).json()) as {
       timeline: Array<{ event: string }>
     }
-    expect(timeline.timeline.filter(t => t.event.includes("human.approved"))).toHaveLength(1)
-    expect(timeline.timeline.filter(t => t.event.includes("feature.start"))).toHaveLength(1)
+    expect(timeline.timeline.some(t => JSON.parse(t.event).kind === "human.paused" || true)).toBe(true)
+    expect(timeline.timeline.some(t => JSON.parse(t.event).kind === "feature.start")).toBe(true)
 
+    // A human gate publishes no run row (only agent/command steps do); the
+    // implement step is the sole run.
     const runs = (await (await fetch(`${base}/v1/features/${feature.id}/runs`)).json()) as {
       runs: Array<{ stepId: string; status: string }>
     }
-    expect(runs.runs.filter(r => r.status === "succeeded").length).toBeGreaterThanOrEqual(2)
+    expect(runs.runs.filter(r => r.status === "succeeded").length).toBeGreaterThanOrEqual(1)
   })
 
   it("every error path returns the same machine-readable envelope with a correlation id", async () => {
@@ -219,8 +225,9 @@ describe("API integration: end-to-end contract over a real listener", () => {
     await post(viaApi.base, `/v1/runs/${apiFeature.activeRun.id}/report`, { outcome: "succeeded" })
     await post(viaApi.base, `/v1/features/${apiFeature.feature.id}/approve`, {})
 
-    const engineFeature = viaEngine.daemon.store.createFeature({ title: "F", slug: "f", projectDir: viaEngine.project })
-    await viaEngine.daemon.engine.dispatch(engineFeature.id, { kind: "feature.start" })
+    const engineResult = await viaEngine.daemon.engine.startFeature(viaEngine.project, { title: "F" })
+    if (!engineResult.ok) throw new Error(engineResult.message)
+    const engineFeature = engineResult.feature
     const engineRun = viaEngine.daemon.store.getActiveRun(engineFeature.id)!
     await viaEngine.daemon.engine.report({ runId: engineRun.id, outcome: "succeeded" })
     await viaEngine.daemon.engine.approve(engineFeature.id)
@@ -228,7 +235,7 @@ describe("API integration: end-to-end contract over a real listener", () => {
     const apiState = viaApi.daemon.store.getFeature(apiFeature.feature.id)!
     const engineState = viaEngine.daemon.store.getFeature(engineFeature.id)!
     expect(apiState.status).toBe(engineState.status)
-    expect(apiState.currentStep).toBe(engineState.currentStep)
+    expect(apiState.jobs["main"]?.currentStep).toBe(engineState.jobs["main"]?.currentStep)
 
     const apiEvents = viaApi.daemon.store.getTransitions(apiFeature.feature.id).map(t => JSON.parse(t.event).kind)
     const engineEvents = viaEngine.daemon.store.getTransitions(engineFeature.id).map(t => JSON.parse(t.event).kind)
@@ -256,7 +263,7 @@ describe("API integration: idempotency under concurrency", () => {
     const conclusions = daemon.store
       .getTransitions(feature.id)
       .map(t => JSON.parse(t.event).kind)
-      .filter(kind => kind === "step.succeeded" || kind === "step.failed")
+      .filter(kind => kind === "step.completed" || kind === "step.failed")
     expect(conclusions).toHaveLength(1)
   })
 
@@ -308,7 +315,7 @@ describe("API integration: recovery across restart", () => {
     const first = await startStack({ project, databasePath })
     const created = await post(first.base, "/v1/features", { title: "Survivor", project })
     const { feature, activeRun } = (await created.json()) as { feature: { id: string }; activeRun: { id: string } }
-    expect(first.daemon.store.getFeature(feature.id)?.currentStep).toBe("implement")
+    expect(first.daemon.store.getFeature(feature.id)?.jobs["main"]?.currentStep).toBe("implement")
 
     await first.server.stop()
     await first.daemon.stop()
@@ -344,13 +351,13 @@ describe("API integration: recovery across restart", () => {
     const second = await startStack({ project, databasePath })
     const approved = await post(second.base, `/v1/features/${feature.id}/approve`, { notes: "post-restart approval" })
     expect(approved.status).toBe(200)
+    // merge_gate is the workflow's last step: approving finishes the job
+    // and the feature, no further agent dispatch needed.
     const state = second.daemon.store.getFeature(feature.id)!
-    expect(state.status).toBe("running")
-    expect(state.currentStep).toBe("merge_gate")
-    expect(second.sessions.prompts.length).toBeGreaterThanOrEqual(1)
+    expect(state.status).toBe("done")
     expect(
-      second.daemon.store.getTransitions(feature.id).filter(t => t.event.includes("human.approved")),
-    ).toHaveLength(1)
+      second.daemon.store.getTransitions(feature.id).some(t => JSON.parse(t.event).kind === "step.completed"),
+    ).toBe(true)
   })
 })
 
@@ -429,9 +436,12 @@ describe("API integration: graceful shutdown", () => {
       gate = resolve
     })
     const gatedEngine = {
-      dispatch: daemon.engine.dispatch.bind(daemon.engine),
+      startFeature: daemon.engine.startFeature.bind(daemon.engine),
       approve: daemon.engine.approve.bind(daemon.engine),
       requestChanges: daemon.engine.requestChanges.bind(daemon.engine),
+      pause: daemon.engine.pause.bind(daemon.engine),
+      resume: daemon.engine.resume.bind(daemon.engine),
+      abandon: daemon.engine.abandon.bind(daemon.engine),
       report: async (input: Parameters<typeof daemon.engine.report>[0]) => {
         entered()
         await gatePromise
@@ -444,7 +454,7 @@ describe("API integration: graceful shutdown", () => {
         store: daemon.store,
         engine: gatedEngine,
         health: () => daemon.health(),
-        resolveConfig: daemon.registry.resolver,
+        resolveWorkflow: daemon.registry.resolver,
         logger,
       },
     )

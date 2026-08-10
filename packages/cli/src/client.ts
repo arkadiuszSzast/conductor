@@ -24,6 +24,19 @@ export interface ApiConnection {
   readonly token?: string
 }
 
+/**
+ * The API's feature projection: the graph `FeatureState` fields plus a
+ * compact `currentStep` (the single running/waiting step across every
+ * job, or null when zero or several are active — a DAG feature can have
+ * more than one), a per-job status summary and the escalation reason
+ * (kept outside the core state shape).
+ */
+export interface FeatureView extends Omit<FeatureState, "jobs"> {
+  readonly currentStep: string | null
+  readonly escalation: string | null
+  readonly jobs: Readonly<Record<string, { readonly status: string; readonly currentStep: string | null }>>
+}
+
 export class ApiError extends Error {
   constructor(
     /** HTTP status; 0 when the daemon was unreachable. */
@@ -40,46 +53,27 @@ export class ApiError extends Error {
 
 export interface ActiveRun {
   readonly id: string
+  readonly featureId: string
+  readonly jobId: string
   readonly stepId: string
-  readonly stepType: string
+  readonly stepType: "agent" | "command"
   readonly attempt: number
+  readonly status: "running" | "succeeded" | "failed" | "reaped"
   readonly sessionId: string | null
-  readonly timeStarted: number
-  readonly nudges: number
-}
-
-export interface FeaturePayload {
-  readonly feature: FeatureState
-  readonly activeRun: ActiveRun | null
-}
-
-export interface RunSummary {
-  readonly id: string
-  readonly stepId: string
-  readonly stepType: string
-  readonly status: string
-  readonly attempt: number
-  readonly role: string | null
-  readonly model: string | null
-  readonly sessionId: string | null
-  readonly nudges: number
-  readonly output: string | null
+  readonly outputs: Readonly<Record<string, string>>
   readonly reason: string | null
+  readonly nudges: number
   readonly timeStarted: number
   readonly timeFinished: number | null
 }
 
-export interface RunDetail {
-  readonly id: string
-  readonly featureId: string
-  readonly stepId: string
-  readonly status: string
-  readonly role: string | null
-  readonly attempt: number
-  readonly output: string | null
-  readonly reason: string | null
-  readonly completionEvent: string | null
+export interface FeaturePayload {
+  readonly feature: FeatureView
+  readonly activeRun: ActiveRun | null
 }
+
+export type RunSummary = ActiveRun
+export type RunDetail = ActiveRun
 
 export interface FindingView {
   readonly id: string
@@ -97,8 +91,7 @@ export interface FindingView {
 
 export interface TransitionView {
   readonly event: string
-  readonly decision: string
-  readonly detail: string | null
+  readonly decisions: readonly { readonly kind: string; readonly [key: string]: unknown }[]
   readonly time: number
 }
 
@@ -137,7 +130,7 @@ export class ApiClient {
     this.base = connection.url.replace(/\/+$/, "")
   }
 
-  listFeatures(filter?: { project?: string; active?: boolean }): Promise<{ features: FeatureState[] }> {
+  listFeatures(filter?: { project?: string; active?: boolean }): Promise<{ features: FeatureView[] }> {
     const params = new URLSearchParams()
     if (filter?.project !== undefined) params.set("project", filter.project)
     if (filter?.active) params.set("active", "true")
