@@ -23,8 +23,8 @@
 ## 4. Build clients and opencode adapter
 
 - [x] [cli] Implement the API client and `conductor init/start/status/approve/request-changes/report/pause/resume/abandon/logs` commands.
-- [ ] [runner] Reduce the opencode plugin to runner registration, correctly routed session operations and daemon-backed Conductor tools.
-- [ ] [test][runner] Cover multi-project directory routing, missing/retrying/idle session states, duplicate reports and tool availability inside worktrees.
+- [x] [runner] Reduce the opencode plugin to runner registration, correctly routed session operations and daemon-backed Conductor tools.
+- [x] [test][runner] Cover multi-project directory routing, missing/retrying/idle session states, duplicate reports and tool availability inside worktrees.
 
 ## 5. Migrate and dogfood
 

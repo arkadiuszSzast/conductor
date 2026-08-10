@@ -118,6 +118,15 @@ export interface Reconciler {
 export interface DaemonDeps {
   /** Session runner. Absent → the daemon starts and reports the runner unavailable. */
   readonly sessions?: SessionClient
+  /**
+   * Dynamic runner availability for health reporting. A composition that
+   * injects a routing session transport (e.g. the opencode runner hub,
+   * which is always constructible but only useful once a runner has
+   * registered its endpoint) supplies the live answer here — typically
+   * `() => runnerRegistry.hasAny()`. Absent → availability stays the
+   * static "was a SessionClient injected" answer.
+   */
+  readonly runnerAvailability?: () => boolean
   readonly gh?: GhClient
   readonly process?: ProcessRunner
   readonly clock?: Clock
@@ -214,7 +223,7 @@ export class Daemon {
   private readonly logger: DaemonLogger
   private readonly scheduler: IntervalScheduler
   private readonly clock: Clock
-  private readonly runnerAvailable: boolean
+  private readonly runnerAvailable: () => boolean
 
   constructor(
     private readonly config: DaemonConfig,
@@ -227,7 +236,7 @@ export class Daemon {
     this.logger = deps.logger ?? jsonLineLogger
     this.scheduler = deps.scheduler ?? systemIntervalScheduler
     this.clock = deps.clock ?? systemClock
-    this.runnerAvailable = deps.sessions !== undefined
+    this.runnerAvailable = deps.runnerAvailability ?? (() => deps.sessions !== undefined)
   }
 
   /**
@@ -318,7 +327,7 @@ export class Daemon {
     })
     this.reconciler = this.deps.reconciler ?? this.engineInstance
 
-    if (!this.runnerAvailable) this.log("warn", "no session runner registered — runner reported unavailable")
+    if (!this.runnerAvailable()) this.log("warn", "no session runner registered — runner reported unavailable")
 
     // Recovery pass before the first heartbeat: pending decisions from
     // the durable outbox are replayed by the same reconcile() the
@@ -429,7 +438,7 @@ export class Daemon {
         diagnostics:
           entry.status.state === "stale" || entry.status.state === "invalid" ? entry.status.diagnostics : [],
       })),
-      runner: this.runnerAvailable ? "available" : "unavailable",
+      runner: this.runnerAvailable() ? "available" : "unavailable",
     }
   }
 

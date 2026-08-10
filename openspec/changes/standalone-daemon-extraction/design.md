@@ -448,6 +448,78 @@ workflow-format change specifies it. All process effects (fs, env,
 stdout/stderr, cwd, transport) enter through an injected `CliDeps`;
 `src/main.ts` is the only file touching the real environment.
 
+### opencode runner adapter and daemon↔runner transport
+
+`@conductor/runner-opencode` is the seed plugin shrunk to a Runner: it
+opens no database, holds no interpreter, starts no reconciler and
+serves no dashboard. Its whole job is (1) registering the project and
+its session capability with the daemon, (2) implementing the session
+transport the engine's `SessionClient` port needs, and (3) exposing
+daemon-backed Conductor tools (`conductor_start`/`report`/`status`/
+`approve`/`request_changes`) that POST to the daemon's API through the
+typed `ApiClient` from `@conductor/cli` — no pipeline logic anywhere in
+the adapter.
+
+**Transport decision (v1, same host):** the daemon calls the runner
+over a local authenticated HTTP callback. The adapter's process-wide
+`OpencodeRunnerHub` binds ONE callback listener (host from
+`CONDUCTOR_RUNNER_HOST`, port from `CONDUCTOR_RUNNER_PORT`, 0/absent =
+ephemeral) and registers its endpoint with `POST /v1/runners` on the
+daemon. The daemon side (`RunnerRegistry` + `createRunnerSessionClient`
+in `@conductor/server`) is runtime-neutral: it stores registered
+endpoints and speaks a five-operation JSON protocol
+(`POST /v1/sessions`, `GET /v1/sessions/:id/{status,exists}`,
+`POST /v1/sessions/:id/{prompt,note}`) — no opencode SDK type or import
+exists outside `packages/runner-opencode`. In-process wiring was
+rejected because the daemon and opencode are separate processes in the
+target topology; a multi-host transport is explicitly out of scope.
+Registrations are in-memory: a runner re-announces on reconnect, and
+an unregistered/unreachable runner degrades to the stand-in semantics
+(status "busy", exists true — never nudge/reap on missing information;
+create/prompt fail loudly into the engine's step-failure path). Health
+`runner: available|unavailable` is live: `DaemonDeps.runnerAvailability`
+lets the composition report `registry.hasAny()` instead of the static
+"was a SessionClient injected" answer.
+
+**Auth is explicit both ways, even for localhost.** Runner→daemon uses
+`CONDUCTOR_URL`/`CONDUCTOR_TOKEN` (the CLI's exact precedent — no
+default address, a missing URL is a configuration error). Daemon→runner
+callback auth is the registration's `token`: the runner requires either
+`CONDUCTOR_RUNNER_TOKEN` (bearer, checked with a timing-safe compare)
+or the written-down opt-out `CONDUCTOR_RUNNER_AUTH=none`; supplying
+both is an error. The callback token is carried in the registration
+body, kept only in the daemon's in-memory registry, and never appears
+in the `GET /v1/runners` listing or any log line.
+
+The three production bugfixes are preserved as constraints. (1) The
+extracted session transport (`createOpencodeSessions`) routes the
+session directory as a QUERY parameter on `/session` — the body
+silently drops it — with the seed's comment intact; the adapter test
+fake reproduces the drop-from-body behaviour so a regression fails
+loudly. (2) Child sessions get the correct tool surface inside
+worktrees: the tools are constructed per plugin instance from
+process-wide environment configuration, so an instance loaded for a
+worktree directory builds the same daemon-backed tools and a report
+from inside a worktree concludes its run. (3) No process-global state
+depends on registration order: the hub's configuration comes entirely
+from the environment (identical for every instance), daemon-side
+registration upserts by endpoint and unions project lists, and
+directory routing picks the longest path-prefix over a SORTED project
+map with a deterministic sorted-first fallback for worktrees outside
+every project (the default `worktreeDir: ".."` layout) — never
+"whoever registered first".
+
+`POST /v1/features` accepts an optional `sessionId` so `conductor_start`
+can adopt the CALLING session as the feature's parent (the seed's "one
+feature, one session": timeline notes land in the session where the
+human asked for the feature, step child sessions hang beneath it). The
+tool preserves the seed's return-text contract, including the "this
+session is the feature's home — do NOT monitor or poll" instruction.
+Idle never concludes a step: only the daemon's report path does, and a
+duplicate report surfaces the daemon's `run_already_concluded` (409)
+envelope as the seed's "Run <id> already concluded" text so an agent's
+retry reads as already-recorded rather than a failure.
+
 ### Configuration migration
 
 A converter reads `.opencode/conductor.json` and emits `conductor.yaml`. It

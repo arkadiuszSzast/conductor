@@ -10,6 +10,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@conductor/server": "workspace:*"
+    "@conductor/cli": "workspace:*",
+    "@conductor/server": "workspace:*",
+    "@opencode-ai/plugin": "^1.18.16"
   }
 }
