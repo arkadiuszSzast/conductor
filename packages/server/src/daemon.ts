@@ -1,0 +1,455 @@
+/**
+ * Daemon lifecycle — the process owner around the extracted pipeline
+ * engine. It opens and migrates the SQLite database, registers projects
+ * through `ProjectConfigRegistry`, constructs the `Engine` with
+ * production adapters, runs the reconciler heartbeat, answers
+ * readiness/liveness queries and shuts down gracefully.
+ *
+ * Ownership boundaries, deliberately preserved from the extraction:
+ *  - the TIMER lives here, never in `Engine` — `reconcile()` stays a
+ *    plain async method the daemon calls after startup recovery and on
+ *    every heartbeat tick;
+ *  - all configuration is explicit (`DaemonConfig`): database path,
+ *    project list, optional global config file, heartbeat interval.
+ *    Nothing is inferred from a home directory or a hardcoded host;
+ *  - every dependency is injectable (`DaemonDeps`); the defaults are the
+ *    production adapters (`RealGh`, `realProcessRunner`, `systemClock`).
+ *    A daemon started without a `SessionClient` reports its runner as
+ *    unavailable instead of failing to start — agent dispatch then flows
+ *    through the engine's existing retry/escalation policy.
+ *
+ * Readiness vs liveness: `health().alive` means the daemon object has
+ * not stopped or failed; `health().ready` additionally requires the
+ * startup sequence to have completed — migrations applied, recovery
+ * pass executed, heartbeat armed. The future HTTP API task exposes this
+ * query over HTTP; nothing here opens a listener.
+ */
+
+import { dirname } from "node:path"
+import {
+  migrateDatabase,
+  openDatabase,
+  resolveDatabasePath,
+  type DatabaseConnection,
+} from "./database.ts"
+import { migrations } from "./migrations.ts"
+import { Store } from "./store.ts"
+import { ProjectConfigRegistry, type ProjectConfigDiagnostic, type ProjectConfigStatus } from "./project-config-registry.ts"
+import { Engine } from "./engine/engine.ts"
+import { RealGh } from "./engine/gh.ts"
+import { realProcessRunner } from "./engine/process.ts"
+import { systemClock } from "./engine/ports.ts"
+import type { Clock, GhClient, ProcessRunner, PublishReview, SessionClient } from "./engine/ports.ts"
+
+// ------------------------------------------------------------ structured log
+
+export type DaemonLogLevel = "info" | "warn" | "error"
+
+/**
+ * One structured log entry. `fields` carries the correlation identifiers
+ * (`project`, `feature`, `step`, `run`) where they apply — never secrets:
+ * nothing in the daemon ever logs a token, a `tokenCommand` output, or a
+ * config file's contents.
+ */
+export interface DaemonLogEntry {
+  readonly level: DaemonLogLevel
+  readonly message: string
+  readonly fields?: Readonly<Record<string, string | number | boolean | null>>
+}
+
+export interface DaemonLogger {
+  log(entry: DaemonLogEntry): void
+}
+
+/** Default logger: one JSON line per entry on stderr. */
+export const jsonLineLogger: DaemonLogger = {
+  log(entry) {
+    console.error(JSON.stringify({ level: entry.level, message: entry.message, ...(entry.fields ?? {}) }))
+  },
+}
+
+// ------------------------------------------------------------------- timers
+
+/**
+ * Interval scheduling as an injectable port so heartbeat tests can fire
+ * ticks deterministically instead of sleeping through real time.
+ */
+export interface IntervalScheduler {
+  setInterval(callback: () => void, intervalMs: number): unknown
+  clearInterval(handle: unknown): void
+}
+
+export const systemIntervalScheduler: IntervalScheduler = {
+  setInterval(callback, intervalMs) {
+    const handle = setInterval(callback, intervalMs)
+    // The heartbeat must never keep an otherwise-finished process alive.
+    if (typeof handle === "object" && handle !== null && "unref" in handle) {
+      ;(handle as { unref(): void }).unref()
+    }
+    return handle
+  },
+  clearInterval(handle) {
+    clearInterval(handle as Parameters<typeof clearInterval>[0])
+  },
+}
+
+// ----------------------------------------------------------- configuration
+
+export interface DaemonConfig {
+  /** Explicit SQLite database path. Never inferred from a home directory. */
+  readonly databasePath: string
+  /** Create the database's parent directory if missing. */
+  readonly createDatabaseDirectory?: boolean
+  /** Project directories to register at startup. Invalid projects get diagnostics, not a failed start. */
+  readonly projects: readonly string[]
+  /** Optional global config file layered beneath every project config. */
+  readonly globalConfigPath?: string
+  /** Directory containing bundled `conductor:<name>` presets (registry default otherwise). */
+  readonly bundledPresetDir?: string
+  /** Reconciler heartbeat interval in milliseconds. */
+  readonly heartbeatIntervalMs: number
+}
+
+/** The one thing the daemon needs from a reconciler: one idempotent pass. */
+export interface Reconciler {
+  reconcile(): Promise<void>
+}
+
+export interface DaemonDeps {
+  /** Session runner. Absent → the daemon starts and reports the runner unavailable. */
+  readonly sessions?: SessionClient
+  readonly gh?: GhClient
+  readonly process?: ProcessRunner
+  readonly clock?: Clock
+  readonly logger?: DaemonLogger
+  readonly scheduler?: IntervalScheduler
+  readonly publishReview?: PublishReview
+  readonly notify?: (title: string, message: string) => void
+  /** Reconciler override for lifecycle tests. Defaults to the constructed `Engine`. */
+  readonly reconciler?: Reconciler
+}
+
+// ------------------------------------------------------------------ health
+
+export type DaemonPhase = "created" | "starting" | "ready" | "failed" | "stopping" | "stopped"
+
+export interface DaemonProjectHealth {
+  readonly projectDir: string
+  readonly state: ProjectConfigStatus["state"]
+  readonly diagnostics: readonly ProjectConfigDiagnostic[]
+}
+
+export interface DaemonHealth {
+  /** Liveness: the daemon object is running (not failed, not stopped). */
+  readonly alive: boolean
+  /** Readiness: migrations applied, recovery pass executed, heartbeat armed. */
+  readonly ready: boolean
+  readonly phase: DaemonPhase
+  readonly database: {
+    readonly path: string
+    readonly migrated: boolean
+    /** Migration ids applied during THIS startup (empty when already current). */
+    readonly appliedNow: readonly string[]
+    readonly knownMigrations: number
+  }
+  readonly heartbeat: {
+    readonly intervalMs: number
+    readonly running: boolean
+    readonly inFlight: boolean
+    readonly lastStartedAt: number | null
+    readonly lastCompletedAt: number | null
+    readonly lastError: string | null
+    readonly cycles: number
+  }
+  readonly projects: readonly DaemonProjectHealth[]
+  readonly runner: "available" | "unavailable"
+}
+
+// ------------------------------------------------------------------ daemon
+
+/**
+ * `SessionClient` used when no runner is injected. Status claims "busy"
+ * and existence claims true — the safe direction: in-flight agent runs
+ * are never nudged or reaped just because no runner is attached (TTL
+ * reaping via the clock still applies). Creating or prompting a session
+ * fails loudly, which flows into the engine's normal step-failure path.
+ */
+function unavailableSessionClient(): SessionClient {
+  const unavailable = () => new Error("no session runner registered with the daemon")
+  return {
+    async createSession() {
+      throw unavailable()
+    },
+    async prompt() {
+      throw unavailable()
+    },
+    async sessionExists() {
+      return true
+    },
+    async status() {
+      return "busy"
+    },
+    async note() {
+      throw unavailable()
+    },
+  }
+}
+
+export class Daemon {
+  private phase: DaemonPhase = "created"
+  private connection: DatabaseConnection | null = null
+  private storeInstance: Store | null = null
+  private registryInstance: ProjectConfigRegistry | null = null
+  private engineInstance: Engine | null = null
+  private reconciler: Reconciler | null = null
+  private timerHandle: unknown = null
+  private cycleInFlight: Promise<void> | null = null
+  private stopPromise: Promise<void> | null = null
+  private appliedNow: readonly string[] = []
+  private lastCycleStartedAt: number | null = null
+  private lastCycleCompletedAt: number | null = null
+  private lastCycleError: string | null = null
+  private cycleCount = 0
+
+  private readonly logger: DaemonLogger
+  private readonly scheduler: IntervalScheduler
+  private readonly clock: Clock
+  private readonly runnerAvailable: boolean
+
+  constructor(
+    private readonly config: DaemonConfig,
+    private readonly deps: DaemonDeps = {},
+  ) {
+    if (!Number.isFinite(config.heartbeatIntervalMs) || config.heartbeatIntervalMs <= 0) {
+      throw new Error("heartbeatIntervalMs must be a positive number")
+    }
+    resolveDatabasePath({ path: config.databasePath })
+    this.logger = deps.logger ?? jsonLineLogger
+    this.scheduler = deps.scheduler ?? systemIntervalScheduler
+    this.clock = deps.clock ?? systemClock
+    this.runnerAvailable = deps.sessions !== undefined
+  }
+
+  /**
+   * Startup sequence: open + migrate the database (a migration failure
+   * fails the start), register projects (an invalid project logs
+   * diagnostics and does not block the rest), construct the engine, run
+   * one recovery pass, then arm the heartbeat. Not restartable: a
+   * stopped or failed daemon is discarded, not restarted in place.
+   */
+  async start(): Promise<void> {
+    if (this.phase !== "created") {
+      throw new Error(`daemon cannot start from phase "${this.phase}"`)
+    }
+    this.phase = "starting"
+    this.log("info", "daemon starting", { database: resolveDatabasePath({ path: this.config.databasePath }) })
+
+    try {
+      const connection = openDatabase({
+        path: this.config.databasePath,
+        ...(this.config.createDatabaseDirectory !== undefined
+          ? { createParentDirectory: this.config.createDatabaseDirectory }
+          : {}),
+      })
+      this.connection = connection
+      try {
+        this.appliedNow = migrateDatabase(connection)
+      } catch (error) {
+        connection.close()
+        this.connection = null
+        throw error
+      }
+      for (const id of this.appliedNow) this.log("info", "migration applied", { migration: id })
+      this.storeInstance = new Store(connection.db)
+    } catch (error) {
+      this.phase = "failed"
+      this.log("error", `startup failed: ${message(error)}`)
+      throw error
+    }
+
+    this.registryInstance = new ProjectConfigRegistry({
+      ...(this.config.globalConfigPath !== undefined ? { globalConfigPath: this.config.globalConfigPath } : {}),
+      ...(this.config.bundledPresetDir !== undefined ? { bundledPresetDir: this.config.bundledPresetDir } : {}),
+    })
+    for (const projectDir of this.config.projects) {
+      const result = this.registryInstance.register(projectDir)
+      if (result.ok) {
+        this.log("info", "project registered", {
+          project: result.snapshot.projectDir,
+          steps: result.snapshot.config.pipeline.length,
+        })
+        for (const warning of result.snapshot.warnings) {
+          this.log("warn", `config warning: ${warning}`, { project: result.snapshot.projectDir })
+        }
+      } else {
+        for (const diagnostic of result.diagnostics) {
+          this.log("warn", `project config invalid: ${diagnostic.message}`, {
+            project: projectDir,
+            source: diagnostic.sourcePath,
+          })
+        }
+      }
+    }
+
+    const processRunner = this.deps.process ?? realProcessRunner
+    // RealGh's default cwd is only used for API-only `gh` calls (checks,
+    // views, GraphQL) that need SOME existing directory; the database's
+    // parent directory is guaranteed to exist after open and is explicit
+    // daemon configuration, not a host assumption. Repo-touching calls
+    // always carry their own cwd from the builtin.
+    const gh = this.deps.gh ?? new RealGh(processRunner, dirname(resolveDatabasePath({ path: this.config.databasePath })))
+    const engineLogger = { log: (text: string) => this.log("info", text, { component: "engine" }) }
+    this.engineInstance = new Engine({
+      store: this.storeInstance!,
+      resolveConfig: this.registryInstance.resolver,
+      gh,
+      sessions: this.deps.sessions ?? unavailableSessionClient(),
+      process: processRunner,
+      clock: this.clock,
+      log: engineLogger,
+      ...(this.deps.notify !== undefined ? { notify: this.deps.notify } : {}),
+      ...(this.deps.publishReview !== undefined ? { publishReview: this.deps.publishReview } : {}),
+    })
+    this.reconciler = this.deps.reconciler ?? this.engineInstance
+
+    if (!this.runnerAvailable) this.log("warn", "no session runner registered — runner reported unavailable")
+
+    // Recovery pass before the first heartbeat: pending decisions from
+    // the durable outbox are replayed by the same reconcile() the
+    // heartbeat drives. Its failure is logged, not fatal — the daemon
+    // still becomes ready and the next heartbeat retries.
+    await this.runCycle("recovery")
+
+    // A stop() issued while startup was in flight wins: never arm the
+    // heartbeat over a connection the stop path is closing.
+    if (this.stopPromise) {
+      await this.stopPromise
+      return
+    }
+
+    this.timerHandle = this.scheduler.setInterval(() => {
+      void this.beat()
+    }, this.config.heartbeatIntervalMs)
+    this.phase = "ready"
+    this.log("info", "daemon ready", { heartbeatIntervalMs: this.config.heartbeatIntervalMs })
+  }
+
+  /**
+   * One heartbeat tick. Skips (returning the in-flight promise) when a
+   * previous cycle is still running — cycles never overlap. Public so
+   * tests and the future API can trigger a cycle deterministically.
+   */
+  beat(): Promise<void> {
+    if (this.phase !== "ready") return Promise.resolve()
+    if (this.cycleInFlight) return this.cycleInFlight
+    return this.runCycle("heartbeat")
+  }
+
+  private runCycle(kind: "recovery" | "heartbeat"): Promise<void> {
+    const reconciler = this.reconciler
+    if (!reconciler) return Promise.resolve()
+    this.lastCycleStartedAt = this.clock.now()
+    const cycle = (async () => {
+      try {
+        await reconciler.reconcile()
+        this.lastCycleError = null
+      } catch (error) {
+        // A failed cycle is logged and recorded, never fatal: the next
+        // heartbeat runs regardless.
+        this.lastCycleError = message(error)
+        this.log("error", `${kind} reconcile failed: ${this.lastCycleError}`)
+      } finally {
+        this.lastCycleCompletedAt = this.clock.now()
+        this.cycleCount += 1
+        this.cycleInFlight = null
+      }
+    })()
+    this.cycleInFlight = cycle
+    return cycle
+  }
+
+  /**
+   * Graceful shutdown: stop the heartbeat timer, wait for an in-flight
+   * reconcile cycle to finish, close the database. Idempotent — repeated
+   * calls share one promise. Active runs stay recoverable: everything
+   * durable is already in SQLite before this returns.
+   */
+  stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise
+    this.stopPromise = (async () => {
+      const from = this.phase
+      if (from === "stopped") return
+      this.phase = "stopping"
+      if (this.timerHandle !== null) {
+        this.scheduler.clearInterval(this.timerHandle)
+        this.timerHandle = null
+      }
+      if (this.cycleInFlight) await this.cycleInFlight
+      this.connection?.close()
+      this.connection = null
+      this.phase = "stopped"
+      this.log("info", "daemon stopped")
+    })()
+    return this.stopPromise
+  }
+
+  /**
+   * Liveness/readiness query. The future HTTP API serves this verbatim;
+   * nothing here touches the network.
+   */
+  health(): DaemonHealth {
+    return {
+      alive: this.phase === "starting" || this.phase === "ready",
+      ready: this.phase === "ready",
+      phase: this.phase,
+      database: {
+        path: resolveDatabasePath({ path: this.config.databasePath }),
+        migrated: this.storeInstance !== null,
+        appliedNow: this.appliedNow,
+        knownMigrations: migrations.length,
+      },
+      heartbeat: {
+        intervalMs: this.config.heartbeatIntervalMs,
+        running: this.timerHandle !== null,
+        inFlight: this.cycleInFlight !== null,
+        lastStartedAt: this.lastCycleStartedAt,
+        lastCompletedAt: this.lastCycleCompletedAt,
+        lastError: this.lastCycleError,
+        cycles: this.cycleCount,
+      },
+      projects: (this.registryInstance?.list() ?? []).map(entry => ({
+        projectDir: entry.projectDir,
+        state: entry.status.state,
+        diagnostics:
+          entry.status.state === "stale" || entry.status.state === "invalid" ? entry.status.diagnostics : [],
+      })),
+      runner: this.runnerAvailable ? "available" : "unavailable",
+    }
+  }
+
+  /** The daemon's store — available once `start()` has opened the database. */
+  get store(): Store {
+    if (!this.storeInstance) throw new Error("daemon has not started")
+    return this.storeInstance
+  }
+
+  /** The daemon's engine — available once `start()` has constructed it. */
+  get engine(): Engine {
+    if (!this.engineInstance) throw new Error("daemon has not started")
+    return this.engineInstance
+  }
+
+  /** The daemon's project registry — available once `start()` has constructed it. */
+  get registry(): ProjectConfigRegistry {
+    if (!this.registryInstance) throw new Error("daemon has not started")
+    return this.registryInstance
+  }
+
+  private log(level: DaemonLogLevel, text: string, fields?: DaemonLogEntry["fields"]): void {
+    this.logger.log({ level, message: text, ...(fields !== undefined ? { fields } : {}) })
+  }
+}
+
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
