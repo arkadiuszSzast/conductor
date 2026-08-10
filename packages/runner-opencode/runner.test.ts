@@ -375,6 +375,27 @@ describe("runner registration and daemon health", () => {
     expect(text).not.toContain(RUNNER_TOKEN)
   })
 
+  it("a failed listener bind leaves no half-registered project behind", async () => {
+    const project = writeProject()
+    const h = await makeHarness({ projects: [project] })
+    const config = resolveRunnerConfig({
+      CONDUCTOR_URL: "http://daemon.test",
+      CONDUCTOR_RUNNER_HOST: RUNNER_ENDPOINT_HOST,
+      CONDUCTOR_RUNNER_TOKEN: RUNNER_TOKEN,
+    })
+    const hub = new OpencodeRunnerHub(config, {
+      daemonFetch: async request => h.api.handle(request),
+      listen: () => {
+        throw new Error("address already in use")
+      },
+    })
+    hubsToStop.push(hub)
+    const sessions = createOpencodeSessions(new FakeOpencodeServer(project).api())
+    await expect(hub.registerProject(project, sessions)).rejects.toThrow("address already in use")
+    expect(hub.registeredProjects).toEqual([])
+    expect(h.registry.hasAny()).toBe(false)
+  })
+
   it("callback requests without the bearer token are rejected", async () => {
     const project = writeProject()
     const h = await makeHarness({ projects: [project] })
