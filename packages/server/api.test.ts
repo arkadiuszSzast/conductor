@@ -1,0 +1,609 @@
+/**
+ * HTTP API v1 — routing, validation, command projection, SSE
+ * invalidation and shutdown. The handler is exercised directly as a
+ * fetch-style function (no socket); one integration block binds a real
+ * listener on an ephemeral loopback port to prove startApiServer's
+ * bind/stop semantics. Full cross-client contract/idempotency/recovery
+ * integration coverage is the next task's job.
+ */
+import { afterEach, describe, expect, it } from "bun:test"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
+import { tmpdir } from "node:os"
+import { Daemon, type DaemonLogEntry } from "./src/daemon.ts"
+import { createApi, startApiServer, type ApiConfig, type ConductorApi } from "./src/api.ts"
+import type { SessionClient } from "./src/engine/ports.ts"
+
+class FakeSessions implements SessionClient {
+  prompts: Array<{ sessionID: string; text: string }> = []
+  private counter = 0
+  async createSession(): Promise<{ id: string }> {
+    return { id: `ses-${++this.counter}` }
+  }
+  async prompt(input: { sessionID: string; text: string }): Promise<void> {
+    this.prompts.push(input)
+  }
+  async sessionExists(): Promise<boolean> {
+    return true
+  }
+  async status(): Promise<"busy" | "idle" | "retry" | "missing"> {
+    return "busy"
+  }
+  async note(): Promise<void> {}
+}
+
+class CollectingLogger {
+  entries: DaemonLogEntry[] = []
+  log(entry: DaemonLogEntry): void {
+    this.entries.push(entry)
+  }
+}
+
+const temporaryDirectories: string[] = []
+const daemonsToStop: Daemon[] = []
+const apisToClose: ConductorApi[] = []
+
+function tempDir(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix))
+  temporaryDirectories.push(dir)
+  return dir
+}
+
+afterEach(async () => {
+  for (const api of apisToClose.splice(0)) api.close()
+  for (const daemon of daemonsToStop.splice(0)) await daemon.stop()
+  for (const dir of temporaryDirectories.splice(0)) rmSync(dir, { recursive: true, force: true })
+})
+
+const agentPipeline = {
+  roles: { implementer: { agent: "build" } },
+  pipeline: [{ id: "implement", type: "agent", role: "implementer" }],
+}
+
+const gatedPipeline = {
+  roles: { implementer: { agent: "build" } },
+  pipeline: [
+    { id: "implement", type: "agent", role: "implementer" },
+    { id: "merge_gate", type: "agent", role: "implementer", requires_human: true, on_reject: { goto: "implement" } },
+  ],
+}
+
+function writeProject(config: unknown = agentPipeline): string {
+  const project = tempDir("conductor-api-project-")
+  const configDir = join(project, ".opencode")
+  mkdirSync(configDir, { recursive: true })
+  writeFileSync(join(configDir, "conductor.json"), JSON.stringify(config))
+  return project
+}
+
+async function makeApi(input?: {
+  config?: unknown
+  auth?: ApiConfig["auth"]
+}): Promise<{
+  api: ConductorApi
+  daemon: Daemon
+  project: string
+  sessions: FakeSessions
+  logger: CollectingLogger
+  request: (method: string, path: string, body?: unknown, headers?: Record<string, string>) => Promise<Response>
+}> {
+  const project = writeProject(input?.config ?? agentPipeline)
+  const sessions = new FakeSessions()
+  const logger = new CollectingLogger()
+  const daemon = new Daemon(
+    {
+      databasePath: join(tempDir("conductor-api-db-"), "state.db"),
+      projects: [project],
+      heartbeatIntervalMs: 60_000,
+    },
+    {
+      sessions,
+      logger,
+      scheduler: { setInterval: () => ({}), clearInterval: () => {} },
+    },
+  )
+  daemonsToStop.push(daemon)
+  await daemon.start()
+  const api = createApi(
+    { bind: { host: "127.0.0.1", port: 0 }, auth: input?.auth ?? { mode: "none" } },
+    {
+      store: daemon.store,
+      engine: daemon.engine,
+      health: () => daemon.health(),
+      resolveConfig: daemon.registry.resolver,
+      logger,
+    },
+  )
+  apisToClose.push(api)
+  const request = (method: string, path: string, body?: unknown, headers?: Record<string, string>) =>
+    api.handle(
+      new Request(`http://conductor.test${path}`, {
+        method,
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+        headers: { "content-type": "application/json", ...headers },
+      }),
+    )
+  return { api, daemon, project, sessions, logger, request }
+}
+
+async function startFeature(
+  request: (method: string, path: string, body?: unknown) => Promise<Response>,
+  project: string,
+  extra?: Record<string, unknown>,
+): Promise<{ id: string; status: string; currentStep: string | null }> {
+  const response = await request("POST", "/v1/features", { title: "Test feature", project, ...extra })
+  expect(response.status).toBe(201)
+  const body = (await response.json()) as { feature: { id: string; status: string; currentStep: string | null } }
+  return body.feature
+}
+
+describe("API: health and probes", () => {
+  it("livez/readyz reflect daemon health and stay unauthenticated under bearer auth", async () => {
+    const { request } = await makeApi({ auth: { mode: "bearer", token: "secret-token" } })
+    const livez = await request("GET", "/v1/livez")
+    expect(livez.status).toBe(200)
+    expect(await livez.json()).toMatchObject({ alive: true, phase: "ready" })
+    const readyz = await request("GET", "/v1/readyz")
+    expect(readyz.status).toBe(200)
+    expect(await readyz.json()).toMatchObject({ ready: true })
+  })
+
+  it("probes report 503 once the daemon has stopped", async () => {
+    const { request, daemon } = await makeApi()
+    await daemon.stop()
+    const livez = await request("GET", "/v1/livez")
+    expect(livez.status).toBe(503)
+    const readyz = await request("GET", "/v1/readyz")
+    expect(readyz.status).toBe(503)
+  })
+
+  it("/v1/health serves the daemon.health() snapshot verbatim", async () => {
+    const { request, daemon } = await makeApi()
+    const response = await request("GET", "/v1/health")
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual(JSON.parse(JSON.stringify(daemon.health())))
+  })
+})
+
+describe("API: authentication boundary", () => {
+  it("bearer mode rejects requests without the token and accepts the right one", async () => {
+    const { request } = await makeApi({ auth: { mode: "bearer", token: "secret-token" } })
+    const denied = await request("GET", "/v1/features")
+    expect(denied.status).toBe(401)
+    const body = (await denied.json()) as { error: { code: string; requestId: string } }
+    expect(body.error.code).toBe("unauthorized")
+    expect(body.error.requestId).toBeTruthy()
+
+    const wrong = await request("GET", "/v1/features", undefined, { authorization: "Bearer nope" })
+    expect(wrong.status).toBe(401)
+
+    const allowed = await request("GET", "/v1/features", undefined, { authorization: "Bearer secret-token" })
+    expect(allowed.status).toBe(200)
+  })
+
+  it("auth mode none is explicit and allows without a header", async () => {
+    const { request } = await makeApi({ auth: { mode: "none" } })
+    const response = await request("GET", "/v1/features")
+    expect(response.status).toBe(200)
+  })
+})
+
+describe("API: feature resources", () => {
+  it("POST /v1/features starts a feature through the engine and returns 201 with durable ids", async () => {
+    const { request, project, daemon, sessions } = await makeApi()
+    const response = await request("POST", "/v1/features", {
+      title: "Add dark mode",
+      project,
+      description: "Full description",
+    })
+    expect(response.status).toBe(201)
+    expect(response.headers.get("x-request-id")).toBeTruthy()
+    const body = (await response.json()) as { feature: { id: string; status: string; currentStep: string }; activeRun: { id: string } }
+    expect(body.feature.status).toBe("running")
+    expect(body.feature.currentStep).toBe("implement")
+    expect(body.activeRun.id).toBeTruthy()
+    expect(sessions.prompts.length).toBe(1)
+    const timeline = daemon.store.getTransitions(body.feature.id)
+    expect(timeline.filter(t => t.event.includes("feature.start"))).toHaveLength(1)
+  })
+
+  it("POST /v1/features validates the body with machine-readable codes", async () => {
+    const { request, project, api } = await makeApi()
+    const noTitle = await request("POST", "/v1/features", { project })
+    expect(noTitle.status).toBe(400)
+    expect(((await noTitle.json()) as { error: { code: string } }).error.code).toBe("invalid_request")
+
+    const noProject = await request("POST", "/v1/features", { title: "T" })
+    expect(noProject.status).toBe(400)
+
+    const badPr = await request("POST", "/v1/features", { title: "T", project, pr: -1 })
+    expect(badPr.status).toBe(400)
+
+    const badJson = await api.handle(
+      new Request("http://conductor.test/v1/features", { method: "POST", body: "{not json" }),
+    )
+    expect(badJson.status).toBe(400)
+    expect(((await badJson.json()) as { error: { code: string } }).error.code).toBe("invalid_json")
+  })
+
+  it("rejects an unregistered project and an unknown workflow with 422", async () => {
+    const { request, project } = await makeApi()
+    const badProject = await request("POST", "/v1/features", { title: "T", project: "/nowhere/at/all" })
+    expect(badProject.status).toBe(422)
+    expect(((await badProject.json()) as { error: { code: string } }).error.code).toBe("project_not_configured")
+
+    const badWorkflow = await request("POST", "/v1/features", { title: "T", project, workflow: "missing" })
+    expect(badWorkflow.status).toBe(422)
+    expect(((await badWorkflow.json()) as { error: { code: string } }).error.code).toBe("unknown_workflow")
+  })
+
+  it("lists features with active/project filters and reads a single feature", async () => {
+    const { request, project } = await makeApi()
+    const feature = await startFeature(request, project)
+
+    const list = await request("GET", "/v1/features")
+    expect(list.status).toBe(200)
+    expect(((await list.json()) as { features: unknown[] }).features).toHaveLength(1)
+
+    const filtered = await request("GET", `/v1/features?project=${encodeURIComponent("/other/project")}`)
+    expect(((await filtered.json()) as { features: unknown[] }).features).toHaveLength(0)
+
+    const single = await request("GET", `/v1/features/${feature.id}`)
+    expect(single.status).toBe(200)
+    const body = (await single.json()) as { feature: { id: string }; activeRun: { stepId: string } }
+    expect(body.feature.id).toBe(feature.id)
+    expect(body.activeRun.stepId).toBe("implement")
+  })
+
+  it("unknown feature ids return 404 with a not_found code on every route", async () => {
+    const { request } = await makeApi()
+    for (const path of ["/v1/features/nope", "/v1/features/nope/runs", "/v1/features/nope/findings", "/v1/features/nope/timeline"]) {
+      const response = await request("GET", path)
+      expect(response.status).toBe(404)
+      expect(((await response.json()) as { error: { code: string } }).error.code).toBe("not_found")
+    }
+    const command = await request("POST", "/v1/features/nope/approve", {})
+    expect(command.status).toBe(404)
+  })
+
+  it("serves runs, findings and timeline for a feature", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    daemon.store.insertFindings(feature.id, "implement", [
+      { path: "src/a.ts", line: 3, severity: "major", tags: [], body: "bug" },
+    ])
+
+    const runs = await request("GET", `/v1/features/${feature.id}/runs`)
+    const runsBody = (await runs.json()) as { runs: Array<{ stepId: string; status: string }> }
+    expect(runsBody.runs).toHaveLength(1)
+    expect(runsBody.runs[0]).toMatchObject({ stepId: "implement", status: "running" })
+
+    const findings = await request("GET", `/v1/features/${feature.id}/findings`)
+    const findingsBody = (await findings.json()) as { findings: Array<{ id: string; severity: string }> }
+    expect(findingsBody.findings).toHaveLength(1)
+    expect(findingsBody.findings[0]).toMatchObject({ id: "F1", severity: "major" })
+
+    const timeline = await request("GET", `/v1/features/${feature.id}/timeline`)
+    const timelineBody = (await timeline.json()) as { timeline: Array<{ decision: string }> }
+    expect(timelineBody.timeline.length).toBeGreaterThanOrEqual(1)
+    expect(timelineBody.timeline.some(t => t.decision === "execute")).toBe(true)
+  })
+
+  it("unknown routes and methods return 404", async () => {
+    const { request } = await makeApi()
+    expect((await request("GET", "/v1/nope")).status).toBe(404)
+    expect((await request("DELETE", "/v1/features")).status).toBe(404)
+    expect((await request("PUT", "/v1/features/abc")).status).toBe(404)
+  })
+})
+
+describe("API: human gates", () => {
+  async function gatedFeature() {
+    const context = await makeApi({ config: gatedPipeline })
+    const feature = await startFeature(context.request, context.project)
+    const run = context.daemon.store.getActiveRun(feature.id)!
+    const report = await context.request("POST", `/v1/runs/${run.id}/report`, { outcome: "succeeded" })
+    expect(report.status).toBe(200)
+    expect(context.daemon.store.getFeature(feature.id)?.status).toBe("waiting_human")
+    return { ...context, feature }
+  }
+
+  it("approve routes through the engine and records the transition once", async () => {
+    const { request, daemon, feature } = await gatedFeature()
+    const before = daemon.store.getTransitions(feature.id).length
+    const response = await request("POST", `/v1/features/${feature.id}/approve`, { notes: "ship it" })
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { result: string; feature: { status: string } }
+    expect(body.result).toContain("Approved")
+    const after = daemon.store.getTransitions(feature.id)
+    expect(after.filter(t => t.event.includes("human.approved"))).toHaveLength(1)
+    expect(after.length).toBe(before + 1)
+  })
+
+  it("request-changes requires notes and routes the gate's on_reject", async () => {
+    const { request, daemon, feature } = await gatedFeature()
+    const missingNotes = await request("POST", `/v1/features/${feature.id}/request-changes`, {})
+    expect(missingNotes.status).toBe(400)
+    expect(((await missingNotes.json()) as { error: { code: string } }).error.code).toBe("invalid_request")
+
+    const response = await request("POST", `/v1/features/${feature.id}/request-changes`, { notes: "fix X" })
+    expect(response.status).toBe(200)
+    const state = daemon.store.getFeature(feature.id)
+    expect(state?.currentStep).toBe("implement")
+    expect(state?.status).toBe("running")
+    expect(daemon.store.getTransitions(feature.id).filter(t => t.event.includes("human.rejected"))).toHaveLength(1)
+  })
+
+  it("approve/request-changes on a feature that is not waiting return 409 conflict", async () => {
+    const { request, project } = await makeApi()
+    const feature = await startFeature(request, project)
+    const approve = await request("POST", `/v1/features/${feature.id}/approve`, {})
+    expect(approve.status).toBe(409)
+    expect(((await approve.json()) as { error: { code: string } }).error.code).toBe("conflict")
+    const reject = await request("POST", `/v1/features/${feature.id}/request-changes`, { notes: "n" })
+    expect(reject.status).toBe(409)
+  })
+
+  it("pause and abandon on a terminal feature return 409 and never resurrect it", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    expect((await request("POST", `/v1/runs/${run.id}/report`, { outcome: "succeeded" })).status).toBe(200)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("done")
+
+    const pause = await request("POST", `/v1/features/${feature.id}/pause`)
+    expect(pause.status).toBe(409)
+    expect(((await pause.json()) as { error: { code: string } }).error.code).toBe("conflict")
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("done")
+
+    const abandon = await request("POST", `/v1/features/${feature.id}/abandon`)
+    expect(abandon.status).toBe(409)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("done")
+
+    const other = await startFeature(request, project)
+    expect((await request("POST", `/v1/features/${other.id}/abandon`)).status).toBe(200)
+    expect(daemon.store.getFeature(other.id)?.status).toBe("abandoned")
+    expect((await request("POST", `/v1/features/${other.id}/pause`)).status).toBe(409)
+    expect((await request("POST", `/v1/features/${other.id}/abandon`)).status).toBe(409)
+    expect(daemon.store.getFeature(other.id)?.status).toBe("abandoned")
+  })
+
+  it("a gate command that loses the pre-check race still maps to 409 via the engine result", async () => {
+    const { api, request, project, daemon } = await makeApi({ config: gatedPipeline })
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    expect((await request("POST", `/v1/runs/${run.id}/report`, { outcome: "succeeded" })).status).toBe(200)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("waiting_human")
+
+    // Approve through the engine AFTER the API has read its snapshot:
+    // stall the body read so the status flips mid-request.
+    const stalledBody = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        await daemon.engine.approve(feature.id)
+        controller.enqueue(new TextEncoder().encode("{}"))
+        controller.close()
+      },
+    })
+    const raced = await api.handle(
+      new Request(`http://conductor.test/v1/features/${feature.id}/approve`, {
+        method: "POST",
+        body: stalledBody,
+        headers: { "content-type": "application/json" },
+      }),
+    )
+    expect(raced.status).toBe(409)
+    expect(((await raced.json()) as { error: { code: string } }).error.code).toBe("conflict")
+    expect(daemon.store.getTransitions(feature.id).filter(t => t.event.includes("human.approved"))).toHaveLength(1)
+  })
+
+  it("pause, resume and abandon dispatch the same engine events", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+
+    const paused = await request("POST", `/v1/features/${feature.id}/pause`)
+    expect(paused.status).toBe(200)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("paused")
+
+    const resumed = await request("POST", `/v1/features/${feature.id}/resume`)
+    expect(resumed.status).toBe(200)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("running")
+
+    const abandoned = await request("POST", `/v1/features/${feature.id}/abandon`)
+    expect(abandoned.status).toBe(200)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("abandoned")
+  })
+})
+
+describe("API: run reports", () => {
+  it("reports an outcome through the engine and advances the feature", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    const response = await request("POST", `/v1/runs/${run.id}/report`, { outcome: "succeeded", notes: "done" })
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { result: string; run: { status: string } }
+    expect(body.result).toContain("succeeded")
+    expect(body.run.status).toBe("succeeded")
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("done")
+  })
+
+  it("rejects a duplicate report idempotently with 409 and leaves state unchanged", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    expect((await request("POST", `/v1/runs/${run.id}/report`, { outcome: "succeeded" })).status).toBe(200)
+    const stateAfterFirst = daemon.store.getFeature(feature.id)
+    const timelineAfterFirst = daemon.store.getTransitions(feature.id).length
+
+    const duplicate = await request("POST", `/v1/runs/${run.id}/report`, { outcome: "failed" })
+    expect(duplicate.status).toBe(409)
+    expect(((await duplicate.json()) as { error: { code: string } }).error.code).toBe("run_already_concluded")
+    expect(daemon.store.getFeature(feature.id)).toEqual(stateAfterFirst)
+    expect(daemon.store.getTransitions(feature.id).length).toBe(timelineAfterFirst)
+  })
+
+  it("a verdict whose text contains 'already concluded' is not misreported as a duplicate", async () => {
+    const trickyPipeline = {
+      roles: { reviewer: { agent: "review" } },
+      pipeline: [
+        {
+          id: "review",
+          type: "agent",
+          role: "reviewer",
+          on_verdict: { "already concluded": { next: true } },
+        },
+      ],
+    }
+    const { request, project, daemon } = await makeApi({ config: trickyPipeline })
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    const response = await request("POST", `/v1/runs/${run.id}/report`, { verdict: "already concluded" })
+    expect(response.status).toBe(200)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("done")
+  })
+
+  it("validates report bodies: unknown run, missing outcome/verdict, both at once", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+
+    const unknown = await request("POST", "/v1/runs/nope/report", { outcome: "succeeded" })
+    expect(unknown.status).toBe(404)
+
+    const neither = await request("POST", `/v1/runs/${run.id}/report`, {})
+    expect(neither.status).toBe(400)
+
+    const both = await request("POST", `/v1/runs/${run.id}/report`, { outcome: "succeeded", verdict: "approved" })
+    expect(both.status).toBe(400)
+
+    const badOutcome = await request("POST", `/v1/runs/${run.id}/report`, { outcome: "maybe" })
+    expect(badOutcome.status).toBe(400)
+
+    expect(daemon.store.getRunById(run.id)?.status).toBe("running")
+  })
+
+  it("reads a single run", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    const response = await request("GET", `/v1/runs/${run.id}`)
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { run: { id: string; stepId: string; status: string } }
+    expect(body.run).toMatchObject({ id: run.id, stepId: "implement", status: "running" })
+  })
+})
+
+describe("API: SSE invalidation events", () => {
+  async function readFrames(
+    reader: { read(): Promise<{ done: boolean; value?: Uint8Array }> },
+    until: (buffered: string) => boolean,
+  ): Promise<string> {
+    const decoder = new TextDecoder()
+    let buffered = ""
+    while (!until(buffered)) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffered += decoder.decode(value)
+    }
+    return buffered
+  }
+
+  it("a subscriber receives an invalidation event after a transition and a finding", async () => {
+    const { api, request, project, daemon } = await makeApi()
+    const events = await api.handle(new Request("http://conductor.test/v1/events"))
+    expect(events.status).toBe(200)
+    expect(events.headers.get("content-type")).toBe("text/event-stream")
+    const reader = events.body!.getReader()
+    await readFrames(reader, text => text.includes("event: hello"))
+    expect(api.sseClientCount).toBe(1)
+
+    const feature = await startFeature(request, project)
+    const afterStart = await readFrames(reader, text => text.includes('"kind":"transition"'))
+    expect(afterStart).toContain(`"featureId":"${feature.id}"`)
+
+    daemon.store.insertFindings(feature.id, "implement", [
+      { path: "a.ts", line: 1, severity: "minor", tags: [], body: "b" },
+    ])
+    const afterFinding = await readFrames(reader, text => text.includes('"kind":"finding"'))
+    expect(afterFinding).toContain('"kind":"finding"')
+    reader.cancel()
+  })
+
+  it("close() ends every SSE stream so shutdown never hangs on a subscriber", async () => {
+    const { api } = await makeApi()
+    const events = await api.handle(new Request("http://conductor.test/v1/events"))
+    const reader = events.body!.getReader()
+    await readFrames(reader, text => text.includes("event: hello"))
+    expect(api.sseClientCount).toBe(1)
+
+    api.close()
+    expect(api.sseClientCount).toBe(0)
+    const { done } = await reader.read()
+    expect(done).toBe(true)
+
+    const afterClose = await api.handle(new Request("http://conductor.test/v1/events"))
+    expect(afterClose.status).toBe(409)
+  })
+
+  it("events endpoint honors the auth boundary", async () => {
+    const { api } = await makeApi({ auth: { mode: "bearer", token: "secret-token" } })
+    const denied = await api.handle(new Request("http://conductor.test/v1/events"))
+    expect(denied.status).toBe(401)
+  })
+})
+
+describe("API: request correlation and logging", () => {
+  it("echoes a caller-provided x-request-id and generates one otherwise", async () => {
+    const { request } = await makeApi()
+    const provided = await request("GET", "/v1/features", undefined, { "x-request-id": "req-123" })
+    expect(provided.headers.get("x-request-id")).toBe("req-123")
+    const generated = await request("GET", "/v1/features")
+    expect(generated.headers.get("x-request-id")).toBeTruthy()
+  })
+
+  it("logs each request with method, path and status — never a bearer token", async () => {
+    const { request, logger } = await makeApi({ auth: { mode: "bearer", token: "super-secret-token" } })
+    await request("GET", "/v1/features", undefined, { authorization: "Bearer super-secret-token" })
+    const entry = logger.entries.find(e => e.message === "api request")
+    expect(entry).toBeDefined()
+    expect(entry!.fields).toMatchObject({ method: "GET", path: "/v1/features", status: 200 })
+    for (const logged of logger.entries) {
+      expect(JSON.stringify(logged)).not.toContain("super-secret-token")
+    }
+  })
+})
+
+describe("API: real listener on an ephemeral loopback port", () => {
+  it("startApiServer binds the explicit host/port, serves requests and stops cleanly with open SSE streams", async () => {
+    const { daemon, logger } = await makeApi()
+    const server = startApiServer(
+      { bind: { host: "127.0.0.1", port: 0 }, auth: { mode: "none" } },
+      {
+        store: daemon.store,
+        engine: daemon.engine,
+        health: () => daemon.health(),
+        resolveConfig: daemon.registry.resolver,
+        logger,
+      },
+    )
+    try {
+      expect(server.port).toBeGreaterThan(0)
+      const base = `http://127.0.0.1:${server.port}`
+
+      const livez = await fetch(`${base}/v1/livez`)
+      expect(livez.status).toBe(200)
+
+      const events = await fetch(`${base}/v1/events`)
+      expect(events.status).toBe(200)
+      const reader = events.body!.getReader()
+      const first = await reader.read()
+      expect(first.done).toBe(false)
+
+      await server.stop()
+      await server.stop()
+    } finally {
+      await server.stop()
+    }
+    expect(logger.entries.some(e => e.message === "api stopped")).toBe(true)
+  })
+})

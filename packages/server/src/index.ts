@@ -15,6 +15,7 @@ export type {
   FeatureState,
   FeatureStatus,
   PipelineEvent,
+  StoreChange,
   Transition,
 } from "./store.ts"
 
@@ -52,6 +53,19 @@ export type {
   IntervalScheduler,
   Reconciler,
 } from "./daemon.ts"
+
+export { createApi, startApiServer } from "./api.ts"
+export type {
+  ApiAuth,
+  ApiBind,
+  ApiConfig,
+  ApiDeps,
+  ApiErrorCode,
+  ApiHandler,
+  ApiServer,
+  ConductorApi,
+  EngineControl,
+} from "./api.ts"
 
 export { ProjectConfigRegistry } from "./project-config-registry.ts"
 export type {

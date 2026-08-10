@@ -327,6 +327,56 @@ a `component: "engine"` field and carry the seed's `feature=<slug>`
 correlation text. Nothing in the daemon logs secrets: `tokenCommand`
 output and config file contents never reach a log entry.
 
+### HTTP API v1 (REST + SSE)
+
+`createApi`/`startApiServer` (`packages/server/src/api.ts`) expose the
+daemon over a versioned HTTP surface. The API is a thin projection: every
+command routes through the SAME engine methods every other client uses —
+`dispatch` (start/pause/resume/abandon), `report`, `approve`,
+`requestChanges` — so the CLI, runners and third-party UIs are equal
+clients with no privileged in-process path and no pipeline logic
+duplicated in the handler.
+
+Resources and commands under `/v1`: `GET/POST /v1/features` (list/start),
+`GET /v1/features/:id` (+ `/runs`, `/findings`, `/timeline`),
+`POST /v1/features/:id/{approve,request-changes,pause,resume,abandon}`,
+`GET /v1/runs/:id` and `POST /v1/runs/:id/report`, `GET /v1/health`
+(the `daemon.health()` snapshot verbatim), and unauthenticated
+`GET /v1/livez` / `GET /v1/readyz` probes. Responses carry durable IDs,
+machine-readable error codes (`{error: {code, message, requestId}}`) and
+a request correlation ID (`x-request-id`, echoed when the caller provides
+one). Gate commands on a feature that is not `waiting_human` are 409
+`conflict` — pre-checked on a snapshot and re-validated against the
+engine's structured result prefix after the call, so a racer that loses
+the engine's own re-check maps to the same 409. `pause`/`abandon` on a
+`done`/`abandoned` feature are 409: the interpreter's `human.paused`/
+`human.abandoned` handlers are deliberately unconditional (seed
+semantics), so the API layer owns the guard that a terminal feature is
+never resurrected into an active status. A report for an
+already-concluded run is 409 `run_already_concluded` — the engine's
+atomic conclusion claim remains the authority; the API projects the
+duplicate rejection onto a status code by its exact `Run <id> already
+concluded` prefix (caller-controlled verdict text cannot spoof it), and
+a concurrent loser of the claim maps to the same 409.
+
+`GET /v1/events` is an SSE INVALIDATION stream, not a state carrier:
+`Store` gains a post-commit `onChange` listener (`StoreChange = {kind:
+feature|transition|run|finding, featureId}`) that fires after the
+mutating transaction commits, so a notified subscriber refetching over
+REST always observes the new state. A throwing listener is swallowed —
+observation never breaks a durable transition.
+
+Bind and auth are explicit configuration even for localhost: `ApiConfig`
+requires `bind: {host, port}` (no hardcoded universal default port) and
+an `auth` shape — `{mode: "none"}` is a written-down operator decision,
+`{mode: "bearer", token}` guards every route except the livez/readyz
+probes. The request handler itself is a plain `(Request) =>
+Promise<Response>` function, contract-testable without a socket;
+`startApiServer` binds it with `Bun.serve` and owns shutdown: `stop()`
+closes every SSE stream first (no hanging responses), then stops the
+listener, and is composed by the process owner with `Daemon.stop()` —
+API first, so no new commands arrive while SQLite is closing.
+
 ### Configuration migration
 
 A converter reads `.opencode/conductor.json` and emits `conductor.yaml`. It
