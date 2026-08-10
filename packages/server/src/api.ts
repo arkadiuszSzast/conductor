@@ -502,10 +502,14 @@ export interface ApiServer {
 
 /**
  * Bind the API on the EXPLICIT host/port from `config.bind`. Graceful
- * shutdown order: end SSE streams (so no response is left hanging),
- * then stop the listener with in-flight requests allowed to finish.
- * The process owner composes this with `Daemon.stop()` — API first, so
- * no new commands arrive while the daemon is closing SQLite.
+ * shutdown order: end SSE streams first (so no response is left
+ * hanging), then force-close the listener. Force, not graceful: a
+ * graceful `server.stop()` keeps existing keep-alive connections open
+ * and a pooled client can still push NEW requests through them after
+ * "stop" — exactly the "accepting new work while SQLite is closing"
+ * window shutdown must close. Every remaining request is a fast local
+ * store read/write, so cutting the connections loses nothing durable.
+ * The process owner composes this with `Daemon.stop()` — API first.
  */
 export function startApiServer(config: ApiConfig, deps: ApiDeps): ApiServer {
   const api = createApi(config, deps)
@@ -530,7 +534,7 @@ export function startApiServer(config: ApiConfig, deps: ApiDeps): ApiServer {
       if (stopPromise) return stopPromise
       stopPromise = (async () => {
         api.close()
-        await server.stop()
+        await server.stop(true)
         deps.logger?.log({ level: "info", message: "api stopped" })
       })()
       return stopPromise

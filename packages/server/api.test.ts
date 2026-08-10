@@ -3,8 +3,8 @@
  * invalidation and shutdown. The handler is exercised directly as a
  * fetch-style function (no socket); one integration block binds a real
  * listener on an ephemeral loopback port to prove startApiServer's
- * bind/stop semantics. Full cross-client contract/idempotency/recovery
- * integration coverage is the next task's job.
+ * bind/stop semantics. Cross-client contract/idempotency/recovery
+ * integration coverage lives in `api-integration.test.ts`.
  */
 import { afterEach, describe, expect, it } from "bun:test"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
