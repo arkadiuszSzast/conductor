@@ -67,6 +67,16 @@ export type {
   EngineControl,
 } from "./api.ts"
 
+export { RunnerRegistry } from "./runner-registry.ts"
+export type {
+  RegisterRunnerInput,
+  RunnerDirectory,
+  RunnerRegistration,
+} from "./runner-registry.ts"
+
+export { createRunnerSessionClient } from "./runner-transport.ts"
+export type { RunnerFetch, RunnerSessionClientDeps } from "./runner-transport.ts"
+
 export { ProjectConfigRegistry } from "./project-config-registry.ts"
 export type {
   LoadResult,

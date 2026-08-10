@@ -29,6 +29,7 @@ import type { Store, StoreChange } from "./store.ts"
 import type { DaemonHealth, DaemonLogger } from "./daemon.ts"
 import type { ConfigResolver } from "./engine/ports.ts"
 import type { PipelineEvent } from "./store.ts"
+import type { RunnerRegistry } from "./runner-registry.ts"
 
 // ------------------------------------------------------------ configuration
 
@@ -66,6 +67,8 @@ export interface ApiDeps {
   readonly health: () => DaemonHealth
   /** Per-project config lookup — used to validate feature-start requests. */
   readonly resolveConfig: ConfigResolver
+  /** Runner endpoint registration (`/v1/runners`). Absent → those routes 404. */
+  readonly runners?: RunnerRegistry
   readonly logger?: DaemonLogger
 }
 
@@ -143,7 +146,7 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
-  const { store, engine, health, resolveConfig, logger } = deps
+  const { store, engine, health, resolveConfig, runners, logger } = deps
   const sseClients = new Set<SseClient>()
   const inFlight = new Set<Promise<void>>()
   let closed = false
@@ -261,6 +264,35 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       return error(requestId, "not_found", `no route for ${method} ${path}`)
     }
 
+    if (path === "/v1/runners" && runners !== undefined) {
+      if (method === "GET") {
+        // Tokens the daemon uses to call runners back never leave the
+        // registry — the listing is projection-only.
+        return json(
+          200,
+          {
+            runners: runners.list().map(entry => ({
+              id: entry.id,
+              name: entry.name,
+              endpoint: entry.endpoint,
+              projects: entry.projects,
+              registeredAt: entry.registeredAt,
+            })),
+          },
+          requestId,
+        )
+      }
+      if (method === "POST") return registerRunner(request, requestId)
+      return error(requestId, "not_found", `no route for ${method} ${path}`)
+    }
+
+    const runnerMatch = path.match(/^\/v1\/runners\/([^/]+)$/)
+    if (runnerMatch && runners !== undefined && method === "DELETE") {
+      const runnerId = decodeURIComponent(runnerMatch[1]!)
+      if (!runners.deregister(runnerId)) return error(requestId, "not_found", `unknown runner "${runnerId}"`)
+      return json(200, { deregistered: runnerId }, requestId)
+    }
+
     const featureMatch = path.match(/^\/v1\/features\/([^/]+)(?:\/([a-z-]+))?$/)
     if (featureMatch) {
       const featureId = decodeURIComponent(featureMatch[1]!)
@@ -295,10 +327,52 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     return error(requestId, "not_found", `no route for ${method} ${path}`)
   }
 
+  async function registerRunner(request: Request, requestId: string): Promise<Response> {
+    const parsed = await readJsonBody(request)
+    if (!parsed.ok) return error(requestId, "invalid_json", "request body must be a JSON object")
+    const { name, endpoint, token, projects } = parsed.body
+    if (typeof name !== "string" || name.trim() === "") {
+      return error(requestId, "invalid_request", "\"name\" (non-empty string) is required")
+    }
+    if (typeof endpoint !== "string" || endpoint.trim() === "") {
+      return error(requestId, "invalid_request", "\"endpoint\" (URL) is required")
+    }
+    if (token !== undefined && typeof token !== "string") {
+      return error(requestId, "invalid_request", "\"token\" must be a string")
+    }
+    if (!Array.isArray(projects) || projects.some(entry => typeof entry !== "string" || entry.trim() === "")) {
+      return error(requestId, "invalid_request", "\"projects\" must be an array of non-empty strings")
+    }
+    let registration
+    try {
+      registration = runners!.register({
+        name,
+        endpoint,
+        ...(token !== undefined ? { token } : {}),
+        projects: projects as string[],
+      })
+    } catch (err) {
+      return error(requestId, "invalid_request", err instanceof Error ? err.message : String(err))
+    }
+    return json(
+      201,
+      {
+        runner: {
+          id: registration.id,
+          name: registration.name,
+          endpoint: registration.endpoint,
+          projects: registration.projects,
+          registeredAt: registration.registeredAt,
+        },
+      },
+      requestId,
+    )
+  }
+
   async function createFeature(request: Request, requestId: string): Promise<Response> {
     const parsed = await readJsonBody(request)
     if (!parsed.ok) return error(requestId, "invalid_json", "request body must be a JSON object")
-    const { title, project, description, workflow, pr } = parsed.body
+    const { title, project, description, workflow, pr, sessionId } = parsed.body
     if (typeof title !== "string" || title.trim() === "") {
       return error(requestId, "invalid_request", "\"title\" (non-empty string) is required")
     }
@@ -313,6 +387,9 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     }
     if (pr !== undefined && (typeof pr !== "number" || !Number.isInteger(pr) || pr <= 0)) {
       return error(requestId, "invalid_request", "\"pr\" must be a positive integer")
+    }
+    if (sessionId !== undefined && (typeof sessionId !== "string" || sessionId.trim() === "")) {
+      return error(requestId, "invalid_request", "\"sessionId\" must be a non-empty string")
     }
     const config = resolveConfig(project)
     if (!config) {
@@ -333,7 +410,16 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       ...(workflow !== undefined ? { workflow } : {}),
       ...(description !== undefined ? { description } : {}),
     })
-    if (pr !== undefined) store.setFeatureFields(feature.id, { pr })
+    // `sessionId` adopts the CALLER's session as the feature's parent —
+    // the seed's "one feature, one session" behaviour: the session where
+    // the human asked for the feature becomes its home; timeline notes
+    // land there and step child sessions hang beneath it.
+    if (pr !== undefined || sessionId !== undefined) {
+      store.setFeatureFields(feature.id, {
+        ...(pr !== undefined ? { pr } : {}),
+        ...(sessionId !== undefined ? { sessionId } : {}),
+      })
+    }
     await engine.dispatch(feature.id, { kind: "feature.start" })
     return json(201, featurePayload(feature.id), requestId)
   }

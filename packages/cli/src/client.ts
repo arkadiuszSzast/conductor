@@ -108,6 +108,8 @@ export interface StartFeatureInput {
   readonly description?: string
   readonly workflow?: string
   readonly pr?: number
+  /** Adopt an existing runner session as the feature's parent session (the seed's "one feature, one session"). */
+  readonly sessionId?: string
 }
 
 export interface ReportInput {
