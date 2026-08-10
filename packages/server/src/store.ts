@@ -52,6 +52,17 @@ export interface Transition {
   }>
 }
 
+/**
+ * Post-commit change notification — the invalidation signal the API's
+ * SSE stream fans out. Deliberately carries no payload beyond the kind
+ * and feature id: subscribers refetch authoritative state over REST,
+ * the notification itself is never a state carrier.
+ */
+export interface StoreChange {
+  readonly kind: "feature" | "transition" | "run" | "finding"
+  readonly featureId: string
+}
+
 interface FeatureRow {
   id: string
   title: string
@@ -91,7 +102,33 @@ function toState(row: FeatureRow): FeatureState {
 }
 
 export class Store {
+  private readonly changeListeners = new Set<(change: StoreChange) => void>()
+
   constructor(private readonly db: Database) {}
+
+  /**
+   * Subscribe to post-commit change notifications. Listeners fire AFTER
+   * the mutating transaction has committed — a notified subscriber
+   * refetching over the same store always observes the new state. A
+   * throwing listener is swallowed: observation must never break a
+   * state transition that is already durable.
+   */
+  onChange(listener: (change: StoreChange) => void): () => void {
+    this.changeListeners.add(listener)
+    return () => {
+      this.changeListeners.delete(listener)
+    }
+  }
+
+  private emit(change: StoreChange): void {
+    for (const listener of this.changeListeners) {
+      try {
+        listener(change)
+      } catch {
+        // Listeners are projections; a broken one never blocks the store.
+      }
+    }
+  }
 
   createFeature(input: {
     title: string
@@ -109,6 +146,7 @@ export class Store {
     )
     const state = this.getFeature(id)
     if (!state) throw new Error(`conductor: feature ${id} vanished after insert`)
+    this.emit({ kind: "feature", featureId: id })
     return state
   }
 
@@ -137,6 +175,7 @@ export class Store {
 
   applyTransition(featureId: string, event: PipelineEvent, transition: Transition): void {
     this.db.transaction(() => this.applyTransitionTx(featureId, event, transition))()
+    this.emit({ kind: "transition", featureId })
   }
 
   private applyTransitionTx(featureId: string, event: PipelineEvent, transition: Transition): void {
@@ -218,6 +257,7 @@ export class Store {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [id, input.featureId, input.stepId, input.stepType, input.attempt, input.role ?? null, input.model ?? null, input.sessionId ?? null, Date.now()],
     )
+    this.emit({ kind: "run", featureId: input.featureId })
     return id
   }
 
@@ -226,6 +266,8 @@ export class Store {
       "UPDATE step_run SET status = ?, output = ?, reason = ?, time_finished = ? WHERE id = ?",
       [status, detail?.output ?? null, detail?.reason ?? null, Date.now(), runId],
     )
+    const featureId = (this.db.query("SELECT feature_id FROM step_run WHERE id = ?").get(runId) as { feature_id: string } | null)?.feature_id
+    if (featureId) this.emit({ kind: "run", featureId })
   }
 
   /**
@@ -277,7 +319,8 @@ export class Store {
     event: PipelineEvent,
     transition: Transition,
   ): boolean {
-    return this.db.transaction(() => {
+    let featureId: string | null = null
+    const claimed = this.db.transaction(() => {
       const result = this.db.run(
         `UPDATE step_run SET status = ?, output = ?, reason = ?, completion_event = ?, completion_decision = ?, action_handled = 0, time_finished = ?
          WHERE id = ? AND status = 'running'`,
@@ -287,8 +330,11 @@ export class Store {
       const run = this.db.query("SELECT feature_id FROM step_run WHERE id = ?").get(runId) as { feature_id: string } | null
       if (!run) return false
       this.applyTransitionTx(run.feature_id, event, transition)
+      featureId = run.feature_id
       return true
     })()
+    if (claimed && featureId !== null) this.emit({ kind: "transition", featureId })
+    return claimed
   }
 
   /**
@@ -343,6 +389,56 @@ export class Store {
       timeStarted: row.time_started,
       nudges: row.nudges,
     } : null
+  }
+
+  listRuns(featureId: string, limit = 100): Array<{
+    id: string
+    stepId: string
+    stepType: string
+    status: string
+    attempt: number
+    role: string | null
+    model: string | null
+    sessionId: string | null
+    nudges: number
+    output: string | null
+    reason: string | null
+    timeStarted: number
+    timeFinished: number | null
+  }> {
+    const rows = this.db.query(
+      `SELECT id, step_id, step_type, status, attempt, role, model, session_id, nudges, output, reason, time_started, time_finished
+       FROM step_run WHERE feature_id = ? ORDER BY time_started DESC LIMIT ?`,
+    ).all(featureId, limit) as Array<{
+      id: string
+      step_id: string
+      step_type: string
+      status: string
+      attempt: number
+      role: string | null
+      model: string | null
+      session_id: string | null
+      nudges: number
+      output: string | null
+      reason: string | null
+      time_started: number
+      time_finished: number | null
+    }>
+    return rows.map(row => ({
+      id: row.id,
+      stepId: row.step_id,
+      stepType: row.step_type,
+      status: row.status,
+      attempt: row.attempt,
+      role: row.role,
+      model: row.model,
+      sessionId: row.session_id,
+      nudges: row.nudges,
+      output: row.output,
+      reason: row.reason,
+      timeStarted: row.time_started,
+      timeFinished: row.time_finished,
+    }))
   }
 
   incrementNudges(runId: string): number {
@@ -426,6 +522,7 @@ export class Store {
         ids.push(id)
       }
     })()
+    if (ids.length > 0) this.emit({ kind: "finding", featureId })
     return ids
   }
 
@@ -476,6 +573,7 @@ export class Store {
        WHERE id = ?`,
       [status, resolution ?? null, Date.now(), `${featureId}:${shortId}`],
     )
+    if (result.changes > 0) this.emit({ kind: "finding", featureId })
     return result.changes > 0
   }
 
