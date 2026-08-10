@@ -39,6 +39,20 @@ export type {
   WorkflowReservationDiagnostic,
 } from "./workflow-reservation.ts"
 
+export { Daemon, jsonLineLogger, systemIntervalScheduler } from "./daemon.ts"
+export type {
+  DaemonConfig,
+  DaemonDeps,
+  DaemonHealth,
+  DaemonLogEntry,
+  DaemonLogLevel,
+  DaemonLogger,
+  DaemonPhase,
+  DaemonProjectHealth,
+  IntervalScheduler,
+  Reconciler,
+} from "./daemon.ts"
+
 export { ProjectConfigRegistry } from "./project-config-registry.ts"
 export type {
   LoadResult,

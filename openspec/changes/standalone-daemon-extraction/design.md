@@ -267,6 +267,66 @@ logged. A valid reload that removes a live feature's current step publishes
 normally — the engine's existing vanished-step escalation handles the feature
 loudly instead of guessing.
 
+### Daemon lifecycle
+
+`Daemon` (`packages/server/src/daemon.ts`) is the process owner around the
+extracted engine. Its configuration is fully explicit (`DaemonConfig`):
+database path, project list, optional global config path and heartbeat
+interval — no home-directory inference and no hardcoded gateway. Every
+dependency is injectable (`DaemonDeps`), with the production adapters
+(`RealGh` over `realProcessRunner`, `systemClock`, a JSON-line stderr
+logger, real `setInterval`) as default wiring. Interval scheduling itself
+is a port (`IntervalScheduler`) so heartbeat tests fire ticks
+deterministically; the real scheduler `unref`s its handle so the heartbeat
+never keeps a finished process alive.
+
+Startup is a strict sequence: open + migrate the database (a migration
+failure closes the connection and fails the start — phase `failed`),
+register every configured project through `ProjectConfigRegistry` (an
+invalid project logs diagnostics and is reported in health, it never
+blocks valid projects), construct the `Engine` with the registry's
+disk-free resolver, run one recovery `reconcile()` pass (draining the
+durable action outbox), then arm the heartbeat. Only after all of that is
+the daemon `ready`. The timer lives exclusively in the daemon — `Engine`
+still owns no timer or singleton, and `reconcile()` remains a plain async
+method.
+
+Heartbeat cycles never overlap: a tick that lands while a cycle is in
+flight joins the running promise instead of starting a second pass. A
+cycle error is recorded in health (`heartbeat.lastError`), logged and
+absorbed — it never kills the daemon or suppresses the next cycle.
+
+Readiness and liveness are distinct queries on `daemon.health()`:
+`alive` means the daemon object is running (`starting`/`ready`); `ready`
+additionally requires migrations applied, the recovery pass executed and
+the heartbeat armed. Health reports migration state (path, ids applied at
+this startup, known-migration count), heartbeat telemetry (interval,
+in-flight flag, last start/completion, last error, cycle count),
+per-project registry status with diagnostics, and runner availability.
+The HTTP API task will expose this query over HTTP; the lifecycle task
+deliberately opens no listener.
+
+A daemon constructed without a `SessionClient` starts normally and reports
+`runner: "unavailable"`. The stand-in session client claims sessions exist
+and are busy — the safe direction: in-flight agent runs are never nudged
+or reaped merely because no runner is attached (TTL reaping via the
+injected clock still applies), and creating/prompting a session fails
+loudly into the engine's normal step-failure path.
+
+Graceful shutdown (`stop()`) clears the timer, awaits any in-flight
+reconcile cycle, then closes the database. It is idempotent — repeated
+calls share one promise — and safe before `start()`. Active runs stay
+recoverable because everything durable was committed to SQLite before the
+cycle ended; a second daemon started on the same database resumes the
+same feature state (covered by lifecycle tests and the historical DB
+contract).
+
+Structured logs flow through an injectable `DaemonLogger` taking
+`{ level, message, fields }` entries; engine log lines are forwarded with
+a `component: "engine"` field and carry the seed's `feature=<slug>`
+correlation text. Nothing in the daemon logs secrets: `tokenCommand`
+output and config file contents never reach a log entry.
+
 ### Configuration migration
 
 A converter reads `.opencode/conductor.json` and emits `conductor.yaml`. It
