@@ -17,8 +17,8 @@ registration order. The extraction must preserve their fixes.
 ## Goals / Non-goals
 
 **Goals:** standalone lifecycle, versioned API, thin opencode adapter, CLI
-client, native `conductor.yaml` execution, dogfooding on the benches and on
-this repo's own changes.
+client, native `conductor.yaml` execution, adoption on a real project and
+then on this repo's own changes.
 
 **Non-goals:** board UI, webhook ingress, distributed execution or replacing
 SQLite.
@@ -601,7 +601,9 @@ converted. The daemon executes `conductor.yaml` natively:
 1. Move pure code/tests to core, preserving imports and semantics.
 2. Move DB/store/engine/actions/tests to server behind interfaces.
 3. Start daemon/API/CLI around the extracted engine.
-4. Turn plugin into HTTP adapter; run `conductor-test` and `quotes-api` canary.
-5. Copy and migrate gloam DB; run shadow/read-only inspection; switch gloam
-   config and plugin; keep rollback (old plugin + untouched DB copy).
-6. Dogfood Conductor's next own OpenSpec change through the daemon.
+4. Turn plugin into HTTP adapter; adopt Conductor on a real project end to
+   end (fresh repo, `conductor init`, daemon + opencode runner, restart
+   during an active run, human-gate round trip). The earlier
+   canary-bench and gloam-DB-migration steps are void — greenfield, no
+   seed database exists.
+5. Dogfood Conductor's next own OpenSpec change through the daemon.
