@@ -31,6 +31,13 @@ export interface ActionHostDeps {
   /** Injectable wall clock for handlers computing a deadline (e.g.
    *  `github/await-checks`) — never ambient `Date.now()` in a handler. */
   readonly now: () => number
+  /**
+   * Per-execution run-log writer: text lands in the executing run's log
+   * with source "action". Injected by the caller (the engine binds it to
+   * the run id) — a handler never touches the store or the run id
+   * directly. A no-op when the caller supplied none.
+   */
+  readonly runLog: (text: string) => void
 }
 
 export type ActionHandler = (ctx: ActionRunContext, deps: ActionHostDeps) => Promise<ActionResult>
@@ -40,9 +47,15 @@ export type ActionHostExecuteResult =
   | { readonly ok: false; readonly error: string }
   | { readonly ok: "pending"; readonly nextPollMs: number; readonly state: Readonly<Record<string, unknown>> | null }
 
+/** Per-invocation side-effect bindings the caller injects — today just the
+ *  run-scoped log writer the engine binds to the executing run's id. */
+export interface ActionExecuteEffects {
+  readonly runLog?: (text: string) => void
+}
+
 /** The engine's view of an action host — small enough to fake in tests without depending on the real dispatch/capability machinery. */
 export interface ActionExecutor {
-  execute(binding: ResolvedActionBinding, ctx: ActionRunContext): Promise<ActionHostExecuteResult>
+  execute(binding: ResolvedActionBinding, ctx: ActionRunContext, effects?: ActionExecuteEffects): Promise<ActionHostExecuteResult>
 }
 
 const DEFAULT_SUBPROCESS_TIMEOUT_MS = 10 * 60 * 1000
@@ -61,18 +74,19 @@ export class CapabilityDeniedError extends Error {
 export class ActionHost implements ActionExecutor {
   constructor(
     private readonly handlers: Readonly<Record<string, ActionHandler>>,
-    private readonly deps: Omit<ActionHostDeps, "sleep" | "now"> & {
+    private readonly deps: Omit<ActionHostDeps, "sleep" | "now" | "runLog"> & {
       readonly sleep?: (ms: number) => Promise<void>
       readonly now?: () => number
     },
   ) {}
 
-  async execute(binding: ResolvedActionBinding, ctx: ActionRunContext): Promise<ActionHostExecuteResult> {
+  async execute(binding: ResolvedActionBinding, ctx: ActionRunContext, effects?: ActionExecuteEffects): Promise<ActionHostExecuteResult> {
     const deps: ActionHostDeps = {
       process: gateProcessRunner(this.deps.process, ctx.capabilities),
       log: this.deps.log,
       sleep: this.deps.sleep ?? realSleep,
       now: this.deps.now ?? Date.now,
+      runLog: effects?.runLog ?? (() => {}),
     }
     try {
       const result = await this.dispatch(binding.manifest, ctx, deps)

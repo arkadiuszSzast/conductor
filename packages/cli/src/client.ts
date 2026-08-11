@@ -75,6 +75,19 @@ export interface FeaturePayload {
 export type RunSummary = ActiveRun
 export type RunDetail = ActiveRun
 
+export interface RunLogLine {
+  readonly seq: number
+  readonly time: number
+  readonly source: string
+  readonly text: string
+}
+
+export interface RunLogPage {
+  readonly lines: readonly RunLogLine[]
+  readonly nextSeq: number
+  readonly truncated: boolean
+}
+
 export interface FindingView {
   readonly id: string
   readonly stepId: string
@@ -184,6 +197,19 @@ export class ApiClient {
 
   report(runId: string, input: ReportInput): Promise<ReportResult> {
     return this.request("POST", `/v1/runs/${encodeURIComponent(runId)}/report`, input)
+  }
+
+  /** Cursor-incremental run-log read. `limit` defaults server-side (500). */
+  getRunLogs(runId: string, options: { after?: number; limit?: number } = {}): Promise<RunLogPage> {
+    const query = new URLSearchParams()
+    if (options.after !== undefined) query.set("after", String(options.after))
+    if (options.limit !== undefined) query.set("limit", String(options.limit))
+    const suffix = query.size > 0 ? `?${query.toString()}` : ""
+    return this.request("GET", `/v1/runs/${encodeURIComponent(runId)}/logs${suffix}`)
+  }
+
+  appendRunLogs(runId: string, lines: readonly { text: string; source?: "step" | "agent" }[]): Promise<{ appended: number }> {
+    return this.request("POST", `/v1/runs/${encodeURIComponent(runId)}/logs`, { lines })
   }
 
   health(): Promise<Record<string, unknown>> {

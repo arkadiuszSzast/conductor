@@ -31,6 +31,7 @@ import { resolveRunnerConfig, RunnerConfigError } from "./src/config.ts"
 import { createOpencodeSessions, type RawOpencodeSessionApi } from "./src/sessions.ts"
 import { OpencodeRunnerHub, type CallbackListener } from "./src/hub.ts"
 import { createConductorTools } from "./src/tools.ts"
+import { createAgentLogPusher } from "./src/agent-logs.ts"
 
 // ------------------------------------------------------------ fake opencode
 
@@ -607,6 +608,125 @@ jobs:
     await h.daemon.beat()
     expect((await h.client.getRun(runId)).run.status).toBe("succeeded")
     expect((await h.client.getFeature(featureId)).feature.status).toBe("done")
+  })
+})
+
+describe("agent log capture via runner push", () => {
+  function partEvent(sessionID: string, part: { id: string; text: string }): unknown {
+    return { type: "message.part.updated", properties: { sessionID, part: { id: part.id, type: "text", text: part.text } } }
+  }
+
+  class FakeLogClient {
+    pushes: Array<{ runId: string; lines: Array<{ text: string; source?: string }> }> = []
+    failNext = 0
+    rejectWith: number | null = null
+    async appendRunLogs(runId: string, lines: Array<{ text: string; source?: string }>): Promise<{ appended: number }> {
+      if (this.rejectWith !== null) {
+        const status = this.rejectWith
+        this.rejectWith = null
+        throw Object.assign(new Error(`rejected ${status}`), { status })
+      }
+      if (this.failNext > 0) {
+        this.failNext -= 1
+        throw new Error("daemon unreachable")
+      }
+      this.pushes.push({ runId, lines })
+      return { appended: lines.length }
+    }
+  }
+
+  function pusher(overrides: { client: FakeLogClient; log?: (m: string) => void }) {
+    return createAgentLogPusher({
+      client: overrides.client as unknown as ApiClient,
+      runIdForSession: sessionID => (sessionID === "ses-mapped" ? "run-1" : undefined),
+      sleep: async () => {},
+      log: overrides.log ?? (() => {}),
+    })
+  }
+
+  it("accumulates text parts per run, dedupes snapshots and flushes batched agent lines", async () => {
+    const client = new FakeLogClient()
+    const logs = pusher({ client })
+    logs.push(partEvent("ses-mapped", { id: "p1", text: "hello " }))
+    logs.push(partEvent("ses-mapped", { id: "p1", text: "hello world" }))
+    logs.push(partEvent("ses-mapped", { id: "p1", text: "hello world" })) // re-sent snapshot: deduped
+    logs.push(partEvent("ses-mapped", { id: "p2", text: " second" }))
+    await logs.flush()
+
+    expect(client.pushes).toEqual([{ runId: "run-1", lines: [{ text: "hello world second", source: "agent" }] }])
+  })
+
+  it("pushes nothing for unmapped sessions", async () => {
+    const client = new FakeLogClient()
+    const logs = pusher({ client })
+    logs.push(partEvent("ses-foreign", { id: "p1", text: "x" }))
+    await logs.flush()
+    expect(client.pushes).toEqual([])
+  })
+
+  it("ignores non-text and non-part events", async () => {
+    const client = new FakeLogClient()
+    const logs = pusher({ client })
+    logs.push({ type: "session.idle", properties: {} })
+    logs.push({ type: "message.part.updated", properties: { sessionID: "ses-mapped", part: { id: "p1", type: "tool", text: "x" } } })
+    await logs.flush()
+    expect(client.pushes).toEqual([])
+  })
+
+  it("is best-effort: a failed push is logged and the buffer dropped, the run stays tracked", async () => {
+    const client = new FakeLogClient()
+    const logMessages: string[] = []
+    const logs = pusher({ client, log: m => logMessages.push(m) })
+    client.failNext = 1
+    logs.push(partEvent("ses-mapped", { id: "p1", text: "line one" }))
+    await logs.flush()
+    expect(logMessages.some(m => m.includes("failed"))).toBe(true)
+    expect(client.pushes).toEqual([])
+
+    // Next flush succeeds and starts clean.
+    logs.push(partEvent("ses-mapped", { id: "p2", text: "line two" }))
+    await logs.flush()
+    expect(client.pushes).toEqual([{ runId: "run-1", lines: [{ text: "line two", source: "agent" }] }])
+  })
+
+  it("drops the run entirely on a 409 — a late flush after conclusion is never retried", async () => {
+    const client = new FakeLogClient()
+    const logs = pusher({ client })
+    client.rejectWith = 409
+    logs.push(partEvent("ses-mapped", { id: "p1", text: "late" }))
+    await logs.flush()
+    expect(client.pushes).toEqual([])
+    // The run is no longer tracked: further flushes attempt nothing.
+    await logs.flush()
+    expect(client.pushes).toEqual([])
+  })
+
+  it("records the run attribution on session create and streams part events into the daemon route", async () => {
+    const project = writeProject()
+    const h = await makeHarness({ projects: [project] })
+    const opencode = new FakeOpencodeServer(project)
+    const hub = h.makeHub()
+    await hub.registerProject(project, createOpencodeSessions(opencode.api()))
+
+    const payload = await h.client.startFeature({ title: "Agent log flow", project })
+    const runId = payload.activeRun!.id
+    const sessionID = payload.activeRun!.sessionId!
+    expect(sessionID).toBeTruthy()
+    expect(hub.runIdForSession(sessionID)).toBe(runId)
+
+    const logs = createAgentLogPusher({
+      client: h.client,
+      runIdForSession: id => hub.runIdForSession(id),
+      sleep: async () => {},
+    })
+    logs.push(partEvent(sessionID, { id: "p1", text: "thinking… " }))
+    logs.push(partEvent(sessionID, { id: "p1", text: "thinking… done" }))
+    await logs.flush()
+
+    const page = await h.client.getRunLogs(runId)
+    expect(page.lines.map(line => ({ source: line.source, text: line.text }))).toEqual([
+      { source: "agent", text: "thinking… done" },
+    ])
   })
 })
 

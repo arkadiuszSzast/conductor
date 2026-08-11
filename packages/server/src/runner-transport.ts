@@ -97,6 +97,9 @@ export function createRunnerSessionClient(deps: RunnerSessionClientDeps): Sessio
         title: input.title,
         directory: input.directory,
         ...(input.parentID !== undefined ? { parentID: input.parentID } : {}),
+        // Optional end-to-end: a runner that ignores it still creates the
+        // session; the field only enables agent-log attribution.
+        ...(input.runId !== undefined ? { runId: input.runId } : {}),
       })
       if (!response.ok) {
         throw new Error(`runner ${runner.endpoint} failed to create session (status ${response.status})`)

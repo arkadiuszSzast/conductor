@@ -11,7 +11,7 @@ import type { Decision, Feedback, FeatureState, FeatureStatus, PipelineEvent, Tr
  * the notification itself is never a state carrier.
  */
 export interface StoreChange {
-  readonly kind: "feature" | "transition" | "run" | "finding"
+  readonly kind: "feature" | "transition" | "run" | "finding" | "run_log"
   readonly featureId: string
 }
 
@@ -158,6 +158,33 @@ export interface FindingCounts {
   readonly reopened: number
 }
 
+export type RunLogSource = "process" | "action" | "agent" | "step"
+
+export interface RunLogEntryInput {
+  readonly source: RunLogSource
+  readonly text: string
+}
+
+export interface RunLogLine {
+  readonly seq: number
+  readonly time: number
+  readonly source: RunLogSource
+  readonly text: string
+}
+
+export interface RunLogPage {
+  readonly lines: readonly RunLogLine[]
+  /** Cursor for the next fetch: the highest seq the caller has seen. */
+  readonly nextSeq: number
+  /** True when more lines exist beyond this page. */
+  readonly truncated: boolean
+}
+
+/** Per-run size cap for run_log chunk text — enforced at write, drop-oldest. */
+const RUN_LOG_CAP_BYTES = 2 * 1024 * 1024
+/** run_log change notifications for one run coalesce within this window. */
+const RUN_LOG_EMIT_WINDOW_MS = 1_000
+
 export interface FindingView {
   readonly id: string
   readonly stepId: string
@@ -174,8 +201,13 @@ export interface FindingView {
 
 export class Store {
   private readonly changeListeners = new Set<(change: StoreChange) => void>()
+  /** run id → last run_log emission time; throttles run_log notifications at the source. */
+  private readonly runLogEmits = new Map<string, number>()
 
-  constructor(private readonly db: Database) {}
+  constructor(
+    private readonly db: Database,
+    private readonly clock: { now(): number } = { now: () => Date.now() },
+  ) {}
 
   /**
    * Subscribe to post-commit change notifications. Listeners fire AFTER
@@ -518,6 +550,81 @@ export class Store {
   getRunById(runId: string): RunSummary | null {
     const row = this.db.query("SELECT * FROM run WHERE id = ?").get(runId) as RunRow | null
     return row ? toRunSummary(row) : null
+  }
+
+  // ------------------------------------------------------------- run logs
+
+  /**
+   * Appends a batch of log lines to a run's log in ONE transaction:
+   * per-run monotonic seq assignment, the inserts, and the per-run size
+   * cap (drop-oldest — the tail always survives) all commit together.
+   * Returns the appended seq range. The post-commit `run_log`
+   * notification is throttled at the source: successive appends to the
+   * same run within one window coalesce into at most one emission, so a
+   * chatty producer can never flood SSE subscribers. The append itself
+   * is never delayed — only the notification is coalesced.
+   */
+  appendRunLog(runId: string, entries: readonly RunLogEntryInput[]): { firstSeq: number; lastSeq: number } | null {
+    if (entries.length === 0) return null
+    const now = Date.now()
+    let firstSeq = 0
+    this.db.transaction(() => {
+      const row = this.db.query("SELECT COALESCE(MAX(seq), 0) AS maxSeq FROM run_log WHERE run_id = ?").get(runId) as { maxSeq: number }
+      firstSeq = row.maxSeq + 1
+      for (const [offset, entry] of entries.entries()) {
+        this.db.run(
+          "INSERT INTO run_log (run_id, seq, time, source, chunk) VALUES (?, ?, ?, ?, ?)",
+          [runId, firstSeq + offset, now, entry.source, entry.text],
+        )
+      }
+      this.enforceRunLogCap(runId)
+    })()
+    this.emitRunLogChange(runId)
+    return { firstSeq, lastSeq: firstSeq + entries.length - 1 }
+  }
+
+  private enforceRunLogCap(runId: string): void {
+    const total = (this.db.query("SELECT COALESCE(SUM(LENGTH(chunk)), 0) AS bytes FROM run_log WHERE run_id = ?").get(runId) as { bytes: number }).bytes
+    if (total <= RUN_LOG_CAP_BYTES) return
+    let excess = total - RUN_LOG_CAP_BYTES
+    const rows = this.db.query("SELECT seq, LENGTH(chunk) AS bytes FROM run_log WHERE run_id = ? ORDER BY seq ASC").all(runId) as Array<{ seq: number; bytes: number }>
+    let dropUpTo = 0
+    for (const row of rows) {
+      if (excess <= 0) break
+      dropUpTo = row.seq
+      excess -= row.bytes
+    }
+    if (dropUpTo > 0) this.db.run("DELETE FROM run_log WHERE run_id = ? AND seq <= ?", [runId, dropUpTo])
+  }
+
+  private emitRunLogChange(runId: string): void {
+    const featureId = (this.db.query("SELECT feature_id FROM run WHERE id = ?").get(runId) as { feature_id: string } | null)?.feature_id
+    if (featureId === undefined) return
+    const now = this.clock.now()
+    const last = this.runLogEmits.get(runId)
+    if (last !== undefined && now - last < RUN_LOG_EMIT_WINDOW_MS) return
+    this.runLogEmits.set(runId, now)
+    // Opportunistic cleanup: stale entries from runs that stopped logging.
+    if (this.runLogEmits.size > 1024) {
+      for (const [id, at] of this.runLogEmits) {
+        if (now - at >= RUN_LOG_EMIT_WINDOW_MS) this.runLogEmits.delete(id)
+      }
+    }
+    this.emit({ kind: "run_log", featureId })
+  }
+
+  /** Cursor-incremental read: lines with seq > afterSeq, capped at limit. */
+  getRunLog(runId: string, options?: { afterSeq?: number; limit?: number }): RunLogPage {
+    const afterSeq = options?.afterSeq ?? 0
+    const limit = options?.limit ?? 500
+    const rows = this.db.query(
+      "SELECT seq, time, source, chunk FROM run_log WHERE run_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
+    ).all(runId, afterSeq, limit + 1) as Array<{ seq: number; time: number; source: RunLogSource; chunk: string }>
+    const truncated = rows.length > limit
+    const page = truncated ? rows.slice(0, limit) : rows
+    const lines = page.map(row => ({ seq: row.seq, time: row.time, source: row.source, text: row.chunk }))
+    const nextSeq = lines.length > 0 ? lines[lines.length - 1]!.seq : afterSeq
+    return { lines, nextSeq, truncated }
   }
 
   // ------------------------------------------------------------ findings

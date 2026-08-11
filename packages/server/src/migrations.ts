@@ -284,6 +284,26 @@ export const migrations: readonly Migration[] = [
       addColumn(db, "run", "next_observation", "INTEGER")
     },
   },
+  {
+    id: "0011_run_log",
+    up(db) {
+      // Per-run narrative log: command output, action-host chatter, agent
+      // transcripts and step-author lines. Append-only with a monotonic
+      // per-run seq (the read API's cursor); the composite PK doubles as
+      // the (run_id, seq) index. A per-run size cap is enforced at write
+      // time in the store — the schema itself stays unbounded.
+      db.run(`
+        CREATE TABLE run_log (
+          run_id  TEXT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+          seq     INTEGER NOT NULL,
+          time    INTEGER NOT NULL,
+          source  TEXT NOT NULL,
+          chunk   TEXT NOT NULL,
+          PRIMARY KEY (run_id, seq)
+        )
+      `)
+    },
+  },
 ]
 
 function validateMigrations(ordered: readonly Migration[]): void {

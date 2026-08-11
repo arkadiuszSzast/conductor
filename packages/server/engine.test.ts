@@ -7,7 +7,7 @@ import { Store } from "./src/store.ts"
 import { Engine, type EngineDeps, type EngineOptions } from "./src/engine.ts"
 import type { ProcessExecOptions, ProcessExecResult, ProcessRunner, SessionClient } from "./src/ports.ts"
 import type { WorkflowSnapshot } from "./src/workflow-registry.ts"
-import type { ActionExecutor, ActionHostExecuteResult } from "./src/action-host.ts"
+import type { ActionExecutor, ActionExecuteEffects, ActionHostExecuteResult } from "./src/action-host.ts"
 import type { ResolvedActionBinding, ResolvedActionBindings } from "./src/workflow-reservation.ts"
 import {
   agentStep,
@@ -86,10 +86,10 @@ class FakeClock {
 
 class FakeActionHost implements ActionExecutor {
   calls: Array<{ binding: ResolvedActionBinding; ctx: ActionRunContext }> = []
-  handler: ((binding: ResolvedActionBinding, ctx: ActionRunContext) => ActionHostExecuteResult) | null = null
-  async execute(binding: ResolvedActionBinding, ctx: ActionRunContext): Promise<ActionHostExecuteResult> {
+  handler: ((binding: ResolvedActionBinding, ctx: ActionRunContext, effects?: ActionExecuteEffects) => ActionHostExecuteResult) | null = null
+  async execute(binding: ResolvedActionBinding, ctx: ActionRunContext, effects?: ActionExecuteEffects): Promise<ActionHostExecuteResult> {
     this.calls.push({ binding, ctx })
-    if (this.handler) return this.handler(binding, ctx)
+    if (this.handler) return this.handler(binding, ctx, effects)
     return { ok: true, outputs: {} }
   }
 }
@@ -286,6 +286,34 @@ describe("Engine: linear happy path", () => {
     const after = store.getFeature(feature.id)!
     expect(after.status).toBe("done")
     expect(after.jobs["main"]?.steps["gate"]?.outputs).toEqual({ notes: "ship it" })
+  })
+
+  it("command step success persists the interleaved output to the run log as process", async () => {
+    process_.handler = () => ({ code: 0, stdout: "out line", stderr: "err line", output: "err line\nout line" })
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const implementRun = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: implementRun.id, outcome: "succeeded" })
+
+    const verifyRun = store.listRuns(feature.id).find(r => r.stepId === "verify")!
+    const log = store.getRunLog(verifyRun.id)
+    expect(log.lines.map(line => ({ source: line.source, text: line.text }))).toEqual([
+      { source: "process", text: "err line\nout line" },
+    ])
+  })
+
+  it("command step failure keeps the run reason and supplements it with the log", async () => {
+    process_.handler = () => ({ code: 1, stdout: "", stderr: "boom", output: "boom" })
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, outcome: "succeeded" })
+
+    const verifyRun = store.listRuns(feature.id).find(r => r.stepId === "verify")!
+    expect(verifyRun.reason).toBe(`"bun test" exited 1: boom`)
+    const log = store.getRunLog(verifyRun.id)
+    expect(log.lines.map(line => line.source)).toEqual(["process"])
+    expect(log.lines[0]!.text).toBe("boom")
   })
 
   it("command step failure fails the job and escalates (single job, no onFail)", async () => {
@@ -628,6 +656,36 @@ describe("Engine: action steps", () => {
   function bindingsFor(manifest: ActionManifest) {
     return actionBindings([{ jobId: "main", stepId: "worktree", uses: "git/worktree@v1", manifest }])
   }
+
+  it("action handler logging through the injected runLog lands as action lines on the executing run", async () => {
+    const prepFlow: WorkflowDef = workflow(
+      {
+        main: job([
+          actionStepDef("worktree", "test/action@v1"),
+          agentStep("implement", "implementer", "go"),
+        ]),
+      },
+      roles,
+      "prep-flow",
+    )
+    const testBinding = actionManifest({ name: "test/action" })
+    const engine = makeEngine(prepFlow, {}, {}, actionBindings([
+      { jobId: "main", stepId: "worktree", uses: "test/action@v1", manifest: testBinding },
+    ]))
+    actions.handler = (_binding, _ctx, effects) => {
+      effects?.runLog?.("observing external state…")
+      effects?.runLog?.("still waiting")
+      return { ok: true, outputs: {} }
+    }
+    const feature = await startedFeature(engine)
+    const actionRun = store.listRuns(feature.id).find(r => r.stepId === "worktree")!
+    expect(actionRun.status).toBe("succeeded")
+    const log = store.getRunLog(actionRun.id)
+    expect(log.lines.map(line => ({ source: line.source, text: line.text }))).toEqual([
+      { source: "action", text: "observing external state…" },
+      { source: "action", text: "still waiting" },
+    ])
+  })
 
   it("dispatches through registry→reservation→host, and downstream steps see its outputs via {{ steps }}", async () => {
     actions.handler = () => ({ ok: true, outputs: { path: "/repo-worktrees/feat-x" } })
