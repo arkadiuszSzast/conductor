@@ -1,0 +1,35 @@
+.wrap {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  z-index: var(--z-toast);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 380px;
+}
+.toast {
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+}
+.toast.error {
+  border-color: color-mix(in oklch, var(--red) 50%, var(--border-strong));
+}
+.toast.info {
+  border-color: color-mix(in oklch, var(--blue) 40%, var(--border-strong));
+}
+.message {
+  font-size: 12px;
+}
+.dismiss {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-faint);
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0;
+}

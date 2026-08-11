@@ -10,10 +10,10 @@
     "apps/*"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && bun run --cwd apps/web typecheck",
     "test": "bun test",
-    "lint": "tsc --noEmit --noUnusedLocals",
-    "build": "bun run typecheck"
+    "lint": "tsc --noEmit --noUnusedLocals && bun run --cwd apps/web lint",
+    "build": "bun run typecheck && bun run --cwd apps/web build:vite"
   },
   "engines": {
     "node": ">=24",
