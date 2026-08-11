@@ -497,6 +497,24 @@ export class Store {
     return row?.nudges ?? 0
   }
 
+  /**
+   * Newest run id per (jobId, stepId) across a feature's WHOLE run
+   * history — one grouped query, immune to any list limit. Backs the
+   * detail projection's truncated-output pointer.
+   */
+  newestRunIdsByStep(featureId: string): ReadonlyMap<string, string> {
+    // SQLite's bare-column-with-MAX() semantics: `id` comes from the row
+    // holding the per-group MAX(time_started).
+    const rows = this.db.query(
+      `SELECT job_id, step_id, id, MAX(time_started) FROM run
+       WHERE feature_id = ?
+       GROUP BY job_id, step_id`,
+    ).all(featureId) as Array<{ job_id: string; step_id: string; id: string }>
+    const ids = new Map<string, string>()
+    for (const row of rows) ids.set(`${row.job_id}\u0000${row.step_id}`, row.id)
+    return ids
+  }
+
   getRunById(runId: string): RunSummary | null {
     const row = this.db.query("SELECT * FROM run WHERE id = ?").get(runId) as RunRow | null
     return row ? toRunSummary(row) : null

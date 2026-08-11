@@ -28,7 +28,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto"
 import { statSync } from "node:fs"
 import { extname, resolve, sep } from "node:path"
 import type { FeatureState, FeatureStatus, StepRuntime } from "@conductor/core"
-import type { RunSummary, Store, StoreChange } from "./store.ts"
+import type { Store, StoreChange } from "./store.ts"
 import type { DaemonHealth, DaemonLogger } from "./daemon.ts"
 import type { WorkflowResolver, WorkflowStatus } from "./workflow-registry.ts"
 import type { RunnerRegistry } from "./runner-registry.ts"
@@ -199,13 +199,8 @@ interface StepDetailProjection {
  */
 function jobsDetail(
   feature: FeatureState,
-  runs: readonly RunSummary[],
+  newestRunByStep: ReadonlyMap<string, string>,
 ): Readonly<Record<string, unknown>> {
-  const newestRunByStep = new Map<string, string>()
-  for (const run of runs) {
-    const key = `${run.jobId}\u0000${run.stepId}`
-    if (!newestRunByStep.has(key)) newestRunByStep.set(key, run.id)
-  }
   const detail: Record<string, unknown> = {}
   for (const [jobId, jobRuntime] of Object.entries(feature.jobs)) {
     const steps: Record<string, StepDetailProjection> = {}
@@ -338,7 +333,6 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     const record = store.getFeatureRecord(featureId)
     if (!record) return null
     const feature = record.state
-    const runs = store.listRuns(featureId)
     return {
       feature: {
         ...feature,
@@ -347,7 +341,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         createdAt: record.createdAt,
         updatedAt: record.updatedAt,
         workflowRef: workflowRefOf(feature.projectDir),
-        jobs: jobsDetail(feature, runs),
+        jobs: jobsDetail(feature, store.newestRunIdsByStep(featureId)),
       },
       activeRun: store.getActiveRun(featureId),
     }
@@ -392,6 +386,15 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     if (method === "GET" && path === "/v1/readyz") {
       const snapshot = health()
       return json(snapshot.ready ? 200 : 503, { ready: snapshot.ready, phase: snapshot.phase }, requestId)
+    }
+
+    // Static SPA serving is opt-in, strictly subordinate to /v1 routing
+    // and — like the probes — unauthenticated: a browser's top-level
+    // navigation and asset fetches cannot attach a bearer header, so the
+    // app shell must load without one. The API under /v1 stays guarded.
+    if (staticRoot !== null && !path.startsWith("/v1") && (method === "GET" || method === "HEAD")) {
+      const served = serveStatic(staticRoot, path, requestId)
+      if (served !== null) return served
     }
 
     if (!authorized(request)) return error(requestId, "unauthorized", "missing or invalid bearer token")
@@ -511,13 +514,6 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       }
       if (action === "report" && method === "POST") return reportRun(request, runId, requestId)
       return error(requestId, "not_found", `no route for ${method} ${path}`)
-    }
-
-    // Static SPA serving is opt-in and strictly subordinate: only paths
-    // the /v1 router did not claim reach here, so API routes always win.
-    if (staticRoot !== null && !path.startsWith("/v1") && (method === "GET" || method === "HEAD")) {
-      const served = serveStatic(staticRoot, path, requestId)
-      if (served !== null) return served
     }
 
     return error(requestId, "not_found", `no route for ${method} ${path}`)

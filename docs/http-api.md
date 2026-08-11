@@ -74,6 +74,8 @@ feature — the graph view fetches here, not from the feature payload.
 explicitly configured directory: `GET`/`HEAD` on non-`/v1` paths serve files
 with extension-derived content types, unmatched paths fall back to
 `index.html`, path traversal is rejected, and `/v1/*` always takes
-precedence. There is no default directory and the API emits **no CORS
+precedence. Static assets are served without authentication (a browser's
+page-load and asset fetches cannot attach a bearer header); everything under
+`/v1` stays guarded. There is no default directory and the API emits **no CORS
 headers**: the shipped SPA is same-origin by construction, and a dev SPA
 server is expected to proxy `/v1` itself.

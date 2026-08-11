@@ -338,6 +338,21 @@ describe("finding counts", () => {
   })
 })
 
+describe("newest run per step", () => {
+  it("returns the newest run id per (job, step) across the whole history", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const oldRun = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 1 })
+    store.finishRun(oldRun, "failed", { reason: "boom" })
+    connection.db.run("UPDATE run SET time_started = time_started - 1000 WHERE id = ?", [oldRun])
+    const newRun = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 2 })
+    const otherStep = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "review", stepType: "agent", attempt: 1 })
+
+    const newest = store.newestRunIdsByStep(feature.id)
+    expect(newest.get("main\u0000implement")).toBe(newRun)
+    expect(newest.get("main\u0000review")).toBe(otherStep)
+  })
+})
+
 describe("timeline events", () => {
   it("returns event as a parsed object", () => {
     const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })

@@ -543,15 +543,37 @@ describe("API: static UI serving", () => {
   })
 
   it("rejects path traversal outside the configured directory", async () => {
-    const staticDir = writeSpa()
-    const secretDir = tempDir("conductor-api-secret-")
-    writeFileSync(join(secretDir, "secret.txt"), "top secret")
+    // The secret sits at the LITERAL parent of staticDir, so a naive
+    // `resolve(root, "../secret.txt")` without the prefix guard would
+    // actually reach it — the fixture proves the guard, not luck.
+    const parent = tempDir("conductor-api-ui-parent-")
+    writeFileSync(join(parent, "secret.txt"), "top secret")
+    const staticDir = join(parent, "dist")
+    mkdirSync(staticDir)
+    writeFileSync(join(staticDir, "index.html"), "<!doctype html><title>conductor ui</title>")
     const { api } = await makeApi({ ui: { staticDir } })
-    for (const path of ["/../secret.txt", "/..%2fsecret.txt", "/%2e%2e/secret.txt"]) {
+    for (const path of ["/../secret.txt", "/..%2fsecret.txt", "/%2e%2e/secret.txt", "/assets/../../secret.txt"]) {
       const response = await api.handle(new Request(`http://conductor.test${path}`))
       const text = await response.text()
       expect(text).not.toContain("top secret")
     }
+  })
+
+  it("serves static assets without a token under bearer auth while /v1 stays guarded", async () => {
+    const staticDir = writeSpa()
+    const { request } = await makeApi({ ui: { staticDir }, auth: { mode: "bearer", token: "secret-token" } })
+
+    const root = await request("GET", "/")
+    expect(root.status).toBe(200)
+    expect(await root.text()).toContain("conductor ui")
+
+    const asset = await request("GET", "/assets/app.js")
+    expect(asset.status).toBe(200)
+
+    const denied = await request("GET", "/v1/features")
+    expect(denied.status).toBe(401)
+    const allowed = await request("GET", "/v1/features", undefined, { authorization: "Bearer secret-token" })
+    expect(allowed.status).toBe(200)
   })
 
   it("without ui config the root path stays the JSON 404 envelope", async () => {

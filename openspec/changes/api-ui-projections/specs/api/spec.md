@@ -135,8 +135,10 @@ When configured: `GET` requests for paths outside `/v1` are served from the
 directory with `Content-Type` derived from the file extension; requests for
 paths that do not match a file fall back to `index.html` (SPA routing);
 `/v1/*` routes always take precedence; path traversal outside the configured
-directory SHALL be rejected. The API SHALL NOT emit CORS headers — the SPA
-is same-origin by construction.
+directory SHALL be rejected. Static assets SHALL be served without
+authentication — a browser's page-load and asset fetches cannot attach a
+bearer header — while every `/v1` route keeps its auth guard. The API SHALL
+NOT emit CORS headers — the SPA is same-origin by construction.
 
 #### Scenario: Configured directory serves the app shell and assets
 
@@ -157,6 +159,14 @@ is same-origin by construction.
 - **WHEN** `ui.staticDir` is configured
 - **THEN** `GET /v1/features` is handled by the API, not the static layer,
   and an unknown `/v1/...` path returns the API's JSON 404 error envelope
+
+#### Scenario: Static assets load under bearer auth without a token
+
+- **WHEN** `ui.staticDir` is configured and the API uses bearer
+  authentication
+- **THEN** `GET /` and asset requests succeed without an `Authorization`
+  header
+- **AND** `/v1` routes still require the token
 
 #### Scenario: Path traversal is rejected
 
