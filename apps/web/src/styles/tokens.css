@@ -1,0 +1,28 @@
+:root {
+  --bg: #0b0e14;
+  --bg-raised: #11151d;
+  --bg-hover: #171c26;
+  --bg-active: #1b2330;
+  --border: #1e2430;
+  --border-strong: #2a3242;
+
+  --text: #e6e9ef;
+  --text-dim: #9aa4b2;
+  --text-faint: #6b7280;
+
+  --amber: #f5a623;
+  --red: #ff5c5c;
+  --blue: #4da3ff;
+  --green: #3fb68b;
+  --gray: #6b7280;
+
+  --radius: 8px;
+  --radius-sm: 5px;
+
+  --font-ui: "Inter", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --z-strip: 10;
+  --z-drawer: 30;
+  --z-toast: 100;
+}

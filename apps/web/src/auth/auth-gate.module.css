@@ -1,0 +1,38 @@
+.wrap {
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+}
+.card {
+  width: 360px;
+  max-width: calc(100vw - 32px);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+}
+.title {
+  font-size: 16px;
+  margin-bottom: 4px;
+}
+.hint {
+  color: var(--text-dim);
+  margin-bottom: 16px;
+}
+.row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.row input {
+  flex: 1;
+}
+.error {
+  color: var(--red);
+  margin-top: 8px;
+  min-height: 16px;
+}
+.reconnect {
+  margin-top: 12px;
+  color: var(--text-dim);
+}
