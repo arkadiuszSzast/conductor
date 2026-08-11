@@ -500,10 +500,18 @@ export interface ActionRunContext {
   readonly workdir: string
   readonly inputs: Readonly<Record<string, unknown>>
   readonly capabilities: readonly ActionCapability[]
+  /** The `state` from this run's previous `pending` result — absent on the
+   *  first invocation. Lets a polling action resume observation (e.g. a
+   *  deadline it computed once) without recomputing it from ambient time. */
+  readonly resume?: Readonly<Record<string, unknown>>
 }
 
-/** What an action returns. `pending`/polling is deliberately absent — the
- *  durable pending protocol arrives with the polling work (task 3.2+). */
+/** What an action returns. `pending` durably suspends the run: the daemon
+ *  records `state` and re-invokes the action no earlier than `nextPollMs`
+ *  from now, passing `state` back as `ctx.resume` — the run row stays
+ *  `running` throughout, so no attempt is burned and no extra run row
+ *  accumulates. */
 export type ActionResult =
   | { readonly status: "succeeded"; readonly outputs: Readonly<Record<string, unknown>> }
   | { readonly status: "failed"; readonly error: string }
+  | { readonly status: "pending"; readonly nextPollMs: number; readonly state?: Readonly<Record<string, unknown>> }

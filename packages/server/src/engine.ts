@@ -29,6 +29,7 @@ import { DEFAULT_OUTCOME, buildEvalContext, extractExpressions, interpret, rende
 import type {
   ActionInputType,
   ActionManifest,
+  ActionRunContext,
   ActionStep,
   AgentStep,
   CommandStep,
@@ -39,11 +40,12 @@ import type {
   StepDef,
   WorkflowDef,
 } from "@conductor/core"
-import type { Store } from "./store.ts"
+import type { RunSummary, Store } from "./store.ts"
 import type { WorkflowResolver, WorkflowSnapshot } from "./workflow-registry.ts"
 import type { Clock, Logger, ProcessRunner, SessionClient } from "./ports.ts"
 import type { ActionExecutor } from "./action-host.ts"
 import { actionBindingsForReconciler } from "./workflow-reservation.ts"
+import type { ResolvedActionBinding } from "./workflow-reservation.ts"
 
 const DEFAULT_RUN_TTL_MS = 3_600_000
 const DEFAULT_NUDGE_IDLE_CYCLES = 2
@@ -341,7 +343,7 @@ export class Engine {
   }
 
   private async executeAction(featureId: string, snapshot: WorkflowSnapshot, jobId: string, step: ActionStep): Promise<void> {
-    const { store, actions, log } = this.deps
+    const { store } = this.deps
     const state = store.getFeature(featureId)
     if (!state) return
     const attempt = (state.jobs[jobId]?.attempts[step.id] ?? 0) + 1
@@ -353,15 +355,12 @@ export class Engine {
       return
     }
 
-    const feedback = store.getFeedback(featureId) ?? undefined
-    const context = buildEvalContext(snapshot.workflow, state, jobId, feedback)
-
     const runId = store.insertRun({
       featureId, jobId, stepId: step.id, stepType: "action", attempt,
       metadata: { uses: step.uses, version: binding.manifest.version, digest: binding.digest },
     })
 
-    const coerced = coerceActionInputs(step.with, binding.manifest, context, log)
+    const coerced = this.renderActionInputs(snapshot, state, jobId, step, binding.manifest)
     if (!coerced.ok) {
       await this.concludeAndDispatch(
         featureId, runId, "failed", { reason: coerced.error },
@@ -370,39 +369,83 @@ export class Engine {
       return
     }
 
-    // Detach the host execution from the dispatch chain: a polling
-    // action (await-checks) blocks its own run for minutes, and awaiting
-    // it here would park reconcile() — and with it nudge/reap/dispatch —
-    // for EVERY feature until it settles. The run row is already
-    // committed, so restart recovery and TTL reaping see the run either
-    // way; `settleActions()` lets tests (and shutdown) drain the map.
+    this.dispatchActionObservation(featureId, jobId, step.id, runId, binding, {
+      featureId,
+      jobId,
+      stepId: step.id,
+      workdir: state.worktree ?? state.projectDir,
+      inputs: coerced.inputs,
+      capabilities: binding.manifest.capabilities,
+    })
+  }
+
+  /**
+   * Renders a step's `with:` values into typed action inputs against the
+   * feature's current state — the exact same render+coerce path
+   * `executeAction`'s first invocation uses and `reconcileActionRun`'s
+   * re-observation reuses, so a template referencing `feedback`/`needs`
+   * resolves consistently across every observation of a durable-pending run.
+   */
+  private renderActionInputs(
+    snapshot: WorkflowSnapshot,
+    state: FeatureState,
+    jobId: string,
+    step: ActionStep,
+    manifest: ActionManifest,
+  ): CoerceActionInputsResult {
+    const feedback = this.deps.store.getFeedback(state.id) ?? undefined
+    const context = buildEvalContext(snapshot.workflow, state, jobId, feedback)
+    return coerceActionInputs(step.with, manifest, context, this.deps.log)
+  }
+
+  /**
+   * Detach one action-host invocation from the dispatch chain and settle
+   * its result onto `runId`. Succeeded/failed conclude the run, advancing
+   * the workflow; pending records the next-observation policy on the SAME
+   * run row (no new row, no burned attempt) for `reconcileActionRun` to
+   * re-invoke later — one observation per invocation. Shared by the first
+   * invocation (`executeAction`) and every re-observation
+   * (`reconcileActionRun`): awaiting a polling action here would park
+   * reconcile() — and with it nudge/reap/dispatch — for EVERY feature
+   * until it settles. `settleActions()` lets tests (and shutdown) drain
+   * the map.
+   */
+  private dispatchActionObservation(
+    featureId: string,
+    jobId: string,
+    stepId: string,
+    runId: string,
+    binding: ResolvedActionBinding,
+    ctx: ActionRunContext,
+  ): void {
+    const { store, actions, log, clock } = this.deps
     const execution = (async () => {
       try {
-        const result = await actions.execute(binding, {
-          featureId,
-          jobId,
-          stepId: step.id,
-          workdir: state.worktree ?? state.projectDir,
-          inputs: coerced.inputs,
-          capabilities: binding.manifest.capabilities,
-        })
+        const result = await actions.execute(binding, ctx)
+        if (result.ok === "pending") {
+          const claimed = store.recordPendingObservation(runId, result.state, clock.now() + result.nextPollMs)
+          if (!claimed) {
+            log.log(`feature=${featureId}: run ${runId} concluded before its pending observation was recorded — dropping`)
+          }
+          return
+        }
         if (!result.ok) {
           await this.concludeAndDispatch(
             featureId, runId, "failed", { reason: result.error },
-            { kind: "step.failed", jobId, stepId: step.id, reason: result.error },
+            { kind: "step.failed", jobId, stepId, reason: result.error },
           )
           return
         }
         const outputs = stringifyOutputs(result.outputs)
         await this.concludeAndDispatch(
           featureId, runId, "succeeded", { outputs },
-          { kind: "step.completed", jobId, stepId: step.id, outcome: DEFAULT_OUTCOME, outputs },
+          { kind: "step.completed", jobId, stepId, outcome: DEFAULT_OUTCOME, outputs },
         )
       } catch (err) {
         const reason = `action host error: ${errorMessage(err)}`
         await this.concludeAndDispatch(
           featureId, runId, "failed", { reason },
-          { kind: "step.failed", jobId, stepId: step.id, reason },
+          { kind: "step.failed", jobId, stepId, reason },
         )
       } finally {
         this.actionRuns.delete(runId)
@@ -564,7 +607,7 @@ export class Engine {
   }
 
   private async reconcileFeature(input: FeatureState): Promise<void> {
-    const { store, log } = this.deps
+    const { store, log, clock } = this.deps
     const snapshot = this.deps.workflows(input.projectDir)
     if (!snapshot) return
 
@@ -618,12 +661,24 @@ export class Engine {
 
       if (step.type === "agent") {
         await this.reconcileAgentRun(feature, snapshot, active)
+      } else if (step.type === "action" && active.nextObservation !== null) {
+        // A durable-pending action run: it survives a daemon restart by
+        // design (that's the whole point of the protocol) — never treated
+        // as orphaned. TTL still governs its overall lifetime; short of
+        // that, re-observe once its next-observation time has passed
+        // (guarding against double-invocation if an observation for this
+        // run is already in flight — e.g. this pass raced dispatch).
+        if (clock.now() - active.timeStarted > this.runTtlMs) {
+          await this.reconcileTtl(feature, snapshot, active)
+        } else if (!this.actionRuns.has(active.id) && clock.now() >= active.nextObservation) {
+          await this.reconcileActionRun(feature, snapshot, jobId, step, active)
+        }
       } else if (step.type === "action" && !this.actionRuns.has(active.id)) {
-        // A running action run with no tracked execution means the daemon
-        // restarted mid-action. Waiting for TTL would stall the feature
-        // for no reason: conclude it failed now — bundled actions are
-        // idempotent, so the workflow's retry/onFail policy can safely
-        // re-dispatch.
+        // A running action run with no tracked execution and no pending
+        // observation means the daemon restarted mid-action. Waiting for
+        // TTL would stall the feature for no reason: conclude it failed
+        // now — bundled actions are idempotent, so the workflow's
+        // retry/onFail policy can safely re-dispatch.
         log.log(`reconcile ${feature.slug}: run ${active.id} (action ${stepId}) has no live execution — daemon restarted, failing for retry`)
         await this.concludeAndDispatch(
           feature.id, active.id, "failed",
@@ -634,6 +689,41 @@ export class Engine {
         await this.reconcileTtl(feature, snapshot, active)
       }
     }
+  }
+
+  private async reconcileActionRun(
+    feature: FeatureState,
+    snapshot: WorkflowSnapshot,
+    jobId: string,
+    step: ActionStep,
+    active: RunSummary,
+  ): Promise<void> {
+    const binding = actionBindingsForReconciler(snapshot.actionBindings).get(jobId, step.id)
+    if (!binding) {
+      const reason = `action "${step.uses}" has no resolved binding for job "${jobId}" step "${step.id}" (workflow changed since load?)`
+      await this.concludeAndDispatch(
+        feature.id, active.id, "failed", { reason },
+        { kind: "step.failed", jobId, stepId: step.id, reason },
+      )
+      return
+    }
+    const coerced = this.renderActionInputs(snapshot, feature, jobId, step, binding.manifest)
+    if (!coerced.ok) {
+      await this.concludeAndDispatch(
+        feature.id, active.id, "failed", { reason: coerced.error },
+        { kind: "step.failed", jobId, stepId: step.id, reason: coerced.error },
+      )
+      return
+    }
+    this.dispatchActionObservation(feature.id, jobId, step.id, active.id, binding, {
+      featureId: feature.id,
+      jobId,
+      stepId: step.id,
+      workdir: feature.worktree ?? feature.projectDir,
+      inputs: coerced.inputs,
+      capabilities: binding.manifest.capabilities,
+      resume: active.pendingState ?? undefined,
+    })
   }
 
   private async reconcileAgentRun(

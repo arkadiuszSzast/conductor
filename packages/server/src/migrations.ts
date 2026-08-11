@@ -271,6 +271,19 @@ export const migrations: readonly Migration[] = [
       db.run("CREATE INDEX IF NOT EXISTS idx_run_feature ON run(feature_id, time_started)")
     },
   },
+  {
+    id: "0010_run_pending_observation",
+    up(db) {
+      // Durable pending observation: a polling action's run row stays
+      // 'running' across observations instead of accumulating a new run
+      // row per poll or holding its detached execution open for the
+      // whole window. `pending_state` is the opaque JSON the action asked
+      // for back; `next_observation` is when the reconciler should
+      // re-invoke it.
+      addColumn(db, "run", "pending_state", "TEXT")
+      addColumn(db, "run", "next_observation", "INTEGER")
+    },
+  },
 ]
 
 function validateMigrations(ordered: readonly Migration[]): void {

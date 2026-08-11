@@ -790,6 +790,167 @@ describe("Engine: action steps", () => {
   })
 })
 
+describe("Engine: durable pending action steps", () => {
+  const pollManifest = actionManifest({
+    name: "test/poll",
+    inputs: {},
+    outputs: {},
+    capabilities: [],
+  })
+
+  const pendingWorkflow: WorkflowDef = workflow(
+    {
+      main: job([
+        actionStepDef("poll", "test/poll@v1"),
+        agentStep("implement", "implementer", "go"),
+      ]),
+    },
+    roles,
+    "action-pending",
+  )
+
+  function bindingsFor() {
+    return actionBindings([{ jobId: "main", stepId: "poll", uses: "test/poll@v1", manifest: pollManifest }])
+  }
+
+  it("a pending result keeps the run running, burns no attempt, persists pendingState/nextObservation, and does not advance the feature", async () => {
+    actions.handler = () => ({ ok: "pending", nextPollMs: 5000, state: { deadline: 999 } })
+    const engine = makeEngine(pendingWorkflow, {}, { clock }, bindingsFor())
+    const feature = await startedFeature(engine)
+    await engine.settleActions()
+
+    const run = store.listRuns(feature.id).find(r => r.stepId === "poll")!
+    expect(run.status).toBe("running")
+    expect(run.attempt).toBe(1)
+    expect(run.pendingState).toEqual({ deadline: 999 })
+    expect(run.nextObservation).toBe(clock.now() + 5000)
+    expect(store.getFeature(feature.id)?.jobs["main"]?.currentStep).toBe("poll")
+    expect(actions.calls).toHaveLength(1)
+  })
+
+  it("reconcile before nextObservation does not re-invoke the action", async () => {
+    actions.handler = () => ({ ok: "pending", nextPollMs: 60_000, state: {} })
+    const engine = makeEngine(pendingWorkflow, {}, { clock }, bindingsFor())
+    await startedFeature(engine)
+    await engine.settleActions()
+    expect(actions.calls).toHaveLength(1)
+
+    clock.advance(1000)
+    await engine.reconcile()
+    expect(actions.calls).toHaveLength(1)
+  })
+
+  it("advancing the clock past nextObservation re-invokes the action with ctx.resume equal to the recorded state", async () => {
+    let call = 0
+    let seenResume: unknown
+    actions.handler = (_binding, ctx) => {
+      call++
+      seenResume = ctx.resume
+      if (call === 1) return { ok: "pending", nextPollMs: 30_000, state: { deadline: 42 } }
+      return { ok: true, outputs: {} }
+    }
+    const engine = makeEngine(pendingWorkflow, {}, { clock }, bindingsFor())
+    await startedFeature(engine)
+    await engine.settleActions()
+    expect(actions.calls).toHaveLength(1)
+    expect(seenResume).toBeUndefined()
+
+    clock.advance(31_000)
+    await engine.reconcile()
+    await engine.settleActions()
+
+    expect(actions.calls).toHaveLength(2)
+    expect(seenResume).toEqual({ deadline: 42 })
+  })
+
+  it("pending then succeeded concludes the SAME run row (attempt stays 1) and advances the workflow", async () => {
+    let call = 0
+    actions.handler = () => {
+      call++
+      if (call === 1) return { ok: "pending", nextPollMs: 10_000, state: { x: 1 } }
+      return { ok: true, outputs: {} }
+    }
+    const engine = makeEngine(pendingWorkflow, {}, { clock }, bindingsFor())
+    const feature = await startedFeature(engine)
+    await engine.settleActions()
+    const runId = store.listRuns(feature.id).find(r => r.stepId === "poll")!.id
+
+    clock.advance(11_000)
+    await engine.reconcile()
+    await engine.settleActions()
+
+    const run = store.getRunById(runId)!
+    expect(run.status).toBe("succeeded")
+    expect(run.attempt).toBe(1)
+    expect(store.listRuns(feature.id).filter(r => r.stepId === "poll")).toHaveLength(1)
+    expect(store.getFeature(feature.id)?.jobs["main"]?.currentStep).toBe("implement")
+  })
+
+  it("a restart re-observes a pending action run instead of failing it (the orphan-fail path is for runs without nextObservation)", async () => {
+    actions.handler = () => ({ ok: "pending", nextPollMs: 5000, state: { a: 1 } })
+    const engine1 = makeEngine(pendingWorkflow, {}, { clock }, bindingsFor())
+    const feature = await startedFeature(engine1)
+    await engine1.settleActions()
+    const runId = store.listRuns(feature.id).find(r => r.stepId === "poll")!.id
+
+    let seenResume: unknown
+    actions.handler = (_binding, ctx) => {
+      seenResume = ctx.resume
+      return { ok: true, outputs: {} }
+    }
+    const engine2 = makeEngine(pendingWorkflow, {}, { clock }, bindingsFor())
+    clock.advance(6000)
+    await engine2.reconcile()
+    await engine2.settleActions()
+
+    const run = store.getRunById(runId)!
+    expect(run.status).toBe("succeeded")
+    expect(seenResume).toEqual({ a: 1 })
+    expect(store.getFeature(feature.id)?.status).not.toBe("escalated")
+  })
+
+  it("TTL reaping still applies to a pending run whose timeStarted is ancient", async () => {
+    actions.handler = () => ({ ok: "pending", nextPollMs: 999_999_999, state: {} })
+    const engine = makeEngine(pendingWorkflow, { runTtlMs: 1000 }, { clock }, bindingsFor())
+    const feature = await startedFeature(engine)
+    await engine.settleActions()
+
+    clock.advance(2000)
+    await engine.reconcile()
+
+    const run = store.listRuns(feature.id).find(r => r.stepId === "poll")!
+    expect(run.status).toBe("reaped")
+  })
+
+  it("recordPendingObservation racing a concluded run is dropped", async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => {
+      release = resolve
+    })
+    actions.execute = async (binding, ctx) => {
+      actions.calls.push({ binding, ctx })
+      await gate
+      return { ok: "pending", nextPollMs: 5000, state: { x: 1 } }
+    }
+    const engine = makeEngine(pendingWorkflow, { runTtlMs: 1000 }, { clock }, bindingsFor())
+    await engine.startFeature("/tmp/project", { title: "Race" })
+    const feature = store.listFeatures()[0]!
+    const runId = store.listRuns(feature.id).find(r => r.stepId === "poll")!.id
+
+    clock.advance(2000)
+    await engine.reconcile()
+    expect(store.getRunById(runId)!.status).toBe("reaped")
+
+    release()
+    await engine.settleActions()
+
+    const run = store.getRunById(runId)!
+    expect(run.status).toBe("reaped")
+    expect(run.pendingState).toBeNull()
+    expect(run.nextObservation).toBeNull()
+  })
+})
+
 describe("Engine: startFeature", () => {
   it("returns project_not_configured when no workflow is registered", async () => {
     const engine = new Engine({

@@ -15,10 +15,10 @@ moves into the monorepo as `@conductor/core` and `@conductor/server`. What is
 opencode-specific shrinks into `@conductor/runner-opencode`.
 
 The acceptance bar is dogfooding, not refactoring: after this change the
-standalone daemon drives real repos (the `conductor-test` / `quotes-api`
-benches, then this repo's own changes) end to end on `conductor.yaml`
-workflows, and the old plugin's tool surface is re-exposed through the
-daemon's API plus a `conductor` CLI.
+standalone daemon drives a real project end to end on `conductor.yaml`
+workflows (a fresh repo adopts Conductor from `conductor init` through a
+human-gate round trip, then this repo's own changes), and the old plugin's
+tool surface is re-exposed through the daemon's API plus a `conductor` CLI.
 
 **Greenfield decision (recorded mid-change):** this project has no users and
 no deployed databases. The seed's `.opencode/conductor.json` pipeline format

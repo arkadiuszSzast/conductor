@@ -133,6 +133,49 @@ describe("runs", () => {
     const b = store.insertRun({ featureId: feature.id, jobId: "b", stepId: "s", stepType: "command", attempt: 1 })
     expect(store.listActiveRuns(feature.id).map(r => r.id).sort()).toEqual([a, b].sort())
   })
+
+  it("insertRun leaves pendingState/nextObservation null", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "poll", stepType: "action", attempt: 1 })
+    const run = store.getRunById(runId)!
+    expect(run.pendingState).toBeNull()
+    expect(run.nextObservation).toBeNull()
+  })
+
+  it("recordPendingObservation claims a running run and round-trips pendingState/nextObservation", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "poll", stepType: "action", attempt: 1 })
+    const claimed = store.recordPendingObservation(runId, { deadline: 123 }, 999)
+    expect(claimed).toBe(true)
+
+    const run = store.getRunById(runId)!
+    expect(run.status).toBe("running")
+    expect(run.pendingState).toEqual({ deadline: 123 })
+    expect(run.nextObservation).toBe(999)
+    expect(store.getActiveRun(feature.id)?.id).toBe(runId)
+  })
+
+  it("recordPendingObservation accepts a null state", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "poll", stepType: "action", attempt: 1 })
+    store.recordPendingObservation(runId, null, 500)
+    const run = store.getRunById(runId)!
+    expect(run.pendingState).toBeNull()
+    expect(run.nextObservation).toBe(500)
+  })
+
+  it("recordPendingObservation returns false and drops the write once the run has concluded", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "poll", stepType: "action", attempt: 1 })
+    store.finishRun(runId, "reaped", { reason: "TTL" })
+
+    const claimed = store.recordPendingObservation(runId, { deadline: 1 }, 1000)
+    expect(claimed).toBe(false)
+    const run = store.getRunById(runId)!
+    expect(run.pendingState).toBeNull()
+    expect(run.nextObservation).toBeNull()
+    expect(run.status).toBe("reaped")
+  })
 })
 
 describe("concludeRun", () => {

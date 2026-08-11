@@ -26,8 +26,11 @@ import type { ResolvedActionBinding } from "./workflow-reservation.ts"
 export interface ActionHostDeps {
   readonly process: ProcessRunner
   readonly log: Logger
-  /** Injectable delay for polling handlers (e.g. `github/await-checks`). Real by default. */
+  /** Injectable delay for polling handlers. Real by default. */
   readonly sleep: (ms: number) => Promise<void>
+  /** Injectable wall clock for handlers computing a deadline (e.g.
+   *  `github/await-checks`) — never ambient `Date.now()` in a handler. */
+  readonly now: () => number
 }
 
 export type ActionHandler = (ctx: ActionRunContext, deps: ActionHostDeps) => Promise<ActionResult>
@@ -35,6 +38,7 @@ export type ActionHandler = (ctx: ActionRunContext, deps: ActionHostDeps) => Pro
 export type ActionHostExecuteResult =
   | { readonly ok: true; readonly outputs: Readonly<Record<string, unknown>> }
   | { readonly ok: false; readonly error: string }
+  | { readonly ok: "pending"; readonly nextPollMs: number; readonly state: Readonly<Record<string, unknown>> | null }
 
 /** The engine's view of an action host — small enough to fake in tests without depending on the real dispatch/capability machinery. */
 export interface ActionExecutor {
@@ -57,7 +61,10 @@ export class CapabilityDeniedError extends Error {
 export class ActionHost implements ActionExecutor {
   constructor(
     private readonly handlers: Readonly<Record<string, ActionHandler>>,
-    private readonly deps: Omit<ActionHostDeps, "sleep"> & { readonly sleep?: (ms: number) => Promise<void> },
+    private readonly deps: Omit<ActionHostDeps, "sleep" | "now"> & {
+      readonly sleep?: (ms: number) => Promise<void>
+      readonly now?: () => number
+    },
   ) {}
 
   async execute(binding: ResolvedActionBinding, ctx: ActionRunContext): Promise<ActionHostExecuteResult> {
@@ -65,6 +72,7 @@ export class ActionHost implements ActionExecutor {
       process: gateProcessRunner(this.deps.process, ctx.capabilities),
       log: this.deps.log,
       sleep: this.deps.sleep ?? realSleep,
+      now: this.deps.now ?? Date.now,
     }
     try {
       const result = await this.dispatch(binding.manifest, ctx, deps)
@@ -127,6 +135,10 @@ function isActionResult(value: unknown): value is ActionResult {
   const record = value as Record<string, unknown>
   if (record.status === "succeeded") return typeof record.outputs === "object" && record.outputs !== null
   if (record.status === "failed") return typeof record.error === "string"
+  if (record.status === "pending") {
+    if (typeof record.nextPollMs !== "number" || !Number.isFinite(record.nextPollMs) || record.nextPollMs <= 0) return false
+    return record.state === undefined || (typeof record.state === "object" && record.state !== null && !Array.isArray(record.state))
+  }
   return false
 }
 
@@ -176,7 +188,9 @@ function gateProcessRunner(inner: ProcessRunner, capabilities: readonly ActionCa
 // ---------------------------------------------------------------------------
 
 function toHostResult(result: ActionResult): ActionHostExecuteResult {
-  return result.status === "succeeded" ? { ok: true, outputs: result.outputs } : { ok: false, error: result.error }
+  if (result.status === "succeeded") return { ok: true, outputs: result.outputs }
+  if (result.status === "pending") return { ok: "pending", nextPollMs: result.nextPollMs, state: result.state ?? null }
+  return { ok: false, error: result.error }
 }
 
 function errorMessage(error: unknown): string {
