@@ -125,6 +125,7 @@ async function startStack(input?: {
       engine: daemon.engine,
       health: () => daemon.health(),
       resolveWorkflow: daemon.registry.resolver,
+      workflowStatus: (dir) => daemon.registry.getStatus(dir),
       logger,
     },
   )
@@ -183,10 +184,9 @@ describe("API integration: end-to-end contract over a real listener", () => {
     expect(done.feature.status).toBe("done")
 
     const timeline = (await (await fetch(`${base}/v1/features/${feature.id}/timeline`)).json()) as {
-      timeline: Array<{ event: string }>
+      timeline: Array<{ event: { kind: string } }>
     }
-    expect(timeline.timeline.some(t => JSON.parse(t.event).kind === "human.paused" || true)).toBe(true)
-    expect(timeline.timeline.some(t => JSON.parse(t.event).kind === "feature.start")).toBe(true)
+    expect(timeline.timeline.some(t => t.event.kind === "feature.start")).toBe(true)
 
     // A human gate publishes no run row (only agent/command steps do); the
     // implement step is the sole run.
@@ -237,8 +237,8 @@ describe("API integration: end-to-end contract over a real listener", () => {
     expect(apiState.status).toBe(engineState.status)
     expect(apiState.jobs["main"]?.currentStep).toBe(engineState.jobs["main"]?.currentStep)
 
-    const apiEvents = viaApi.daemon.store.getTransitions(apiFeature.feature.id).map(t => JSON.parse(t.event).kind)
-    const engineEvents = viaEngine.daemon.store.getTransitions(engineFeature.id).map(t => JSON.parse(t.event).kind)
+    const apiEvents = viaApi.daemon.store.getTransitions(apiFeature.feature.id).map(t => t.event.kind)
+    const engineEvents = viaEngine.daemon.store.getTransitions(engineFeature.id).map(t => t.event.kind)
     expect(apiEvents).toEqual(engineEvents)
   })
 })
@@ -262,7 +262,7 @@ describe("API integration: idempotency under concurrency", () => {
     expect(["succeeded", "failed"]).toContain(run.status)
     const conclusions = daemon.store
       .getTransitions(feature.id)
-      .map(t => JSON.parse(t.event).kind)
+      .map(t => t.event.kind)
       .filter(kind => kind === "step.completed" || kind === "step.failed")
     expect(conclusions).toHaveLength(1)
   })
@@ -356,7 +356,7 @@ describe("API integration: recovery across restart", () => {
     const state = second.daemon.store.getFeature(feature.id)!
     expect(state.status).toBe("done")
     expect(
-      second.daemon.store.getTransitions(feature.id).some(t => JSON.parse(t.event).kind === "step.completed"),
+      second.daemon.store.getTransitions(feature.id).some(t => t.event.kind === "step.completed"),
     ).toBe(true)
   })
 })
@@ -455,6 +455,7 @@ describe("API integration: graceful shutdown", () => {
         engine: gatedEngine,
         health: () => daemon.health(),
         resolveWorkflow: daemon.registry.resolver,
+        workflowStatus: (dir) => daemon.registry.getStatus(dir),
         logger,
       },
     )

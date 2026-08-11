@@ -10,7 +10,16 @@ export type { Database, DatabaseConfig, DatabaseConnection } from "./database.ts
 export { migrations, runMigrations } from "./migrations.ts"
 export type { Migration } from "./migrations.ts"
 export { Store } from "./store.ts"
-export type { FindingView, RunActionMetadata, RunSummary, StoreChange, TransitionEntry } from "./store.ts"
+export type {
+  FeatureFilter,
+  FeatureRecord,
+  FindingCounts,
+  FindingView,
+  RunActionMetadata,
+  RunSummary,
+  StoreChange,
+  TransitionEntry,
+} from "./store.ts"
 
 export { applyPatch, initialFeatureState } from "./state.ts"
 export type { CreateFeatureInput, InitialFeatureStateInput } from "./state.ts"

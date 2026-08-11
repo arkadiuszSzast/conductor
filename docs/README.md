@@ -12,6 +12,7 @@ interpreter.
 | [Concepts](concepts.md) | The execution model: features, jobs, steps, outcomes vs failures, loops, escalation. Read this first. |
 | [Workflow reference](workflow-reference.md) | Every YAML field, with types, defaults and examples — the `conductor.yaml` counterpart to GHA's workflow syntax reference. |
 | [Expressions](expressions.md) | The `{{ }}` template contexts: `inputs`, `steps`, `needs`, `feedback` — what resolves when, and what is validated. |
+| [HTTP API](http-api.md) | The daemon's REST + SSE control surface: routes, feature payload projections, workflow structure endpoint, static UI serving. |
 
 ## Status of this documentation
 
