@@ -288,6 +288,83 @@ describe("findings", () => {
   })
 })
 
+describe("feature records (API projection reads)", () => {
+  it("returns row timestamps alongside the state and bumps updatedAt on transition", () => {
+    const before = Date.now()
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const record = store.getFeatureRecord(feature.id)!
+    expect(record.state).toEqual(feature)
+    expect(record.createdAt).toBeGreaterThanOrEqual(before)
+    expect(record.updatedAt).toBe(record.createdAt)
+
+    store.applyTransition(feature.id, { kind: "feature.start" }, {
+      decisions: [{ kind: "execute_step", jobId: "main", stepId: "implement" }],
+      patch: jobRunningPatch("main", "implement"),
+    })
+    const after = store.getFeatureRecord(feature.id)!
+    expect(after.updatedAt).toBeGreaterThanOrEqual(after.createdAt)
+    expect(after.createdAt).toBe(record.createdAt)
+  })
+
+  it("listFeatureRecords filters by statuses", () => {
+    const running = store.createFeature({ title: "A", slug: "a", projectDir: "/p", workflow: "wf" })
+    const done = store.createFeature({ title: "B", slug: "b", projectDir: "/p", workflow: "wf" })
+    store.applyTransition(done.id, { kind: "feature.start" }, { decisions: [], patch: { status: "done" } })
+    const waiting = store.createFeature({ title: "C", slug: "c", projectDir: "/p", workflow: "wf" })
+    store.applyTransition(waiting.id, { kind: "feature.start" }, { decisions: [], patch: { status: "waiting_human" } })
+
+    const filtered = store.listFeatureRecords({ statuses: ["done", "waiting_human"] })
+    expect(filtered.map(record => record.state.id).sort()).toEqual([done.id, waiting.id].sort())
+
+    const all = store.listFeatureRecords()
+    expect(all.map(record => record.state.id)).toContain(running.id)
+  })
+})
+
+describe("finding counts", () => {
+  it("groups counts per feature and status in one query and omits zero-finding features", () => {
+    const first = store.createFeature({ title: "A", slug: "a", projectDir: "/p", workflow: "wf" })
+    const second = store.createFeature({ title: "B", slug: "b", projectDir: "/p", workflow: "wf" })
+    store.insertFindings(first.id, "review", [
+      { path: "a.ts", line: 1, severity: "major", tags: [], body: "x" },
+      { path: "b.ts", line: 2, severity: "minor", tags: [], body: "y" },
+    ])
+    store.setFindingStatus(first.id, "F2", "fixed")
+
+    const counts = store.countFindingsByStatus([first.id, second.id])
+    expect(counts.get(first.id)).toEqual({ new: 1, fixed: 1, dismissed: 0, reopened: 0 })
+    expect(counts.get(second.id)).toBeUndefined()
+    expect(store.countFindingsByStatus([])).toEqual(new Map())
+  })
+})
+
+describe("newest run per step", () => {
+  it("returns the newest run id per (job, step) across the whole history", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const oldRun = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 1 })
+    store.finishRun(oldRun, "failed", { reason: "boom" })
+    connection.db.run("UPDATE run SET time_started = time_started - 1000 WHERE id = ?", [oldRun])
+    const newRun = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 2 })
+    const otherStep = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "review", stepType: "agent", attempt: 1 })
+
+    const newest = store.newestRunIdsByStep(feature.id)
+    expect(newest.get("main\u0000implement")).toBe(newRun)
+    expect(newest.get("main\u0000review")).toBe(otherStep)
+  })
+})
+
+describe("timeline events", () => {
+  it("returns event as a parsed object", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    store.applyTransition(feature.id, { kind: "feature.start" }, {
+      decisions: [{ kind: "execute_step", jobId: "main", stepId: "implement" }],
+      patch: jobRunningPatch("main", "implement"),
+    })
+    const [entry] = store.getTransitions(feature.id)
+    expect(entry?.event).toEqual({ kind: "feature.start" })
+  })
+})
+
 describe("onChange", () => {
   it("fires post-commit for feature/transition/run/finding changes", () => {
     const changes: StoreChange[] = []

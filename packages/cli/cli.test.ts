@@ -471,8 +471,8 @@ describe("CLI: pause / resume / abandon / logs", () => {
 
     h.out.length = 0
     expect(await h.run("logs", featureId, "--json")).toBe(EXIT.ok)
-    const payload = JSON.parse(h.out.at(-1)!) as { timeline: Array<{ event: string }> }
-    expect(payload.timeline.some(t => t.event.includes("feature.start"))).toBe(true)
+    const payload = JSON.parse(h.out.at(-1)!) as { timeline: Array<{ event: { kind: string } }> }
+    expect(payload.timeline.some(t => t.event.kind === "feature.start")).toBe(true)
   })
 })
 

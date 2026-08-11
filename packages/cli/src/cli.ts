@@ -481,13 +481,6 @@ function decisionsLabel(decisions: TransitionView["decisions"]): string {
     .join(", ")
 }
 
-/** Timeline events are stored as JSON (`{"kind": "...", ...}`); show the kind. */
-function eventLabel(event: string): string {
-  try {
-    const parsed = JSON.parse(event) as { kind?: unknown }
-    if (typeof parsed.kind === "string") return parsed.kind
-  } catch {
-    // not JSON — print verbatim
-  }
-  return event
+function eventLabel(event: TransitionView["event"]): string {
+  return event.kind
 }

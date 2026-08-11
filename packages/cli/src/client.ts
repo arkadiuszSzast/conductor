@@ -90,7 +90,7 @@ export interface FindingView {
 }
 
 export interface TransitionView {
-  readonly event: string
+  readonly event: { readonly kind: string; readonly [key: string]: unknown }
   readonly decisions: readonly { readonly kind: string; readonly [key: string]: unknown }[]
   readonly time: number
 }

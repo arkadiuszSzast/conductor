@@ -7,7 +7,7 @@
  * integration coverage lives in `api-integration.test.ts`.
  */
 import { afterEach, describe, expect, it } from "bun:test"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { Daemon, type DaemonLogEntry } from "./src/daemon.ts"
@@ -97,6 +97,7 @@ function writeProject(source: string = agentWorkflow): string {
 async function makeApi(input?: {
   workflow?: string
   auth?: ApiConfig["auth"]
+  ui?: ApiConfig["ui"]
 }): Promise<{
   api: ConductorApi
   daemon: Daemon
@@ -123,12 +124,17 @@ async function makeApi(input?: {
   daemonsToStop.push(daemon)
   await daemon.start()
   const api = createApi(
-    { bind: { host: "127.0.0.1", port: 0 }, auth: input?.auth ?? { mode: "none" } },
+    {
+      bind: { host: "127.0.0.1", port: 0 },
+      auth: input?.auth ?? { mode: "none" },
+      ...(input?.ui !== undefined ? { ui: input.ui } : {}),
+    },
     {
       store: daemon.store,
       engine: daemon.engine,
       health: () => daemon.health(),
       resolveWorkflow: daemon.registry.resolver,
+      workflowStatus: (dir) => daemon.registry.getStatus(dir),
       logger,
     },
   )
@@ -222,7 +228,7 @@ describe("API: feature resources", () => {
     expect(body.activeRun.id).toBeTruthy()
     expect(sessions.prompts.length).toBe(1)
     const timeline = daemon.store.getTransitions(body.feature.id)
-    expect(timeline.some(t => JSON.parse(t.event).kind === "feature.start")).toBe(true)
+    expect(timeline.some(t => t.event.kind === "feature.start")).toBe(true)
   })
 
   it("POST /v1/features validates the body with machine-readable codes", async () => {
@@ -312,6 +318,269 @@ describe("API: feature resources", () => {
     expect((await request("GET", "/v1/nope")).status).toBe(404)
     expect((await request("DELETE", "/v1/features")).status).toBe(404)
     expect((await request("PUT", "/v1/features/abc")).status).toBe(404)
+  })
+})
+
+describe("API: UI projections", () => {
+  it("list and detail payloads carry createdAt/updatedAt from the store row", async () => {
+    const { request, project } = await makeApi()
+    const before = Date.now()
+    const feature = await startFeature(request, project)
+
+    const list = await request("GET", "/v1/features")
+    const listBody = (await list.json()) as { features: Array<{ createdAt: number; updatedAt: number }> }
+    expect(listBody.features[0]!.createdAt).toBeGreaterThanOrEqual(before)
+    expect(listBody.features[0]!.updatedAt).toBeGreaterThanOrEqual(listBody.features[0]!.createdAt)
+
+    const detail = await request("GET", `/v1/features/${feature.id}`)
+    const detailBody = (await detail.json()) as { feature: { createdAt: number; updatedAt: number } }
+    expect(detailBody.feature.createdAt).toBe(listBody.features[0]!.createdAt)
+    expect(detailBody.feature.updatedAt).toBeGreaterThanOrEqual(detailBody.feature.createdAt)
+  })
+
+  it("detail returns full per-step runtime while the list keeps the summary", async () => {
+    const { request, project } = await makeApi({ workflow: gatedWorkflow })
+    const feature = await startFeature(request, project)
+    const detailBefore = await request("GET", `/v1/features/${feature.id}`)
+    const runId = ((await detailBefore.json()) as { activeRun: { id: string } }).activeRun.id
+    await request("POST", `/v1/runs/${runId}/report`, { outcome: "succeeded", notes: "did the thing" })
+
+    const detail = await request("GET", `/v1/features/${feature.id}`)
+    const body = (await detail.json()) as {
+      feature: {
+        jobs: Record<string, {
+          status: string
+          currentStep: string | null
+          attempts: Record<string, number>
+          reruns: Record<string, number>
+          outputs: Record<string, unknown>
+          steps: Record<string, { status: string; outputs: Record<string, string> }>
+        }>
+      }
+    }
+    const main = body.feature.jobs["main"]!
+    expect(main.steps["implement"]).toMatchObject({ status: "succeeded" })
+    expect(main.steps["implement"]!.outputs["report"]).toBe("did the thing")
+    expect(main.steps["merge_gate"]).toMatchObject({ status: "waiting_human" })
+    expect(main.attempts).toBeDefined()
+    expect(main.reruns).toBeDefined()
+
+    const list = await request("GET", "/v1/features")
+    const listBody = (await list.json()) as { features: Array<{ jobs: Record<string, Record<string, unknown>> }> }
+    expect(Object.keys(listBody.features[0]!.jobs["main"]!).sort()).toEqual(["currentStep", "status"])
+  })
+
+  it("truncates oversized step outputs in the detail and points at the newest run", async () => {
+    const { request, project } = await makeApi()
+    const feature = await startFeature(request, project)
+    const detailBefore = await request("GET", `/v1/features/${feature.id}`)
+    const runId = ((await detailBefore.json()) as { activeRun: { id: string } }).activeRun.id
+    const longNotes = "x".repeat(2_000)
+    await request("POST", `/v1/runs/${runId}/report`, { outcome: "succeeded", notes: longNotes })
+
+    const detail = await request("GET", `/v1/features/${feature.id}`)
+    const body = (await detail.json()) as {
+      feature: { jobs: Record<string, { steps: Record<string, { outputs: Record<string, string>; truncated?: boolean; runId?: string }> }> }
+    }
+    const step = body.feature.jobs["main"]!.steps["implement"]!
+    expect(step.outputs["report"]!.length).toBe(500)
+    expect(step.truncated).toBe(true)
+    expect(step.runId).toBe(runId)
+
+    const run = await request("GET", `/v1/runs/${runId}`)
+    const runBody = (await run.json()) as { run: { outputs: Record<string, string> } }
+    expect(runBody.run.outputs["report"]).toBe(longNotes)
+  })
+
+  it("detail carries a workflowRef hint for the project's resolved workflow", async () => {
+    const { request, project } = await makeApi()
+    const feature = await startFeature(request, project)
+    const detail = await request("GET", `/v1/features/${feature.id}`)
+    const body = (await detail.json()) as { feature: { workflowRef: { name: string; stale: boolean } } }
+    expect(body.feature.workflowRef).toEqual({ name: "agent-only", stale: false })
+  })
+
+  it("filters the feature list by status and rejects unknown values", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const other = daemon.store.createFeature({ title: "Done one", slug: "done-one", projectDir: project, workflow: "agent-only" })
+    daemon.store.applyTransition(other.id, { kind: "feature.start" }, { decisions: [], patch: { status: "done" } })
+
+    const done = await request("GET", "/v1/features?status=done")
+    const doneBody = (await done.json()) as { features: Array<{ id: string }> }
+    expect(doneBody.features.map(f => f.id)).toEqual([other.id])
+
+    const both = await request("GET", "/v1/features?status=done,running")
+    expect(((await both.json()) as { features: unknown[] }).features).toHaveLength(2)
+    expect(feature.id).toBeTruthy()
+
+    const bad = await request("GET", "/v1/features?status=bogus")
+    expect(bad.status).toBe(400)
+    expect(((await bad.json()) as { error: { code: string } }).error.code).toBe("invalid_request")
+  })
+
+  it("list items carry grouped findingCounts with zeros for finding-less features", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const bare = daemon.store.createFeature({ title: "Bare", slug: "bare", projectDir: project, workflow: "agent-only" })
+    daemon.store.insertFindings(feature.id, "implement", [
+      { path: "a.ts", line: 1, severity: "major", tags: [], body: "x" },
+      { path: "b.ts", line: 2, severity: "minor", tags: [], body: "y" },
+    ])
+    daemon.store.setFindingStatus(feature.id, "F2", "dismissed", "not relevant")
+
+    const list = await request("GET", "/v1/features")
+    const body = (await list.json()) as { features: Array<{ id: string; findingCounts: Record<string, number> }> }
+    const withFindings = body.features.find(f => f.id === feature.id)!
+    const without = body.features.find(f => f.id === bare.id)!
+    expect(withFindings.findingCounts).toEqual({ new: 1, fixed: 0, dismissed: 1, reopened: 0 })
+    expect(without.findingCounts).toEqual({ new: 0, fixed: 0, dismissed: 0, reopened: 0 })
+  })
+
+  it("timeline serves event as a parsed object", async () => {
+    const { request, project } = await makeApi()
+    const feature = await startFeature(request, project)
+    const timeline = await request("GET", `/v1/features/${feature.id}/timeline`)
+    const body = (await timeline.json()) as { timeline: Array<{ event: { kind: string } }> }
+    expect(body.timeline.some(t => t.event.kind === "feature.start")).toBe(true)
+    for (const entry of body.timeline) expect(typeof entry.event).toBe("object")
+  })
+})
+
+describe("API: project workflow structure", () => {
+  it("returns the structure of a valid workflow without any authoring content", async () => {
+    const { request, project } = await makeApi({ workflow: gatedWorkflow })
+    const response = await request("GET", `/v1/projects/workflow?dir=${encodeURIComponent(project)}`)
+    expect(response.status).toBe(200)
+    const text = await response.text()
+    expect(text).not.toContain("Implement it.")
+    expect(text).not.toContain("prompt")
+    const body = JSON.parse(text) as {
+      name: string
+      stale: boolean
+      jobs: Record<string, { needs: string[]; steps: Array<{ id: string; kind: string }> }>
+      diagnostics: unknown[]
+    }
+    expect(body.name).toBe("gated")
+    expect(body.stale).toBe(false)
+    expect(body.diagnostics).toEqual([])
+    expect(body.jobs["main"]!.needs).toEqual([])
+    expect(body.jobs["main"]!.steps).toEqual([
+      { id: "implement", kind: "agent" },
+      { id: "merge_gate", kind: "human" },
+    ])
+  })
+
+  it("serves the last valid structure with stale=true and diagnostics after a broken reload", async () => {
+    const { request, project, daemon } = await makeApi()
+    writeFileSync(join(project, "conductor.yaml"), "name: [broken")
+    daemon.registry.reload(project)
+    const response = await request("GET", `/v1/projects/workflow?dir=${encodeURIComponent(project)}`)
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { name: string; stale: boolean; diagnostics: unknown[] }
+    expect(body.name).toBe("agent-only")
+    expect(body.stale).toBe(true)
+    expect(body.diagnostics.length).toBeGreaterThan(0)
+  })
+
+  it("responds 409 with diagnostics for a never-valid project and 404 for an unregistered one", async () => {
+    const { request, daemon } = await makeApi()
+    const broken = tempDir("conductor-api-broken-")
+    writeFileSync(join(broken, "conductor.yaml"), "name: [broken")
+    daemon.registry.register(broken)
+    const invalid = await request("GET", `/v1/projects/workflow?dir=${encodeURIComponent(broken)}`)
+    expect(invalid.status).toBe(409)
+    expect(((await invalid.json()) as { error: { code: string; message: string } }).error.code).toBe("conflict")
+
+    const unregistered = await request("GET", `/v1/projects/workflow?dir=${encodeURIComponent("/never/registered")}`)
+    expect(unregistered.status).toBe(404)
+
+    const missingDir = await request("GET", "/v1/projects/workflow")
+    expect(missingDir.status).toBe(400)
+  })
+})
+
+describe("API: static UI serving", () => {
+  function writeSpa(): string {
+    const dir = tempDir("conductor-api-ui-")
+    writeFileSync(join(dir, "index.html"), "<!doctype html><title>conductor ui</title>")
+    mkdirSync(join(dir, "assets"))
+    writeFileSync(join(dir, "assets", "app.js"), "console.log('ui')")
+    return dir
+  }
+
+  it("serves index.html, assets by content type, and SPA fallback for client routes", async () => {
+    const staticDir = writeSpa()
+    const { request } = await makeApi({ ui: { staticDir } })
+
+    const root = await request("GET", "/")
+    expect(root.status).toBe(200)
+    expect(root.headers.get("content-type")).toContain("text/html")
+    expect(await root.text()).toContain("conductor ui")
+
+    const asset = await request("GET", "/assets/app.js")
+    expect(asset.status).toBe(200)
+    expect(asset.headers.get("content-type")).toContain("javascript")
+
+    const fallback = await request("GET", "/features/abc-123")
+    expect(fallback.status).toBe(200)
+    expect(await fallback.text()).toContain("conductor ui")
+  })
+
+  it("keeps /v1 routes first and never emits CORS headers", async () => {
+    const staticDir = writeSpa()
+    const { request } = await makeApi({ ui: { staticDir } })
+    const api = await request("GET", "/v1/features")
+    expect(api.status).toBe(200)
+    expect(api.headers.get("access-control-allow-origin")).toBeNull()
+
+    const unknownApi = await request("GET", "/v1/definitely-not-a-route")
+    expect(unknownApi.status).toBe(404)
+    expect(((await unknownApi.json()) as { error: { code: string } }).error.code).toBe("not_found")
+
+    const root = await request("GET", "/")
+    expect(root.headers.get("access-control-allow-origin")).toBeNull()
+  })
+
+  it("rejects path traversal outside the configured directory", async () => {
+    // The secret sits at the LITERAL parent of staticDir, so a naive
+    // `resolve(root, "../secret.txt")` without the prefix guard would
+    // actually reach it — the fixture proves the guard, not luck.
+    const parent = tempDir("conductor-api-ui-parent-")
+    writeFileSync(join(parent, "secret.txt"), "top secret")
+    const staticDir = join(parent, "dist")
+    mkdirSync(staticDir)
+    writeFileSync(join(staticDir, "index.html"), "<!doctype html><title>conductor ui</title>")
+    const { api } = await makeApi({ ui: { staticDir } })
+    for (const path of ["/../secret.txt", "/..%2fsecret.txt", "/%2e%2e/secret.txt", "/assets/../../secret.txt"]) {
+      const response = await api.handle(new Request(`http://conductor.test${path}`))
+      const text = await response.text()
+      expect(text).not.toContain("top secret")
+    }
+  })
+
+  it("serves static assets without a token under bearer auth while /v1 stays guarded", async () => {
+    const staticDir = writeSpa()
+    const { request } = await makeApi({ ui: { staticDir }, auth: { mode: "bearer", token: "secret-token" } })
+
+    const root = await request("GET", "/")
+    expect(root.status).toBe(200)
+    expect(await root.text()).toContain("conductor ui")
+
+    const asset = await request("GET", "/assets/app.js")
+    expect(asset.status).toBe(200)
+
+    const denied = await request("GET", "/v1/features")
+    expect(denied.status).toBe(401)
+    const allowed = await request("GET", "/v1/features", undefined, { authorization: "Bearer secret-token" })
+    expect(allowed.status).toBe(200)
+  })
+
+  it("without ui config the root path stays the JSON 404 envelope", async () => {
+    const { request } = await makeApi()
+    const root = await request("GET", "/")
+    expect(root.status).toBe(404)
+    expect(((await root.json()) as { error: { code: string } }).error.code).toBe("not_found")
   })
 })
 
@@ -602,6 +871,7 @@ describe("API: real listener on an ephemeral loopback port", () => {
         engine: daemon.engine,
         health: () => daemon.health(),
         resolveWorkflow: daemon.registry.resolver,
+        workflowStatus: (dir) => daemon.registry.getStatus(dir),
         logger,
       },
     )

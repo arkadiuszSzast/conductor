@@ -27,10 +27,49 @@ interface FeatureRow {
   escalation: string | null
   state: string
   feedback: string | null
+  time_created: number
+  time_updated: number
 }
 
 function toFeatureState(row: FeatureRow): FeatureState {
   return JSON.parse(row.state) as FeatureState
+}
+
+/**
+ * A feature's interpreter state plus the row metadata the API projects
+ * (creation/update timestamps). The timestamps deliberately live OUTSIDE
+ * `FeatureState`: the interpreter never writes them, so they are store
+ * metadata returned alongside the state, not part of it.
+ */
+export interface FeatureRecord {
+  readonly state: FeatureState
+  readonly createdAt: number
+  readonly updatedAt: number
+}
+
+function toFeatureRecord(row: FeatureRow): FeatureRecord {
+  return { state: toFeatureState(row), createdAt: row.time_created, updatedAt: row.time_updated }
+}
+
+export interface FeatureFilter {
+  activeOnly?: boolean
+  projectDir?: string
+  statuses?: readonly FeatureStatus[]
+}
+
+function featureWhere(filter?: FeatureFilter): { where: string; params: (string | number)[] } {
+  const clauses: string[] = []
+  const params: (string | number)[] = []
+  if (filter?.activeOnly) clauses.push("status IN ('running','paused','waiting_human','escalated')")
+  if (filter?.projectDir !== undefined) {
+    clauses.push("project_dir = ?")
+    params.push(filter.projectDir)
+  }
+  if (filter?.statuses !== undefined && filter.statuses.length > 0) {
+    clauses.push(`status IN (${filter.statuses.map(() => "?").join(", ")})`)
+    params.push(...filter.statuses)
+  }
+  return { where: clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "", params }
 }
 
 interface RunRow {
@@ -107,9 +146,16 @@ function toRunSummary(row: RunRow): RunSummary {
 }
 
 export interface TransitionEntry {
-  readonly event: string
+  readonly event: PipelineEvent
   readonly decisions: readonly Decision[]
   readonly time: number
+}
+
+export interface FindingCounts {
+  readonly new: number
+  readonly fixed: number
+  readonly dismissed: number
+  readonly reopened: number
 }
 
 export interface FindingView {
@@ -192,17 +238,20 @@ export class Store {
     return row?.feedback ? (JSON.parse(row.feedback) as Feedback) : null
   }
 
-  listFeatures(filter?: { activeOnly?: boolean; projectDir?: string }): FeatureState[] {
-    const clauses: string[] = []
-    const params: (string | number)[] = []
-    if (filter?.activeOnly) clauses.push("status IN ('running','paused','waiting_human','escalated')")
-    if (filter?.projectDir !== undefined) {
-      clauses.push("project_dir = ?")
-      params.push(filter.projectDir)
-    }
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""
+  listFeatures(filter?: FeatureFilter): FeatureState[] {
+    return this.listFeatureRecords(filter).map(record => record.state)
+  }
+
+  /** Feature state plus row timestamps — the API's projection read. */
+  getFeatureRecord(id: string): FeatureRecord | null {
+    const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(id) as FeatureRow | null
+    return row ? toFeatureRecord(row) : null
+  }
+
+  listFeatureRecords(filter?: FeatureFilter): FeatureRecord[] {
+    const { where, params } = featureWhere(filter)
     const rows = this.db.query(`SELECT * FROM feature ${where} ORDER BY time_created DESC`).all(...params) as FeatureRow[]
-    return rows.map(toFeatureState)
+    return rows.map(toFeatureRecord)
   }
 
   findFeatureByPr(pr: number): FeatureState | null {
@@ -448,6 +497,24 @@ export class Store {
     return row?.nudges ?? 0
   }
 
+  /**
+   * Newest run id per (jobId, stepId) across a feature's WHOLE run
+   * history — one grouped query, immune to any list limit. Backs the
+   * detail projection's truncated-output pointer.
+   */
+  newestRunIdsByStep(featureId: string): ReadonlyMap<string, string> {
+    // SQLite's bare-column-with-MAX() semantics: `id` comes from the row
+    // holding the per-group MAX(time_started).
+    const rows = this.db.query(
+      `SELECT job_id, step_id, id, MAX(time_started) FROM run
+       WHERE feature_id = ?
+       GROUP BY job_id, step_id`,
+    ).all(featureId) as Array<{ job_id: string; step_id: string; id: string }>
+    const ids = new Map<string, string>()
+    for (const row of rows) ids.set(`${row.job_id}\u0000${row.step_id}`, row.id)
+    return ids
+  }
+
   getRunById(runId: string): RunSummary | null {
     const row = this.db.query("SELECT * FROM run WHERE id = ?").get(runId) as RunRow | null
     return row ? toRunSummary(row) : null
@@ -482,6 +549,22 @@ export class Store {
       threadId: row.thread_id,
       synced: row.synced === 1,
     }))
+  }
+
+  /** One grouped query for the list projection — never one query per feature. */
+  countFindingsByStatus(featureIds: readonly string[]): ReadonlyMap<string, FindingCounts> {
+    const counts = new Map<string, FindingCounts>()
+    if (featureIds.length === 0) return counts
+    const rows = this.db.query(
+      `SELECT feature_id, status, COUNT(*) AS total FROM finding
+       WHERE feature_id IN (${featureIds.map(() => "?").join(", ")})
+       GROUP BY feature_id, status`,
+    ).all(...featureIds) as Array<{ feature_id: string; status: "new" | "fixed" | "dismissed" | "reopened"; total: number }>
+    for (const row of rows) {
+      const existing = counts.get(row.feature_id) ?? { new: 0, fixed: 0, dismissed: 0, reopened: 0 }
+      counts.set(row.feature_id, { ...existing, [row.status]: row.total })
+    }
+    return counts
   }
 
   insertFindings(featureId: string, stepId: string, findings: ReadonlyArray<{
@@ -527,7 +610,11 @@ export class Store {
       `SELECT event, decisions, time_created FROM transition_log
        WHERE feature_id = ? ORDER BY time_created DESC LIMIT ?`,
     ).all(featureId, limit) as Array<{ event: string; decisions: string; time_created: number }>
-    return rows.map(row => ({ event: row.event, decisions: JSON.parse(row.decisions) as Decision[], time: row.time_created }))
+    return rows.map(row => ({
+      event: JSON.parse(row.event) as PipelineEvent,
+      decisions: JSON.parse(row.decisions) as Decision[],
+      time: row.time_created,
+    }))
   }
 }
 

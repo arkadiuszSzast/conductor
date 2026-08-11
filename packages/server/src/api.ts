@@ -25,10 +25,12 @@
  */
 
 import { randomUUID, timingSafeEqual } from "node:crypto"
-import type { FeatureState } from "@conductor/core"
+import { statSync } from "node:fs"
+import { extname, resolve, sep } from "node:path"
+import type { FeatureState, FeatureStatus, StepRuntime } from "@conductor/core"
 import type { Store, StoreChange } from "./store.ts"
 import type { DaemonHealth, DaemonLogger } from "./daemon.ts"
-import type { WorkflowResolver } from "./workflow-registry.ts"
+import type { WorkflowResolver, WorkflowStatus } from "./workflow-registry.ts"
 import type { RunnerRegistry } from "./runner-registry.ts"
 
 // ------------------------------------------------------------ configuration
@@ -46,6 +48,16 @@ export interface ApiConfig {
   readonly bind: ApiBind
   /** Authentication shape — explicit even for localhost. */
   readonly auth: ApiAuth
+  /**
+   * Opt-in static SPA serving. Absent → the API behaves exactly as
+   * without the capability. `staticDir` is always an explicit operator
+   * decision — never defaulted from the package location or a home
+   * directory. Serving is same-origin by construction, so the API never
+   * emits CORS headers.
+   */
+  readonly ui?: {
+    readonly staticDir: string
+  }
 }
 
 // ------------------------------------------------------------------- deps
@@ -76,6 +88,12 @@ export interface ApiDeps {
   readonly health: () => DaemonHealth
   /** Per-project workflow lookup — used to validate feature-start requests. */
   readonly resolveWorkflow: WorkflowResolver
+  /**
+   * Per-project workflow status (valid/stale/invalid/unregistered plus
+   * diagnostics) — backs `/v1/projects/workflow` and the feature detail's
+   * `workflowRef` hint. Absent → those projections report null/404.
+   */
+  readonly workflowStatus?: (projectDir: string) => WorkflowStatus
   /** Runner endpoint registration (`/v1/runners`). Absent → those routes 404. */
   readonly runners?: RunnerRegistry
   readonly logger?: DaemonLogger
@@ -163,8 +181,102 @@ function jobsSummary(feature: FeatureState): Readonly<Record<string, { status: s
   return summary
 }
 
+/** Detail-payload bound per step-output value; full output stays one GET /v1/runs/:id away. */
+const STEP_OUTPUT_LIMIT = 500
+
+interface StepDetailProjection {
+  readonly status: StepRuntime["status"]
+  readonly outputs: Readonly<Record<string, string>>
+  readonly truncated?: boolean
+  readonly runId?: string
+}
+
+/**
+ * Full per-job runtime for the DETAIL payload: everything `JobRuntime`
+ * carries, with step outputs cut at `STEP_OUTPUT_LIMIT`. A truncated
+ * step is marked and points at its newest run so the client can fetch
+ * the full output from the runs API.
+ */
+function jobsDetail(
+  feature: FeatureState,
+  newestRunByStep: ReadonlyMap<string, string>,
+): Readonly<Record<string, unknown>> {
+  const detail: Record<string, unknown> = {}
+  for (const [jobId, jobRuntime] of Object.entries(feature.jobs)) {
+    const steps: Record<string, StepDetailProjection> = {}
+    for (const [stepId, stepRuntime] of Object.entries(jobRuntime.steps)) {
+      let truncated = false
+      const outputs: Record<string, string> = {}
+      for (const [name, value] of Object.entries(stepRuntime.outputs)) {
+        if (value.length > STEP_OUTPUT_LIMIT) {
+          outputs[name] = value.slice(0, STEP_OUTPUT_LIMIT)
+          truncated = true
+        } else {
+          outputs[name] = value
+        }
+      }
+      const runId = newestRunByStep.get(`${jobId}\u0000${stepId}`)
+      steps[stepId] = {
+        status: stepRuntime.status,
+        outputs,
+        ...(truncated ? { truncated: true } : {}),
+        ...(truncated && runId !== undefined ? { runId } : {}),
+      }
+    }
+    detail[jobId] = {
+      status: jobRuntime.status,
+      currentStep: jobRuntime.currentStep,
+      attempts: jobRuntime.attempts,
+      reruns: jobRuntime.reruns,
+      outputs: jobRuntime.outputs,
+      steps,
+    }
+  }
+  return detail
+}
+
+const FEATURE_STATUSES: readonly FeatureStatus[] = [
+  "running",
+  "paused",
+  "waiting_human",
+  "escalated",
+  "done",
+  "abandoned",
+]
+
+function parseStatusFilter(raw: string): FeatureStatus[] | null {
+  const statuses: FeatureStatus[] = []
+  for (const token of raw.split(",").map(entry => entry.trim()).filter(entry => entry !== "")) {
+    if (!(FEATURE_STATUSES as readonly string[]).includes(token)) return null
+    statuses.push(token as FeatureStatus)
+  }
+  return statuses
+}
+
+const STATIC_CONTENT_TYPES: Readonly<Record<string, string>> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
+  ".map": "application/json",
+  ".txt": "text/plain; charset=utf-8",
+  ".webmanifest": "application/manifest+json",
+}
+
 export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
-  const { store, engine, health, resolveWorkflow, runners, logger } = deps
+  const { store, engine, health, resolveWorkflow, workflowStatus, runners, logger } = deps
+  const staticRoot = config.ui !== undefined ? resolve(config.ui.staticDir) : null
   const sseClients = new Set<SseClient>()
   const inFlight = new Set<Promise<void>>()
   let closed = false
@@ -210,15 +322,26 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     }
   }
 
+  function workflowRefOf(projectDir: string): { name: string; stale: boolean } | null {
+    const status = workflowStatus?.(projectDir)
+    if (status === undefined) return null
+    if (status.state !== "valid" && status.state !== "stale") return null
+    return { name: status.snapshot.workflow.name, stale: status.state === "stale" }
+  }
+
   function featurePayload(featureId: string): unknown {
-    const feature = store.getFeature(featureId)
-    if (!feature) return null
+    const record = store.getFeatureRecord(featureId)
+    if (!record) return null
+    const feature = record.state
     return {
       feature: {
         ...feature,
         escalation: store.getEscalation(featureId),
         currentStep: currentStepOf(feature),
-        jobs: jobsSummary(feature),
+        createdAt: record.createdAt,
+        updatedAt: record.updatedAt,
+        workflowRef: workflowRefOf(feature.projectDir),
+        jobs: jobsDetail(feature, store.newestRunIdsByStep(featureId)),
       },
       activeRun: store.getActiveRun(featureId),
     }
@@ -265,6 +388,15 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       return json(snapshot.ready ? 200 : 503, { ready: snapshot.ready, phase: snapshot.phase }, requestId)
     }
 
+    // Static SPA serving is opt-in, strictly subordinate to /v1 routing
+    // and — like the probes — unauthenticated: a browser's top-level
+    // navigation and asset fetches cannot attach a bearer header, so the
+    // app shell must load without one. The API under /v1 stays guarded.
+    if (staticRoot !== null && !path.startsWith("/v1") && (method === "GET" || method === "HEAD")) {
+      const served = serveStatic(staticRoot, path, requestId)
+      if (served !== null) return served
+    }
+
     if (!authorized(request)) return error(requestId, "unauthorized", "missing or invalid bearer token")
 
     if (method === "GET" && path === "/v1/health") {
@@ -280,18 +412,37 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       if (method === "GET") {
         const project = url.searchParams.get("project") ?? undefined
         const active = url.searchParams.get("active") === "true"
-        const features = store.listFeatures({
+        const statusRaw = url.searchParams.get("status")
+        let statuses: FeatureStatus[] | undefined
+        if (statusRaw !== null) {
+          const parsed = parseStatusFilter(statusRaw)
+          if (parsed === null) {
+            return error(
+              requestId,
+              "invalid_request",
+              `"status" must be a comma-separated list of: ${FEATURE_STATUSES.join(", ")}`,
+            )
+          }
+          if (parsed.length > 0) statuses = parsed
+        }
+        const records = store.listFeatureRecords({
           ...(active ? { activeOnly: true } : {}),
           ...(project !== undefined ? { projectDir: project } : {}),
+          ...(statuses !== undefined ? { statuses } : {}),
         })
+        const findingCounts = store.countFindingsByStatus(records.map(record => record.state.id))
+        const zeroCounts = { new: 0, fixed: 0, dismissed: 0, reopened: 0 }
         return json(
           200,
           {
-            features: features.map(feature => ({
-              ...feature,
-              escalation: store.getEscalation(feature.id),
-              currentStep: currentStepOf(feature),
-              jobs: jobsSummary(feature),
+            features: records.map(record => ({
+              ...record.state,
+              escalation: store.getEscalation(record.state.id),
+              currentStep: currentStepOf(record.state),
+              createdAt: record.createdAt,
+              updatedAt: record.updatedAt,
+              findingCounts: findingCounts.get(record.state.id) ?? zeroCounts,
+              jobs: jobsSummary(record.state),
             })),
           },
           requestId,
@@ -299,6 +450,10 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       }
       if (method === "POST") return createFeature(request, requestId)
       return error(requestId, "not_found", `no route for ${method} ${path}`)
+    }
+
+    if (path === "/v1/projects/workflow" && method === "GET") {
+      return projectWorkflow(url, requestId)
     }
 
     if (path === "/v1/runners" && runners !== undefined) {
@@ -362,6 +517,59 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     }
 
     return error(requestId, "not_found", `no route for ${method} ${path}`)
+  }
+
+  function projectWorkflow(url: URL, requestId: string): Response {
+    const dir = url.searchParams.get("dir")
+    if (dir === null || dir.trim() === "") {
+      return error(requestId, "invalid_request", "\"dir\" (project directory) query parameter is required")
+    }
+    if (workflowStatus === undefined) {
+      return error(requestId, "not_found", `no workflow registered for "${dir}"`)
+    }
+    const status = workflowStatus(dir)
+    if (status.state === "unregistered") {
+      return error(requestId, "not_found", `no workflow registered for "${dir}"`)
+    }
+    if (status.state === "invalid") {
+      const detail = status.diagnostics.map(diagnostic => diagnostic.message).join("; ")
+      return error(requestId, "conflict", `workflow for "${dir}" is invalid: ${detail}`)
+    }
+    // Structure only — job edges plus step ids and kinds. Prompts,
+    // expressions, `with:` payloads and retry policies never leave the
+    // daemon through this route.
+    const workflow = status.snapshot.workflow
+    const jobs: Record<string, { needs: readonly string[]; steps: Array<{ id: string; kind: string }> }> = {}
+    for (const [jobId, job] of Object.entries(workflow.jobs)) {
+      jobs[jobId] = {
+        needs: job.needs,
+        steps: job.steps.map(step => ({ id: step.id, kind: step.type })),
+      }
+    }
+    return json(
+      200,
+      {
+        name: workflow.name,
+        stale: status.state === "stale",
+        jobs,
+        diagnostics: status.state === "stale" ? status.diagnostics : [],
+      },
+      requestId,
+    )
+  }
+
+  function serveStatic(root: string, path: string, requestId: string): Response | null {
+    const decoded = safeDecode(path)
+    if (decoded === null) return null
+    const candidate = resolve(root, `.${decoded}`)
+    if (candidate !== root && !candidate.startsWith(root + sep)) return null
+    const file = pickStaticFile(candidate) ?? pickStaticFile(resolve(root, "index.html"))
+    if (file === null) return null
+    const contentType = STATIC_CONTENT_TYPES[extname(file).toLowerCase()] ?? "application/octet-stream"
+    return new Response(Bun.file(file), {
+      status: 200,
+      headers: { "content-type": contentType, "x-request-id": requestId },
+    })
   }
 
   async function registerRunner(request: Request, requestId: string): Promise<Response> {
@@ -612,6 +820,24 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     get sseClientCount() {
       return sseClients.size
     },
+  }
+}
+
+function safeDecode(path: string): string | null {
+  try {
+    const decoded = decodeURIComponent(path)
+    if (decoded.includes("\0")) return null
+    return decoded
+  } catch {
+    return null
+  }
+}
+
+function pickStaticFile(path: string): string | null {
+  try {
+    return statSync(path).isFile() ? path : null
+  } catch {
+    return null
   }
 }
 
