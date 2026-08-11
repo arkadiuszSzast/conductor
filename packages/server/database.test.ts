@@ -38,6 +38,7 @@ describe("database lifecycle and migrations", () => {
     expect(columnNames(connection.db, "feature")).toEqual(expect.arrayContaining(["state", "feedback", "workflow", "description"]))
     expect(columnNames(connection.db, "run")).toEqual(expect.arrayContaining([
       "job_id", "step_id", "nudges", "completion_event", "completion_decisions", "action_handled",
+      "pending_state", "next_observation",
     ]))
     const ledger = connection.db.query("SELECT id FROM schema_migration ORDER BY position").all() as Array<{ id: string }>
     expect(ledger.map(row => row.id)).toEqual(migrations.map(migration => migration.id))
@@ -47,6 +48,7 @@ describe("database lifecycle and migrations", () => {
   it("the ledger is an append-only exact prefix of the compiled migration list", () => {
     expect(migrations[0]!.id).toBe("0001_legacy_pipeline_schema")
     expect(migrations.map(m => m.id)).toContain("0008_graph_state_schema")
+    expect(migrations.map(m => m.id)).toContain("0010_run_pending_observation")
   })
 
   it("is idempotent and executes migrations monotonically in declaration order", () => {

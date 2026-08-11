@@ -49,6 +49,8 @@ interface RunRow {
   completion_decisions: string | null
   action_handled: number
   metadata: string | null
+  pending_state: string | null
+  next_observation: number | null
   time_started: number
   time_finished: number | null
 }
@@ -75,6 +77,10 @@ export interface RunSummary {
   readonly reason: string | null
   readonly nudges: number
   readonly metadata: RunActionMetadata | null
+  /** Opaque state a durable-pending action asked to see again on its next observation. */
+  readonly pendingState: Readonly<Record<string, unknown>> | null
+  /** When the reconciler should re-invoke a durable-pending action run. Null while not pending. */
+  readonly nextObservation: number | null
   readonly timeStarted: number
   readonly timeFinished: number | null
 }
@@ -93,6 +99,8 @@ function toRunSummary(row: RunRow): RunSummary {
     reason: row.reason,
     nudges: row.nudges,
     metadata: row.metadata ? (JSON.parse(row.metadata) as RunActionMetadata) : null,
+    pendingState: row.pending_state ? (JSON.parse(row.pending_state) as Record<string, unknown>) : null,
+    nextObservation: row.next_observation,
     timeStarted: row.time_started,
     timeFinished: row.time_finished,
   }
@@ -304,6 +312,21 @@ export class Store {
     )
     const featureId = (this.db.query("SELECT feature_id FROM run WHERE id = ?").get(runId) as { feature_id: string } | null)?.feature_id
     if (featureId) this.emit({ kind: "run", featureId })
+  }
+
+  /**
+   * Records a durable-pending action's next-observation policy on its run
+   * row — the run stays `running`, no new row is inserted, and the
+   * attempt counter is untouched. Guarded by `WHERE status = 'running'`:
+   * if the run concluded meanwhile (e.g. TTL-reaped by a concurrent
+   * reconcile pass), this returns false and the caller drops the
+   * observation instead of resurrecting a finished run.
+   */
+  recordPendingObservation(runId: string, state: Readonly<Record<string, unknown>> | null, nextObservation: number): boolean {
+    return this.db.run(
+      "UPDATE run SET pending_state = ?, next_observation = ? WHERE id = ? AND status = 'running'",
+      [state ? JSON.stringify(state) : null, nextObservation, runId],
+    ).changes > 0
   }
 
   /**

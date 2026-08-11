@@ -30,6 +30,6 @@
 
 - [x] [server][db] Delete the seed pipeline engine (`packages/server/src/engine/`), seed config registry, bundled seed presets and their tests; rewire the daemon/API onto a graph engine that drives `@conductor/core`'s `interpret()` with a `WorkflowRegistry` loading `conductor.yaml`, persist graph `FeatureState`, and keep confirmation-of-effect, nudge/reap and atomic run conclusion on the new model.
 - [x] [cli] Point `conductor init` at `conductor.yaml` scaffolding; remove the seed JSON template.
-- [ ] [test] Canary the daemon on `conductor-test` and `quotes-api` with `conductor.yaml` workflows, including restart during an active run and human-gate round trip.
+- [ ] [test] Adopt Conductor on a real project end to end (fresh repo + `conductor init` + daemon + opencode runner), including restart during an active run and a human-gate round trip.
 - [ ] [docs] Publish daemon install/upgrade, API/OpenAPI and runner troubleshooting docs; document the greenfield pivot (no seed-format support).
 - [ ] [review] Perform architecture and security review; verify no host-specific path, no model gateway and no seed-format remnant is embedded.

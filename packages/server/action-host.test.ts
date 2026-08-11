@@ -345,6 +345,47 @@ describe("ActionHost: subprocess JSON protocol", () => {
     expect(result.error).toContain("invalid JSON")
   })
 
+  it("accepts a durable pending ActionResult, carrying nextPollMs and state", async () => {
+    const host = new ActionHost({}, { process: realProcessRunner, log: noopLog })
+    const script = `console.log(JSON.stringify({ status: "pending", nextPollMs: 5000, state: { deadline: 123 } }))`
+    const m = manifest({ run: { kind: "process", command: ["bun", "-e", script] }, capabilities: ["process"] })
+    const result = await host.execute(binding(m), ctx({ capabilities: ["process"] }))
+
+    expect(result).toEqual({ ok: "pending", nextPollMs: 5000, state: { deadline: 123 } })
+  })
+
+  it("accepts a durable pending ActionResult with no state", async () => {
+    const host = new ActionHost({}, { process: realProcessRunner, log: noopLog })
+    const script = `console.log(JSON.stringify({ status: "pending", nextPollMs: 5000 }))`
+    const m = manifest({ run: { kind: "process", command: ["bun", "-e", script] }, capabilities: ["process"] })
+    const result = await host.execute(binding(m), ctx({ capabilities: ["process"] }))
+
+    expect(result).toEqual({ ok: "pending", nextPollMs: 5000, state: null })
+  })
+
+  it("a pending ActionResult with a missing or non-positive nextPollMs is a malformed-result failure", async () => {
+    const host = new ActionHost({}, { process: realProcessRunner, log: noopLog })
+    for (const payload of ['{"status":"pending"}', '{"status":"pending","nextPollMs":0}', '{"status":"pending","nextPollMs":-5}']) {
+      const script = `console.log(JSON.stringify(${payload}))`
+      const m = manifest({ run: { kind: "process", command: ["bun", "-e", script] }, capabilities: ["process"] })
+      const result = await host.execute(binding(m), ctx({ capabilities: ["process"] }))
+      expect(result.ok).toBe(false)
+      if (result.ok) continue
+      expect(result.error).toContain("malformed")
+    }
+  })
+
+  it("a pending ActionResult with a non-object state is a malformed-result failure", async () => {
+    const host = new ActionHost({}, { process: realProcessRunner, log: noopLog })
+    const script = `console.log(JSON.stringify({ status: "pending", nextPollMs: 5000, state: "not-an-object" }))`
+    const m = manifest({ run: { kind: "process", command: ["bun", "-e", script] }, capabilities: ["process"] })
+    const result = await host.execute(binding(m), ctx({ capabilities: ["process"] }))
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toContain("malformed")
+  })
+
   it("a process-kind action without the process capability is denied before it ever launches", async () => {
     const process_ = new FakeProcess()
     const host = new ActionHost({}, { process: process_, log: noopLog })

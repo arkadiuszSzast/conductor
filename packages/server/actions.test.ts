@@ -29,8 +29,8 @@ class FakeProcess implements ProcessRunner {
   }
 }
 
-function deps(process_: FakeProcess, sleep?: (ms: number) => Promise<void>): ActionHostDeps {
-  return { process: process_, log: { log: () => {} }, sleep: sleep ?? (async () => {}) }
+function deps(process_: FakeProcess, sleep?: (ms: number) => Promise<void>, now?: () => number): ActionHostDeps {
+  return { process: process_, log: { log: () => {} }, sleep: sleep ?? (async () => {}), now: now ?? Date.now }
 }
 
 function ctx(inputs: Readonly<Record<string, unknown>>, overrides: Partial<ActionRunContext> = {}): ActionRunContext {
@@ -224,42 +224,42 @@ describe("github/await-checks", () => {
     expect(result.error).not.toContain("build")
   })
 
-  it("polls via injected sleep until conclusion, without real time", async () => {
+  it("returns a durable pending result on first observation with unconcluded checks, one exec per invocation", async () => {
     const process_ = new FakeProcess()
-    process_.handlers = [
-      () => ok(JSON.stringify([{ name: "build", state: "PENDING" }])),
-      () => ok(JSON.stringify([{ name: "build", state: "SUCCESS" }])),
-    ]
-    const sleeps: number[] = []
-    const result = await githubAwaitChecks(ctx({ pr: 5, poll_seconds: 15 }), deps(process_, async ms => { sleeps.push(ms) }))
+    process_.handlers = [() => ok(JSON.stringify([{ name: "build", state: "PENDING" }]))]
+    const result = await githubAwaitChecks(ctx({ pr: 5, timeout_minutes: 1, poll_seconds: 15 }), deps(process_, undefined, () => 0))
 
-    expect(result).toEqual({ status: "succeeded", outputs: { conclusion: "success" } })
-    expect(sleeps).toEqual([15000])
-    expect(process_.calls).toHaveLength(2)
+    expect(result.status).toBe("pending")
+    if (result.status !== "pending") return
+    expect(result.nextPollMs).toBe(15000)
+    expect(result.state?.deadline).toBe(60_000)
+    expect(process_.calls).toHaveLength(1)
   })
 
-  it("times out after the deadline without ever calling the real clock", async () => {
+  it("resuming with the deadline passed and checks still pending fails with a timeout, without a fresh exec loop", async () => {
     const process_ = new FakeProcess()
-    process_.default = ok(JSON.stringify([{ name: "build", state: "PENDING" }]))
-    let now = 0
-    const realNow = Date.now
-    Date.now = () => now
-    try {
-      const sleeps: number[] = []
-      const result = await githubAwaitChecks(
-        ctx({ pr: 5, timeout_minutes: 1, poll_seconds: 30 }),
-        deps(process_, async ms => {
-          sleeps.push(ms)
-          now += ms
-        }),
-      )
-      expect(result.status).toBe("failed")
-      if (result.status !== "failed") return
-      expect(result.error).toContain("timed out")
-      expect(sleeps.length).toBeGreaterThan(0)
-    } finally {
-      Date.now = realNow
-    }
+    process_.handlers = [() => ok(JSON.stringify([{ name: "build", state: "PENDING" }]))]
+    const result = await githubAwaitChecks(
+      ctx({ pr: 5, timeout_minutes: 1 }, { resume: { deadline: 1000 } }),
+      deps(process_, undefined, () => 2000),
+    )
+
+    expect(result.status).toBe("failed")
+    if (result.status !== "failed") return
+    expect(result.error).toContain("timed out")
+    expect(process_.calls).toHaveLength(1)
+  })
+
+  it("resuming succeeds once checks conclude, using the deadline carried in ctx.resume", async () => {
+    const process_ = new FakeProcess()
+    process_.handlers = [() => ok(JSON.stringify([{ name: "build", state: "SUCCESS" }]))]
+    const result = await githubAwaitChecks(
+      ctx({ pr: 5 }, { resume: { deadline: 999_999 } }),
+      deps(process_, undefined, () => 500),
+    )
+
+    expect(result).toEqual({ status: "succeeded", outputs: { conclusion: "success" } })
+    expect(process_.calls).toHaveLength(1)
   })
 })
 
