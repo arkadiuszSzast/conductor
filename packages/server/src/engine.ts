@@ -85,6 +85,16 @@ export class Engine {
    * the debounce restarts from zero — the safe direction of error.
    */
   private readonly idleCycles = new Map<string, number>()
+  /**
+   * In-flight action executions (run id → settling promise). Action
+   * steps can poll for minutes (`github/await-checks`), so their host
+   * execution is detached from the dispatch chain — a blocking action
+   * must never freeze reconciliation for every other feature. In-memory
+   * by design: a run that is `running` after a restart with no tracked
+   * execution is concluded failed (bundled actions are idempotent, the
+   * workflow's retry/onFail policy decides what happens next).
+   */
+  private readonly actionRuns = new Map<string, Promise<void>>()
   private readonly runTtlMs: number
   private readonly nudgeIdleCycles: number
   private readonly maxNudges: number
@@ -360,27 +370,52 @@ export class Engine {
       return
     }
 
-    const result = await actions.execute(binding, {
-      featureId,
-      jobId,
-      stepId: step.id,
-      workdir: state.worktree ?? state.projectDir,
-      inputs: coerced.inputs,
-      capabilities: binding.manifest.capabilities,
-    })
+    // Detach the host execution from the dispatch chain: a polling
+    // action (await-checks) blocks its own run for minutes, and awaiting
+    // it here would park reconcile() — and with it nudge/reap/dispatch —
+    // for EVERY feature until it settles. The run row is already
+    // committed, so restart recovery and TTL reaping see the run either
+    // way; `settleActions()` lets tests (and shutdown) drain the map.
+    const execution = (async () => {
+      try {
+        const result = await actions.execute(binding, {
+          featureId,
+          jobId,
+          stepId: step.id,
+          workdir: state.worktree ?? state.projectDir,
+          inputs: coerced.inputs,
+          capabilities: binding.manifest.capabilities,
+        })
+        if (!result.ok) {
+          await this.concludeAndDispatch(
+            featureId, runId, "failed", { reason: result.error },
+            { kind: "step.failed", jobId, stepId: step.id, reason: result.error },
+          )
+          return
+        }
+        const outputs = stringifyOutputs(result.outputs)
+        await this.concludeAndDispatch(
+          featureId, runId, "succeeded", { outputs },
+          { kind: "step.completed", jobId, stepId: step.id, outcome: DEFAULT_OUTCOME, outputs },
+        )
+      } catch (err) {
+        const reason = `action host error: ${errorMessage(err)}`
+        await this.concludeAndDispatch(
+          featureId, runId, "failed", { reason },
+          { kind: "step.failed", jobId, stepId: step.id, reason },
+        )
+      } finally {
+        this.actionRuns.delete(runId)
+      }
+    })()
+    this.actionRuns.set(runId, execution)
+  }
 
-    if (!result.ok) {
-      await this.concludeAndDispatch(
-        featureId, runId, "failed", { reason: result.error },
-        { kind: "step.failed", jobId, stepId: step.id, reason: result.error },
-      )
-      return
+  /** Await every in-flight detached action execution. Tests and shutdown drain the engine with this. */
+  async settleActions(): Promise<void> {
+    while (this.actionRuns.size > 0) {
+      await Promise.all([...this.actionRuns.values()])
     }
-    const outputs = stringifyOutputs(result.outputs)
-    await this.concludeAndDispatch(
-      featureId, runId, "succeeded", { outputs },
-      { kind: "step.completed", jobId, stepId: step.id, outcome: DEFAULT_OUTCOME, outputs },
-    )
   }
 
   // ------------------------------------------------------------ conclusion
@@ -583,6 +618,18 @@ export class Engine {
 
       if (step.type === "agent") {
         await this.reconcileAgentRun(feature, snapshot, active)
+      } else if (step.type === "action" && !this.actionRuns.has(active.id)) {
+        // A running action run with no tracked execution means the daemon
+        // restarted mid-action. Waiting for TTL would stall the feature
+        // for no reason: conclude it failed now — bundled actions are
+        // idempotent, so the workflow's retry/onFail policy can safely
+        // re-dispatch.
+        log.log(`reconcile ${feature.slug}: run ${active.id} (action ${stepId}) has no live execution — daemon restarted, failing for retry`)
+        await this.concludeAndDispatch(
+          feature.id, active.id, "failed",
+          { reason: "daemon restarted while action was executing" },
+          { kind: "step.failed", jobId, stepId, reason: "daemon restarted while action was executing" },
+        )
       } else {
         await this.reconcileTtl(feature, snapshot, active)
       }

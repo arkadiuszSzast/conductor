@@ -634,8 +634,8 @@ describe("Engine: action steps", () => {
     const engine = makeEngine(actionWorkflow, {}, {}, bindingsFor(worktreeManifest))
     const feature = await engine.startFeature("/tmp/project", { title: "Ship it" })
     if (!feature.ok) throw new Error(feature.message)
+    await engine.settleActions()
 
-    // the action step ran synchronously to completion during dispatch
     const worktreeRun = store.listRuns(feature.feature.id).find(r => r.stepId === "worktree")!
     expect(worktreeRun.status).toBe("succeeded")
     expect(worktreeRun.stepType).toBe("action")
@@ -652,6 +652,7 @@ describe("Engine: action steps", () => {
     const bindings = bindingsFor(worktreeManifest)
     const engine = makeEngine(actionWorkflow, {}, {}, bindings)
     const feature = await startedFeature(engine)
+    await engine.settleActions()
     const run = store.listRuns(feature.id).find(r => r.stepId === "worktree")!
 
     expect(run.metadata).toEqual({
@@ -669,6 +670,7 @@ describe("Engine: action steps", () => {
     }
     const engine = makeEngine(actionWorkflow, {}, {}, bindingsFor(worktreeManifest))
     await engine.startFeature("/tmp/project", { title: "Ship it" })
+    await engine.settleActions()
 
     expect(seenRetries).toBe(3)
     expect(typeof seenRetries).toBe("number")
@@ -678,6 +680,7 @@ describe("Engine: action steps", () => {
     actions.handler = () => ({ ok: false, error: "boom" })
     const engine = makeEngine(actionWorkflow, {}, {}, bindingsFor(worktreeManifest))
     const feature = await startedFeature(engine)
+    await engine.settleActions()
 
     expect(store.getFeature(feature.id)?.status).toBe("escalated")
     const run = store.listRuns(feature.id).find(r => r.stepId === "worktree")!
@@ -732,6 +735,58 @@ describe("Engine: action steps", () => {
     const run = store.listRuns(feature.id).find(r => r.stepId === "worktree")!
     expect(run.status).toBe("reaped")
     void originalExecute
+  })
+
+  it("a slow action does not block reconciliation of other features", async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => {
+      release = resolve
+    })
+    actions.execute = async (binding, ctx) => {
+      actions.calls.push({ binding, ctx })
+      await gate
+      return { ok: true, outputs: { path: "/x" } }
+    }
+    const engine = makeEngine(actionWorkflow, {}, {}, bindingsFor(worktreeManifest))
+    await engine.startFeature("/tmp/project", { title: "Slow action" })
+    // the action is in flight (host gate held) yet dispatch returned:
+    expect(actions.calls).toHaveLength(1)
+    expect(store.listRuns(store.listFeatures()[0]!.id).find(r => r.stepId === "worktree")!.status).toBe("running")
+
+    // a full reconcile pass completes while the action still hangs
+    await engine.reconcile()
+
+    release()
+    await engine.settleActions()
+    expect(store.listRuns(store.listFeatures()[0]!.id).find(r => r.stepId === "worktree")!.status).toBe("succeeded")
+  })
+
+  it("a restart concludes an orphaned running action run as failed for retry", async () => {
+    let hold!: () => void
+    const gate = new Promise<void>(resolve => {
+      hold = resolve
+    })
+    actions.execute = async (binding, ctx) => {
+      actions.calls.push({ binding, ctx })
+      await gate
+      return { ok: true, outputs: { path: "/x" } }
+    }
+    const engine1 = makeEngine(actionWorkflow, {}, {}, bindingsFor(worktreeManifest))
+    await engine1.startFeature("/tmp/project", { title: "Interrupted" })
+    const feature = store.listFeatures()[0]!
+    expect(store.listRuns(feature.id).find(r => r.stepId === "worktree")!.status).toBe("running")
+
+    // a fresh engine on the same store has no tracked execution for the run
+    const engine2 = makeEngine(actionWorkflow, {}, {}, bindingsFor(worktreeManifest))
+    await engine2.reconcile()
+
+    const run = store.listRuns(feature.id).find(r => r.stepId === "worktree")!
+    expect(run.status).toBe("failed")
+    expect(run.reason).toBe("daemon restarted while action was executing")
+    // no onFail route on the action step → the interpreter escalates
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    hold()
+    await engine1.settleActions()
   })
 })
 

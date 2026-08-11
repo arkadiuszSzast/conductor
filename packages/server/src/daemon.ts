@@ -434,6 +434,9 @@ export class Daemon {
         this.timerHandle = null
       }
       if (this.cycleInFlight) await this.cycleInFlight
+      // Drain detached action executions before closing SQLite: their
+      // conclusion writes must land while the connection is still open.
+      await this.engineInstance?.settleActions()
       this.connection?.close()
       this.connection = null
       this.phase = "stopped"

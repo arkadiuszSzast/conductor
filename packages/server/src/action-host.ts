@@ -5,14 +5,18 @@
  * execution protocol over stdio); there is no action-name switch here or
  * anywhere downstream.
  *
- * Capability enforcement wraps the injected `ProcessRunner` so a handler
- * (in-process or, transitively, a subprocess action) that calls
- * `exec`/`shell` without the manifest having declared the `process`
- * capability gets a classified `capability_denied` rejection instead of
- * silently running. This is a guardrail and an audit trail — declaring a
- * capability is a policy statement the daemon enforces, not a sandbox; an
- * in-process handler can still reach outside its declared capabilities
- * through any other ambient API Node exposes.
+ * Capability enforcement wraps the injected `ProcessRunner`: every
+ * `exec` call has its required capability set inferred from the argv
+ * (any exec → `process`; `git` → `git`, network-touching git subcommands
+ * and known network binaries → `network`, `git worktree` → `filesystem`,
+ * `gh` → `credentials`), and a call requiring a capability the manifest
+ * did not declare gets a classified `capability_denied` rejection naming
+ * the missing capability. `shell` is opaque to inference, so it demands
+ * the broadest declaration (`process` + `network`). This is a guardrail
+ * and an audit trail — declaring a capability is a policy statement the
+ * daemon enforces, not a sandbox; an in-process handler can still reach
+ * outside its declared capabilities through any other ambient API Node
+ * exposes.
  */
 
 import type { ActionCapability, ActionManifest, ActionResult, ActionRunContext } from "@conductor/core"
@@ -130,15 +134,40 @@ function isActionResult(value: unknown): value is ActionResult {
 // Capability-gated process runner
 // ---------------------------------------------------------------------------
 
+const NETWORK_GIT_SUBCOMMANDS = new Set(["push", "fetch", "pull", "ls-remote", "remote", "clone", "submodule"])
+const NETWORK_BINARIES = new Set(["gh", "curl", "wget", "ssh", "scp", "rsync"])
+
+/** The capabilities an argv invocation requires, inferred from its shape. */
+export function requiredCapabilities(command: readonly string[]): readonly ActionCapability[] {
+  const required = new Set<ActionCapability>(["process"])
+  const binary = command[0] ?? ""
+  if (binary === "git") {
+    required.add("git")
+    const subcommand = command.find((arg, i) => i > 0 && !arg.startsWith("-")) ?? ""
+    if (NETWORK_GIT_SUBCOMMANDS.has(subcommand)) required.add("network")
+    if (subcommand === "worktree") required.add("filesystem")
+  }
+  if (NETWORK_BINARIES.has(binary)) required.add("network")
+  if (binary === "gh") required.add("credentials")
+  return [...required]
+}
+
 function gateProcessRunner(inner: ProcessRunner, capabilities: readonly ActionCapability[]): ProcessRunner {
-  const allowed = capabilities.includes("process")
+  const declared = new Set(capabilities)
+  const check = (required: readonly ActionCapability[]) => {
+    for (const capability of required) {
+      if (!declared.has(capability)) throw new CapabilityDeniedError(capability)
+    }
+  }
   return {
     async exec(command, options) {
-      if (!allowed) throw new CapabilityDeniedError("process")
+      check(requiredCapabilities(command))
       return inner.exec(command, options)
     },
     async shell(command, options) {
-      if (!allowed) throw new CapabilityDeniedError("process")
+      // A shell string is opaque to argv inference — it demands the
+      // broadest declaration instead of pretending to parse it.
+      check(["process", "network"])
       return inner.shell(command, options)
     },
   }

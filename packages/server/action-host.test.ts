@@ -159,7 +159,139 @@ describe("ActionHost: capability gating", () => {
     expect(error.capability).toBe("network")
     expect(error.message).toContain("network")
   })
+
+  it("denies a network git subcommand when only process+git are declared, naming network", async () => {
+    const process_ = new FakeProcess()
+    const handler: ActionHandler = async (_runCtx, deps) => {
+      await deps.process.exec(["git", "push", "origin", "main"], { cwd: "/tmp" })
+      return { status: "succeeded", outputs: {} }
+    }
+    const host = new ActionHost({ "test/action": handler }, { process: process_, log: noopLog })
+    const result = await host.execute(binding(manifest({ capabilities: ["process", "git"] })), ctx({ capabilities: ["process", "git"] }))
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toContain("capability_denied")
+    expect(result.error).toContain('"network"')
+    expect(process_.calls).toHaveLength(0)
+  })
+
+  it("allows a local git command with process+git and denies plain git without git capability", async () => {
+    const process_ = new FakeProcess()
+    const handler: ActionHandler = async (_runCtx, deps) => {
+      await deps.process.exec(["git", "status"], { cwd: "/tmp" })
+      return { status: "succeeded", outputs: {} }
+    }
+    const host = new ActionHost({ "test/action": handler }, { process: process_, log: noopLog })
+
+    const allowed = await host.execute(binding(manifest({ capabilities: ["process", "git"] })), ctx({ capabilities: ["process", "git"] }))
+    expect(allowed.ok).toBe(true)
+
+    const denied = await host.execute(binding(manifest({ capabilities: ["process"] })), ctx({ capabilities: ["process"] }))
+    expect(denied.ok).toBe(false)
+    if (denied.ok) return
+    expect(denied.error).toContain('"git"')
+  })
+
+  it("denies git worktree without filesystem and gh without credentials", async () => {
+    const process_ = new FakeProcess()
+    const worktreeHandler: ActionHandler = async (_runCtx, deps) => {
+      await deps.process.exec(["git", "worktree", "list"], { cwd: "/tmp" })
+      return { status: "succeeded", outputs: {} }
+    }
+    const ghHandler: ActionHandler = async (_runCtx, deps) => {
+      await deps.process.exec(["gh", "pr", "view", "1"], { cwd: "/tmp" })
+      return { status: "succeeded", outputs: {} }
+    }
+    const host = new ActionHost(
+      { "test/worktree": worktreeHandler, "test/gh": ghHandler },
+      { process: process_, log: noopLog },
+    )
+
+    const worktree = await host.execute(
+      binding(manifest({ capabilities: ["process", "git"], run: { kind: "inprocess", handler: "test/worktree" } })),
+      ctx({ capabilities: ["process", "git"] }),
+    )
+    expect(worktree.ok).toBe(false)
+    if (!worktree.ok) expect(worktree.error).toContain('"filesystem"')
+
+    const gh = await host.execute(
+      binding(manifest({ capabilities: ["process", "network"], run: { kind: "inprocess", handler: "test/gh" } })),
+      ctx({ capabilities: ["process", "network"] }),
+    )
+    expect(gh.ok).toBe(false)
+    if (!gh.ok) expect(gh.error).toContain('"credentials"')
+  })
+
+  it("shell is opaque and demands process+network", async () => {
+    const process_ = new FakeProcess()
+    const handler: ActionHandler = async (_runCtx, deps) => {
+      await deps.process.shell("echo hi", { cwd: "/tmp" })
+      return { status: "succeeded", outputs: {} }
+    }
+    const host = new ActionHost({ "test/action": handler }, { process: process_, log: noopLog })
+
+    const denied = await host.execute(binding(manifest({ capabilities: ["process"] })), ctx({ capabilities: ["process"] }))
+    expect(denied.ok).toBe(false)
+    if (!denied.ok) expect(denied.error).toContain('"network"')
+
+    const allowed = await host.execute(
+      binding(manifest({ capabilities: ["process", "network"] })),
+      ctx({ capabilities: ["process", "network"] }),
+    )
+    expect(allowed.ok).toBe(true)
+  })
+
+  it("every bundled handler's calls are covered by its manifest's declared capabilities", async () => {
+    const { bundledHandlers } = await import("./src/actions/bundled.ts")
+    const { loadActionRegistry } = await import("./src/action-registry.ts")
+    const loaded = await loadActionRegistry({ baseDir: import.meta.dir, bundledPath: "actions" })
+    expect(loaded.ok).toBe(true)
+    if (!loaded.ok) return
+
+    const success = (command: readonly string[]) => {
+      const stdout = command[0] === "gh" && command[2] === "checks"
+        ? '[{"name":"ci","state":"SUCCESS"}]'
+        : command[0] === "gh"
+          ? '{"number": 7, "url": "https://github.com/o/r/pull/7", "mergeCommit": {"oid": "abc123"}}'
+          : "https://github.com/o/r/pull/7\nabc123"
+      return { code: 0, stdout, stderr: "", output: stdout }
+    }
+    for (const entries of Object.values(loaded.value.registry)) {
+      for (const entry of entries) {
+        const m = entry.manifest
+        if (m.run.kind !== "inprocess") continue
+        const process_ = new FakeProcess()
+        process_.handler = success
+        const host = new ActionHost(bundledHandlers, { process: process_, log: noopLog, sleep: async () => {} })
+        const inputs: Record<string, unknown> = {}
+        for (const [name, def] of Object.entries(m.inputs)) {
+          inputs[name] = def.presence === "optional" ? def.default : sampleInput(def.type)
+        }
+        const result = await host.execute(
+          { jobId: "main", stepId: "s", uses: `${m.name}@v1`, manifest: m, digest: computeActionDigest(m), sourcePath: "x" },
+          ctx({ inputs, capabilities: m.capabilities }),
+        )
+        if (!result.ok) {
+          expect(result.error).not.toContain("capability_denied")
+        }
+      }
+    }
+  })
 })
+
+function sampleInput(type: string): unknown {
+  switch (type) {
+    case "number":
+      return 1
+    case "boolean":
+      return false
+    case "string[]":
+      return []
+    default:
+      return "feature-branch"
+  }
+}
 
 describe("ActionHost: subprocess JSON protocol", () => {
   // A "process" kind action's own command launch goes through the same
