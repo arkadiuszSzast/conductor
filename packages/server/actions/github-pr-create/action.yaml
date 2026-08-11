@@ -1,0 +1,14 @@
+name: github/pr-create
+version: 1.0.0
+description: Create a GitHub pull request, recovering idempotently if one already exists.
+inputs:
+  title: { type: string, required: true }
+  body:  { type: string, default: "" }
+  base:  { type: string, default: main }
+  head:  { type: string, required: true }
+  draft: { type: boolean, default: false }
+outputs:
+  number: { type: number }
+  url:    { type: string }
+capabilities: [process, network, credentials]
+run: { handler: github/pr-create }

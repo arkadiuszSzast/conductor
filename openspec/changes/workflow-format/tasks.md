@@ -20,8 +20,9 @@
 
 - [x] [core] Define ActionManifest IR, typed input/output, capability vocabulary, manifest YAML parser and validation, pure registry resolution with content digest and `with:` input checking, and JSON execution protocol envelope types.
 - [x] [server] Wire configured registry search paths (bundled + local), load manifests from disk, and expose the populated `ActionRegistry` to the daemon pre-start check and the reconciler.
-- [ ] [server] Record resolved action version/content digest and enforce declared capability policy at dispatch.
-- [ ] [server] Extract every seed builtin into a bundled `@v1` action; remove action-name dispatch from the engine.
+- [x] [server] Record resolved action version/content digest and enforce declared capability policy at dispatch.
+- [x] [server] Extract every seed builtin into a bundled `@v1` action (`git/worktree`, `git/worktree-remove`, `git/push`, `github/pr-create`, `github/await-checks`, `github/pr-merge`); remove action-name dispatch from the engine. `findings.sync`/`findings.check`/`threads.check_resolved` are not extracted here — they await the findings write-path change (not yet shipped) and stay out of scope until that lands. `github/await-checks` polls inline within one detached run for now — the spec's durable-pending scenario is tracked by the task below.
+- [ ] [core][server] Implement the durable pending `ActionResult` protocol: a polling action returns a durable pending result with a next-observation policy instead of holding its run open for the whole window; `github/await-checks@v1` migrates onto it (satisfies the spec's "Polling action reports pending" scenario).
 - [x] [test] Add action registry contract tests: versioned resolution with deterministic digest, missing action/version diagnostics naming paths, incompatible `with:` inputs, unknown capabilities, safe IO variants; golden manifest fixtures (valid/invalid) in `packages/core/fixtures/actions/`.
 
 ## 4. Triggers and durable execution
@@ -33,8 +34,8 @@
 
 ## 5. Migration and documentation
 
-- [ ] [cli] Implement legacy JSON → v1 YAML conversion with builtin→action mapping and no guessed semantics.
-- [ ] [test] Build event-level parity fixtures running representative legacy pipelines through old and new interpreters.
+- [x] [cli] ~~Implement legacy JSON → v1 YAML conversion with builtin→action mapping and no guessed semantics.~~ (void — greenfield pivot, see standalone-daemon-extraction: seed format deleted)
+- [x] [test] ~~Build event-level parity fixtures running representative legacy pipelines through old and new interpreters.~~ (void — greenfield pivot, see standalone-daemon-extraction: seed format deleted)
 - [x] [docs] Publish workflow reference (`docs/workflow-reference.md`), expression language (`docs/expressions.md`) and execution concepts (`docs/concepts.md`); planned-but-unimplemented behaviour is marked in place.
 - [ ] [docs] Publish JSON schema/editor integration, action authoring and migration guide (blocked on parser and registry).
 - [ ] [review] Review the dialect cold against the GHA UX benchmark and run security review of YAML/expression/action inputs.

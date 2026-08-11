@@ -1,0 +1,11 @@
+name: git/push
+version: 1.0.0
+description: Push commits to a remote over git.
+inputs:
+  remote:        { type: string, default: origin }
+  branch:        { type: string, required: true }
+  set_upstream:  { type: boolean, default: true }
+outputs:
+  sha: { type: string }
+capabilities: [process, git, network]
+run: { handler: git/push }

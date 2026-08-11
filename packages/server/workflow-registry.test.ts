@@ -221,6 +221,13 @@ jobs:
     const registry = new WorkflowRegistry({ actionRegistry })
     const result = registry.register(project)
     expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const binding = result.snapshot.actionBindings[JSON.stringify(["main", "push"])]
+    expect(binding).toBeDefined()
+    expect(binding?.uses).toBe("git/push@v1")
+    expect(binding?.manifest.name).toBe("git/push")
+    expect(binding?.digest).toMatch(/^[0-9a-f]{64}$/)
+    expect(registry.resolver(project)?.actionBindings).toBe(result.snapshot.actionBindings)
   })
 
   it("an action step referring to an unresolvable action is invalid with a clear diagnostic", () => {

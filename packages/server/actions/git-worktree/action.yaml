@@ -1,0 +1,12 @@
+name: git/worktree
+version: 1.0.0
+description: Create a git worktree for a feature branch, idempotently.
+inputs:
+  branch: { type: string, required: true }
+  base:   { type: string, default: main }
+  dir:    { type: string, default: "" }
+outputs:
+  path:    { type: string }
+  created: { type: boolean }
+capabilities: [filesystem, process, git]
+run: { handler: git/worktree }

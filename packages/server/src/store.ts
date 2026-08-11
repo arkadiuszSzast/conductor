@@ -38,7 +38,7 @@ interface RunRow {
   feature_id: string
   job_id: string
   step_id: string
-  step_type: "agent" | "command"
+  step_type: "agent" | "command" | "action"
   attempt: number
   status: "running" | "succeeded" | "failed" | "reaped"
   session_id: string | null
@@ -48,8 +48,18 @@ interface RunRow {
   completion_event: string | null
   completion_decisions: string | null
   action_handled: number
+  metadata: string | null
   time_started: number
   time_finished: number | null
+}
+
+/** Resolved action identity recorded on an action run — pins `uses`, the
+ *  resolved manifest version and the content digest the run executed
+ *  against, independent of what the registry resolves to later. */
+export interface RunActionMetadata {
+  readonly uses: string
+  readonly version: string
+  readonly digest: string
 }
 
 export interface RunSummary {
@@ -57,13 +67,14 @@ export interface RunSummary {
   readonly featureId: string
   readonly jobId: string
   readonly stepId: string
-  readonly stepType: "agent" | "command"
+  readonly stepType: "agent" | "command" | "action"
   readonly attempt: number
   readonly status: "running" | "succeeded" | "failed" | "reaped"
   readonly sessionId: string | null
   readonly outputs: Readonly<Record<string, string>>
   readonly reason: string | null
   readonly nudges: number
+  readonly metadata: RunActionMetadata | null
   readonly timeStarted: number
   readonly timeFinished: number | null
 }
@@ -81,6 +92,7 @@ function toRunSummary(row: RunRow): RunSummary {
     outputs: JSON.parse(row.outputs) as Record<string, string>,
     reason: row.reason,
     nudges: row.nudges,
+    metadata: row.metadata ? (JSON.parse(row.metadata) as RunActionMetadata) : null,
     timeStarted: row.time_started,
     timeFinished: row.time_finished,
   }
@@ -260,15 +272,26 @@ export class Store {
     featureId: string
     jobId: string
     stepId: string
-    stepType: "agent" | "command"
+    stepType: "agent" | "command" | "action"
     attempt: number
     sessionId?: string
+    metadata?: RunActionMetadata
   }): string {
     const id = randomUUID()
     this.db.run(
-      `INSERT INTO run (id, feature_id, job_id, step_id, step_type, attempt, session_id, time_started)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, input.featureId, input.jobId, input.stepId, input.stepType, input.attempt, input.sessionId ?? null, Date.now()],
+      `INSERT INTO run (id, feature_id, job_id, step_id, step_type, attempt, session_id, metadata, time_started)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        input.featureId,
+        input.jobId,
+        input.stepId,
+        input.stepType,
+        input.attempt,
+        input.sessionId ?? null,
+        input.metadata ? JSON.stringify(input.metadata) : null,
+        Date.now(),
+      ],
     )
     this.emit({ kind: "run", featureId: input.featureId })
     return id

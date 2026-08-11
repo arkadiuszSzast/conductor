@@ -1,0 +1,11 @@
+name: github/await-checks
+version: 1.0.0
+description: Poll a pull request's checks until they all conclude, fail, or time out.
+inputs:
+  pr:              { type: number, required: true }
+  timeout_minutes: { type: number, default: 30 }
+  poll_seconds:    { type: number, default: 60 }
+outputs:
+  conclusion: { type: string }
+capabilities: [process, network, credentials]
+run: { handler: github/await-checks }
