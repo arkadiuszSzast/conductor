@@ -701,6 +701,30 @@ describe("agent log capture via runner push", () => {
     expect(client.pushes).toEqual([])
   })
 
+  it("the session→run map is bounded: oldest attributions are evicted beyond the cap", async () => {
+    const project = writeProject()
+    const h = await makeHarness({ projects: [project] })
+    const opencode = new FakeOpencodeServer(project)
+    const hub = h.makeHub()
+    await hub.registerProject(project, createOpencodeSessions(opencode.api()))
+
+    const create = (runId: string) =>
+      hub.handle(
+        new Request(`http://${RUNNER_ENDPOINT_HOST}:1/v1/sessions`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${RUNNER_TOKEN}` },
+          body: JSON.stringify({ title: "step", directory: project, runId }),
+        }),
+      )
+
+    const first = (await (await create("run-first")).json()) as { id: string }
+    for (let i = 0; i < 1024; i += 1) await create(`run-${i}`)
+    expect(hub.runIdForSession(first.id)).toBeUndefined()
+
+    const last = (await (await create("run-last")).json()) as { id: string }
+    expect(hub.runIdForSession(last.id)).toBe("run-last")
+  })
+
   it("records the run attribution on session create and streams part events into the daemon route", async () => {
     const project = writeProject()
     const h = await makeHarness({ projects: [project] })

@@ -563,12 +563,30 @@ export class Store {
    * same run within one window coalesce into at most one emission, so a
    * chatty producer can never flood SSE subscribers. The append itself
    * is never delayed — only the notification is coalesced.
+   *
+   * `requireRunning` makes the running-state check part of the SAME
+   * transaction as the insert — the atomic authority the HTTP write
+   * route relies on (its pre-await status snapshot can go stale while
+   * the request body is still being read; a concurrent conclusion must
+   * not slip an append through the gap). Returns null without writing
+   * when the run is no longer `running`. Daemon-internal producers
+   * (process/action capture) stay lenient: their run may legitimately be
+   * concluded by a concurrent reaper while output is still settling, and
+   * a best-effort narrative keeps that tail rather than dropping it.
    */
-  appendRunLog(runId: string, entries: readonly RunLogEntryInput[]): { firstSeq: number; lastSeq: number } | null {
+  appendRunLog(
+    runId: string,
+    entries: readonly RunLogEntryInput[],
+    options?: { requireRunning?: boolean },
+  ): { firstSeq: number; lastSeq: number } | null {
     if (entries.length === 0) return null
     const now = Date.now()
     let firstSeq = 0
-    this.db.transaction(() => {
+    const appended = this.db.transaction(() => {
+      if (options?.requireRunning) {
+        const run = this.db.query("SELECT status FROM run WHERE id = ?").get(runId) as { status: string } | null
+        if (run?.status !== "running") return false
+      }
       const row = this.db.query("SELECT COALESCE(MAX(seq), 0) AS maxSeq FROM run_log WHERE run_id = ?").get(runId) as { maxSeq: number }
       firstSeq = row.maxSeq + 1
       for (const [offset, entry] of entries.entries()) {
@@ -578,7 +596,9 @@ export class Store {
         )
       }
       this.enforceRunLogCap(runId)
+      return true
     })()
+    if (!appended) return null
     this.emitRunLogChange(runId)
     return { firstSeq, lastSeq: firstSeq + entries.length - 1 }
   }
@@ -589,7 +609,10 @@ export class Store {
     let excess = total - RUN_LOG_CAP_BYTES
     const rows = this.db.query("SELECT seq, LENGTH(chunk) AS bytes FROM run_log WHERE run_id = ? ORDER BY seq ASC").all(runId) as Array<{ seq: number; bytes: number }>
     let dropUpTo = 0
-    for (const row of rows) {
+    // Never drop the newest line: even when a single oversized chunk
+    // exceeds the whole cap, "the tail survives" stays literally true —
+    // an append can never erase itself.
+    for (const row of rows.slice(0, -1)) {
       if (excess <= 0) break
       dropUpTo = row.seq
       excess -= row.bytes

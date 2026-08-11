@@ -66,6 +66,9 @@ function isPathPrefix(prefix: string, directory: string): boolean {
   return directory === prefix || directory.startsWith(prefix.endsWith("/") ? prefix : `${prefix}/`)
 }
 
+/** Bound on the session→run attribution map — evicted oldest-first. */
+const MAX_SESSION_RUN_IDS = 1024
+
 export const bunListen: ListenFn = (host, port, handler) => {
   const server = Bun.serve({ hostname: host, port, idleTimeout: 0, fetch: handler })
   return {
@@ -248,8 +251,17 @@ export class OpencodeRunnerHub {
       })
       // Remember the run attribution for the plugin's agent-log push.
       // The hint is optional end-to-end; when absent no mapping is kept
-      // and no push happens for this session.
-      if (body.runId !== undefined) this.sessionRunIds.set(created.id, body.runId)
+      // and no push happens for this session. The map is bounded: beyond
+      // the cap the oldest entries (insertion order = session-creation
+      // order) are evicted — those sessions' runs have long concluded.
+      if (body.runId !== undefined) {
+        this.sessionRunIds.set(created.id, body.runId)
+        while (this.sessionRunIds.size > MAX_SESSION_RUN_IDS) {
+          const oldest = this.sessionRunIds.keys().next().value
+          if (oldest === undefined) break
+          this.sessionRunIds.delete(oldest)
+        }
+      }
       return json(201, { id: created.id })
     }
 

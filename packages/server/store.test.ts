@@ -412,6 +412,26 @@ describe("run logs", () => {
     expect(page.lines[page.lines.length - 1]!.text).toBe("tail marker")
   })
 
+  it("requireRunning refuses the append atomically once the run has concluded", () => {
+    const runId = makeRun()
+    store.finishRun(runId, "succeeded", { outputs: {} })
+    expect(store.appendRunLog(runId, [{ source: "agent", text: "late" }], { requireRunning: true })).toBeNull()
+    expect(store.getRunLog(runId).lines).toEqual([])
+    // Daemon-internal producers stay lenient: no requireRunning, the append lands.
+    expect(store.appendRunLog(runId, [{ source: "process", text: "settling output" }])).toEqual({ firstSeq: 1, lastSeq: 1 })
+  })
+
+  it("a single chunk larger than the whole cap survives as the tail — an append never erases itself", () => {
+    const runId = makeRun()
+    store.appendRunLog(runId, [{ source: "process", text: "old line" }])
+    const oversized = "y".repeat(3 * 1024 * 1024)
+    store.appendRunLog(runId, [{ source: "process", text: oversized }])
+    const page = store.getRunLog(runId)
+    expect(page.lines).toHaveLength(1)
+    expect(page.lines[0]!.seq).toBe(2)
+    expect(page.lines[0]!.text.length).toBe(oversized.length)
+  })
+
   it("pages with after/limit and reports truncation", () => {
     const runId = makeRun()
     store.appendRunLog(runId, Array.from({ length: 5 }, (_, i) => ({ source: "step" as const, text: `l${i + 1}` })))

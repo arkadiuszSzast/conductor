@@ -902,6 +902,53 @@ describe("API: run logs", () => {
     expect(unknownRun.status).toBe(404)
   })
 
+  it("POST rejects an oversized line with 400 before touching the store", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    const response = await request("POST", `/v1/runs/${run.id}/logs`, {
+      lines: [{ text: "x".repeat(64 * 1024 + 1) }],
+    })
+    expect(response.status).toBe(400)
+    expect(daemon.store.getRunLog(run.id).lines).toEqual([])
+  })
+
+  it("POST loses the race to a concurrent conclusion: the store's atomic guard maps to 409", async () => {
+    const { api, request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+
+    // Simulate the TOCTOU window: the handler snapshots the run as
+    // running, then the run concludes while the request body is still
+    // being read. A streamed body whose read yields lets the conclusion
+    // land between the pre-check and the append.
+    let releaseBody!: () => void
+    const gate = new Promise<void>(resolve => {
+      releaseBody = resolve
+    })
+    const encoderLocal = new TextEncoder()
+    const body = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        await gate
+        controller.enqueue(encoderLocal.encode(JSON.stringify({ lines: [{ text: "raced" }] })))
+        controller.close()
+      },
+    })
+    const pending = api.handle(
+      new Request(`http://conductor.test/v1/runs/${run.id}/logs`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      }),
+    )
+    await request("POST", `/v1/runs/${run.id}/report`, { outcome: "succeeded" })
+    releaseBody()
+    const raced = await pending
+    expect(raced.status).toBe(409)
+    expect(((await raced.json()) as { error: { code: string } }).error.code).toBe("run_already_concluded")
+    expect(daemon.store.getRunLog(run.id).lines).toEqual([])
+  })
+
   it("POST rejects appends to a concluded run with 409", async () => {
     const { request, project, daemon } = await makeApi()
     const feature = await startFeature(request, project)

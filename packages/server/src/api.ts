@@ -184,6 +184,9 @@ function jobsSummary(feature: FeatureState): Readonly<Record<string, { status: s
 /** Detail-payload bound per step-output value; full output stays one GET /v1/runs/:id away. */
 const STEP_OUTPUT_LIMIT = 500
 
+/** Max characters per POSTed log line — well under the store's 2 MB per-run cap. */
+const RUN_LOG_LINE_LIMIT = 64 * 1024
+
 interface StepDetailProjection {
   readonly status: StepRuntime["status"]
   readonly outputs: Readonly<Record<string, string>>
@@ -773,16 +776,29 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       if (typeof record.text !== "string" || record.text === "") {
         return error(requestId, "invalid_request", "each line's \"text\" must be a non-empty string")
       }
+      // Bounded per line so a single entry can never blow through the
+      // per-run storage cap (and silently erase the log it lands in).
+      if (record.text.length > RUN_LOG_LINE_LIMIT) {
+        return error(requestId, "invalid_request", `each line's "text" must be at most ${RUN_LOG_LINE_LIMIT} characters`)
+      }
       const source = record.source ?? "step"
       if (source !== "step" && source !== "agent") {
         return error(requestId, "invalid_request", "\"source\" must be \"step\" or \"agent\"")
       }
       entries.push({ source, text: record.text })
     }
+    // The pre-check projects a friendly 409 from the pre-await snapshot;
+    // the store's requireRunning guard is the atomic authority — a run
+    // concluded by a concurrent report while this request's body was
+    // still being read yields null here and maps to the same 409.
     if (run.status !== "running") {
       return error(requestId, "run_already_concluded", `run ${runId} already concluded (${run.status})`)
     }
-    store.appendRunLog(runId, entries)
+    const appended = store.appendRunLog(runId, entries, { requireRunning: true })
+    if (appended === null) {
+      const after = store.getRunById(runId)
+      return error(requestId, "run_already_concluded", `run ${runId} already concluded (${after?.status ?? "unknown"})`)
+    }
     return json(201, { appended: entries.length }, requestId)
   }
 

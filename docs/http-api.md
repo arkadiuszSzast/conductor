@@ -110,7 +110,8 @@ Bearer-authenticated. Body: `{lines: [{text, source?}]}`.
   and `"agent"` — anything else → 400 (`process`/`action` are daemon-
   internal sources and can never be forged over HTTP).
 - An empty/malformed `lines` array → 400. At most 2000 entries per
-  request.
+  request; each line's `text` is bounded at 64 KiB (oversized → 400), so
+  a single request can never blow through the per-run storage cap.
 - Appends to a run that is no longer `running` → 409
   (`run_already_concluded`, consistent with the report route) — a runner's
   late agent-log flush after conclusion is dropped this way. Unknown run → 404.
