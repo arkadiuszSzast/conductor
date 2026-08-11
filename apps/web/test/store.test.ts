@@ -217,6 +217,34 @@ describe("invalidation store: own-command echo skip", () => {
     expect(calls.some(c => c.path === "/v1/features/f-1")).toBe(false)
   })
 
+  it("a multi-kind echo burst for one feature is fully suppressed", async () => {
+    const scheduler = new FakeScheduler()
+    const { client, calls } = makeStack({
+      "/v1/features/f-1/approve": () => ({ result: "Approved", ...detailResponse("f-1") }),
+      "/v1/features/f-1": () => detailResponse("f-1"),
+      "/v1/features": () => ({ features: [listItem("f-1")] }),
+      "/v1/health": () => ({ alive: true, ready: true, phase: "ready", database: { path: "", migrated: true, appliedNow: [], knownMigrations: 0 }, heartbeat: { intervalMs: 0, running: true, inFlight: false, lastStartedAt: null, lastCompletedAt: null, lastError: null, cycles: 0 }, projects: [], runner: "available" }),
+    })
+    const store = new DataSource({ client, setTimeoutFn: scheduler.set, clearTimeoutFn: scheduler.clear })
+    store.setActiveFeature("f-1")
+    await store.command("f-1", c => c.approve("f-1"))
+    await settle()
+
+    // An approve legitimately echoes as transition+run+feature in one
+    // coalesce window — every kind must be swallowed, not just the first.
+    calls.length = 0
+    const anyStore = store as unknown as { queue(change: { kind: string; featureId: string }): void }
+    anyStore.queue({ kind: "transition", featureId: "f-1" })
+    anyStore.queue({ kind: "run", featureId: "f-1" })
+    anyStore.queue({ kind: "feature", featureId: "f-1" })
+    scheduler.tick()
+    await settle()
+
+    expect(calls.some(c => c.path === "/v1/features/f-1")).toBe(false)
+    expect(calls.some(c => c.path === "/v1/features/f-1/runs")).toBe(false)
+    expect(calls.some(c => c.path === "/v1/features")).toBe(false)
+  })
+
   it("a second, non-echo invalidation after the window does refetch", async () => {
     const scheduler = new FakeScheduler()
     let nowValue = 1_000

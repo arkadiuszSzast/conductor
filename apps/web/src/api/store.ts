@@ -428,10 +428,14 @@ export class DataSource {
   }
 
   private collectTargets(change: ChangeEvent, targets: Set<string>): void {
+    // A command response was applied for this feature moments ago: every
+    // invalidation kind echoing that write inside the window is suppressed
+    // (a transition+run burst is one echo, not one echo plus a refetch).
+    // The entry expires by time, never by first match.
     const echoedAt = this.echo.get(change.featureId)
-    if (echoedAt !== undefined && this.now() - echoedAt < ECHO_WINDOW_MS) {
+    if (echoedAt !== undefined) {
+      if (this.now() - echoedAt < ECHO_WINDOW_MS) return
       this.echo.delete(change.featureId)
-      return
     }
     const onScreen = this.activeFeatureId !== null && change.featureId === this.activeFeatureId
     switch (change.kind) {

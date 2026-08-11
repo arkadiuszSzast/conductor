@@ -27,6 +27,7 @@ export function App(): React.ReactNode {
   const [services, setServices] = useState<AppServices | null>(null)
 
   useEffect(() => {
+    let active = true
     const storage = localStorageAuthStorage()
     const session = new AuthSession({ storage, probe: probeHealth })
     const client = new ApiClient({
@@ -38,10 +39,12 @@ export function App(): React.ReactNode {
     })
     const store = new DataSource({ client })
     void session.bootstrap().then(() => {
+      if (!active) return
       if (session.status === "authenticated") void store.start()
       setServices({ session, client, store })
     })
     return () => {
+      active = false
       store.stop()
     }
   }, [])
