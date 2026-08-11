@@ -1,0 +1,23 @@
+# Tasks — run-log-capture
+
+- [x] 1. [server] API: GAP-12 — `feedback` in the feature DETAIL payload (`featurePayload()` gains `feedback: store.getFeedback(id)`, null when absent; list payload untouched)
+- [x] 2. [test] API test: detail carries `feedback` after a rerun transition, null before, absent from list items
+- [x] 3. [docs] `docs/http-api.md`: document `feedback` in the detail payload and its lifecycle per the code's actual semantics — written only by a rerun transition, never cleared, replaced by a later rerun
+- [x] 4. [db] Migration `0011_run_log`: `run_log(run_id, seq, time, source, chunk, PRIMARY KEY(run_id, seq))`, append-only ledger position 11
+- [x] 5. [db] Store: `appendRunLog(runId, entries)` — per-run monotonic seq computed in one transaction, batch insert, 2 MB cap enforced in the same transaction (drop-oldest, tail survives), returns the appended seq range
+- [x] 6. [db] Store: `getRunLog(runId, {afterSeq, limit})` → `{lines: [{seq, time, source, text}], nextSeq, truncated}` — cursor-incremental, `truncated` true when more lines remain
+- [x] 7. [db] Store: `StoreChange.kind` gains `"run_log"`; emission throttled at the source — at most one `{kind: "run_log", featureId}` per run per 1 s window (clock injectable for tests), appends never delayed
+- [x] 8. [test] Store tests: append/get round-trip, seq monotonic across batches, batch atomicity (mid-batch failure rolls back), cap drop-oldest keeps tail, after/limit cursor paging + truncated flag, run_log emission coalescence within a window and re-emission after it
+- [x] 9. [server] Engine: command steps persist the interleaved `result.output` to the run log as `source: "process"` on settle (per command, when non-empty); failure `reason` behaviour unchanged
+- [x] 10. [server] Action host: `ActionHostDeps` gains an injected `runLog` writer; engine wiring binds it to `store.appendRunLog(runId, [{source: "action", …}])` per execution — handlers never touch the store
+- [x] 11. [test] Engine tests: command success → output readable as `process` lines; command failure → run_log lines AND unchanged `reason`; action handler logging → `action` lines on the executing run
+- [x] 12. [server] API: `GET /v1/runs/:id/logs?after=<seq>&limit=<n>` — bearer auth, default limit 500, hard max 2000, unknown run → 404 in the standard envelope; log lines never added to feature/run payloads
+- [x] 13. [server] API: `POST /v1/runs/:id/logs {lines: [{text, source?}]}` — source defaults to `step`, allowed values `step|agent` (else 400), run not `running` → 409, unknown run → 404
+- [x] 14. [cli] ApiClient: `getRunLogs(runId, {after, limit})` and `appendRunLogs(runId, lines)` typed methods
+- [x] 15. [test] API tests: GET happy path, after-cursor tail, limit clamping, 404; POST happy path, batch, default source, invalid source 400, concluded run 409, auth required; SSE stream delivers `run_log` kind
+- [x] 16. [server][runner] Runner protocol: daemon passes optional `runId` on session create — engine supplies it for step sessions, `createRunnerSessionClient` forwards it, hub accepts and records `sessionID → runId` (field optional end-to-end; runners ignoring it stay valid)
+- [x] 17. [runner] opencode plugin: `event` hook observes `message.part.updated` for mapped sessions, accumulates text chunks per run (dedupe by part id/length), flushes batched `source: "agent"` lines to `POST /v1/runs/:id/logs` on a 1 s debounce; push is best-effort (failures logged and dropped, never affect the session or run)
+- [x] 18. [test] Runner tests: mapped session's part events land as `agent` lines via the daemon route (batched); unmapped sessions push nothing; daemon-unreachable push failure is swallowed; late flush after run conclusion is dropped on 409 without retry
+- [x] 19. [test] Integration: command step end-to-end through a real Daemon — after the feature settles, `GET /v1/runs/:id/logs` returns the command's output as `process` lines
+- [x] 20. [docs] `docs/http-api.md`: document both log routes (cursor contract, limits, source validation, 409 semantics) and the `run_log` SSE kind incl. source-side throttling; note per-run cap and out-of-scope retention
+- [x] 21. [review] `bun test && bun run typecheck && bun run lint && openspec validate run-log-capture`; confirm `docs/design/web-ui/` untouched and no `@conductor/core` diffs

@@ -353,6 +353,136 @@ describe("newest run per step", () => {
   })
 })
 
+describe("run logs", () => {
+  function makeRun(): string {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    return store.insertRun({ featureId: feature.id, jobId: "main", stepId: "verify", stepType: "command", attempt: 1 })
+  }
+
+  it("round-trips an append batch with monotonic seq, time and source", () => {
+    const runId = makeRun()
+    const range = store.appendRunLog(runId, [
+      { source: "process", text: "line one" },
+      { source: "process", text: "line two" },
+    ])
+    expect(range).toEqual({ firstSeq: 1, lastSeq: 2 })
+    const page = store.getRunLog(runId)
+    expect(page.lines.map(line => line.text)).toEqual(["line one", "line two"])
+    expect(page.lines.map(line => line.seq)).toEqual([1, 2])
+    expect(page.lines.every(line => line.source === "process" && line.time > 0)).toBe(true)
+    expect(page.nextSeq).toBe(2)
+    expect(page.truncated).toBe(false)
+  })
+
+  it("seq stays monotonic across batches", () => {
+    const runId = makeRun()
+    store.appendRunLog(runId, [{ source: "step", text: "a" }])
+    const second = store.appendRunLog(runId, [{ source: "step", text: "b" }, { source: "step", text: "c" }])
+    expect(second).toEqual({ firstSeq: 2, lastSeq: 3 })
+  })
+
+  it("an empty batch is a no-op", () => {
+    const runId = makeRun()
+    expect(store.appendRunLog(runId, [])).toBeNull()
+    expect(store.getRunLog(runId).lines).toEqual([])
+  })
+
+  it("a batch is atomic — a mid-batch failure leaves nothing behind", () => {
+    const runId = makeRun()
+    connection.db.run(`
+      CREATE TRIGGER reject_second_line BEFORE INSERT ON run_log
+      WHEN NEW.seq = 2
+      BEGIN SELECT RAISE(ABORT, 'batch rejected'); END
+    `)
+    expect(() => store.appendRunLog(runId, [
+      { source: "agent", text: "first" },
+      { source: "agent", text: "second" },
+    ])).toThrow("batch rejected")
+    expect(store.getRunLog(runId).lines).toEqual([])
+  })
+
+  it("enforces the per-run cap by dropping the oldest lines — the tail survives", () => {
+    const runId = makeRun()
+    const megabyte = "x".repeat(1024 * 1024)
+    store.appendRunLog(runId, [{ source: "process", text: megabyte }])
+    store.appendRunLog(runId, [{ source: "process", text: megabyte }])
+    store.appendRunLog(runId, [{ source: "process", text: "tail marker" }])
+    const page = store.getRunLog(runId)
+    expect(page.lines.map(line => line.seq)).toEqual([2, 3])
+    expect(page.lines[page.lines.length - 1]!.text).toBe("tail marker")
+  })
+
+  it("requireRunning refuses the append atomically once the run has concluded", () => {
+    const runId = makeRun()
+    store.finishRun(runId, "succeeded", { outputs: {} })
+    expect(store.appendRunLog(runId, [{ source: "agent", text: "late" }], { requireRunning: true })).toBeNull()
+    expect(store.getRunLog(runId).lines).toEqual([])
+    // Daemon-internal producers stay lenient: no requireRunning, the append lands.
+    expect(store.appendRunLog(runId, [{ source: "process", text: "settling output" }])).toEqual({ firstSeq: 1, lastSeq: 1 })
+  })
+
+  it("a single chunk larger than the whole cap survives as the tail — an append never erases itself", () => {
+    const runId = makeRun()
+    store.appendRunLog(runId, [{ source: "process", text: "old line" }])
+    const oversized = "y".repeat(3 * 1024 * 1024)
+    store.appendRunLog(runId, [{ source: "process", text: oversized }])
+    const page = store.getRunLog(runId)
+    expect(page.lines).toHaveLength(1)
+    expect(page.lines[0]!.seq).toBe(2)
+    expect(page.lines[0]!.text.length).toBe(oversized.length)
+  })
+
+  it("pages with after/limit and reports truncation", () => {
+    const runId = makeRun()
+    store.appendRunLog(runId, Array.from({ length: 5 }, (_, i) => ({ source: "step" as const, text: `l${i + 1}` })))
+    const first = store.getRunLog(runId, { limit: 2 })
+    expect(first.lines.map(line => line.text)).toEqual(["l1", "l2"])
+    expect(first.nextSeq).toBe(2)
+    expect(first.truncated).toBe(true)
+
+    const second = store.getRunLog(runId, { afterSeq: first.nextSeq, limit: 2 })
+    expect(second.lines.map(line => line.text)).toEqual(["l3", "l4"])
+    expect(second.truncated).toBe(true)
+
+    const last = store.getRunLog(runId, { afterSeq: second.nextSeq, limit: 2 })
+    expect(last.lines.map(line => line.text)).toEqual(["l5"])
+    expect(last.nextSeq).toBe(5)
+    expect(last.truncated).toBe(false)
+
+    const empty = store.getRunLog(runId, { afterSeq: 5 })
+    expect(empty.lines).toEqual([])
+    expect(empty.nextSeq).toBe(5)
+  })
+
+  it("throttles run_log notifications per run within the window and re-emits after it", () => {
+    const clock = { current: 1_000_000, now(): number { return this.current } }
+    const throttled = new Store(connection.db, clock)
+    const feature = throttled.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const runId = throttled.insertRun({ featureId: feature.id, jobId: "main", stepId: "verify", stepType: "command", attempt: 1 })
+    const other = throttled.insertRun({ featureId: feature.id, jobId: "other", stepId: "verify", stepType: "command", attempt: 1 })
+    const changes: StoreChange[] = []
+    throttled.onChange(change => {
+      if (change.kind === "run_log") changes.push(change)
+    })
+
+    throttled.appendRunLog(runId, [{ source: "step", text: "a" }])
+    throttled.appendRunLog(runId, [{ source: "step", text: "b" }])
+    throttled.appendRunLog(runId, [{ source: "step", text: "c" }])
+    expect(changes).toHaveLength(1)
+
+    // The throttle is per run: another run of the same feature emits independently.
+    throttled.appendRunLog(other, [{ source: "step", text: "x" }])
+    expect(changes).toHaveLength(2)
+
+    clock.current += 1_000
+    throttled.appendRunLog(runId, [{ source: "step", text: "d" }])
+    expect(changes).toHaveLength(3)
+
+    // Every append landed regardless of notification coalescing.
+    expect(throttled.getRunLog(runId).lines.map(line => line.text)).toEqual(["a", "b", "c", "d"])
+  })
+})
+
 describe("timeline events", () => {
   it("returns event as a parsed object", () => {
     const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })

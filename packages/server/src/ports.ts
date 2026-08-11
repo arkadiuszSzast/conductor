@@ -64,7 +64,7 @@ export interface ProcessRunner {
  * (opencode today, others later) implement it against their own client.
  */
 export interface SessionClient {
-  createSession(input: { title: string; directory: string; parentID?: string }): Promise<{ id: string }>
+  createSession(input: { title: string; directory: string; parentID?: string; runId?: string }): Promise<{ id: string }>
   prompt(input: {
     sessionID: string
     text: string

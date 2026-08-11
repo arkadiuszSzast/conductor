@@ -66,6 +66,9 @@ function isPathPrefix(prefix: string, directory: string): boolean {
   return directory === prefix || directory.startsWith(prefix.endsWith("/") ? prefix : `${prefix}/`)
 }
 
+/** Bound on the session→run attribution map — evicted oldest-first. */
+const MAX_SESSION_RUN_IDS = 1024
+
 export const bunListen: ListenFn = (host, port, handler) => {
   const server = Bun.serve({ hostname: host, port, idleTimeout: 0, fetch: handler })
   return {
@@ -80,6 +83,8 @@ export const bunListen: ListenFn = (host, port, handler) => {
 export class OpencodeRunnerHub {
   /** projectDir → that instance's session transport. Sorted iteration everywhere. */
   private readonly projects = new Map<string, SessionClient>()
+  /** sessionID → the conductor run the daemon created it for (optional hint). */
+  private readonly sessionRunIds = new Map<string, string>()
   private listener: CallbackListener | null = null
   private runnerId: string | null = null
   private stopped = false
@@ -151,6 +156,15 @@ export class OpencodeRunnerHub {
     return [...this.projects.keys()].sort()
   }
 
+  /**
+   * The conductor run id a session was created for, when the daemon
+   * supplied the hint on session create. Absent for parent/other
+   * sessions — callers (agent-log push) treat that as "not mapped".
+   */
+  runIdForSession(sessionID: string): string | undefined {
+    return this.sessionRunIds.get(sessionID)
+  }
+
   private async announce(): Promise<void> {
     const endpoint = this.endpoint
     if (endpoint === null) throw new Error("runner hub has no listener")
@@ -218,12 +232,15 @@ export class OpencodeRunnerHub {
     const method = request.method.toUpperCase()
 
     if (path === "/v1/sessions" && method === "POST") {
-      const body = (await request.json()) as { title?: unknown; directory?: unknown; parentID?: unknown }
+      const body = (await request.json()) as { title?: unknown; directory?: unknown; parentID?: unknown; runId?: unknown }
       if (typeof body.title !== "string" || typeof body.directory !== "string") {
         return json(400, { error: "\"title\" and \"directory\" are required strings" })
       }
       if (body.parentID !== undefined && typeof body.parentID !== "string") {
         return json(400, { error: "\"parentID\" must be a string" })
+      }
+      if (body.runId !== undefined && typeof body.runId !== "string") {
+        return json(400, { error: "\"runId\" must be a string" })
       }
       const sessions = this.sessionsForDirectory(body.directory)
       if (!sessions) return json(503, { error: "no project registered with this runner" })
@@ -232,6 +249,19 @@ export class OpencodeRunnerHub {
         directory: body.directory,
         ...(body.parentID !== undefined ? { parentID: body.parentID } : {}),
       })
+      // Remember the run attribution for the plugin's agent-log push.
+      // The hint is optional end-to-end; when absent no mapping is kept
+      // and no push happens for this session. The map is bounded: beyond
+      // the cap the oldest entries (insertion order = session-creation
+      // order) are evicted — those sessions' runs have long concluded.
+      if (body.runId !== undefined) {
+        this.sessionRunIds.set(created.id, body.runId)
+        while (this.sessionRunIds.size > MAX_SESSION_RUN_IDS) {
+          const oldest = this.sessionRunIds.keys().next().value
+          if (oldest === undefined) break
+          this.sessionRunIds.delete(oldest)
+        }
+      }
       return json(201, { id: created.id })
     }
 

@@ -30,7 +30,7 @@ class FakeProcess implements ProcessRunner {
 }
 
 function deps(process_: FakeProcess, sleep?: (ms: number) => Promise<void>, now?: () => number): ActionHostDeps {
-  return { process: process_, log: { log: () => {} }, sleep: sleep ?? (async () => {}), now: now ?? Date.now }
+  return { process: process_, log: { log: () => {} }, sleep: sleep ?? (async () => {}), now: now ?? Date.now, runLog: () => {} }
 }
 
 function ctx(inputs: Readonly<Record<string, unknown>>, overrides: Partial<ActionRunContext> = {}): ActionRunContext {

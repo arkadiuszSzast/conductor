@@ -28,7 +28,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto"
 import { statSync } from "node:fs"
 import { extname, resolve, sep } from "node:path"
 import type { FeatureState, FeatureStatus, StepRuntime } from "@conductor/core"
-import type { Store, StoreChange } from "./store.ts"
+import type { RunLogEntryInput, Store, StoreChange } from "./store.ts"
 import type { DaemonHealth, DaemonLogger } from "./daemon.ts"
 import type { WorkflowResolver, WorkflowStatus } from "./workflow-registry.ts"
 import type { RunnerRegistry } from "./runner-registry.ts"
@@ -183,6 +183,9 @@ function jobsSummary(feature: FeatureState): Readonly<Record<string, { status: s
 
 /** Detail-payload bound per step-output value; full output stays one GET /v1/runs/:id away. */
 const STEP_OUTPUT_LIMIT = 500
+
+/** Max characters per POSTed log line — well under the store's 2 MB per-run cap. */
+const RUN_LOG_LINE_LIMIT = 64 * 1024
 
 interface StepDetailProjection {
   readonly status: StepRuntime["status"]
@@ -341,6 +344,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         createdAt: record.createdAt,
         updatedAt: record.updatedAt,
         workflowRef: workflowRefOf(feature.projectDir),
+        feedback: store.getFeedback(featureId),
         jobs: jobsDetail(feature, store.newestRunIdsByStep(featureId)),
       },
       activeRun: store.getActiveRun(featureId),
@@ -503,7 +507,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       return error(requestId, "not_found", `no route for ${method} ${path}`)
     }
 
-    const runMatch = path.match(/^\/v1\/runs\/([^/]+)(?:\/(report))?$/)
+    const runMatch = path.match(/^\/v1\/runs\/([^/]+)(?:\/(report|logs))?$/)
     if (runMatch) {
       const runId = decodeURIComponent(runMatch[1]!)
       const action = runMatch[2]
@@ -513,6 +517,8 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         return json(200, { run }, requestId)
       }
       if (action === "report" && method === "POST") return reportRun(request, runId, requestId)
+      if (action === "logs" && method === "GET") return getRunLogs(url, runId, requestId)
+      if (action === "logs" && method === "POST") return appendRunLogs(request, runId, requestId)
       return error(requestId, "not_found", `no route for ${method} ${path}`)
     }
 
@@ -722,6 +728,78 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       default:
         return error(requestId, "not_found", `no route for POST /v1/features/:id/${action}`)
     }
+  }
+
+  function getRunLogs(url: URL, runId: string, requestId: string): Response {
+    if (!store.getRunById(runId)) return error(requestId, "not_found", `unknown run "${runId}"`)
+    const DEFAULT_LIMIT = 500
+    const MAX_LIMIT = 2000
+    let limit = DEFAULT_LIMIT
+    let afterSeq = 0
+    const rawLimit = url.searchParams.get("limit")
+    if (rawLimit !== null) {
+      const parsed = Number(rawLimit)
+      if (!Number.isInteger(parsed) || parsed < 1) {
+        return error(requestId, "invalid_request", "\"limit\" must be a positive integer")
+      }
+      limit = Math.min(parsed, MAX_LIMIT)
+    }
+    const rawAfter = url.searchParams.get("after")
+    if (rawAfter !== null) {
+      const parsed = Number(rawAfter)
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        return error(requestId, "invalid_request", "\"after\" must be a non-negative integer sequence number")
+      }
+      afterSeq = parsed
+    }
+    return json(200, store.getRunLog(runId, { afterSeq, limit }), requestId)
+  }
+
+  async function appendRunLogs(request: Request, runId: string, requestId: string): Promise<Response> {
+    const run = store.getRunById(runId)
+    if (!run) return error(requestId, "not_found", `unknown run "${runId}"`)
+    const parsed = await readJsonBody(request)
+    if (!parsed.ok) return error(requestId, "invalid_json", "request body must be a JSON object")
+    const { lines } = parsed.body
+    if (!Array.isArray(lines) || lines.length === 0) {
+      return error(requestId, "invalid_request", "\"lines\" must be a non-empty array")
+    }
+    if (lines.length > 2000) {
+      return error(requestId, "invalid_request", "\"lines\" must contain at most 2000 entries")
+    }
+    const entries: RunLogEntryInput[] = []
+    for (const line of lines) {
+      if (typeof line !== "object" || line === null || Array.isArray(line)) {
+        return error(requestId, "invalid_request", "each line must be an object with \"text\"")
+      }
+      const record = line as Record<string, unknown>
+      if (typeof record.text !== "string" || record.text === "") {
+        return error(requestId, "invalid_request", "each line's \"text\" must be a non-empty string")
+      }
+      // Bounded per line so a single entry can never blow through the
+      // per-run storage cap (and silently erase the log it lands in).
+      if (record.text.length > RUN_LOG_LINE_LIMIT) {
+        return error(requestId, "invalid_request", `each line's "text" must be at most ${RUN_LOG_LINE_LIMIT} characters`)
+      }
+      const source = record.source ?? "step"
+      if (source !== "step" && source !== "agent") {
+        return error(requestId, "invalid_request", "\"source\" must be \"step\" or \"agent\"")
+      }
+      entries.push({ source, text: record.text })
+    }
+    // The pre-check projects a friendly 409 from the pre-await snapshot;
+    // the store's requireRunning guard is the atomic authority — a run
+    // concluded by a concurrent report while this request's body was
+    // still being read yields null here and maps to the same 409.
+    if (run.status !== "running") {
+      return error(requestId, "run_already_concluded", `run ${runId} already concluded (${run.status})`)
+    }
+    const appended = store.appendRunLog(runId, entries, { requireRunning: true })
+    if (appended === null) {
+      const after = store.getRunById(runId)
+      return error(requestId, "run_already_concluded", `run ${runId} already concluded (${after?.status ?? "unknown"})`)
+    }
+    return json(201, { appended: entries.length }, requestId)
   }
 
   async function reportRun(request: Request, runId: string, requestId: string): Promise<Response> {

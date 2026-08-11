@@ -243,6 +243,57 @@ describe("API integration: end-to-end contract over a real listener", () => {
   })
 })
 
+describe("API integration: run logs end to end", () => {
+  const commandWorkflow = `
+name: command-flow
+on: [manual]
+roles:
+  implementer: { agent: build }
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Implement it."
+      - id: verify
+        command:
+          run:
+            - "printf 'stdout line\\nstderr line\\n' >&1 && printf 'second\\n' >&2"
+`
+
+  it("captures command output during the run and serves it over the log endpoint", async () => {
+    const { base, project } = await startStack({ workflow: commandWorkflow })
+
+    const created = await post(base, "/v1/features", { title: "Logs e2e", project })
+    expect(created.status).toBe(201)
+    const { feature, activeRun } = (await created.json()) as {
+      feature: { id: string }
+      activeRun: { id: string }
+    }
+
+    // Report the agent step: the command step runs synchronously within
+    // the dispatch, so the feature has advanced past it by the time the
+    // report returns.
+    const reported = await post(base, `/v1/runs/${activeRun.id}/report`, { outcome: "succeeded", notes: "done" })
+    expect(reported.status).toBe(200)
+
+    const runs = (await (await fetch(`${base}/v1/features/${feature.id}/runs`)).json()) as {
+      runs: Array<{ id: string; stepId: string; status: string }>
+    }
+    const verifyRun = runs.runs.find(run => run.stepId === "verify")
+    expect(verifyRun).toMatchObject({ status: "succeeded" })
+
+    const logs = (await (await fetch(`${base}/v1/runs/${verifyRun!.id}/logs`)).json()) as {
+      lines: Array<{ source: string; text: string }>
+    }
+    expect(logs.lines.map(line => line.source)).toEqual(["process"])
+    // The interleaved capture preserved arrival order of stdout+stderr.
+    expect(logs.lines[0]!.text).toContain("stdout line")
+    expect(logs.lines[0]!.text).toContain("stderr line")
+  })
+})
+
 describe("API integration: idempotency under concurrency", () => {
   it("two duplicate reports racing over real sockets conclude the run exactly once", async () => {
     const { base, project, daemon } = await startStack()

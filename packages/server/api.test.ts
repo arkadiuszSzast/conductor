@@ -400,6 +400,28 @@ describe("API: UI projections", () => {
     expect(body.feature.workflowRef).toEqual({ name: "agent-only", stale: false })
   })
 
+  it("detail carries the rerun feedback snapshot; the list never does", async () => {
+    const { request, project } = await makeApi({ workflow: gatedWorkflow })
+    const feature = await startFeature(request, project)
+
+    const before = await request("GET", `/v1/features/${feature.id}`)
+    const beforeBody = (await before.json()) as { feature: { feedback: unknown }; activeRun: { id: string } }
+    expect(beforeBody.feature.feedback).toBeNull()
+
+    await request("POST", `/v1/runs/${beforeBody.activeRun.id}/report`, { outcome: "succeeded", notes: "done" })
+    await request("POST", `/v1/features/${feature.id}/request-changes`, { notes: "fix the naming" })
+
+    const after = await request("GET", `/v1/features/${feature.id}`)
+    const afterBody = (await after.json()) as { feature: { feedback: { message: string; jobs: Record<string, unknown> } | null } }
+    expect(afterBody.feature.feedback).not.toBeNull()
+    expect(afterBody.feature.feedback!.message).toContain("rejected")
+    expect(JSON.stringify(afterBody.feature.feedback!.jobs)).toContain("fix the naming")
+
+    const list = await request("GET", "/v1/features")
+    const listBody = (await list.json()) as { features: Array<Record<string, unknown>> }
+    expect("feedback" in listBody.features[0]!).toBe(false)
+  })
+
   it("filters the feature list by status and rejects unknown values", async () => {
     const { request, project, daemon } = await makeApi()
     const feature = await startFeature(request, project)
@@ -778,6 +800,196 @@ jobs:
     expect(response.status).toBe(200)
     const body = (await response.json()) as { run: { id: string; stepId: string; status: string } }
     expect(body.run).toMatchObject({ id: run.id, stepId: "implement", status: "running" })
+  })
+})
+
+describe("API: run logs", () => {
+  interface LogPage {
+    lines: Array<{ seq: number; time: number; source: string; text: string }>
+    nextSeq: number
+    truncated: boolean
+  }
+
+  it("GET returns appended lines with the cursor contract", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    daemon.store.appendRunLog(run.id, [
+      { source: "process", text: "line one" },
+      { source: "process", text: "line two" },
+      { source: "process", text: "line three" },
+    ])
+
+    const first = await request("GET", `/v1/runs/${run.id}/logs?limit=2`)
+    expect(first.status).toBe(200)
+    const firstBody = (await first.json()) as LogPage
+    expect(firstBody.lines.map(line => line.text)).toEqual(["line one", "line two"])
+    expect(firstBody.lines.map(line => line.source)).toEqual(["process", "process"])
+    expect(firstBody.lines[0]!.seq).toBe(1)
+    expect(firstBody.lines[0]!.time).toBeGreaterThan(0)
+    expect(firstBody.nextSeq).toBe(2)
+    expect(firstBody.truncated).toBe(true)
+
+    const tail = await request("GET", `/v1/runs/${run.id}/logs?after=${firstBody.nextSeq}`)
+    expect(tail.status).toBe(200)
+    const tailBody = (await tail.json()) as LogPage
+    expect(tailBody.lines.map(line => line.text)).toEqual(["line three"])
+    expect(tailBody.nextSeq).toBe(3)
+    expect(tailBody.truncated).toBe(false)
+
+    const empty = await request("GET", `/v1/runs/${run.id}/logs?after=3`)
+    expect((await empty.json()) as LogPage).toEqual({ lines: [], nextSeq: 3, truncated: false })
+  })
+
+  it("GET clamps limit to the hard maximum", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    daemon.store.appendRunLog(run.id, Array.from({ length: 5 }, (_, i) => ({ source: "step" as const, text: `l${i + 1}` })))
+    const response = await request("GET", `/v1/runs/${run.id}/logs?limit=1`)
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as LogPage
+    expect(body.lines).toHaveLength(1)
+    expect(body.truncated).toBe(true)
+
+    const bad = await request("GET", `/v1/runs/${run.id}/logs?limit=0`)
+    expect(bad.status).toBe(400)
+    const badAfter = await request("GET", `/v1/runs/${run.id}/logs?after=-1`)
+    expect(badAfter.status).toBe(400)
+  })
+
+  it("GET on an unknown run is 404", async () => {
+    const { request } = await makeApi()
+    const response = await request("GET", "/v1/runs/does-not-exist/logs")
+    expect(response.status).toBe(404)
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe("not_found")
+  })
+
+  it("POST appends a batch with the default step source", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+
+    const response = await request("POST", `/v1/runs/${run.id}/logs`, {
+      lines: [{ text: "checkpoint one" }, { text: "checkpoint two", source: "agent" }],
+    })
+    expect(response.status).toBe(201)
+    expect(((await response.json()) as { appended: number }).appended).toBe(2)
+
+    const page = (await (await request("GET", `/v1/runs/${run.id}/logs`)).json()) as LogPage
+    expect(page.lines.map(line => [line.source, line.text])).toEqual([
+      ["step", "checkpoint one"],
+      ["agent", "checkpoint two"],
+    ])
+  })
+
+  it("POST validates the body and the source values", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+
+    const noLines = await request("POST", `/v1/runs/${run.id}/logs`, {})
+    expect(noLines.status).toBe(400)
+
+    const badSource = await request("POST", `/v1/runs/${run.id}/logs`, { lines: [{ text: "x", source: "process" }] })
+    expect(badSource.status).toBe(400)
+    expect(((await badSource.json()) as { error: { message: string } }).error.message).toContain("source")
+
+    const badShape = await request("POST", `/v1/runs/${run.id}/logs`, { lines: ["not an object"] })
+    expect(badShape.status).toBe(400)
+
+    const unknownRun = await request("POST", "/v1/runs/nope/logs", { lines: [{ text: "x" }] })
+    expect(unknownRun.status).toBe(404)
+  })
+
+  it("POST rejects an oversized line with 400 before touching the store", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    const response = await request("POST", `/v1/runs/${run.id}/logs`, {
+      lines: [{ text: "x".repeat(64 * 1024 + 1) }],
+    })
+    expect(response.status).toBe(400)
+    expect(daemon.store.getRunLog(run.id).lines).toEqual([])
+  })
+
+  it("POST loses the race to a concurrent conclusion: the store's atomic guard maps to 409", async () => {
+    const { api, request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+
+    // Simulate the TOCTOU window: the handler snapshots the run as
+    // running, then the run concludes while the request body is still
+    // being read. A streamed body whose read yields lets the conclusion
+    // land between the pre-check and the append.
+    let releaseBody!: () => void
+    const gate = new Promise<void>(resolve => {
+      releaseBody = resolve
+    })
+    const encoderLocal = new TextEncoder()
+    const body = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        await gate
+        controller.enqueue(encoderLocal.encode(JSON.stringify({ lines: [{ text: "raced" }] })))
+        controller.close()
+      },
+    })
+    const pending = api.handle(
+      new Request(`http://conductor.test/v1/runs/${run.id}/logs`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      }),
+    )
+    await request("POST", `/v1/runs/${run.id}/report`, { outcome: "succeeded" })
+    releaseBody()
+    const raced = await pending
+    expect(raced.status).toBe(409)
+    expect(((await raced.json()) as { error: { code: string } }).error.code).toBe("run_already_concluded")
+    expect(daemon.store.getRunLog(run.id).lines).toEqual([])
+  })
+
+  it("POST rejects appends to a concluded run with 409", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    await request("POST", `/v1/runs/${run.id}/report`, { outcome: "succeeded" })
+    expect(daemon.store.getRunById(run.id)?.status).toBe("succeeded")
+
+    const late = await request("POST", `/v1/runs/${run.id}/logs`, { lines: [{ text: "late flush" }] })
+    expect(late.status).toBe(409)
+    expect(((await late.json()) as { error: { code: string } }).error.code).toBe("run_already_concluded")
+  })
+
+  it("log routes sit behind the auth boundary", async () => {
+    const { api } = await makeApi({ auth: { mode: "bearer", token: "secret-token" } })
+    const denied = await api.handle(new Request("http://conductor.test/v1/runs/x/logs"))
+    expect(denied.status).toBe(401)
+  })
+
+  it("appending log lines emits a run_log SSE invalidation event", async () => {
+    const { api, request, project, daemon } = await makeApi()
+    const events = await api.handle(new Request("http://conductor.test/v1/events"))
+    const reader = events.body!.getReader()
+    const readFrames = async (until: (text: string) => boolean): Promise<string> => {
+      const decoder = new TextDecoder()
+      let buffered = ""
+      while (!until(buffered)) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffered += decoder.decode(value)
+      }
+      return buffered
+    }
+    await readFrames(text => text.includes("event: hello"))
+
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    daemon.store.appendRunLog(run.id, [{ source: "step", text: "hi" }])
+    const frame = await readFrames(text => text.includes('"kind":"run_log"'))
+    expect(frame).toContain('"kind":"run_log"')
+    expect(frame).toContain(`"featureId":"${feature.id}"`)
+    reader.cancel()
   })
 })
 

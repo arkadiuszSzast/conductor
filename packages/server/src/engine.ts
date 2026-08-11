@@ -260,6 +260,9 @@ export class Engine {
           title: `[${role.agent}] ${state.title}${attempt > 1 ? ` (attempt ${attempt})` : ""}`,
           directory: state.worktree ?? state.projectDir,
           parentID: parentId,
+          // Optional runner hint so agent output can be attributed to this
+          // run's log. The parent session (no run) is deliberately bare.
+          runId,
         })
       ).id
 
@@ -313,6 +316,10 @@ export class Engine {
           env: { CONDUCTOR_OUTPUT: outputPath },
           ...(step.timeoutMs !== undefined ? { timeoutMs: step.timeoutMs } : {}),
         })
+        // The interleaved capture becomes the run's narrative log — the
+        // failure `reason` below keeps carrying the output tail exactly as
+        // before; the log supplements it, never replaces it.
+        if (result.output !== "") store.appendRunLog(runId, [{ source: "process", text: result.output }])
         if (result.code !== 0) {
           failureReason = `"${command}" exited ${result.code}: ${result.output.slice(-4000)}`
           break
@@ -419,9 +426,12 @@ export class Engine {
     ctx: ActionRunContext,
   ): void {
     const { store, actions, log, clock } = this.deps
+    const runLog = (text: string) => {
+      if (text !== "") store.appendRunLog(runId, [{ source: "action", text }])
+    }
     const execution = (async () => {
       try {
-        const result = await actions.execute(binding, ctx)
+        const result = await actions.execute(binding, ctx, { runLog })
         if (result.ok === "pending") {
           const claimed = store.recordPendingObservation(runId, result.state, clock.now() + result.nextPollMs)
           if (!claimed) {

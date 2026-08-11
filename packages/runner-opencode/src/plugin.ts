@@ -23,6 +23,7 @@ import { resolveRunnerConfig } from "./config.ts"
 import { OpencodeRunnerHub } from "./hub.ts"
 import { createOpencodeSessions, type RawOpencodeSessionApi } from "./sessions.ts"
 import { createConductorTools } from "./tools.ts"
+import { createAgentLogPusher } from "./agent-logs.ts"
 
 const HUB_KEY = Symbol.for("conductor.runner-opencode.hub")
 
@@ -49,8 +50,23 @@ export const ConductorRunnerPlugin: Plugin = async input => {
     ...(config.daemonToken !== undefined ? { token: config.daemonToken } : {}),
   })
   const tools = createConductorTools(client, input.directory)
+  const agentLogs = createAgentLogPusher({
+    client,
+    runIdForSession: sessionID => hub.runIdForSession(sessionID),
+    log,
+  })
 
   return {
+    event: async ({ event }) => {
+      agentLogs.push(event)
+      // Session-idle is the natural conclusion moment for a step's
+      // output: flush whatever the debounce has not yet sent so the log
+      // is complete by the time the agent reports.
+      if (event.type === "session.idle") await agentLogs.flush()
+    },
+    dispose: async () => {
+      await agentLogs.flush()
+    },
     tool: {
       conductor_start: tool({
         description:
