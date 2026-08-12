@@ -30,4 +30,4 @@
 ## 6. Docs & verification
 
 - [x] 6.1 [docs] Update `docs/install.md` + README quick start to the collapsed flow (`conductor daemon` → `conductor init` → `conductor start`); document config-comment loss on init rewrite and the auth-none default.
-- [ ] 6.2 [test] Full gate: `bun test`, typecheck, lint, `openspec validate zero-config-defaults`; manual smoke: zero-flag daemon on clean XDG_CONFIG_HOME/XDG_DATA_HOME, init registers live, status with no env.
+- [x] 6.2 [test] Full gate: `bun test`, typecheck, lint, `openspec validate zero-config-defaults`; manual smoke: zero-flag daemon on clean XDG_CONFIG_HOME/XDG_DATA_HOME, init registers live, status with no env.
