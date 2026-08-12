@@ -374,10 +374,22 @@ export interface StepOutputsContext {
   readonly outputs: Readonly<Record<string, string>>
 }
 
+export interface FeatureContext {
+  readonly title: string
+  readonly slug: string
+  /** Empty string when the operator gave no description. */
+  readonly description: string
+  /** Null when no PR is attached. */
+  readonly pr: number | null
+}
+
 export interface EvalContext {
   readonly inputs: Readonly<Record<string, Value>>
   readonly steps: Readonly<Record<string, StepOutputsContext>>
   readonly needs: Readonly<Record<string, StepOutputsContext>>
+  /** The feature's own fields — absent only in contexts with no feature
+   *  (e.g. action manifest defaults). */
+  readonly feature?: FeatureContext
   /** Absent outside a rerun round — `feedback.*` then resolves to null
    *  (soft by design; templates render null as the empty string). */
   readonly feedback?: Feedback
@@ -474,8 +486,22 @@ function evaluatePath(segments: readonly string[], context: EvalContext): Value 
     return requireValue(value, dotted)
   }
 
+  if (root === "feature") {
+    const field = rest[0]
+    if (rest.length !== 1 || field === undefined || !FEATURE_FIELDS.has(field)) {
+      throw new ExpressionError(`"${dotted}" is not a feature field — available: ${[...FEATURE_FIELDS].sort().join(", ")}`)
+    }
+    const feature = context.feature
+    if (feature === undefined) throw new MissingValueError(dotted)
+    // `pr` is soft (null when absent) so `?? ` supplies defaults;
+    // `description` is always a string (empty when the operator gave none).
+    return feature[field as keyof FeatureContext]
+  }
+
   throw new ExpressionError(`unknown context "${root ?? ""}" in "${dotted}"`)
 }
+
+const FEATURE_FIELDS: ReadonlySet<string> = new Set(["title", "slug", "description", "pr"])
 
 function walk(start: unknown, segments: readonly string[]): unknown {
   let current: unknown = start

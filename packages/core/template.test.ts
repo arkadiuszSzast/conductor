@@ -129,6 +129,16 @@ describe("buildEvalContext", () => {
     const ctx = buildEvalContext(workflowDef, state, "arch-a", feedback)
     expect(renderTemplate("{{ feedback.jobs['arch-a']['design']['report'] }}", ctx).text).toBe("OLD")
   })
+
+  it("exposes the feature's own fields; missing description renders empty", () => {
+    const state = featureState({ "arch-a": jobRuntime({ status: "running" }) }, { description: null, pr: 7 })
+    const ctx = buildEvalContext(workflowDef, state, "arch-a")
+    expect(renderTemplate("{{ feature.title }}|{{ feature.slug }}|{{ feature.description }}|{{ feature.pr }}", ctx).text).toBe(
+      "test feature|test-feature||7",
+    )
+    const described = buildEvalContext(workflowDef, featureState({ "arch-a": jobRuntime({ status: "running" }) }, { description: "Do the thing" }), "arch-a")
+    expect(renderTemplate("Task: {{ feature.description }}", described).text).toBe("Task: Do the thing")
+  })
 })
 
 describe("resolveJobOutputs", () => {

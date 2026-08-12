@@ -20,6 +20,7 @@ const context: EvalContext = {
   needs: {
     "arch-a": { outputs: { design: "A" } },
   },
+  feature: { title: "Add auth", slug: "add-auth", description: "Implement the auth change", pr: null },
   functions: { success: true, failure: false, always: true },
 }
 
@@ -148,6 +149,16 @@ describe("evaluate", () => {
     expect(() => evalExpr("steps.gate.outputs.absent")).toThrow(MissingValueError)
     expect(() => evalExpr("inputs.unknown")).toThrow(MissingValueError)
     expect(() => evalExpr("needs.ghost.outputs.x")).toThrow(MissingValueError)
+  })
+
+  it("resolves feature fields; pr is soft-null, unknown fields error", () => {
+    expect(evalExpr("feature.title")).toBe("Add auth")
+    expect(evalExpr("feature.slug")).toBe("add-auth")
+    expect(evalExpr("feature.description")).toBe("Implement the auth change")
+    expect(evalExpr("feature.pr")).toBeNull()
+    expect(evalExpr('feature.pr ?? "none"')).toBe("none")
+    expect(() => evalExpr("feature.nope")).toThrow(ExpressionError)
+    expect(() => evalExpr("feature.title.extra")).toThrow(ExpressionError)
   })
 
   it("resolves feedback as soft nulls outside a rerun", () => {

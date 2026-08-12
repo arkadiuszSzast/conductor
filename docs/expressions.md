@@ -53,6 +53,7 @@ workflow reference).
 | Context | Scope | Reads | Guarantee |
 |---|---|---|---|
 | `inputs.*` | everywhere | trigger inputs | **Hard** — typed and validated at trigger time |
+| `feature.*` | everywhere | the feature's own fields | **Hard** for `title`/`slug`; `description`/`pr` are soft (see below) |
 | `steps.*` | within a job | earlier steps of the same job, live | **Hard** — declaration order guarantees existence |
 | `needs.*` | within a job | declared outputs of dependency jobs, live | **Hard** — the DAG guarantees the dependency finished |
 | `feedback.*` | re-run steps | the previous round, snapshot | **Soft** — empty outside a rerun *by design* |
@@ -71,6 +72,28 @@ prompt: "Zaimplementuj {{ inputs.feature }}"
 
 Available everywhere. Typed per the workflow's `inputs` declaration;
 required inputs are guaranteed present, optional ones carry their default.
+
+## `feature` — the feature's own fields
+
+```yaml
+branch: "feature/{{ feature.slug }}"
+prompt: |
+  Task: {{ feature.description }}
+```
+
+Available everywhere. A fixed, statically-typed field set — unknown
+fields fail validation at load time:
+
+| Field | Type | Semantics |
+|---|---|---|
+| `feature.title` | string | The operator's feature title, verbatim. |
+| `feature.slug` | string | Daemon-derived from the title (lowercase, `[a-z0-9-]`, ≤48 chars) — safe for branch names. |
+| `feature.description` | string | What the operator passed with `--description`; **empty string** when absent (interpolation-friendly). |
+| `feature.pr` | number | The attached PR number; **null** when absent — `{{ feature.pr ?? "none" }}` works. |
+
+This is the intended way to hand the task at hand to the first agent
+step: start the feature with a description pointing at the work (e.g. an
+OpenSpec change name) and read it via `{{ feature.description }}`.
 
 ## `steps` — earlier steps in the same job
 

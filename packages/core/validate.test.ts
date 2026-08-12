@@ -201,3 +201,39 @@ describe("validateWorkflow", () => {
     expect(r.errors).toEqual([])
   })
 })
+
+describe("feature context in expressions", () => {
+  it("accepts feature fields in every template position", () => {
+    const def = withJobs({
+      up: job(
+        [agentStep("impl", "implementer", "Task: {{ feature.description }} ({{ feature.title }})")],
+        [],
+        undefined,
+        { branch: "feature/{{ feature.slug }}" },
+      ),
+      down: job(
+        [
+          commandStep("run", ["echo {{ feature.slug }}"]),
+          actionStep("push", "git/push@v1"),
+          humanStep("gate", { prompt: "Merge {{ feature.title }}? PR: {{ feature.pr ?? 'none' }}" }),
+        ],
+        ["up"],
+        "always()",
+      ),
+    })
+    expect(validateWorkflow(def).errors).toEqual([])
+  })
+
+  it("rejects unknown feature fields naming the available set", () => {
+    const r = validateWorkflow(withJobs({ main: job([agentStep("impl", "implementer", "{{ feature.nope }}")]) }))
+    expect(r.errors.join("\n")).toContain("not a feature field")
+    expect(r.errors.join("\n")).toContain("description, pr, slug, title")
+  })
+
+  it("typechecks feature.pr as a number", () => {
+    const r = validateWorkflow(withJobs({ main: job([agentStep("impl", "implementer", "{{ feature.pr > 0 }}")]) }))
+    expect(r.errors).toEqual([])
+    const bad = validateWorkflow(withJobs({ main: job([agentStep("impl", "implementer", "{{ feature.title > 0 }}")]) }))
+    expect(bad.errors.join("\n")).toContain("number")
+  })
+})

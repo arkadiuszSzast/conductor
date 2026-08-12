@@ -435,7 +435,7 @@ function validateExpressions(def: WorkflowDef, errors: string[], warnings: strin
       validateExpression(job.if, {
         where: `job "${jobId}": if`,
         typeOfPath: path => typeOfJobIfPath(path, jobId, job, def, refs),
-        allowedRoots: new Set(["inputs", "needs", "feedback"]),
+        allowedRoots: new Set(["inputs", "needs", "feedback", "feature"]),
         feedbackRoot: jobId,
         rerunRoutes,
         def,
@@ -463,7 +463,7 @@ function validateExpressions(def: WorkflowDef, errors: string[], warnings: strin
         validateExpression(source, {
           where,
           typeOfPath: path => typeOfJobPath(path, jobId, job, def, refs),
-          allowedRoots: new Set(["inputs", "steps"]),
+          allowedRoots: new Set(["inputs", "steps", "feature"]),
           feedbackRoot: jobId,
           rerunRoutes,
           def,
@@ -479,7 +479,7 @@ function validateExpressions(def: WorkflowDef, errors: string[], warnings: strin
         validateExpression(step.if, {
           where: `${where}: if`,
           typeOfPath: path => typeOfStepPath(path, index, jobId, job, def, refs),
-          allowedRoots: new Set(["inputs", "steps", "needs", "feedback"]),
+          allowedRoots: new Set(["inputs", "steps", "needs", "feedback", "feature"]),
           feedbackRoot: jobId,
           rerunRoutes,
           def,
@@ -492,7 +492,7 @@ function validateExpressions(def: WorkflowDef, errors: string[], warnings: strin
           validateExpression(expression, {
             where: `${where}: prompt`,
             typeOfPath: path => typeOfStepPath(path, index, jobId, job, def, refs),
-            allowedRoots: new Set(["inputs", "steps", "needs", "feedback"]),
+            allowedRoots: new Set(["inputs", "steps", "needs", "feedback", "feature"]),
             feedbackRoot: jobId,
             rerunRoutes,
             def,
@@ -507,7 +507,7 @@ function validateExpressions(def: WorkflowDef, errors: string[], warnings: strin
             validateExpression(expression, {
               where: `${where}: run[${lineIndex}]`,
               typeOfPath: path => typeOfStepPath(path, index, jobId, job, def, refs),
-              allowedRoots: new Set(["inputs", "steps", "needs", "feedback"]),
+              allowedRoots: new Set(["inputs", "steps", "needs", "feedback", "feature"]),
               feedbackRoot: jobId,
               rerunRoutes,
               def,
@@ -524,7 +524,7 @@ function validateExpressions(def: WorkflowDef, errors: string[], warnings: strin
             validateExpression(expression, {
               where: `${where}: with["${key}"]`,
               typeOfPath: path => typeOfStepPath(path, index, jobId, job, def, refs),
-              allowedRoots: new Set(["inputs", "steps", "needs", "feedback"]),
+              allowedRoots: new Set(["inputs", "steps", "needs", "feedback", "feature"]),
               feedbackRoot: jobId,
               rerunRoutes,
               def,
@@ -569,7 +569,13 @@ function validateExpression(expression: string, check: ExpressionCheck): void {
     }
     const known = check.typeOfPath(segments)
     if (known === undefined) {
-      errors.push(`${where}: "${formatPath(segments)}" is not a known value`)
+      if (root === "feature") {
+        errors.push(
+          `${where}: "${formatPath(segments)}" is not a feature field — available: ${Object.keys(FEATURE_FIELD_TYPES).sort().join(", ")}`,
+        )
+      } else {
+        errors.push(`${where}: "${formatPath(segments)}" is not a known value`)
+      }
     }
   }
 
@@ -582,6 +588,19 @@ function validateExpression(expression: string, check: ExpressionCheck): void {
 /** Static types for a path read inside job `jobId` at step position
  *  `stepIndex`. Only earlier steps are readable — declaration order is the
  *  existence guarantee. */
+/** The fixed, statically-typed field set of the `feature` context root. */
+const FEATURE_FIELD_TYPES: Readonly<Record<string, ExprType>> = {
+  title: "string",
+  slug: "string",
+  description: "string",
+  pr: "number",
+}
+
+function typeOfFeaturePath(segments: readonly string[]): ExprType | undefined {
+  if (segments.length !== 2) return undefined
+  return FEATURE_FIELD_TYPES[segments[1]!]
+}
+
 function typeOfStepPath(
   segments: readonly string[],
   stepIndex: number,
@@ -590,6 +609,7 @@ function typeOfStepPath(
   def: WorkflowDef,
   refs: ValidatedRefs,
 ): ExprType | undefined {
+  if (segments[0] === "feature") return typeOfFeaturePath(segments)
   if (segments[0] === "inputs") {
     const name = segments[1]
     return name !== undefined ? def.inputs[name]?.type : undefined
@@ -633,6 +653,7 @@ function typeOfJobPath(
   def: WorkflowDef,
   refs: ValidatedRefs,
 ): ExprType | undefined {
+  if (segments[0] === "feature") return typeOfFeaturePath(segments)
   if (segments[0] === "inputs") {
     const name = segments[1]
     return name !== undefined ? def.inputs[name]?.type : undefined
