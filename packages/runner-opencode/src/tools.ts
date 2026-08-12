@@ -51,6 +51,7 @@ export interface GateArgs {
 export interface ConductorTools {
   start(args: StartArgs, context: ConductorToolContext): Promise<string>
   report(args: ReportArgs): Promise<string>
+  ask(args: { run_id: string; question: string }): Promise<string>
   status(): Promise<string>
   approve(args: GateArgs): Promise<string>
   requestChanges(args: { feature_id: string; notes: string }): Promise<string>
@@ -125,6 +126,21 @@ export function createConductorTools(client: ApiClient, projectDir: string): Con
         // A duplicate report is already-recorded, not a failure: hand the
         // agent the daemon's idempotent-rejection text so a retry loop
         // stops instead of escalating.
+        if (err instanceof ApiError && err.code === "run_already_concluded") return err.message
+        if (err instanceof ApiError && err.code === "not_found") return `Unknown run_id "${args.run_id}".`
+        return describeError(err)
+      }
+    },
+
+    async ask(args) {
+      try {
+        const result = await client.report(args.run_id, { ask: args.question })
+        return (
+          `${result.result}\n` +
+          `Your session stays alive: the human's answer will arrive here as a new message. ` +
+          `End your turn now and wait — do NOT report an outcome yet.`
+        )
+      } catch (err) {
         if (err instanceof ApiError && err.code === "run_already_concluded") return err.message
         if (err instanceof ApiError && err.code === "not_found") return `Unknown run_id "${args.run_id}".`
         return describeError(err)

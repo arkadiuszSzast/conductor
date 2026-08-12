@@ -445,6 +445,44 @@ jobs:
   })
 })
 
+describe("CLI: answer (interactive steps)", () => {
+  it("answer delivers the notes into the asking run's session and resumes the feature", async () => {
+    const h = await makeHarness()
+    const { featureId, runId } = await startFeature(h)
+    expect(await h.run("report", runId, "--notes", "ignored")).toBe(EXIT.usage)
+    await h.daemon.engine.report({ runId, ask: "Which storage?" })
+    expect(h.daemon.store.getFeature(featureId)!.status).toBe("waiting_human")
+
+    h.out.length = 0
+    expect(await h.run("answer", runId, "--notes", "SQLite")).toBe(EXIT.ok)
+    expect(h.out.join("\n")).toContain("Answer delivered")
+    expect(h.daemon.store.getFeature(featureId)!.status).toBe("running")
+    expect(h.daemon.store.getRunById(runId)!.pendingQuestion).toBeNull()
+  })
+
+  it("answer requires --notes and maps a non-asking run to the conflict exit", async () => {
+    const h = await makeHarness()
+    const { runId } = await startFeature(h)
+    expect(await h.run("answer", runId)).toBe(EXIT.usage)
+    expect(await h.run("answer", runId, "--notes", "eager")).toBe(EXIT.conflict)
+    expect(h.err.join("\n")).toContain("no_pending_question")
+  })
+
+  it("status <id> prints the pending question with the answer hint", async () => {
+    const h = await makeHarness()
+    const { featureId, runId } = await startFeature(h)
+    await h.daemon.engine.report({ runId, ask: "Which storage?\nSQLite or Postgres?" })
+
+    h.out.length = 0
+    expect(await h.run("status", featureId)).toBe(EXIT.ok)
+    const output = h.out.join("\n")
+    expect(output).toContain("status   waiting_human")
+    expect(output).toContain(`conductor answer ${runId}`)
+    expect(output).toContain("  Which storage?")
+    expect(output).toContain("  SQLite or Postgres?")
+  })
+})
+
 describe("CLI: approve / request-changes", () => {
   async function driveToGate(h: Harness): Promise<{ featureId: string }> {
     const { featureId, runId } = await startFeature(h)

@@ -533,3 +533,59 @@ describe("onChange", () => {
     expect(store.getFeature(feature.id)).not.toBeNull()
   })
 })
+
+describe("interactive steps: run questions", () => {
+  it("setRunQuestion parks the feature and clearRunQuestion resumes it, with timeline entries", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "explore", stepType: "agent", attempt: 1 })
+
+    expect(store.setRunQuestion(runId, "Which storage?")).toBe(true)
+    expect(store.getFeature(feature.id)!.status).toBe("waiting_human")
+    const asked = store.getRunById(runId)!
+    expect(asked.status).toBe("running")
+    expect(asked.pendingQuestion).toBe("Which storage?")
+    expect(asked.askedAt).not.toBeNull()
+
+    expect(store.clearRunQuestion(runId)).toBe(true)
+    expect(store.getFeature(feature.id)!.status).toBe("running")
+    const cleared = store.getRunById(runId)!
+    expect(cleared.pendingQuestion).toBeNull()
+    expect(cleared.askedAt).toBeNull()
+
+    const kinds = store.getTransitions(feature.id).map(t => (t.event as { kind: string }).kind)
+    expect(kinds).toContain("run.ask")
+    expect(kinds).toContain("run.answer")
+  })
+
+  it("rejects asking on a concluded run and clearing without a question", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "explore", stepType: "agent", attempt: 1 })
+
+    expect(store.clearRunQuestion(runId)).toBe(false)
+
+    store.finishRun(runId, "succeeded")
+    expect(store.setRunQuestion(runId, "Too late?")).toBe(false)
+    expect(store.getFeature(feature.id)!.status).toBe("running")
+  })
+
+  it("a pending question survives a fresh store over the same database", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "explore", stepType: "agent", attempt: 1 })
+    store.setRunQuestion(runId, "Persisted?")
+
+    const fresh = new Store(connection.db)
+    expect(fresh.getRunById(runId)!.pendingQuestion).toBe("Persisted?")
+    expect(fresh.getFeature(feature.id)!.status).toBe("waiting_human")
+  })
+
+  it("emits a feature change on ask and on answer", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "explore", stepType: "agent", attempt: 1 })
+    const changes: StoreChange[] = []
+    const unsubscribe = store.onChange(change => changes.push(change))
+    store.setRunQuestion(runId, "Q")
+    store.clearRunQuestion(runId)
+    unsubscribe()
+    expect(changes.filter(c => c.kind === "feature").length).toBe(2)
+  })
+})

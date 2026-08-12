@@ -90,6 +90,8 @@ interface RunRow {
   metadata: string | null
   pending_state: string | null
   next_observation: number | null
+  pending_question: string | null
+  asked_at: number | null
   time_started: number
   time_finished: number | null
 }
@@ -120,6 +122,9 @@ export interface RunSummary {
   readonly pendingState: Readonly<Record<string, unknown>> | null
   /** When the reconciler should re-invoke a durable-pending action run. Null while not pending. */
   readonly nextObservation: number | null
+  /** Question an interactive agent run asked; null when not waiting for an answer. */
+  readonly pendingQuestion: string | null
+  readonly askedAt: number | null
   readonly timeStarted: number
   readonly timeFinished: number | null
 }
@@ -140,6 +145,8 @@ function toRunSummary(row: RunRow): RunSummary {
     metadata: row.metadata ? (JSON.parse(row.metadata) as RunActionMetadata) : null,
     pendingState: row.pending_state ? (JSON.parse(row.pending_state) as Record<string, unknown>) : null,
     nextObservation: row.next_observation,
+    pendingQuestion: row.pending_question,
+    askedAt: row.asked_at,
     timeStarted: row.time_started,
     timeFinished: row.time_finished,
   }
@@ -377,6 +384,67 @@ export class Store {
     }
     this.db.run("UPDATE feature SET time_updated = ?, state = ? WHERE id = ?", [Date.now(), JSON.stringify(next), featureId])
     this.emit({ kind: "feature", featureId })
+  }
+
+  // ------------------------------------------------------------- interactive steps (questions)
+
+  /**
+   * Park a running agent run on a human question. Persists the question
+   * text, flips the owning feature to `waiting_human` and logs a
+   * transition so the timeline stays honest. Guarded by `status = 'running'`.
+   * Returns false when the run already concluded — the caller must not
+   * park it.
+   */
+  setRunQuestion(runId: string, question: string): boolean {
+    let featureId: string | null = null
+    const ok = this.db.transaction(() => {
+      const run = this.db.query("SELECT * FROM run WHERE id = ?").get(runId) as RunRow | undefined
+      if (!run || run.status !== "running") return false
+      featureId = run.feature_id
+      const now = Date.now()
+      this.db.run(
+        "UPDATE run SET pending_question = ?, asked_at = ? WHERE id = ?",
+        [question, now, runId],
+      )
+      const row = this.db.query("SELECT state FROM feature WHERE id = ?").get(run.feature_id) as FeatureRow | null
+      if (!row) return false
+      const next: FeatureState = { ...toFeatureState(row), status: "waiting_human" }
+      this.db.run("UPDATE feature SET time_updated = ?, state = ?, status = ? WHERE id = ?", [now, JSON.stringify(next), next.status, run.feature_id])
+      this.db.run(
+        "INSERT INTO transition_log (feature_id, event, decisions, time_created) VALUES (?, ?, ?, ?)",
+        [run.feature_id, JSON.stringify({ kind: "run.ask", runId, jobId: run.job_id, stepId: run.step_id }), "[]", now],
+      )
+      return true
+    })()
+    if (ok && featureId !== null) this.emit({ kind: "feature", featureId })
+    return ok
+  }
+
+  /**
+   * Clear a pending question after the human answers. The feature returns
+   * to `running`; the caller is responsible for forwarding the answer into
+   * the session.
+   */
+  clearRunQuestion(runId: string): boolean {
+    let featureId: string | null = null
+    const ok = this.db.transaction(() => {
+      const run = this.db.query("SELECT * FROM run WHERE id = ?").get(runId) as RunRow | undefined
+      if (!run || run.status !== "running" || run.pending_question === null) return false
+      featureId = run.feature_id
+      const now = Date.now()
+      this.db.run("UPDATE run SET pending_question = NULL, asked_at = NULL WHERE id = ?", [runId])
+      const row = this.db.query("SELECT state FROM feature WHERE id = ?").get(run.feature_id) as FeatureRow | null
+      if (!row) return false
+      const next: FeatureState = { ...toFeatureState(row), status: "running" }
+      this.db.run("UPDATE feature SET time_updated = ?, state = ?, status = ? WHERE id = ?", [now, JSON.stringify(next), next.status, run.feature_id])
+      this.db.run(
+        "INSERT INTO transition_log (feature_id, event, decisions, time_created) VALUES (?, ?, ?, ?)",
+        [run.feature_id, JSON.stringify({ kind: "run.answer", runId, jobId: run.job_id, stepId: run.step_id }), "[]", now],
+      )
+      return true
+    })()
+    if (ok && featureId !== null) this.emit({ kind: "feature", featureId })
+    return ok
   }
 
   insertRun(input: {

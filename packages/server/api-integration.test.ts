@@ -488,6 +488,7 @@ describe("API integration: graceful shutdown", () => {
     })
     const gatedEngine = {
       startFeature: daemon.engine.startFeature.bind(daemon.engine),
+      answer: daemon.engine.answer.bind(daemon.engine),
       approve: daemon.engine.approve.bind(daemon.engine),
       requestChanges: daemon.engine.requestChanges.bind(daemon.engine),
       pause: daemon.engine.pause.bind(daemon.engine),
@@ -538,5 +539,67 @@ describe("API integration: graceful shutdown", () => {
     // may have been cut: the run concluded and the feature advanced.
     expect(daemon.store.getRunById(activeRun.id)?.status).toBe("succeeded")
     expect(daemon.store.getFeature(feature.id)?.status).toBe("waiting_human")
+  })
+})
+
+describe("API integration: interactive steps over HTTP", () => {
+  it("ask via report parks the feature; answer resumes it into the same session", async () => {
+    const { base, project, sessions } = await startStack()
+
+    const created = await post(base, "/v1/features", { title: "Interactive", project })
+    expect(created.status).toBe(201)
+    const { feature } = (await created.json()) as { feature: { id: string } }
+    const state = (await (await fetch(`${base}/v1/features/${feature.id}`)).json()) as { activeRun: { id: string; sessionId: string } }
+
+    const asked = await post(base, `/v1/runs/${state.activeRun.id}/report`, { ask: "Which storage?\n\n```conductor-questions\n[{\"question\":\"Storage?\",\"options\":[\"SQLite\",\"Postgres\"]}]\n```" })
+    expect(asked.status).toBe(200)
+
+    const waiting = (await (await fetch(`${base}/v1/features/${feature.id}`)).json()) as {
+      feature: { status: string }
+      activeRun: { id: string; pendingQuestion: string | null; sessionId: string }
+    }
+    expect(waiting.feature.status).toBe("waiting_human")
+    expect(waiting.activeRun.pendingQuestion).toContain("conductor-questions")
+
+    const answered = await post(base, `/v1/runs/${state.activeRun.id}/answer`, { notes: "Q: Storage?\nA: SQLite" })
+    expect(answered.status).toBe(200)
+
+    expect(sessions.prompts.at(-1)!.sessionID).toBe(waiting.activeRun.sessionId)
+    expect(sessions.prompts.at(-1)!.text).toContain("A: SQLite")
+
+    const resumed = (await (await fetch(`${base}/v1/features/${feature.id}`)).json()) as {
+      feature: { status: string }
+      activeRun: { pendingQuestion: string | null }
+    }
+    expect(resumed.feature.status).toBe("running")
+    expect(resumed.activeRun.pendingQuestion).toBeNull()
+  })
+
+  it("answer conflict codes: no pending question and unknown run", async () => {
+    const { base, project } = await startStack()
+    const created = await post(base, "/v1/features", { title: "Conflicts", project })
+    const { feature } = (await created.json()) as { feature: { id: string } }
+    const state = (await (await fetch(`${base}/v1/features/${feature.id}`)).json()) as { activeRun: { id: string } }
+
+    await expectErrorEnvelope(await post(base, `/v1/runs/${state.activeRun.id}/answer`, { notes: "eager" }), 409, "no_pending_question")
+    await expectErrorEnvelope(await post(base, "/v1/runs/nope/answer", { notes: "x" }), 404, "not_found")
+    await expectErrorEnvelope(await post(base, `/v1/runs/${state.activeRun.id}/answer`, {}), 400, "invalid_request")
+    await expectErrorEnvelope(
+      await post(base, `/v1/runs/${state.activeRun.id}/report`, { ask: "q", outcome: "succeeded" }),
+      400,
+      "invalid_request",
+    )
+  })
+
+  it("bearer auth guards the answer endpoint", async () => {
+    const { base, project } = await startStack({ auth: { mode: "bearer", token: "sekret" } })
+    const headers = { authorization: "Bearer sekret" }
+    const created = await post(base, "/v1/features", { title: "Auth", project }, headers)
+    const { feature } = (await created.json()) as { feature: { id: string } }
+    const state = (await (
+      await fetch(`${base}/v1/features/${feature.id}`, { headers })
+    ).json()) as { activeRun: { id: string } }
+
+    await expectErrorEnvelope(await post(base, `/v1/runs/${state.activeRun.id}/answer`, { notes: "x" }), 401, "unauthorized")
   })
 })

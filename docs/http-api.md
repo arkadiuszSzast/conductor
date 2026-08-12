@@ -24,7 +24,8 @@ Authentication is explicit (`auth.mode: "none"` or `"bearer"`); only
 | `GET /v1/runs/:id` | One run, with full (untruncated) `outputs`. |
 | `GET /v1/runs/:id/logs` | Cursor-incremental run-log tail: `?after=<seq>&limit=<n>`. |
 | `POST /v1/runs/:id/logs` | Append log lines to a running run (step authors and runner agent-log push). |
-| `POST /v1/runs/:id/report` | Agent/runner report-back. |
+| `POST /v1/runs/:id/report` | Agent/runner report-back (`outcome`/`verdict`), or a mid-step `ask`. |
+| `POST /v1/runs/:id/answer` | Human answers a run's pending question; the notes flow into the live session. |
 | `GET /v1/projects/workflow?dir=<projectDir>` | Structure-only workflow projection (below). |
 | `GET/POST /v1/runners`, `DELETE /v1/runners/:id` | Runner endpoint registration (when a registry is configured). |
 
@@ -118,6 +119,30 @@ Bearer-authenticated. Body: `{lines: [{text, source?}]}`.
 - A successful append emits a `run_log` SSE invalidation event (throttled
   to at most one per run per second), so an open inspector can refetch the
   tail.
+
+### `POST /v1/runs/:id/report` — the `ask` shape
+
+Besides `outcome` and `verdict`, a running agent run may report
+`{ask: "<question>"}` — the three shapes are mutually exclusive. An ask
+does NOT conclude the run: the session stays alive, the question is
+persisted on the run (`pendingQuestion`, `askedAt` — restart-safe) and the
+feature flips to `waiting_human`. Asking on a concluded run → 409
+(`run_already_concluded`), same as a stale report. The feature detail's
+`activeRun` prefers an asking run over the merely-newest one so answering
+surfaces always see the question.
+
+### `POST /v1/runs/:id/answer`
+
+Bearer-authenticated. Body: `{notes: string}` (required, non-empty).
+Delivers a human's answer to an asking run: the notes are forwarded as a
+prompt **into the run's existing session**, the pending question is
+cleared, and the feature returns to `running`. Errors:
+
+- unknown run → 404 (`not_found`)
+- run not running or no pending question → 409 (`no_pending_question`)
+- session gone / prompt delivery failed → 409 (`session_lost`) — the step
+  is concluded `failed` through normal failure routing (retry/onFail),
+  never left as a zombie wait.
 
 ## Workflow structure
 

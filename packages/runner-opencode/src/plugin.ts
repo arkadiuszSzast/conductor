@@ -106,6 +106,25 @@ export const ConductorRunnerPlugin: Plugin = async input => {
         },
       }),
 
+      conductor_ask: tool({
+        description:
+          "Ask the human a question mid-step WITHOUT ending the conductor run — use ONLY when a human " +
+          "decision is required to proceed (ambiguous requirements, a choice between approaches). " +
+          "The answer arrives in this same session as a new message. Prefer a fenced " +
+          "```conductor-questions``` block containing a JSON array of {question, options?} so the " +
+          "web UI renders an answer form. After asking, end your turn and wait.",
+        args: {
+          run_id: tool.schema.string().describe("The run id from the [conductor] task header"),
+          question: tool.schema.string().describe(
+            "The question text. May embed a ```conductor-questions``` fenced block with " +
+            '[{"question": "...", "options": ["..."]}] for structured answers.',
+          ),
+        },
+        async execute(args) {
+          return tools.ask(args)
+        },
+      }),
+
       conductor_status: tool({
         description: "Show this project's active conductor features with their current step, status, and recent transitions.",
         args: {},

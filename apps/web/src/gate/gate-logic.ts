@@ -26,6 +26,30 @@ export function isGateAction(value: string): value is GateAction {
   return value === "approve" || value === "request-changes"
 }
 
+export type GateSurface =
+  | { readonly kind: "gate"; readonly prompt: string | null }
+  | { readonly kind: "ask"; readonly runId: string; readonly stepId: string; readonly prompt: string }
+
+/**
+ * Which waiting surface the panel serves: a waiting gate step (approve /
+ * request-changes) or an asking run (send answer into the live session).
+ * A gate wins when both exist — one job has one current step, so a
+ * simultaneous pair only happens across parallel jobs, and the gate is
+ * the more consequential decision.
+ */
+export function selectGateSurface(
+  waiting: boolean,
+  gatePrompt: string | null,
+  activeRun: { readonly id: string; readonly stepId: string; readonly pendingQuestion?: string | null } | null,
+): GateSurface | null {
+  if (!waiting) return null
+  if (gatePrompt !== null) return { kind: "gate", prompt: gatePrompt }
+  if (activeRun?.pendingQuestion != null) {
+    return { kind: "ask", runId: activeRun.id, stepId: activeRun.stepId, prompt: activeRun.pendingQuestion }
+  }
+  return { kind: "gate", prompt: null }
+}
+
 export interface GateErrorHandling {
   /** What to surface to the operator. */
   readonly toast: string

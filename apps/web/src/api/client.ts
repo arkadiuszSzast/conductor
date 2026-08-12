@@ -154,6 +154,14 @@ export class ApiClient {
     })
   }
 
+  async answerRun(runId: string, notes: string): Promise<CommandResponse> {
+    return this.request<CommandResponse>(`/v1/runs/${encodeURIComponent(runId)}/answer`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ notes }),
+    })
+  }
+
   async requestChanges(featureId: string, notes: string): Promise<CommandResponse> {
     return this.request<CommandResponse>(`/v1/features/${encodeURIComponent(featureId)}/request-changes`, {
       method: "POST",
