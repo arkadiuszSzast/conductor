@@ -110,6 +110,8 @@ export const ConductorRunnerPlugin: Plugin = async input => {
         description:
           "Ask the human a question mid-step WITHOUT ending the conductor run — use ONLY when a human " +
           "decision is required to proceed (ambiguous requirements, a choice between approaches). " +
+          "Only works on steps the workflow marks `interactive: true`; on other steps the daemon " +
+          "refuses — then decide autonomously and report an outcome instead. " +
           "The answer arrives in this same session as a new message. Prefer a fenced " +
           "```conductor-questions``` block containing a JSON array of {question, options?} so the " +
           "web UI renders an answer form. After asking, end your turn and wait.",

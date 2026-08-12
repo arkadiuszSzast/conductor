@@ -604,13 +604,18 @@ type StepBase = Pick<StepDef, "id" | "if" | "outcomes" | "onFail" | "retry">
 function readAgentBody(node: Node | null, base: StepBase, where: string, reader: Reader): StepDef | undefined {
   const map = readMap(node, `${where}: agent`, reader)
   if (map === undefined) return undefined
-  const fields = readFields(map, `${where}: agent`, ["role", "prompt"], reader)
+  const fields = readFields(map, `${where}: agent`, ["role", "prompt", "interactive"], reader)
   const roleNode = requireField(fields, "role", map, `${where}: agent`, reader)
   const promptNode = requireField(fields, "prompt", map, `${where}: agent`, reader)
   const role = roleNode === undefined ? undefined : readString(roleNode, `${where}: agent: role`, reader)
   const prompt = promptNode === undefined ? undefined : readString(promptNode, `${where}: agent: prompt`, reader)
+  let interactive: boolean | undefined
+  if (fields.has("interactive")) {
+    interactive = readBoolean(fields.get("interactive")!.value, `${where}: agent: interactive`, reader)
+    if (interactive === undefined) return undefined
+  }
   if (role === undefined || prompt === undefined) return undefined
-  return { ...base, type: "agent", role, prompt }
+  return { ...base, type: "agent", role, prompt, ...(interactive !== undefined ? { interactive } : {}) }
 }
 
 function readCommandBody(node: Node | null, base: StepBase, where: string, reader: Reader): StepDef | undefined {

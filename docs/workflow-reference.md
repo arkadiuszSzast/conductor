@@ -259,17 +259,26 @@ Performs LLM work.
 |---|---|---|
 | `role` | yes | Must exist in `roles`. |
 | `prompt` | yes | Template; see [Expressions](expressions.md). |
+| `interactive` | no | Boolean, default `false`. Grants the step the right to pause mid-run and ask the human a question. |
 
 **Outputs:** the agent's report is published as `outputs.report`.
 
-**Asking mid-step.** Any agent step may ask the human a question without
-ending its run (the runner reports an `ask` instead of an outcome — with
-the opencode runner, via the `conductor_ask` tool). The feature waits
-(`waiting_human`), the answer is delivered into the same live session, and
-the step continues; nothing is declared in the YAML. Questions render as
-answer forms in the web UI when they embed a `conductor-questions` block
-(see [`human`](#human) below). Prefer an ask over an explore→gate→re-run
-loop whenever the questioner needs to keep its conversation context.
+**Asking mid-step.** An `interactive: true` agent step may ask the human a
+question without ending its run (the runner reports an `ask` instead of an
+outcome — with the opencode runner, via the `conductor_ask` tool). The
+feature waits (`waiting_human`), the answer is delivered into the same
+live session, and the step continues. Questions render as answer forms in
+the web UI when they embed a `conductor-questions` block (see
+[`human`](#human) below). Prefer an ask over an explore→gate→re-run loop
+whenever the questioner needs to keep its conversation context.
+
+Steps without the flag are autonomous by contract: the daemon refuses
+their asks and instructs the agent to decide on its own and report an
+outcome (or report `failed` with notes when human input is genuinely
+indispensable — normal failure routing then applies). Mark only the steps
+where a human conversation is part of the job (exploration, requirements
+clarification), and keep delivery steps autonomous so a pipeline never
+stalls mid-implementation waiting for a question nobody expected.
 
 ### `command`
 

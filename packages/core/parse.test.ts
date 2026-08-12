@@ -173,6 +173,23 @@ describe("steps", () => {
     expect(messages(errors)).toContain("human: prompt")
   })
 
+  it("accepts interactive on agent steps, absent means autonomous", () => {
+    const on = parsed(wrap("      - id: s\n        agent: { role: r, prompt: p, interactive: true }\n")).jobs.main!.steps[0]!
+    expect(on).toMatchObject({ type: "agent", interactive: true })
+    const off = parsed(wrap("      - id: s\n        agent: { role: r, prompt: p }\n")).jobs.main!.steps[0]!
+    expect((off as { interactive?: boolean }).interactive).toBeUndefined()
+  })
+
+  it("rejects a non-boolean interactive", () => {
+    const errors = failed(wrap("      - id: s\n        agent: { role: r, prompt: p, interactive: maybe }\n"))
+    expect(messages(errors)).toContain("agent: interactive must be a boolean")
+  })
+
+  it("rejects interactive on non-agent step bodies", () => {
+    const errors = failed(wrap("      - id: s\n        command:\n          run: [ls]\n          interactive: true\n"))
+    expect(messages(errors)).toContain('unknown field "interactive"')
+  })
+
   it("rejects timeoutMs below 1", () => {
     const errors = failed(wrap("      - id: s\n        command:\n          run: [ls]\n          timeoutMs: 0\n"))
     expect(messages(errors)).toContain("timeoutMs must be ≥ 1")
