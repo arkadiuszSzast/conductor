@@ -65,7 +65,10 @@ function resolveUiRoot(log: DaemonStartInput["log"]): string | null {
     return null
   }
 
-  if (existsSync(resolve(dist, "index.html"))) return dist
+  if (existsSync(resolve(dist, "index.html"))) {
+    if (stale) log({ level: "warn", message: "web ui sources changed but this checkout cannot rebuild — serving the previous (stale) build" })
+    return dist
+  }
   log({ level: "info", message: "no web ui in this artifact — API only" })
   return null
 }
