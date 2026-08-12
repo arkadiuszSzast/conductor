@@ -91,6 +91,7 @@ export interface RunSummary {
   readonly outputs: Readonly<Record<string, string>>
   readonly reason: string | null
   readonly nudges: number
+  readonly pendingQuestion?: string | null
   readonly timeStarted: number
   readonly timeFinished: number | null
 }

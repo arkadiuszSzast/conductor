@@ -179,6 +179,17 @@ export class Engine {
           })
           return
         }
+        // One active run per job+step is an invariant: resume re-arms a
+        // running agent step (onResumed cannot know a run is live — e.g.
+        // mid-question on an interactive step), and dispatching a second
+        // run would orphan the first's session and its context.
+        const already = this.deps.store.getActiveRunForStep(featureId, decision.jobId, decision.stepId)
+        if (already) {
+          this.deps.log.log(
+            `feature=${featureId}: step "${decision.jobId}/${decision.stepId}" already has active run ${already.id} — skipping duplicate dispatch`,
+          )
+          return
+        }
         if (step.type === "agent") return this.executeAgent(featureId, snapshot, decision.jobId, step)
         if (step.type === "command") return this.executeCommand(featureId, snapshot, decision.jobId, step)
         if (step.type === "action") return this.executeAction(featureId, snapshot, decision.jobId, step)
@@ -532,11 +543,24 @@ export class Engine {
    * Called by the API's report endpoint from inside agent sessions. The
    * ONLY path by which an agent step concludes — idle never does.
    */
-  async report(input: { runId: string; outcome?: "succeeded" | "failed"; verdict?: string; notes?: string }): Promise<string> {
+  async report(input: { runId: string; outcome?: "succeeded" | "failed"; verdict?: string; notes?: string; ask?: string }): Promise<string> {
     const { store } = this.deps
     const run = store.getRunById(input.runId)
     if (!run) return `Unknown run_id "${input.runId}".`
     if (run.status !== "running") return alreadyConcludedText(input.runId, run.status)
+
+    if (input.ask !== undefined) {
+      // An ask parks the run on a human question WITHOUT concluding it:
+      // the session stays alive so the answer resumes with full context.
+      const parked = store.setRunQuestion(input.runId, input.ask)
+      if (!parked) return alreadyConcludedText(input.runId, store.getRunById(input.runId)?.status ?? run.status)
+      const state = store.getFeature(run.featureId)
+      this.deps.notify?.(
+        `Conductor: question — ${state?.slug ?? run.featureId}`,
+        `Step "${run.stepId}" (job "${run.jobId}") is waiting for your answer.`,
+      )
+      return `Question recorded for step "${run.stepId}" — the run is waiting for a human answer.`
+    }
 
     const event: PipelineEvent =
       input.outcome === "failed"
@@ -559,6 +583,64 @@ export class Engine {
     if (status === "failed") return `Step "${run.stepId}" marked failed.`
     if (input.verdict !== undefined) return `Verdict "${input.verdict}" recorded for step "${run.stepId}".`
     return `Step "${run.stepId}" marked succeeded.`
+  }
+
+  /**
+   * Deliver a human's answer to an asking run: forward the notes into the
+   * run's LIVE session (that is the whole point — context is preserved),
+   * clear the pending question and return the feature to `running`. A
+   * dead session fails the step honestly through the normal step-failed
+   * path so retry/onFail semantics apply.
+   */
+  async answer(runId: string, notes: string): Promise<{ ok: true; message: string } | { ok: false; code: "unknown_run" | "no_pending_question" | "session_lost"; message: string }> {
+    const { store, log } = this.deps
+    const run = store.getRunById(runId)
+    if (!run) return { ok: false, code: "unknown_run", message: `Unknown run_id "${runId}".` }
+
+    // Claim first, act after — the same discipline as concludeAndDispatch.
+    // clearRunQuestion is a guarded transaction (`status = 'running' AND
+    // pending_question IS NOT NULL`), so of two racing answers exactly one
+    // wins; the loser maps to the same conflict as answering a non-asking
+    // run and never re-sends the prompt into the session.
+    if (!store.clearRunQuestion(runId)) {
+      return { ok: false, code: "no_pending_question", message: `Run "${runId}" has no pending question.` }
+    }
+
+    const failStep = async (reason: string, message: string): Promise<{ ok: false; code: "session_lost"; message: string }> => {
+      log.log(`answer ${runId}: ${reason} — failing the step`)
+      await this.concludeAndDispatch(
+        run.featureId, runId, "failed", { reason },
+        { kind: "step.failed", jobId: run.jobId, stepId: run.stepId, reason },
+      )
+      return { ok: false, code: "session_lost", message }
+    }
+
+    const sessionAlive = run.sessionId !== null && (await this.deps.sessions.status(run.sessionId)) !== "missing"
+    if (!sessionAlive) {
+      return failStep(
+        `session ${run.sessionId ?? "(none)"} was lost while waiting for a human answer`,
+        `The run's session is gone — step "${run.stepId}" failed and normal failure routing applies.`,
+      )
+    }
+
+    try {
+      await this.deps.sessions.prompt({
+        sessionID: run.sessionId!,
+        text:
+          `[conductor] The human answered your question:\n\n${notes}\n\n` +
+          `Treat the answers as binding decisions. Continue step "${run.stepId}" and report ` +
+          `run_id="${runId}" with the appropriate outcome when done (or ask again if a further decision is needed).`,
+      })
+    } catch (err) {
+      return failStep(
+        `failed to deliver the answer to session ${run.sessionId}: ${errorMessage(err)}`,
+        `Delivering the answer failed — step "${run.stepId}" failed and normal failure routing applies.`,
+      )
+    }
+
+    this.idleCycles.delete(runId)
+    const after = store.getFeature(run.featureId)
+    return { ok: true, message: `Answer delivered to step "${run.stepId}". Feature is now: ${after?.status ?? "running"}.` }
   }
 
   /**
@@ -762,9 +844,22 @@ export class Engine {
   private async reconcileAgentRun(
     feature: FeatureState,
     snapshot: WorkflowSnapshot,
-    active: { id: string; jobId: string; stepId: string; sessionId: string | null; nudges: number; timeStarted: number },
+    active: { id: string; jobId: string; stepId: string; sessionId: string | null; nudges: number; timeStarted: number; pendingQuestion?: string | null },
   ): Promise<void> {
     const { log } = this.deps
+    // Waiting for a human answer is not being stuck: no idle nudging, no
+    // idle reaping. The TTL below still bounds an abandoned question.
+    if (active.pendingQuestion != null) {
+      this.idleCycles.delete(active.id)
+      // A pause/resume cycle rewrites feature.status to `running` without
+      // knowing about the pending question — re-park so the answering
+      // surfaces reappear instead of the question silently aging out.
+      if (feature.status === "running") {
+        this.deps.store.setRunQuestion(active.id, active.pendingQuestion)
+      }
+      await this.reconcileTtl(feature, snapshot, active)
+      return
+    }
     if (active.sessionId) {
       const status = await this.deps.sessions.status(active.sessionId)
       if (status === "missing") {

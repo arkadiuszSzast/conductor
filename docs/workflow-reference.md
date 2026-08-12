@@ -262,6 +262,15 @@ Performs LLM work.
 
 **Outputs:** the agent's report is published as `outputs.report`.
 
+**Asking mid-step.** Any agent step may ask the human a question without
+ending its run (the runner reports an `ask` instead of an outcome — with
+the opencode runner, via the `conductor_ask` tool). The feature waits
+(`waiting_human`), the answer is delivered into the same live session, and
+the step continues; nothing is declared in the YAML. Questions render as
+answer forms in the web UI when they embed a `conductor-questions` block
+(see [`human`](#human) below). Prefer an ask over an explore→gate→re-run
+loop whenever the questioner needs to keep its conversation context.
+
 ### `command`
 
 Runs shell commands.

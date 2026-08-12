@@ -74,7 +74,11 @@ export interface EngineControl {
     | { readonly ok: true; readonly feature: FeatureState }
     | { readonly ok: false; readonly code: "project_not_configured" | "unknown_workflow"; readonly message: string }
   >
-  report(input: { runId: string; outcome?: "succeeded" | "failed"; verdict?: string; notes?: string }): Promise<string>
+  report(input: { runId: string; outcome?: "succeeded" | "failed"; verdict?: string; notes?: string; ask?: string }): Promise<string>
+  answer(runId: string, notes: string): Promise<
+    | { readonly ok: true; readonly message: string }
+    | { readonly ok: false; readonly code: "unknown_run" | "no_pending_question" | "session_lost"; readonly message: string }
+  >
   approve(featureId: string, notes?: string): Promise<string>
   requestChanges(featureId: string, notes: string): Promise<string>
   pause(featureId: string): Promise<void>
@@ -115,6 +119,8 @@ export type ApiErrorCode =
   | "unknown_workflow"
   | "conflict"
   | "run_already_concluded"
+  | "no_pending_question"
+  | "session_lost"
   | "internal"
 
 interface ErrorBody {
@@ -130,6 +136,8 @@ const ERROR_STATUS: Record<ApiErrorCode, number> = {
   unknown_workflow: 422,
   conflict: 409,
   run_already_concluded: 409,
+  no_pending_question: 409,
+  session_lost: 409,
   internal: 500,
 }
 
@@ -357,8 +365,15 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         feedback: store.getFeedback(featureId),
         jobs: jobsDetail(feature, store.newestRunIdsByStep(featureId)),
       },
-      activeRun: store.getActiveRun(featureId),
+      activeRun: activeRunProjection(featureId),
     }
+  }
+
+  /** The detail's active run: an asking run wins over merely-newest so the
+   *  answering surfaces always see the pending question under fan-out. */
+  function activeRunProjection(featureId: string) {
+    const asking = store.listActiveRuns(featureId).find((run) => run.pendingQuestion !== null)
+    return asking ?? store.getActiveRun(featureId)
   }
 
   async function handle(request: Request): Promise<Response> {
@@ -542,7 +557,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       return error(requestId, "not_found", `no route for ${method} ${path}`)
     }
 
-    const runMatch = path.match(/^\/v1\/runs\/([^/]+)(?:\/(report|logs))?$/)
+    const runMatch = path.match(/^\/v1\/runs\/([^/]+)(?:\/(report|logs|answer))?$/)
     if (runMatch) {
       const runId = decodeURIComponent(runMatch[1]!)
       const action = runMatch[2]
@@ -552,6 +567,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         return json(200, { run }, requestId)
       }
       if (action === "report" && method === "POST") return reportRun(request, runId, requestId)
+      if (action === "answer" && method === "POST") return answerRun(request, runId, requestId)
       if (action === "logs" && method === "GET") return getRunLogs(url, runId, requestId)
       if (action === "logs" && method === "POST") return appendRunLogs(request, runId, requestId)
       return error(requestId, "not_found", `no route for ${method} ${path}`)
@@ -842,7 +858,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     if (!run) return error(requestId, "not_found", `unknown run "${runId}"`)
     const parsed = await readJsonBody(request)
     if (!parsed.ok) return error(requestId, "invalid_json", "request body must be a JSON object")
-    const { outcome, verdict, notes } = parsed.body
+    const { outcome, verdict, notes, ask } = parsed.body
     if (outcome !== undefined && outcome !== "succeeded" && outcome !== "failed") {
       return error(requestId, "invalid_request", "\"outcome\" must be \"succeeded\" or \"failed\"")
     }
@@ -852,11 +868,15 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     if (notes !== undefined && typeof notes !== "string") {
       return error(requestId, "invalid_request", "\"notes\" must be a string")
     }
-    if (outcome === undefined && verdict === undefined) {
-      return error(requestId, "invalid_request", "one of \"outcome\" or \"verdict\" is required")
+    if (ask !== undefined && (typeof ask !== "string" || ask.trim() === "")) {
+      return error(requestId, "invalid_request", "\"ask\" must be a non-empty string")
     }
-    if (outcome !== undefined && verdict !== undefined) {
-      return error(requestId, "invalid_request", "\"outcome\" and \"verdict\" are mutually exclusive")
+    const shapes = [outcome !== undefined, verdict !== undefined, ask !== undefined].filter(Boolean).length
+    if (shapes === 0) {
+      return error(requestId, "invalid_request", "one of \"outcome\", \"verdict\" or \"ask\" is required")
+    }
+    if (shapes > 1) {
+      return error(requestId, "invalid_request", "\"outcome\", \"verdict\" and \"ask\" are mutually exclusive")
     }
     // Duplicate reports are rejected idempotently: the engine's atomic
     // conclusion claim is the authority; this pre-check only projects the
@@ -869,6 +889,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       ...(outcome !== undefined ? { outcome } : {}),
       ...(verdict !== undefined ? { verdict } : {}),
       ...(notes !== undefined ? { notes } : {}),
+      ...(ask !== undefined ? { ask } : {}),
     })
     // A concurrent report can still win the engine's atomic claim between
     // the pre-check and this call — the loser maps to the same 409. The
@@ -880,6 +901,21 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       return error(requestId, "run_already_concluded", result)
     }
     return json(200, { result, run: store.getRunById(runId) }, requestId)
+  }
+
+  async function answerRun(request: Request, runId: string, requestId: string): Promise<Response> {
+    const parsed = await readJsonBody(request)
+    if (!parsed.ok) return error(requestId, "invalid_json", "request body must be a JSON object")
+    const notes = parsed.body.notes
+    if (typeof notes !== "string" || notes.trim() === "") {
+      return error(requestId, "invalid_request", "\"notes\" is required and must be a non-empty string")
+    }
+    const result = await engine.answer(runId, notes)
+    if (!result.ok) {
+      if (result.code === "unknown_run") return error(requestId, "not_found", result.message)
+      return error(requestId, result.code, result.message)
+    }
+    return json(200, { result: result.message, run: store.getRunById(runId) }, requestId)
   }
 
   function sseResponse(requestId: string): Response {

@@ -304,6 +304,17 @@ export const migrations: readonly Migration[] = [
       `)
     },
   },
+  {
+    id: "0012_run_pending_question",
+    up(db) {
+      // Interactive steps: a running agent run may ask a human a question
+      // and stay alive waiting for the answer. The question is run state
+      // (the step stays running with the same active run) — persisted so
+      // an ask survives a daemon restart.
+      addColumn(db, "run", "pending_question", "TEXT")
+      addColumn(db, "run", "asked_at", "INTEGER")
+    },
+  },
 ]
 
 function validateMigrations(ordered: readonly Migration[]): void {

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react"
 import { useApp } from "../app-context.ts"
 import { useCommand, useFeatureDetail } from "../api/hooks.ts"
-import { mapGateError, validateGateDecision, type GateAction, type GateDecision } from "./gate-logic.ts"
+import { mapGateError, selectGateSurface, validateGateDecision, type GateAction, type GateDecision } from "./gate-logic.ts"
 import {
   answersComplete,
   composeAnswerNotes,
@@ -41,9 +41,14 @@ export function GateActions({ featureId, showChangeNoteInline = true }: GateActi
     return null
   }, [waiting, detail])
 
+  const activeRun = detailState.data?.activeRun ?? null
+  const surface = selectGateSurface(waiting, gatePrompt, activeRun)
+  const askingRun = surface?.kind === "ask" ? surface : null
+  const panelPrompt = surface?.prompt ?? null
+
   const parsedQuestions = useMemo(
-    () => (gatePrompt !== null ? parseGateQuestions(gatePrompt) : null),
-    [gatePrompt],
+    () => (panelPrompt !== null ? parseGateQuestions(panelPrompt) : null),
+    [panelPrompt],
   )
   const [answers, setAnswers] = useState<readonly GateAnswer[]>([])
 
@@ -55,7 +60,7 @@ export function GateActions({ featureId, showChangeNoteInline = true }: GateActi
     setAnswers([])
     setNotes("")
     setInlineError(null)
-  }, [featureId, gatePrompt])
+  }, [featureId, panelPrompt])
 
   const setAnswer = (index: number, answer: GateAnswer): void => {
     setAnswers(previous => {
@@ -64,6 +69,34 @@ export function GateActions({ featureId, showChangeNoteInline = true }: GateActi
       next[index] = answer
       return next
     })
+  }
+
+  const submitAnswer = async (): Promise<void> => {
+    if (askingRun === null) return
+    const composed = parsedQuestions !== null
+      ? [composeAnswerNotes(parsedQuestions.questions, answers), notes.trim()].filter(part => part !== "").join("\n\n")
+      : notes.trim()
+    if (composed === "") {
+      setInlineError("an answer is required")
+      return
+    }
+    setInlineError(null)
+    setPending(true)
+    try {
+      await runCommand(featureId, client => client.answerRun(askingRun.runId, composed))
+      setNotes("")
+      setAnswers([])
+    } catch (err) {
+      const handled = mapGateError(err)
+      if (handled.inline) {
+        setInlineError(handled.toast !== "" ? handled.toast : "invalid request")
+      } else if (handled.toast !== "") {
+        pushToast(handled.toast)
+      }
+      if (handled.refetch) store.refetchFeatureDetail(featureId)
+    } finally {
+      setPending(false)
+    }
   }
 
   const submit = async (action: GateAction): Promise<void> => {
@@ -109,7 +142,7 @@ export function GateActions({ featureId, showChangeNoteInline = true }: GateActi
   return (
     <div className={styles.gateRow}>
       <div className={styles.meta}>
-        ≡ {detail?.currentStep ?? "gate"} · ⚑ {detail?.findingCounts.new ?? 0} new
+        ≡ {askingRun !== null ? `${askingRun.stepId} (question)` : detail?.currentStep ?? "gate"} · ⚑ {detail?.findingCounts.new ?? 0} new
       </div>
       {parsedQuestions !== null ? (
         <>
@@ -151,36 +184,48 @@ export function GateActions({ featureId, showChangeNoteInline = true }: GateActi
             )
           })}
         </>
-      ) : gatePrompt !== null ? (
-        <div className={styles.prompt}>{gatePrompt}</div>
+      ) : panelPrompt !== null ? (
+        <div className={styles.prompt}>{panelPrompt}</div>
       ) : null}
       {showChangeNoteInline ? (
         <div className={styles.row}>
           <input
             className={styles.note}
-            placeholder="note (required to request changes)"
+            placeholder={askingRun !== null ? "answer (free text)" : "note (required to request changes)"}
             value={notes}
             onChange={e => setNotes(e.target.value)}
             disabled={pending}
           />
         </div>
       ) : null}
-      <div className={styles.actions}>
-        <button
-          className="primary"
-          disabled={pending || questionsIncomplete}
-          onClick={() => submit("approve")}
-        >
-          {pending && pendingAction === "approve" ? "…" : "✓ Approve"}
-        </button>
-        <button
-          className="danger"
-          disabled={pending || (showChangeNoteInline && notes.trim() === "")}
-          onClick={() => submit("request-changes")}
-        >
-          {pending && pendingAction === "request-changes" ? "…" : "✎ Request changes"}
-        </button>
-      </div>
+      {askingRun !== null ? (
+        <div className={styles.actions}>
+          <button
+            className="primary"
+            disabled={pending || questionsIncomplete}
+            onClick={() => void submitAnswer()}
+          >
+            {pending ? "…" : "↩ Send answer"}
+          </button>
+        </div>
+      ) : (
+        <div className={styles.actions}>
+          <button
+            className="primary"
+            disabled={pending || questionsIncomplete}
+            onClick={() => submit("approve")}
+          >
+            {pending && pendingAction === "approve" ? "…" : "✓ Approve"}
+          </button>
+          <button
+            className="danger"
+            disabled={pending || (showChangeNoteInline && notes.trim() === "")}
+            onClick={() => submit("request-changes")}
+          >
+            {pending && pendingAction === "request-changes" ? "…" : "✎ Request changes"}
+          </button>
+        </div>
+      )}
       {inlineError !== null ? <div className={styles.inlineError}>{inlineError}</div> : null}
     </div>
   )

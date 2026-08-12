@@ -114,6 +114,8 @@ commands:
                        reject the waiting human gate with notes
   report <run-id> (--outcome succeeded|failed | --verdict <verdict>) [--notes <text|@file>]
                        report an agent run's result to the daemon
+  answer <run-id> --notes <text|@file>
+                       answer a run's pending question (interactive step)
   pause <feature-id>   pause the feature
   resume <feature-id>  resume a paused feature
   abandon <feature-id> abandon the feature
@@ -245,6 +247,8 @@ function exitCodeFor(error: ApiError): number {
     case "run_already_concluded":
       return EXIT.duplicateReport
     case "conflict":
+    case "no_pending_question":
+    case "session_lost":
       return EXIT.conflict
     default:
       return EXIT.failure
@@ -282,6 +286,7 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
     "approve",
     "request-changes",
     "report",
+    "answer",
     "pause",
     "resume",
     "abandon",
@@ -320,6 +325,8 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
         return await commandRequestChanges(parsed, deps, client, json)
       case "report":
         return await commandReport(parsed, deps, client, json)
+      case "answer":
+        return await commandAnswer(parsed, deps, client, json)
       case "pause":
       case "resume":
       case "abandon":
@@ -581,7 +588,7 @@ function printFeature(
       escalation: string | null
       jobs?: Readonly<Record<string, { steps?: Readonly<Record<string, { status?: string; prompt?: string }>> }>>
     }
-    activeRun: { id: string; jobId: string; stepId: string; attempt: number } | null
+    activeRun: { id: string; jobId: string; stepId: string; attempt: number; pendingQuestion?: string | null } | null
   },
 ): void {
   const { feature, activeRun } = payload
@@ -593,6 +600,10 @@ function printFeature(
   if (feature.pr !== null) deps.stdout(`pr       #${feature.pr}`)
   if (feature.escalation !== null) deps.stdout(`escalation ${feature.escalation}`)
   if (activeRun) deps.stdout(`run      ${activeRun.id} (${activeRun.stepId}, attempt ${activeRun.attempt})`)
+  if (activeRun?.pendingQuestion != null && activeRun.pendingQuestion.trim() !== "") {
+    deps.stdout(`question ${activeRun.jobId}/${activeRun.stepId} (answer with: conductor answer ${activeRun.id} --notes <text>):`)
+    for (const line of activeRun.pendingQuestion.split("\n")) deps.stdout(`  ${line}`)
+  }
   for (const [jobId, job] of Object.entries(feature.jobs ?? {})) {
     for (const [stepId, step] of Object.entries(job.steps ?? {})) {
       if (step.status === "waiting_human" && step.prompt !== undefined && step.prompt.trim() !== "") {
@@ -719,6 +730,22 @@ async function commandReport(parsed: Parsed, deps: CliDeps, client: ApiClient, j
     ...(verdict !== undefined ? { verdict } : {}),
     ...(notes !== undefined ? { notes } : {}),
   })
+  if (json) {
+    deps.stdout(JSON.stringify(payload))
+    return EXIT.ok
+  }
+  deps.stdout(payload.result)
+  return EXIT.ok
+}
+
+async function commandAnswer(parsed: Parsed, deps: CliDeps, client: ApiClient, json: boolean): Promise<number> {
+  requireFlags(parsed, ["notes"])
+  const runId = requireId(parsed, "answer requires a run id")
+  const notes = resolveNotes(stringFlag(parsed, "notes"), deps)
+  if (notes === undefined || notes.trim() === "") {
+    throw new UsageError("answer requires --notes with the answer text")
+  }
+  const payload = await client.answer(runId, notes)
   if (json) {
     deps.stdout(JSON.stringify(payload))
     return EXIT.ok

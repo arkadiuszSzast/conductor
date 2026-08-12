@@ -129,6 +129,7 @@ export interface ReportInput {
   readonly outcome?: "succeeded" | "failed"
   readonly verdict?: string
   readonly notes?: string
+  readonly ask?: string
 }
 
 export interface CommandResult extends FeaturePayload {
@@ -204,6 +205,10 @@ export class ApiClient {
 
   report(runId: string, input: ReportInput): Promise<ReportResult> {
     return this.request("POST", `/v1/runs/${encodeURIComponent(runId)}/report`, input)
+  }
+
+  answer(runId: string, notes: string): Promise<ReportResult> {
+    return this.request("POST", `/v1/runs/${encodeURIComponent(runId)}/answer`, { notes })
   }
 
   /** Cursor-incremental run-log read. `limit` defaults server-side (500). */

@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "bun:test"
 import { ApiError } from "../src/api/client.ts"
-import { mapGateError, validateGateDecision } from "../src/gate/gate-logic.ts"
+import { mapGateError, selectGateSurface, validateGateDecision } from "../src/gate/gate-logic.ts"
 
 describe("gate validation", () => {
   it("approve needs no note", () => {
@@ -50,5 +50,28 @@ describe("gate error mapping", () => {
     const handled = mapGateError(new Error("network down"))
     expect(handled.toast).toContain("network down")
     expect(handled.refetch).toBe(true)
+  })
+})
+
+describe("selectGateSurface", () => {
+  const askingRun = { id: "run-1", stepId: "explore", pendingQuestion: "Which storage?" }
+
+  it("returns null when the feature is not waiting", () => {
+    expect(selectGateSurface(false, "gate prompt", askingRun)).toBeNull()
+  })
+
+  it("a waiting gate step wins over an asking run", () => {
+    const surface = selectGateSurface(true, "merge?", askingRun)
+    expect(surface).toEqual({ kind: "gate", prompt: "merge?" })
+  })
+
+  it("an asking run claims the panel when no gate step waits", () => {
+    const surface = selectGateSurface(true, null, askingRun)
+    expect(surface).toEqual({ kind: "ask", runId: "run-1", stepId: "explore", prompt: "Which storage?" })
+  })
+
+  it("waiting with neither prompt nor question is a bare gate", () => {
+    expect(selectGateSurface(true, null, null)).toEqual({ kind: "gate", prompt: null })
+    expect(selectGateSurface(true, null, { id: "r", stepId: "s", pendingQuestion: null })).toEqual({ kind: "gate", prompt: null })
   })
 })

@@ -1123,3 +1123,170 @@ describe("Engine: gate prompts", () => {
     expect(fresh.getFeature(feature.id)?.jobs["main"]?.steps["gate"]?.outputs["prompt"]).toBe("Please answer: persisted?")
   })
 })
+
+describe("Engine: interactive steps (ask/answer)", () => {
+  it("ask parks the feature waiting_human, preserves the run and session", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+
+    const message = await engine.report({ runId: run.id, ask: "Which storage?" })
+    expect(message).toContain("waiting for a human answer")
+
+    const after = store.getFeature(feature.id)!
+    expect(after.status).toBe("waiting_human")
+    const parked = store.getRunById(run.id)!
+    expect(parked.status).toBe("running")
+    expect(parked.sessionId).toBe(run.sessionId)
+    expect(parked.pendingQuestion).toBe("Which storage?")
+    expect(after.jobs["main"]?.currentStep).toBe("implement")
+  })
+
+  it("answer forwards the notes into the same session and resumes the feature", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, ask: "Which storage?" })
+
+    const result = await engine.answer(run.id, "Q: Which storage?\nA: SQLite")
+    expect(result.ok).toBe(true)
+
+    const delivered = sessions.prompts.at(-1)!
+    expect(delivered.sessionID).toBe(run.sessionId!)
+    expect(delivered.text).toContain("A: SQLite")
+    expect(delivered.text).toContain(`run_id="${run.id}"`)
+
+    expect(store.getFeature(feature.id)!.status).toBe("running")
+    expect(store.getRunById(run.id)!.pendingQuestion).toBeNull()
+
+    // The agent can still conclude the step normally afterwards.
+    await engine.report({ runId: run.id, outcome: "succeeded", notes: "done with SQLite" })
+    expect(store.getFeature(feature.id)!.jobs["main"]?.currentStep).toBe("gate")
+  })
+
+  it("answer on a dead session fails the step through normal routing", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, ask: "Anyone there?" })
+    sessions.liveSessions.delete(run.sessionId!)
+
+    const result = await engine.answer(run.id, "yes")
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.code).toBe("session_lost")
+    expect(store.getRunById(run.id)!.status).toBe("failed")
+    expect(store.getFeature(feature.id)!.status).toBe("escalated")
+  })
+
+  it("ask on a concluded run and answer without a question are rejected", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+
+    const noQuestion = await engine.answer(run.id, "nothing pending")
+    expect(noQuestion.ok).toBe(false)
+    if (!noQuestion.ok) expect(noQuestion.code).toBe("no_pending_question")
+
+    await engine.report({ runId: run.id, outcome: "succeeded" })
+    const staleAsk = await engine.report({ runId: run.id, ask: "too late?" })
+    expect(staleAsk).toContain("already")
+    expect(store.getRunById(run.id)!.pendingQuestion).toBeNull()
+  })
+
+  it("an asking run is never nudged or idle-reaped, but TTL still applies", async () => {
+    const engine = makeEngine(linearWorkflow, { nudgeIdleCycles: 1, maxNudges: 1, runTtlMs: 10_000 }, { clock })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, ask: "Waiting..." })
+    sessions.statuses.set(run.sessionId!, "idle")
+    const promptsBefore = sessions.prompts.length
+
+    await engine.reconcile()
+    await engine.reconcile()
+    await engine.reconcile()
+    expect(sessions.prompts.length).toBe(promptsBefore)
+    expect(store.getRunById(run.id)!.status).toBe("running")
+
+    clock.advance(20_000)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)!.status).toBe("reaped")
+  })
+
+  it("a pending question survives a restart (fresh engine over the same store)", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, ask: "Persisted?" })
+
+    const restarted = makeEngine(linearWorkflow)
+    await restarted.reconcile()
+
+    expect(store.getFeature(feature.id)!.status).toBe("waiting_human")
+    const after = store.getRunById(run.id)!
+    expect(after.status).toBe("running")
+    expect(after.pendingQuestion).toBe("Persisted?")
+
+    const result = await restarted.answer(run.id, "yes")
+    expect(result.ok).toBe(true)
+    expect(store.getFeature(feature.id)!.status).toBe("running")
+  })
+})
+
+describe("Engine: interactive steps — review findings (PR #35)", () => {
+  it("two racing answers deliver the prompt exactly once; the loser gets no_pending_question", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, ask: "Which storage?" })
+    const promptsBefore = sessions.prompts.length
+
+    const [first, second] = await Promise.all([
+      engine.answer(run.id, "SQLite"),
+      engine.answer(run.id, "Postgres"),
+    ])
+    const outcomes = [first, second]
+    expect(outcomes.filter(r => r.ok).length).toBe(1)
+    const loser = outcomes.find(r => !r.ok)!
+    if (!loser.ok) expect(loser.code).toBe("no_pending_question")
+    expect(sessions.prompts.length).toBe(promptsBefore + 1)
+    expect(store.getFeature(feature.id)!.status).toBe("running")
+  })
+
+  it("a serial duplicate answer is rejected without re-sending the prompt", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, ask: "Q" })
+
+    expect((await engine.answer(run.id, "A")).ok).toBe(true)
+    const promptsAfterFirst = sessions.prompts.length
+    const duplicate = await engine.answer(run.id, "A again")
+    expect(duplicate.ok).toBe(false)
+    if (!duplicate.ok) expect(duplicate.code).toBe("no_pending_question")
+    expect(sessions.prompts.length).toBe(promptsAfterFirst)
+  })
+
+  it("pause then resume during an ask never dispatches a second run for the step", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, ask: "Still deciding?" })
+
+    await engine.pause(feature.id)
+    await engine.resume(feature.id)
+
+    const active = store.listActiveRuns(feature.id)
+    expect(active.length).toBe(1)
+    expect(active[0]!.id).toBe(run.id)
+    expect(active[0]!.pendingQuestion).toBe("Still deciding?")
+
+    // The reconciler re-parks the feature so the question resurfaces.
+    await engine.reconcile()
+    expect(store.getFeature(feature.id)!.status).toBe("waiting_human")
+
+    const answered = await engine.answer(run.id, "Answered after resume")
+    expect(answered.ok).toBe(true)
+    expect(sessions.prompts.at(-1)!.sessionID).toBe(run.sessionId!)
+  })
+})

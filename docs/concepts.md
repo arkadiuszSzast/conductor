@@ -87,6 +87,22 @@ Human gates use the same mechanism: approving is an outcome, rejecting is an
 outcome, and the reviewer's note travels in `outputs.notes`. There is no
 separate human-decision vocabulary in the engine.
 
+### Interactive steps: asking mid-step
+
+An agent step can also pause itself *without* concluding: the runner
+reports an **ask** — a question for the human — and the run's session
+stays alive while the feature waits (`waiting_human`). The answer is
+forwarded straight into that same session, so the agent continues with its
+full conversation context; no rerun, no fresh session. This is run-level
+state, not a workflow transition: the step stays `running` with the same
+active run, and the workflow YAML needs nothing special — any agent step
+may ask. While a question is pending the run is exempt from idle
+nudging/reaping (waiting on a human is not being stuck), but the overall
+run TTL still applies, so an abandoned question eventually fails the step
+through normal failure routing. Contrast with a `human` step: a gate is a
+step *between* steps with approve/reject outcomes; an ask is a
+conversation *inside* a step.
+
 ## Outputs: named values, GHA-style
 
 Every step publishes **named outputs** — a map, not a single value:
