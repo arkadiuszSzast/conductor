@@ -10,7 +10,7 @@
  * SIGINT/SIGTERM → graceful stop. A second signal forces exit.
  */
 
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs"
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs"
 import { dirname, resolve } from "node:path"
 import { spawnSync } from "node:child_process"
 import {
@@ -21,6 +21,7 @@ import {
   type ApiServer,
 } from "@conductor/server"
 import { runCli, type DaemonProcessHandle, type DaemonStartInput } from "./cli.ts"
+import { uiDistStale, type UiDistFs } from "./ui-dist.ts"
 
 /**
  * The UI is a property of the artifact, never configuration. Resolution
@@ -36,11 +37,21 @@ function resolveUiRoot(log: DaemonStartInput["log"]): string | null {
 
   const repoRoot = resolve(import.meta.dirname, "../../..")
   const dist = resolve(repoRoot, "apps/web/dist")
-  if (existsSync(resolve(dist, "index.html"))) return dist
+  const hasDist = existsSync(resolve(dist, "index.html"))
+  const stale =
+    hasDist &&
+    uiDistStale(uiDistFs, resolve(repoRoot, "apps/web"), dist, error =>
+      log({
+        level: "warn",
+        message: "ui staleness check failed — treating dist as fresh",
+        fields: { error: String(error) },
+      }),
+    )
+  if (hasDist && !stale) return dist
 
   const webPackage = resolve(repoRoot, "apps/web/package.json")
   if (existsSync(webPackage) && existsSync(resolve(repoRoot, "node_modules"))) {
-    log({ level: "info", message: "building web ui (first run from this checkout)..." })
+    log({ level: "info", message: "building web ui..." })
     const build = spawnSync("bun", ["run", "--cwd", resolve(repoRoot, "apps/web"), "build:vite"], {
       stdio: "ignore",
       timeout: 300_000,
@@ -49,12 +60,28 @@ function resolveUiRoot(log: DaemonStartInput["log"]): string | null {
       log({ level: "info", message: "web ui built", fields: { dist } })
       return dist
     }
+    if (existsSync(resolve(dist, "index.html"))) {
+      log({ level: "warn", message: "web ui build failed — serving the previous (stale) build" })
+      return dist
+    }
     log({ level: "warn", message: "web ui build failed — continuing without UI" })
     return null
   }
 
+  if (existsSync(resolve(dist, "index.html"))) {
+    if (stale) log({ level: "warn", message: "web ui sources changed but this checkout cannot rebuild — serving the previous (stale) build" })
+    return dist
+  }
   log({ level: "info", message: "no web ui in this artifact — API only" })
   return null
+}
+
+const uiDistFs: UiDistFs = {
+  exists: existsSync,
+  mtimeMs: path => statSync(path).mtimeMs,
+  isDirectory: path => statSync(path).isDirectory(),
+  readdir: path => readdirSync(path),
+  join: (...parts) => resolve(...parts),
 }
 
 function startDaemon(input: DaemonStartInput): DaemonProcessHandle {
