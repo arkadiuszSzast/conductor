@@ -21,8 +21,8 @@
 ## 4. Runner connection & docs
 
 - [x] 4.1 [runner] Confirm `packages/runner-opencode` env config (`CONDUCTOR_URL`/`CONDUCTOR_TOKEN` + callback bind/auth) covers a fresh machine; fill any minimal gap if missing.
-- [ ] 4.2 [docs] Write `docs/install.md`: requirements (Bun per `engines`), the three paths (dev `bun link`, binary `bun run build:binary` + copy, run with example config), runner hookup, first feature walkthrough (init → start → status → approve), and troubleshooting (port taken, wrong token, invalid workflow). Document bundled-actions and SPA-on-disk constraints.
-- [ ] 4.3 [docs] Update the CLI `--help`/usage in `packages/cli/src/cli.ts` to include the `daemon` command.
+- [x] 4.2 [docs] Write `docs/install.md`: requirements (Bun per `engines`), the three paths (dev `bun link`, binary `bun run build:binary` + copy, run with example config), runner hookup, first feature walkthrough (init → start → status → approve), and troubleshooting (port taken, wrong token, invalid workflow). Document bundled-actions and SPA-on-disk constraints.
+- [x] 4.3 [docs] Update the CLI `--help`/usage in `packages/cli/src/cli.ts` to include the `daemon` command.
 
 ## 5. Verification
 

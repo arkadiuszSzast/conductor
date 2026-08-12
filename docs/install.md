@@ -1,0 +1,151 @@
+# Installing and running Conductor
+
+Conductor installs **only from this repository** — nothing is published to
+any registry before a stable release. Two install paths cover the dev loop
+and moving a build to another machine; both end at the same place: a
+`conductor daemon --config <file>` process and clients talking to its HTTP
+API.
+
+## Requirements
+
+- **Bun >= 1.0** (see `engines` in the root `package.json`). Bun is a hard
+  runtime requirement — the server uses `bun:sqlite`, so Node/npx cannot
+  run the daemon. The compiled binary (path B) embeds the Bun runtime, so
+  the *target* machine needs no Bun install.
+- Git, and a project you want Conductor to drive.
+
+## Path A — dev loop (`bun link`)
+
+From a repo checkout:
+
+```sh
+bun install
+cd packages/cli
+bun link            # registers @conductor/cli
+bun link @conductor/cli   # or rely on the global bin: ~/.bun/bin/conductor
+```
+
+`bun link` exposes the `conductor` bin (it points at `src/main.ts`, which
+runs directly under Bun — no build step). Verify:
+
+```sh
+conductor --help
+```
+
+## Path B — single-file binary (`bun build --compile`)
+
+```sh
+bun install
+bun run build:binary     # → dist/conductor (embedded Bun runtime)
+```
+
+Copy `dist/conductor` to any Linux machine of the same architecture and
+run it directly — no Bun, no repo needed for the CLI itself.
+
+Two things do **not** travel inside the binary:
+
+- **Bundled action manifests** (`packages/server/actions/*.yaml`). A
+  binary-run daemon starts without them and logs a warning; workflows
+  using `action:` steps are reported invalid until you point
+  `actions.bundledPath` in the daemon config at a directory containing the
+  manifests (e.g. a copy of `packages/server/actions` from a checkout).
+- **The web UI** (`apps/web/dist`). Build it separately with
+  `bun run build` and point `ui.staticDir` at the output directory.
+  Embedding the SPA into the binary is a possible follow-up, not current
+  behaviour.
+
+## Running the daemon
+
+The daemon takes exactly one input: a YAML config file. There are no
+default paths, ports or auth modes — every setting is written down
+(config: see the annotated example below; the daemon refuses to guess).
+
+```sh
+conductor daemon --init-config ./conductor-daemon.yaml   # write an annotated example
+$EDITOR ./conductor-daemon.yaml
+conductor daemon --config ./conductor-daemon.yaml
+```
+
+Minimal config:
+
+```yaml
+databasePath: /var/lib/conductor/conductor.db
+createDatabaseDirectory: true
+projects:
+  - /path/to/my-project        # must contain conductor.yaml
+bind:
+  host: 127.0.0.1
+  port: 4400
+auth:
+  mode: bearer
+  token: "change-me"           # or mode: none — logged as an explicit warning
+heartbeatIntervalMs: 5000
+# ui:
+#   staticDir: /path/to/conductor/apps/web/dist
+# actions:
+#   bundledPath: /path/to/conductor/packages/server/actions   # needed for the compiled binary
+```
+
+Logs are JSON lines on stdout. Readiness: `GET /v1/readyz` → 200 once
+migrations ran, projects registered and the heartbeat is armed. The
+daemon stops gracefully on SIGINT/SIGTERM (drains in-flight work, closes
+the listener and SQLite, exits 0); a second signal forces exit.
+
+## Connecting the opencode runner
+
+The runner adapter (`@conductor/runner-opencode`) is an opencode plugin.
+It is configured entirely through environment variables — set them in the
+environment opencode runs in:
+
+| Variable | Meaning |
+|---|---|
+| `CONDUCTOR_URL` | daemon API base URL, e.g. `http://127.0.0.1:4400` (required) |
+| `CONDUCTOR_TOKEN` | bearer token, matching the daemon's `auth` (omit for `mode: none`) |
+| `CONDUCTOR_RUNNER_HOST` | callback listen host, e.g. `127.0.0.1` (required) |
+| `CONDUCTOR_RUNNER_PORT` | callback listen port (omit/0 = ephemeral) |
+| `CONDUCTOR_RUNNER_TOKEN` | bearer token the daemon must present on callbacks — or |
+| `CONDUCTOR_RUNNER_AUTH` | `none`, the explicit opt-out (exactly one of the two) |
+
+Load the plugin from the repo checkout in the project's opencode config
+(`.opencode/`): reference `packages/runner-opencode/src/plugin.ts`. On
+start the plugin registers its callback endpoint with the daemon
+(`POST /v1/runners`); `GET /v1/health` then reports the runner available.
+
+## First feature
+
+```sh
+cd /path/to/my-project
+conductor init                       # scaffold conductor.yaml, commit it
+# register the project dir in the daemon config, restart the daemon
+
+export CONDUCTOR_URL=http://127.0.0.1:4400
+export CONDUCTOR_TOKEN=change-me
+
+conductor start "Ship the thing" --project /path/to/my-project
+conductor status --active            # watch progress
+conductor status <feature-id>        # detail: status, current step, run
+conductor approve <feature-id> --notes "ship it"   # when waiting_human
+conductor logs <feature-id>          # transition timeline
+```
+
+## Troubleshooting
+
+- **Port already in use** — `conductor daemon` fails at startup with a
+  bind error. Change `bind.port` in the config, or find the occupant:
+  `lsof -i :4400`.
+- **`error[unauthorized]` / exit code 3** — the client's token does not
+  match the daemon's `auth.token`. Set `--token`/`CONDUCTOR_TOKEN` to the
+  daemon's configured value. `auth.mode: none` daemons need no token.
+- **`daemon unreachable` / exit code 7** — wrong `--url`, daemon not
+  running, or it bound a different host/port. Check the daemon's
+  `api listening` log line.
+- **Workflow invalid at registration** — the daemon logs
+  `workflow invalid: …` per diagnostic and `/v1/health` reports the
+  project's state. Fix `conductor.yaml`; the registry reloads on the next
+  registration (restart the daemon or fix before start).
+- **`action:` steps invalid under the compiled binary** — the bundled
+  manifests are not inside the binary; set `actions.bundledPath` (see
+  Path B above).
+- **Runner reported unavailable** — no runner registered yet. Check the
+  opencode plugin env (`CONDUCTOR_URL`, callback auth pair) and that
+  opencode is running in a directory registered under `projects`.
