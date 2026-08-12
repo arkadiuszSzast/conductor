@@ -396,3 +396,22 @@ describe("invalidation store: ensure is load-once", () => {
     expect(calls.filter(c => c.path.startsWith("/v1/health")).length).toBe(2)
   })
 })
+
+describe("invalidation store: retry timers are cancelled by stop()", () => {
+  it("stop() clears a pending load retry so it never fires", async () => {
+    const { client, calls } = makeStack({
+      "/v1/features": () =>
+        new Response(JSON.stringify({ error: { code: "internal", message: "blip", requestId: "r" } }), { status: 500 }),
+    })
+    const scheduler = new FakeScheduler()
+    const store = new DataSource({ client, setTimeoutFn: scheduler.set, clearTimeoutFn: scheduler.clear })
+    store.ensureFeaturesLoaded()
+    await settle()
+    expect(scheduler.timers.some(t => !t.cleared)).toBe(true)
+    store.stop()
+    expect(scheduler.timers.every(t => t.cleared)).toBe(true)
+    scheduler.tick()
+    await settle()
+    expect(calls.filter(c => c.path.startsWith("/v1/features")).length).toBe(1)
+  })
+})

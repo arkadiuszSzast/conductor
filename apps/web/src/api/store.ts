@@ -91,6 +91,7 @@ export class DataSource {
   private readonly listeners = new Map<string, Set<() => void>>()
   private readonly runLogListeners = new Map<string, Set<() => void>>()
   private readonly inflight = new Map<string, Inflight>()
+  private readonly retryHandles = new Map<string, unknown>()
   private readonly echo = new Map<string, number>()
 
   private readonly pending = new Map<string, ChangeEvent>()
@@ -251,10 +252,12 @@ export class DataSource {
         // permanent error state. Forced refetches carry attempt 1+ and
         // rely on their own trigger repeating instead.
         if (attempt < LOAD_RETRY_MAX_ATTEMPTS) {
-          this.setTimeoutFn(() => {
+          const handle = this.setTimeoutFn(() => {
+            this.retryHandles.delete(key)
             if (this.inflight.get(key)?.id !== requestId) return
             this.load(key, loader, attempt + 1)
           }, LOAD_RETRY_BASE_MS * 2 ** attempt)
+          this.retryHandles.set(key, handle)
           return
         }
         this.inflight.delete(key)
@@ -557,5 +560,7 @@ export class DataSource {
       this.clearTimeoutFn(this.healthPollHandle)
       this.healthPollHandle = null
     }
+    for (const handle of this.retryHandles.values()) this.clearTimeoutFn(handle)
+    this.retryHandles.clear()
   }
 }
