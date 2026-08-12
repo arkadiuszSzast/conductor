@@ -44,6 +44,8 @@ defaults (loopback bind `127.0.0.1:4400`, database under
 
 ```sh
 conductor daemon          # JSON logs on stdout; /v1/readyz → 200
+                          # web UI serves automatically at the same address
+                          # (ships inside the artifact; --no-ui disables it)
 ```
 
 Operators who want full control: `conductor daemon --config <path>`

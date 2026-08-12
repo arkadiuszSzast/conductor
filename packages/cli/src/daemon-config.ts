@@ -31,7 +31,6 @@ const TOP_LEVEL_FIELDS = new Set([
   "projects",
   "bind",
   "auth",
-  "ui",
   "heartbeatIntervalMs",
   "engine",
   "actions",
@@ -41,7 +40,6 @@ const ENGINE_FIELDS = new Set(["runTtlMs", "nudgeIdleCycles", "maxNudges"])
 const ACTIONS_FIELDS = new Set(["bundledPath", "localPaths"])
 const BIND_FIELDS = new Set(["host", "port"])
 const AUTH_FIELDS = new Set(["mode", "token"])
-const UI_FIELDS = new Set(["staticDir"])
 
 interface YamlObject {
   readonly [key: string]: unknown
@@ -107,18 +105,6 @@ export function assembleDaemonConfig(raw: unknown): DaemonFileConfig {
     apiAuth = { mode: "bearer", token: authToken }
   } else {
     throw new UsageError('"auth.mode" must be "none" or "bearer"')
-  }
-
-  const ui = raw["ui"]
-  let staticDir: string | undefined
-  if (ui !== undefined) {
-    if (!isObject(ui)) throw new UsageError('"ui" must be a mapping with "staticDir"')
-    for (const key of Object.keys(ui)) {
-      if (!UI_FIELDS.has(key)) throw new UsageError(`unknown daemon config field "ui.${key}"`)
-    }
-    const value = ui["staticDir"]
-    if (!isNonEmptyString(value)) throw new UsageError('"ui.staticDir" must be a non-empty string (e.g. /path/to/apps/web/dist)')
-    staticDir = value
   }
 
   const createDatabaseDirectory = raw["createDatabaseDirectory"]
@@ -187,7 +173,6 @@ export function assembleDaemonConfig(raw: unknown): DaemonFileConfig {
     api: {
       bind: { host: host!, port },
       auth: apiAuth,
-      ...(staticDir !== undefined ? { ui: { staticDir } } : {}),
     },
   }
 }
@@ -228,11 +213,6 @@ auth:
   mode: none
   # mode: bearer
   # token: "change-me"
-
-# Optional: serve the built web UI (apps/web/dist after "bun run build").
-# The SPA is never embedded in the executable — point at a directory on disk.
-# ui:
-#   staticDir: /path/to/apps/web/dist
 
 # Reconciler heartbeat interval in milliseconds (default: 5000).
 heartbeatIntervalMs: 5000

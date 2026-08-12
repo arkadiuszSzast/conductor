@@ -767,6 +767,16 @@ auth:
     expect(await runCli(["daemon", "--config", "/daemon.yaml"], h.deps)).toBe(0)
   })
 
+  it("passes --no-ui through to the daemon start input", async () => {
+    const h = makeDaemonHarness()
+    h.files.set("/daemon.yaml", VALID_CONFIG)
+    expect(await runCli(["daemon", "--config", "/daemon.yaml", "--no-ui"], h.deps)).toBe(EXIT.ok)
+    expect(h.starts[0]!.noUi).toBe(true)
+    h.starts.length = 0
+    expect(await runCli(["daemon", "--config", "/daemon.yaml"], h.deps)).toBe(EXIT.ok)
+    expect(h.starts[0]!.noUi).toBe(false)
+  })
+
   it("fails cleanly when no daemon runtime is wired", async () => {
     const h = makeDaemonHarness()
     h.files.set("/daemon.yaml", VALID_CONFIG)
@@ -788,7 +798,6 @@ describe("CLI: daemon config parsing", () => {
     const config = assembleDaemonConfig({
       ...base,
       auth: { mode: "bearer", token: "t" },
-      ui: { staticDir: "/spa/dist" },
       heartbeatIntervalMs: 250,
       createDatabaseDirectory: false,
       engine: { runTtlMs: 1000, nudgeIdleCycles: 2, maxNudges: 3 },
@@ -805,7 +814,6 @@ describe("CLI: daemon config parsing", () => {
     expect(config.api).toEqual({
       bind: { host: "127.0.0.1", port: 4400 },
       auth: { mode: "bearer", token: "t" },
-      ui: { staticDir: "/spa/dist" },
     })
   })
 
@@ -823,7 +831,7 @@ describe("CLI: daemon config parsing", () => {
     ["unknown top-level field", { ...base, portt: 1 }, "portt"],
     ["unknown engine field", { ...base, engine: { ttl: 5 } }, "engine.ttl"],
     ["negative heartbeat", { ...base, heartbeatIntervalMs: -5 }, "heartbeatIntervalMs"],
-    ["bad ui", { ...base, ui: { staticDir: "" } }, "ui.staticDir"],
+    ["removed ui field", { ...base, ui: { staticDir: "/x" } }, "ui"],
     ["bad localPaths", { ...base, actions: { localPaths: [""] } }, "actions.localPaths"],
     ["fractional nudgeIdleCycles", { ...base, engine: { nudgeIdleCycles: 2.5 } }, "positive integer"],
     ["fractional maxNudges", { ...base, engine: { maxNudges: 1.5 } }, "positive integer"],

@@ -29,6 +29,12 @@ import { DAEMON_CONFIG_TEMPLATE, addProjectToConfig, defaultDaemonConfig, loadDa
 export interface DaemonStartInput {
   readonly daemon: DaemonConfig
   readonly api: ApiConfig
+  /**
+   * Disable web-UI serving. The UI is a property of the artifact
+   * (embedded in the binary, or the checkout's built SPA) — never user
+   * configuration; this flag is the only knob.
+   */
+  readonly noUi: boolean
   /** Structured JSON log lines, `jsonLineLogger` shape. */
   readonly log: (entry: DaemonLogEntry) => void
 }
@@ -87,11 +93,13 @@ commands:
                        scaffold <dir>/conductor.yaml (default: cwd) and
                        register the project with the local daemon
                        (--no-register: scaffold only)
-  daemon [--config <path>]
+  daemon [--config <path>] [--no-ui]
                        run the daemon; without --config uses (and generates
                        on first run) the platform config at
                        $XDG_CONFIG_HOME/conductor/daemon.yaml
-                       (~/.config/conductor/daemon.yaml)
+                       (~/.config/conductor/daemon.yaml); the web UI ships
+                       inside the artifact and serves automatically
+                       (--no-ui disables it)
   daemon --init-config <path> [--force]
                        write an example daemon config and exit
   start <title> [--project <dir>] [--description <text>] [--workflow <name>] [--pr <n>]
@@ -113,7 +121,7 @@ commands:
 exit codes: 0 ok, 1 failure, 2 usage, 3 unauthorized, 4 not found,
             5 conflict, 6 duplicate report, 7 daemon unreachable`
 
-const BOOLEAN_FLAGS = new Set(["json", "active", "force", "help", "no-register"])
+const BOOLEAN_FLAGS = new Set(["json", "active", "force", "help", "no-register", "no-ui"])
 
 const VALUE_FLAGS = new Set([
   "url",
@@ -440,7 +448,7 @@ async function registerWithRunningDaemon(dir: string, deps: CliDeps, parsed: Par
 }
 
 async function commandDaemon(parsed: Parsed, deps: CliDeps): Promise<number> {
-  requireFlags(parsed, ["config", "init-config", "force"])
+  requireFlags(parsed, ["config", "init-config", "force", "no-ui"])
   if (parsed.positionals.length > 0) throw new UsageError(`unexpected argument "${parsed.positionals[0]}"`)
 
   const initPath = stringFlag(parsed, "init-config")
@@ -500,7 +508,7 @@ async function commandDaemon(parsed: Parsed, deps: CliDeps): Promise<number> {
     deps.stderr("error: this build cannot start a daemon (no daemon runtime wired)")
     return EXIT.failure
   }
-  const handle = deps.startDaemon({ daemon, api, log })
+  const handle = deps.startDaemon({ daemon, api, noUi: parsed.flags.has("no-ui"), log })
   try {
     await handle.started
   } catch (err) {
