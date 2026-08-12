@@ -21,4 +21,12 @@ export { resolveConnection, UsageError } from "./config.ts"
 export type { ConnectionInput } from "./config.ts"
 
 export { runCli, EXIT } from "./cli.ts"
-export type { CliDeps } from "./cli.ts"
+export type { CliDeps, DaemonProcessHandle, DaemonStartInput } from "./cli.ts"
+
+export {
+  DAEMON_CONFIG_TEMPLATE,
+  DEFAULT_HEARTBEAT_INTERVAL_MS,
+  assembleDaemonConfig,
+  loadDaemonConfig,
+} from "./daemon-config.ts"
+export type { DaemonFileConfig } from "./daemon-config.ts"
