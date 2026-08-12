@@ -26,6 +26,70 @@ in [`openspec/changes/`](openspec/changes).
 | 3 | Agents pull work (scheduler, scopes, concurrency) | planned |
 | 4 | GitHub webhook triggers + git-resolved action registry | future |
 
+## Quick start
+
+Conductor installs **only from this repo** (no registry publication before a
+stable release). Requires [Bun](https://bun.sh) ≥ 1.0.
+
+```sh
+git clone https://github.com/arkadiuszSzast/conductor && cd conductor
+bun install
+cd packages/cli && bun link && cd ../..   # global `conductor` (or: bun run build:binary → dist/conductor)
+```
+
+**1. Configure and start the daemon.** One YAML file is the single source of
+truth — there are no default paths, ports or auth modes:
+
+```sh
+conductor daemon --init-config ~/conductor-daemon.yaml   # annotated example
+$EDITOR ~/conductor-daemon.yaml                          # databasePath, projects, bind, auth
+conductor daemon --config ~/conductor-daemon.yaml        # JSON logs on stdout; /v1/readyz → 200
+```
+
+**2. Adopt a project.** Each project carries its own workflow file,
+GHA-style:
+
+```sh
+cd /path/to/my-project
+conductor init            # scaffolds conductor.yaml (roles, steps, human gate)
+# add /path/to/my-project to `projects:` in the daemon config, restart the daemon
+```
+
+**3. Point the CLI at the daemon.** Every command except `init`/`daemon`
+needs an explicit address:
+
+```sh
+export CONDUCTOR_URL=http://127.0.0.1:4400
+export CONDUCTOR_TOKEN=change-me          # only for auth.mode: bearer
+```
+
+**4. Connect a runner** (executes `agent:` steps — without one, gates and
+the API still work but agent steps wait). The opencode adapter is configured
+by environment variables in the environment opencode runs in:
+
+```sh
+export CONDUCTOR_URL=http://127.0.0.1:4400
+export CONDUCTOR_RUNNER_HOST=127.0.0.1    # callback listener bind
+export CONDUCTOR_RUNNER_AUTH=none         # or CONDUCTOR_RUNNER_TOKEN=<token>
+# load packages/runner-opencode/src/plugin.ts in the project's opencode config
+```
+
+The runner registers itself with the daemon on startup; `GET /v1/health`
+then reports it available.
+
+**5. Drive a feature:**
+
+```sh
+conductor start "Ship the thing" --project /path/to/my-project
+conductor status --active                 # the board
+conductor status <feature-id>             # detail: status, current step, run
+conductor approve <feature-id> --notes "ship it"   # when waiting_human
+conductor logs <feature-id>               # transition timeline
+```
+
+Full walkthrough, the compiled-binary path and troubleshooting:
+[docs/install.md](docs/install.md).
+
 ## The pillars
 
 1. **A standalone system, not a plugin** — own daemon with its own state, API
@@ -47,6 +111,8 @@ in [`openspec/changes/`](openspec/changes).
 
 ## Documentation
 
+- [Install](docs/install.md) — installing from the repo, running the
+  daemon, connecting the opencode runner, first feature, troubleshooting.
 - [Concepts](docs/concepts.md) — the execution model: jobs, outcomes vs
   failures, loops, feedback, escalation.
 - [Workflow reference](docs/workflow-reference.md) — every `conductor.yaml`
