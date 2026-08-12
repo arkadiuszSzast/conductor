@@ -55,8 +55,13 @@ describe("expression validation", () => {
   })
 
   it("rejects an unknown expression context in a prompt", () => {
+    const def = workflow({ main: job([agentStep("a", "architect", "{{ ctx.thing }}")]) }, roles)
+    expect(errorsIn(def.jobs).join("\n")).toContain('unknown context "ctx"')
+  })
+
+  it("rejects a bare feature read without a field", () => {
     const def = workflow({ main: job([agentStep("a", "architect", "{{ feature }}")]) }, roles)
-    expect(errorsIn(def.jobs).join("\n")).toContain('unknown context "feature"')
+    expect(errorsIn(def.jobs).join("\n")).toContain("not a feature field")
   })
 
   it("rejects a bare environment-style read", () => {

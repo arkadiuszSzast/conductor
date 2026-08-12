@@ -40,8 +40,8 @@ export function commandStep(id: string, run: readonly string[], options?: StepOp
   return { ...stepBase(id, options), type: "command", run }
 }
 
-export function actionStep(id: string, uses: string, options?: StepOptions): ActionStep {
-  return { ...stepBase(id, options), type: "action", uses, with: {} }
+export function actionStep(id: string, uses: string, options?: StepOptions & { with?: Readonly<Record<string, unknown>> }): ActionStep {
+  return { ...stepBase(id, options), type: "action", uses, with: options?.with ?? {} }
 }
 
 export function humanStep(id: string, options?: StepOptions & { prompt?: string }): HumanStep {

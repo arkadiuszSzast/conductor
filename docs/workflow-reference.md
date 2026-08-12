@@ -65,6 +65,12 @@ inputs:
 
 Referenced in expressions as `{{ inputs.<name> }}`.
 
+> For manually-started features, the operator's task text travels on the
+> feature itself — read it as `{{ feature.description }}` (with
+> `{{ feature.title }}` / `{{ feature.slug }}` alongside; see
+> [Expressions](expressions.md#feature--the-features-own-fields)) instead
+> of declaring an input nothing populates.
+
 ### `roles`
 
 `map<string, RoleDef>`. Roles are pure metadata that `agent` steps refer to;

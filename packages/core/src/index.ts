@@ -23,6 +23,7 @@ export type {
   EvalContext,
   Expr,
   ExprType,
+  FeatureContext,
   ParseResult,
   StepOutputsContext,
   TypeOfPath,

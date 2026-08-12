@@ -88,6 +88,12 @@ export function buildEvalContext(
     inputs: onlyValues(state.input),
     steps,
     needs,
+    feature: {
+      title: state.title,
+      slug: state.slug,
+      description: state.description ?? "",
+      pr: state.pr,
+    },
     ...(feedback ? { feedback } : {}),
   }
 }
