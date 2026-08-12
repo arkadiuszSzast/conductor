@@ -978,3 +978,24 @@ describe("CLI: connection fallback to the daemon config", () => {
     ).toThrow(UsageError)
   })
 })
+
+describe("CLI: init review fixes", () => {
+  it("resolves a relative --dir against cwd before persisting", async () => {
+    const h = await makeHarness()
+    const deps = { ...h.deps, env: { HOME: "/home/dev" } }
+    expect(await runCli(["init", "--dir", "sub/app"], deps)).toBe(EXIT.ok)
+    expect(h.files.has("/work/project/sub/app/conductor.yaml")).toBe(true)
+    const config = h.files.get("/home/dev/.config/conductor/daemon.yaml")!
+    expect(loadDaemonConfig(config).daemon.projects).toEqual(["/work/project/sub/app"])
+  })
+
+  it("an explicit connection registers live only and leaves the local platform config untouched", async () => {
+    const h = await makeHarness()
+    const project = writeProject()
+    const deps = { ...h.deps, env: { HOME: "/home/dev", CONDUCTOR_URL: CLI_URL } }
+    expect(await runCli(["init", "--dir", project, "--force"], deps)).toBe(EXIT.ok)
+    expect(h.files.has("/home/dev/.config/conductor/daemon.yaml")).toBe(false)
+    expect(h.out.join("\n")).toContain("registering live only")
+    expect(h.daemon.registry.getStatus(project).state).toBe("valid")
+  })
+})

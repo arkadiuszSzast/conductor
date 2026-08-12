@@ -129,8 +129,11 @@ start the plugin registers its callback endpoint with the daemon
 ```sh
 cd /path/to/my-project
 conductor init      # scaffolds conductor.yaml AND registers the project:
-                    # it is added to the daemon config (generated if absent) and,
+                    # it is added to the LOCAL daemon config (generated if absent) and,
                     # when a daemon is running, registered live — no restart.
+                    # With an explicit connection (--url/CONDUCTOR_URL/--config) the
+                    # daemon of record may be remote: init registers live only and
+                    # never touches the local platform config.
                     # --no-register: scaffold only.
 
 # Only needed for a REMOTE daemon or auth overrides — a local daemon's

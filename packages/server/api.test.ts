@@ -1156,3 +1156,29 @@ describe("API: runtime project registration", () => {
     expect(anonymous.status).toBe(401)
   })
 })
+
+describe("API: project registration absent", () => {
+  it("404s when no registerProject dep is wired", async () => {
+    const project = writeProject()
+    const sessions = new FakeSessions()
+    const daemon = new Daemon(
+      { databasePath: join(tempDir("conductor-api-noreg-db-"), "state.db"), projects: [project], heartbeatIntervalMs: 60_000 },
+      { sessions, logger: { log: () => {} }, scheduler: { setInterval: () => ({}), clearInterval: () => {} } },
+    )
+    daemonsToStop.push(daemon)
+    await daemon.start()
+    const api = createApi(
+      { bind: { host: "127.0.0.1", port: 0 }, auth: { mode: "none" } },
+      { store: daemon.store, engine: daemon.engine, health: () => daemon.health(), resolveWorkflow: daemon.registry.resolver },
+    )
+    apisToClose.push(api)
+    const response = await api.handle(
+      new Request("http://conductor.test/v1/projects", {
+        method: "POST",
+        body: JSON.stringify({ dir: project }),
+        headers: { "content-type": "application/json" },
+      }),
+    )
+    expect(response.status).toBe(404)
+  })
+})

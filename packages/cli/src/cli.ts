@@ -321,7 +321,11 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
 async function commandInit(parsed: Parsed, deps: CliDeps): Promise<number> {
   requireFlags(parsed, ["dir", "force", "no-register"])
   if (parsed.positionals.length > 0) throw new UsageError(`unexpected argument "${parsed.positionals[0]}"`)
-  const dir = stringFlag(parsed, "dir") ?? deps.cwd()
+  const rawDir = stringFlag(parsed, "dir") ?? deps.cwd()
+  // The directory is persisted into the daemon config and sent to a
+  // separate daemon process — a relative path would resolve against THAT
+  // process's cwd, so it must become absolute here, against ours.
+  const dir = rawDir.startsWith("/") ? rawDir : joinPath(deps.cwd(), rawDir)
   const configPath = joinPath(dir, "conductor.yaml")
   if (deps.exists(configPath) && !parsed.flags.has("force")) {
     deps.stderr(`error: ${configPath} already exists (use --force to overwrite)`)
@@ -336,8 +340,22 @@ async function commandInit(parsed: Parsed, deps: CliDeps): Promise<number> {
     return EXIT.ok
   }
 
-  registerInDaemonConfig(dir, deps)
-  await registerWithRunningDaemon(dir, deps)
+  // An explicit connection (flags/env/client config) means the daemon of
+  // record is whatever that connection points at — possibly remote. The
+  // LOCAL platform config would never be read by that daemon, so writing
+  // the project there would fake durable registration. Only the
+  // zero-config local path owns the platform config.
+  const explicitConnection =
+    stringFlag(parsed, "url") !== undefined ||
+    stringFlag(parsed, "config") !== undefined ||
+    (deps.env["CONDUCTOR_URL"] ?? "") !== "" ||
+    (deps.env["CONDUCTOR_CONFIG"] ?? "") !== ""
+  if (explicitConnection) {
+    deps.stdout("Explicit daemon connection configured — registering live only (the daemon's own config is not touched).")
+  } else {
+    registerInDaemonConfig(dir, deps)
+  }
+  await registerWithRunningDaemon(dir, deps, parsed)
   return EXIT.ok
 }
 
@@ -366,11 +384,15 @@ function registerInDaemonConfig(dir: string, deps: CliDeps): void {
 }
 
 /** Best-effort live registration: a reachable daemon picks the project up without restart; unreachable is a hint, not a failure. */
-async function registerWithRunningDaemon(dir: string, deps: CliDeps): Promise<void> {
+async function registerWithRunningDaemon(dir: string, deps: CliDeps, parsed: Parsed): Promise<void> {
   let client: ApiClient
   try {
     const connection = resolveConnection({
-      flags: {},
+      flags: {
+        ...(stringFlag(parsed, "url") !== undefined ? { url: stringFlag(parsed, "url")! } : {}),
+        ...(stringFlag(parsed, "token") !== undefined ? { token: stringFlag(parsed, "token")! } : {}),
+        ...(stringFlag(parsed, "config") !== undefined ? { config: stringFlag(parsed, "config")! } : {}),
+      },
       env: deps.env,
       readFile: deps.readFile,
       exists: deps.exists,
