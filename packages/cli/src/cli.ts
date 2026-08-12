@@ -99,7 +99,8 @@ commands:
                        $XDG_CONFIG_HOME/conductor/daemon.yaml
                        (~/.config/conductor/daemon.yaml); the web UI ships
                        inside the artifact and serves automatically
-                       (--no-ui disables it)
+                       (--no-ui disables it); env CONDUCTOR_BIND_HOST /
+                       CONDUCTOR_BIND_PORT override the config's bind
   daemon --init-config <path> [--force]
                        write an example daemon config and exit
   start <title> [--project <dir>] [--description <text>] [--workflow <name>] [--pr <n>]
@@ -495,13 +496,40 @@ async function commandDaemon(parsed: Parsed, deps: CliDeps): Promise<number> {
     return EXIT.usage
   }
 
-  const { daemon, api } = loadDaemonConfig(source)
+  const config = loadDaemonConfig(source)
+  const { daemon } = config
+  let api = config.api
+
+  // Environment overrides for the listener — the deployment surface
+  // (Docker, systemd, quick LAN exposure) without editing the file. The
+  // file stays the source of truth for everything else.
+  const hostOverride = deps.env["CONDUCTOR_BIND_HOST"]
+  const portOverride = deps.env["CONDUCTOR_BIND_PORT"]
+  if (hostOverride !== undefined && hostOverride.trim() !== "") {
+    api = { ...api, bind: { ...api.bind, host: hostOverride } }
+    log({ level: "info", message: "bind host overridden by CONDUCTOR_BIND_HOST", fields: { host: hostOverride } })
+  }
+  if (portOverride !== undefined && portOverride.trim() !== "") {
+    const port = Number(portOverride)
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      deps.stderr(`error: CONDUCTOR_BIND_PORT "${portOverride}" must be an integer between 1 and 65535`)
+      return EXIT.usage
+    }
+    api = { ...api, bind: { ...api.bind, port } }
+    log({ level: "info", message: "bind port overridden by CONDUCTOR_BIND_PORT", fields: { port } })
+  }
 
   if (api.auth.mode === "none") {
     log({
       level: "warn",
       message: `API authentication is disabled (auth.mode: none) — the API is open on ${api.bind.host}:${api.bind.port}`,
     })
+    if (!isLoopbackHost(api.bind.host)) {
+      log({
+        level: "warn",
+        message: `auth.mode: none on a non-loopback bind (${api.bind.host}) — anyone on the network can drive this daemon; switch to auth.mode: bearer`,
+      })
+    }
   }
 
   if (deps.startDaemon === undefined) {
@@ -522,6 +550,22 @@ async function commandDaemon(parsed: Parsed, deps: CliDeps): Promise<number> {
 function parentPath(path: string): string {
   const index = path.lastIndexOf("/")
   return index <= 0 ? "" : path.slice(0, index)
+}
+
+/**
+ * Loopback detection for the auth-none safety warning. Covers the whole
+ * 127.0.0.0/8 range, IPv6 loopback in expanded/bracketed forms, the
+ * IPv4-mapped IPv6 loopback and case-insensitive "localhost" — a false
+ * negative here silently defeats the warning.
+ */
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase().replace(/^\[|\]$/g, "")
+  if (normalized === "localhost") return true
+  if (normalized.startsWith("127.")) return true
+  const unmapped = normalized.startsWith("::ffff:") ? normalized.slice(7) : normalized
+  if (unmapped.startsWith("127.")) return true
+  const zeroStripped = unmapped.replace(/^(0+:)+/, "::").replace(/^::+/, "::")
+  return unmapped === "::1" || zeroStripped === "::1"
 }
 
 function printFeature(
