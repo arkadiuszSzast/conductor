@@ -49,10 +49,9 @@ Two things do **not** travel inside the binary:
   using `action:` steps are reported invalid until you point
   `actions.bundledPath` in the daemon config at a directory containing the
   manifests (e.g. a copy of `packages/server/actions` from a checkout).
-- **The web UI** (`apps/web/dist`). Build it separately with
-  `bun run build` and point `ui.staticDir` at the output directory.
-  Embedding the SPA into the binary is a possible follow-up, not current
-  behaviour.
+- ~~The web UI~~ — no longer a pitfall: `bun run build:binary` builds the
+  SPA and **embeds it in the executable**; the daemon serves it
+  automatically (disable with `conductor daemon --no-ui`).
 
 ## Running the daemon
 
@@ -70,6 +69,11 @@ with working defaults — database under `$XDG_DATA_HOME/conductor`
 `auth.mode: none` (loopback-only; an explicit warning is logged — switch
 to `bearer` for anything non-local), empty project list — and the daemon
 starts from it. Edit the file and restart to change anything.
+
+The **web UI** ships inside the artifact and serves automatically at the
+daemon's address (`/v1/*` keeps API precedence): the compiled binary
+carries an embedded SPA; a checkout-run daemon serves `apps/web/dist`,
+building it once on first start when missing. `--no-ui` disables it.
 
 Explicit config (operators who want full control):
 
@@ -93,8 +97,6 @@ auth:
   mode: bearer
   token: "change-me"           # or mode: none — logged as an explicit warning
 heartbeatIntervalMs: 5000
-# ui:
-#   staticDir: /path/to/conductor/apps/web/dist
 # actions:
 #   bundledPath: /path/to/conductor/packages/server/actions   # needed for the compiled binary
 ```
