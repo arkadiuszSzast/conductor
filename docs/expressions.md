@@ -91,7 +91,7 @@ Output names by step kind:
 | `command` | whatever it wrote to `$CONDUCTOR_OUTPUT` (`name=value` lines) |
 | `action` | per the action's manifest (e.g. `git/push@v1` → `sha`, `url`) |
 | `agent` | `report` |
-| `human` | `notes` |
+| `human` | `notes` (decision note); `prompt` is reserved for the rendered gate prompt and not part of the validated contract |
 
 ## `needs` — declared outputs of dependencies
 

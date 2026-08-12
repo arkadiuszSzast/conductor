@@ -197,6 +197,9 @@ interface StepDetailProjection {
   readonly outputs: Readonly<Record<string, string>>
   readonly truncated?: boolean
   readonly runId?: string
+  /** Rendered gate prompt, present untruncated while the step waits for a
+   *  human — the approver must see the whole question. */
+  readonly prompt?: string
 }
 
 /**
@@ -224,11 +227,13 @@ function jobsDetail(
         }
       }
       const runId = newestRunByStep.get(`${jobId}\u0000${stepId}`)
+      const gatePrompt = stepRuntime.status === "waiting_human" ? stepRuntime.outputs["prompt"] : undefined
       steps[stepId] = {
         status: stepRuntime.status,
         outputs,
         ...(truncated ? { truncated: true } : {}),
         ...(truncated && runId !== undefined ? { runId } : {}),
+        ...(gatePrompt !== undefined ? { prompt: gatePrompt } : {}),
       }
     }
     detail[jobId] = {

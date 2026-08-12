@@ -357,6 +357,28 @@ export class Store {
     this.emit({ kind: "feature", featureId: id })
   }
 
+  /** Merge named outputs into a step's runtime record (used for the
+   *  reserved gate `prompt` output, written when a gate arms). */
+  mergeStepOutputs(featureId: string, jobId: string, stepId: string, outputs: Readonly<Record<string, string>>): void {
+    const current = this.getFeature(featureId)
+    if (!current) return
+    const job = current.jobs[jobId]
+    if (!job) return
+    const step = job.steps[stepId] ?? { status: "pending" as const, outputs: {} }
+    const next: FeatureState = {
+      ...current,
+      jobs: {
+        ...current.jobs,
+        [jobId]: {
+          ...job,
+          steps: { ...job.steps, [stepId]: { ...step, outputs: { ...step.outputs, ...outputs } } },
+        },
+      },
+    }
+    this.db.run("UPDATE feature SET time_updated = ?, state = ? WHERE id = ?", [Date.now(), JSON.stringify(next), featureId])
+    this.emit({ kind: "feature", featureId })
+  }
+
   insertRun(input: {
     featureId: string
     jobId: string

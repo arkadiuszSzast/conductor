@@ -127,6 +127,10 @@ export interface CommandStep extends StepBase {
 
 export interface HumanStep extends StepBase {
   readonly type: "human"
+  /** Template shown to the approver when the gate arms. Same expression
+   *  contexts as agent prompts. Rendered once at arm time and persisted
+   *  under the step's reserved `prompt` output. */
+  readonly prompt?: string
 }
 
 // ---------------------------------------------------------------------------

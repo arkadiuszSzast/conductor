@@ -117,6 +117,34 @@ describe("validateWorkflow", () => {
     expect(r.errors).toEqual([])
   })
 
+  it("accepts a human prompt quoting an earlier step's report", () => {
+    const r = validateWorkflow(withJobs({
+      main: job([
+        agentStep("explore", "implementer", "explore"),
+        humanStep("gate", { prompt: "Answer: {{ steps.explore.outputs.report }}" }),
+      ]),
+    }))
+    expect(r.errors).toEqual([])
+  })
+
+  it("rejects a human prompt referencing a later step", () => {
+    const r = validateWorkflow(withJobs({
+      main: job([
+        humanStep("gate", { prompt: "{{ steps.impl.outputs.report }}" }),
+        agentStep("impl", "implementer", "impl"),
+      ]),
+    }))
+    expect(r.errors.some(e => e.includes("gate") && e.includes("prompt"))).toBe(true)
+  })
+
+  it("rejects a human prompt reading an undeclared needs output", () => {
+    const r = validateWorkflow(withJobs({
+      up: job([agentStep("a", "implementer", "a")]),
+      main: job([humanStep("gate", { prompt: "{{ needs.up.outputs.missing }}" })], ["up"]),
+    }))
+    expect(r.errors.some(e => e.includes("prompt"))).toBe(true)
+  })
+
   it("rejects an empty command run list", () => {
     const r = validateWorkflow(withJobs({ main: job([commandStep("a", [])]) }))
     expect(r.errors.join("\n")).toContain("empty run")

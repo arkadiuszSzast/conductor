@@ -44,8 +44,12 @@ export function actionStep(id: string, uses: string, options?: StepOptions): Act
   return { ...stepBase(id, options), type: "action", uses, with: {} }
 }
 
-export function humanStep(id: string, options?: StepOptions): HumanStep {
-  return { ...stepBase(id, options), type: "human" }
+export function humanStep(id: string, options?: StepOptions & { prompt?: string }): HumanStep {
+  return {
+    ...stepBase(id, options),
+    type: "human",
+    ...(options?.prompt !== undefined ? { prompt: options.prompt } : {}),
+  }
 }
 
 export function job(

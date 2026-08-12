@@ -200,6 +200,7 @@ export class Engine {
       }
       case "wait_human": {
         const state = this.deps.store.getFeature(featureId)
+        this.renderGatePrompt(featureId, snapshot, decision.jobId, decision.stepId)
         this.deps.notify?.(
           `Conductor: approval needed — ${state?.slug ?? featureId}`,
           `Step "${decision.stepId}" (job "${decision.jobId}") awaits your approval.`,
@@ -213,6 +214,25 @@ export class Engine {
       case "noop":
         return
     }
+  }
+
+  /**
+   * Render a gate's prompt template when the gate arms and persist the
+   * text under the step's reserved `prompt` output. Render errors log and
+   * the gate still arms with the partial text — a gate exists to hand
+   * control to a human, so a broken template must never block it.
+   */
+  private renderGatePrompt(featureId: string, snapshot: WorkflowSnapshot, jobId: string, stepId: string): void {
+    const { store, log } = this.deps
+    const step = findStep(snapshot.workflow, jobId, stepId)
+    if (!step || step.type !== "human" || step.prompt === undefined) return
+    const state = store.getFeature(featureId)
+    if (!state) return
+    const feedback = store.getFeedback(featureId) ?? undefined
+    const context = buildEvalContext(snapshot.workflow, state, jobId, feedback)
+    const rendered = renderTemplate(step.prompt, context)
+    for (const error of rendered.errors) log.log(`feature=${state.slug} gate=${jobId}/${stepId}: ${error}`)
+    store.mergeStepOutputs(featureId, jobId, stepId, { prompt: rendered.text })
   }
 
   // ------------------------------------------------------------- execution
@@ -571,7 +591,10 @@ export class Engine {
     for (const { jobId, stepId } of waiting) {
       const current = store.getFeature(featureId)
       if (!current) break
-      const event: PipelineEvent = { kind: "step.completed", jobId, stepId, outcome, outputs: { notes } }
+      // Merge over the step's existing outputs (the reserved `prompt`
+      // written at arm time) — `step.completed` replaces outputs wholesale.
+      const existing = current.jobs[jobId]?.steps[stepId]?.outputs ?? {}
+      const event: PipelineEvent = { kind: "step.completed", jobId, stepId, outcome, outputs: { ...existing, notes } }
       const transition = interpret(snapshot.workflow, current, event)
       store.applyTransition(featureId, event, transition)
       log.log(`feature=${state.slug} event=${event.kind} → ${transition.decisions.map(decisionLabel).join(",")}`)

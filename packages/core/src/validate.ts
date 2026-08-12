@@ -487,8 +487,8 @@ function validateExpressions(def: WorkflowDef, errors: string[], warnings: strin
         })
       }
 
-      if (step.type === "agent") {
-        for (const expression of extractExpressions(step.prompt)) {
+      if (step.type === "agent" || (step.type === "human" && step.prompt !== undefined)) {
+        for (const expression of extractExpressions(step.prompt!)) {
           validateExpression(expression, {
             where: `${where}: prompt`,
             typeOfPath: path => typeOfStepPath(path, index, jobId, job, def, refs),

@@ -34,7 +34,14 @@ export interface ApiConnection {
 export interface FeatureView extends Omit<FeatureState, "jobs"> {
   readonly currentStep: string | null
   readonly escalation: string | null
-  readonly jobs: Readonly<Record<string, { readonly status: string; readonly currentStep: string | null }>>
+  /** The list projection carries `{status, currentStep}` per job; the
+   *  detail projection adds full step runtimes (with the rendered gate
+   *  `prompt` while a step waits for a human). */
+  readonly jobs: Readonly<Record<string, {
+    readonly status: string
+    readonly currentStep: string | null
+    readonly steps?: Readonly<Record<string, { readonly status?: string; readonly prompt?: string }>>
+  }>>
 }
 
 export class ApiError extends Error {

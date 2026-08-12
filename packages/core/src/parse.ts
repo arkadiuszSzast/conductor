@@ -691,10 +691,14 @@ function plainValue(node: Node | null, where: string, reader: Reader): unknown {
 function readHumanBody(node: Node | null, base: StepBase, where: string, reader: Reader): StepDef | undefined {
   if (isEmptyValue(node)) return { ...base, type: "human" }
   if (isMap(node)) {
-    readFields(node, `${where}: human`, [], reader)
-    return node.items.length === 0 ? { ...base, type: "human" } : undefined
+    const fields = readFields(node, `${where}: human`, ["prompt"], reader)
+    if (node.items.length > fields.size) return undefined
+    if (!fields.has("prompt")) return { ...base, type: "human" }
+    const prompt = readString(fields.get("prompt")!.value, `${where}: human: prompt`, reader)
+    if (prompt === undefined) return undefined
+    return { ...base, type: "human", prompt }
   }
-  reader.error(node, `${where}: human is a fieldless gate — write human: {}`)
+  reader.error(node, `${where}: human is a gate — write human: {} or human: { prompt: ... }`)
   return undefined
 }
 
