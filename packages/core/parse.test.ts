@@ -152,14 +152,25 @@ describe("steps", () => {
     expect(messages(errors)).toContain("a step is exactly one kind — add one of: agent, command, action, human")
   })
 
-  it("rejects a human gate with fields", () => {
-    const errors = failed(wrap("      - id: s\n        human:\n          prompt: approve?\n"))
-    expect(messages(errors)).toContain('unknown field "prompt" — this block carries no fields')
+  it("rejects a human gate with unknown fields", () => {
+    const errors = failed(wrap("      - id: s\n        human:\n          question: approve?\n"))
+    expect(messages(errors)).toContain('unknown field "question"')
   })
 
   it("accepts a fieldless human gate written as human: or human: {}", () => {
     expect(parsed(wrap("      - id: s\n        human: {}\n")).jobs.main!.steps[0]!.type).toBe("human")
     expect(parsed(wrap("      - id: s\n        human:\n")).jobs.main!.steps[0]!.type).toBe("human")
+  })
+
+  it("accepts a human gate with a prompt", () => {
+    const step = parsed(wrap("      - id: s\n        human:\n          prompt: 'Answer: {{ inputs.q }}'\n")).jobs.main!.steps[0]!
+    expect(step.type).toBe("human")
+    expect((step as { prompt?: string }).prompt).toBe("Answer: {{ inputs.q }}")
+  })
+
+  it("rejects a non-string human prompt", () => {
+    const errors = failed(wrap("      - id: s\n        human:\n          prompt: [a, b]\n"))
+    expect(messages(errors)).toContain("human: prompt")
   })
 
   it("rejects timeoutMs below 1", () => {

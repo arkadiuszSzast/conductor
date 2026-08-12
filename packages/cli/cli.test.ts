@@ -340,6 +340,49 @@ describe("CLI: start / status", () => {
     expect(await h.run("status", "nope")).toBe(EXIT.notFound)
     expect(h.err.join("\n")).toContain("not_found")
   })
+
+  it("status <id> prints the pending gate prompt", async () => {
+    const h = await makeHarness({
+      workflow: `
+name: prompted
+on: [manual]
+roles:
+  implementer: { agent: build }
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Implement it."
+      - id: ask
+        human:
+          prompt: "Open questions:\\n{{ steps.implement.outputs.report }}"
+        outcomes:
+          approved: next
+`,
+    })
+    const { featureId, runId } = await startFeature(h)
+    expect(await h.run("report", runId, "--outcome", "succeeded", "--notes", "1. which db?")).toBe(EXIT.ok)
+
+    h.out.length = 0
+    expect(await h.run("status", featureId)).toBe(EXIT.ok)
+    const output = h.out.join("\n")
+    expect(output).toContain("status   waiting_human")
+    expect(output).toContain("gate     main/ask:")
+    expect(output).toContain("  Open questions:")
+    expect(output).toContain("  1. which db?")
+  })
+
+  it("status <id> prints no gate line for a promptless gate", async () => {
+    const h = await makeHarness()
+    const { featureId, runId } = await startFeature(h)
+    expect(await h.run("report", runId, "--outcome", "succeeded")).toBe(EXIT.ok)
+
+    h.out.length = 0
+    expect(await h.run("status", featureId)).toBe(EXIT.ok)
+    expect(h.out.join("\n")).not.toContain("gate     ")
+  })
 })
 
 describe("CLI: report", () => {

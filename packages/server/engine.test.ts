@@ -1034,3 +1034,92 @@ describe("Engine: startFeature", () => {
     expect(result.code).toBe("unknown_workflow")
   })
 })
+
+describe("Engine: gate prompts", () => {
+  const gatePromptWorkflow: WorkflowDef = workflow(
+    {
+      main: job([
+        agentStep("explore", "implementer", "Explore {{ inputs.feature }}."),
+        humanStep("gate", {
+          prompt: "Please answer: {{ steps.explore.outputs.report }}",
+          outcomes: { approved: next, rejected: rerunSteps(["explore"], 3) },
+        }),
+      ]),
+    },
+    roles,
+    "gate-prompt",
+  )
+
+  it("renders and persists the prompt when the gate arms; decision preserves it", async () => {
+    const engine = makeEngine(gatePromptWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "explore")!
+    await engine.report({ runId: run.id, outcome: "succeeded", notes: "Q1: which storage?" })
+
+    const armed = store.getFeature(feature.id)!
+    expect(armed.status).toBe("waiting_human")
+    expect(armed.jobs["main"]?.steps["gate"]?.outputs["prompt"]).toBe("Please answer: Q1: which storage?")
+
+    await engine.approve(feature.id, "SQLite")
+    const after = store.getFeature(feature.id)!
+    expect(after.jobs["main"]?.steps["gate"]?.outputs).toEqual({
+      prompt: "Please answer: Q1: which storage?",
+      notes: "SQLite",
+    })
+  })
+
+  it("re-arm inside a rerun round re-renders with the new round's context", async () => {
+    const engine = makeEngine(gatePromptWorkflow)
+    const feature = await startedFeature(engine)
+    const first = store.getActiveRunForStep(feature.id, "main", "explore")!
+    await engine.report({ runId: first.id, outcome: "succeeded", notes: "round one questions" })
+    expect(store.getFeature(feature.id)?.jobs["main"]?.steps["gate"]?.outputs["prompt"]).toBe("Please answer: round one questions")
+
+    await engine.requestChanges(feature.id, "dig deeper")
+    const second = store.getActiveRunForStep(feature.id, "main", "explore")!
+    await engine.report({ runId: second.id, outcome: "succeeded", notes: "round two questions" })
+
+    const rearmed = store.getFeature(feature.id)!
+    expect(rearmed.status).toBe("waiting_human")
+    expect(rearmed.jobs["main"]?.steps["gate"]?.outputs["prompt"]).toBe("Please answer: round two questions")
+  })
+
+  it("a render error arms the gate with partial text and logs", async () => {
+    const badPromptWorkflow: WorkflowDef = workflow(
+      {
+        main: job([
+          humanStep("gate", { prompt: "Value: {{ inputs.missing }}", outcomes: { approved: next } }),
+        ]),
+      },
+      roles,
+      "gate-bad-prompt",
+    )
+    const logs: string[] = []
+    const engine = makeEngine(badPromptWorkflow, {}, { log: { log: line => logs.push(line) } })
+    const feature = await startedFeature(engine)
+    const armed = store.getFeature(feature.id)!
+    expect(armed.jobs["main"]?.steps["gate"]?.status).toBe("waiting_human")
+    expect(armed.jobs["main"]?.steps["gate"]?.outputs["prompt"]).toBe("Value: ")
+    expect(logs.some(line => line.includes("gate=main/gate"))).toBe(true)
+  })
+
+  it("a promptless gate writes no prompt output", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, outcome: "succeeded" })
+    const armed = store.getFeature(feature.id)!
+    expect(armed.status).toBe("waiting_human")
+    expect(armed.jobs["main"]?.steps["gate"]?.outputs["prompt"]).toBeUndefined()
+  })
+
+  it("the persisted prompt survives a fresh store read (restart)", async () => {
+    const engine = makeEngine(gatePromptWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "explore")!
+    await engine.report({ runId: run.id, outcome: "succeeded", notes: "persisted?" })
+
+    const fresh = new Store(connection.db)
+    expect(fresh.getFeature(feature.id)?.jobs["main"]?.steps["gate"]?.outputs["prompt"]).toBe("Please answer: persisted?")
+  })
+})

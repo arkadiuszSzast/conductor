@@ -50,6 +50,8 @@ export interface StepRuntimeProjection {
   readonly outputs: Readonly<Record<string, string>>
   readonly truncated?: boolean
   readonly runId?: string
+  /** Rendered gate prompt, present while the step waits for a human. */
+  readonly prompt?: string
 }
 
 export interface JobRuntimeProjection {

@@ -571,7 +571,16 @@ function isLoopbackHost(host: string): boolean {
 function printFeature(
   deps: CliDeps,
   payload: {
-    feature: { id: string; title: string; status: string; currentStep: string | null; workflow: string | null; pr: number | null; escalation: string | null }
+    feature: {
+      id: string
+      title: string
+      status: string
+      currentStep: string | null
+      workflow: string | null
+      pr: number | null
+      escalation: string | null
+      jobs?: Readonly<Record<string, { steps?: Readonly<Record<string, { status?: string; prompt?: string }>> }>>
+    }
     activeRun: { id: string; jobId: string; stepId: string; attempt: number } | null
   },
 ): void {
@@ -584,6 +593,14 @@ function printFeature(
   if (feature.pr !== null) deps.stdout(`pr       #${feature.pr}`)
   if (feature.escalation !== null) deps.stdout(`escalation ${feature.escalation}`)
   if (activeRun) deps.stdout(`run      ${activeRun.id} (${activeRun.stepId}, attempt ${activeRun.attempt})`)
+  for (const [jobId, job] of Object.entries(feature.jobs ?? {})) {
+    for (const [stepId, step] of Object.entries(job.steps ?? {})) {
+      if (step.status === "waiting_human" && step.prompt !== undefined && step.prompt.trim() !== "") {
+        deps.stdout(`gate     ${jobId}/${stepId}:`)
+        for (const line of step.prompt.split("\n")) deps.stdout(`  ${line}`)
+      }
+    }
+  }
 }
 
 async function commandStart(parsed: Parsed, deps: CliDeps, client: ApiClient, json: boolean): Promise<number> {

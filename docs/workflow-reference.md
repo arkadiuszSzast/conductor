@@ -315,13 +315,21 @@ IR are stable.
 A human gate: the feature waits (`waiting_human`) until a person decides.
 
 ```yaml
-- id: pr-review
-  human: {}
+- id: answer-questions
+  human:
+    prompt: |
+      The explorer has open questions:
+      {{ steps.explore.outputs.report }}
+      Answer them in the decision notes.
   outcomes:
     approved: next
     rejected:
       rerun: { scope: steps, stepIds: [implement], maxRounds: 3 }
 ```
+
+| Field | Required | Description |
+|---|---|---|
+| `prompt` | no | Template shown to the approver; same contexts and validation rules as agent prompts. |
 
 A gate completes like any other step: the decision is an **outcome**
 (`approved`, `rejected` — or any names your workflow declares), and the
@@ -329,9 +337,40 @@ reviewer's note is published as `outputs.notes`. There is no separate
 approval vocabulary in the engine, which is exactly what lets a rejection
 route back into a fix loop like any review step.
 
-The gate carries no fields today; a `prompt`/description shown to the
-approver is **(planned)** — the surface that presents gates (board/CLI) has
-not landed.
+**Prompt semantics.** The engine renders `prompt` once, when the gate arms
+(the step enters `waiting_human`), against the same context an agent step
+dispatched at that point would see — including the `feedback.*` snapshot
+when the gate re-arms inside a rerun round (each round re-renders). The
+rendered text is persisted under the step's reserved `prompt` output and
+shown wherever the gate is decided: the web UI gate panel, `conductor
+status <feature-id>`, and the feature detail API (on the waiting step's
+entry). A render error never blocks the gate — the failed expressions
+render empty, the errors are logged, and the gate arms with the partial
+text.
+
+**Structured questions.** When the rendered prompt contains a fenced code
+block tagged `conductor-questions` — a JSON array of
+`{ "question": string, "options"?: string[] }` — the web UI renders an
+answer form instead of plain text: each question shows its suggested
+options plus a free-text "your own answer" field, and the submitted
+decision serialises the answers into the notes as `Q: …\nA: …` pairs.
+Anything malformed degrades to the plain-text prompt. The block typically
+comes from an earlier agent step: instruct the agent to end its report
+with it, then quote the report in the gate prompt:
+
+````yaml
+- id: explore
+  agent:
+    role: explorer
+    prompt: |
+      Investigate the task. If decisions remain, end your report with a
+      fenced block tagged `conductor-questions` containing a JSON array
+      of { "question": string, "options": string[] } — suggest the most
+      likely options for each question.
+- id: answer-questions
+  human:
+    prompt: "{{ steps.explore.outputs.report }}"
+````
 
 ---
 

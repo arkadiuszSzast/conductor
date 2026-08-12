@@ -371,6 +371,55 @@ describe("API: UI projections", () => {
     expect(Object.keys(listBody.features[0]!.jobs["main"]!).sort()).toEqual(["currentStep", "status"])
   })
 
+  it("carries the rendered gate prompt on the waiting step and omits it for promptless gates", async () => {
+    const promptedWorkflow = `
+name: prompted
+on: [manual]
+roles:
+  implementer: { agent: build }
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Implement it."
+      - id: merge_gate
+        human:
+          prompt: "Questions: {{ steps.implement.outputs.report }}"
+        outcomes:
+          approved: next
+`
+    const { request, project } = await makeApi({ workflow: promptedWorkflow })
+    const feature = await startFeature(request, project)
+    const before = await request("GET", `/v1/features/${feature.id}`)
+    const runId = ((await before.json()) as { activeRun: { id: string } }).activeRun.id
+    await request("POST", `/v1/runs/${runId}/report`, { outcome: "succeeded", notes: "which db?" })
+
+    const detail = await request("GET", `/v1/features/${feature.id}`)
+    const body = (await detail.json()) as {
+      feature: { status: string; jobs: Record<string, { steps: Record<string, { status: string; prompt?: string }> }> }
+    }
+    expect(body.feature.status).toBe("waiting_human")
+    expect(body.feature.jobs["main"]!.steps["merge_gate"]!.prompt).toBe("Questions: which db?")
+  })
+
+  it("a promptless waiting gate carries no prompt field", async () => {
+    const { request, project } = await makeApi({ workflow: gatedWorkflow })
+    const feature = await startFeature(request, project)
+    const before = await request("GET", `/v1/features/${feature.id}`)
+    const runId = ((await before.json()) as { activeRun: { id: string } }).activeRun.id
+    await request("POST", `/v1/runs/${runId}/report`, { outcome: "succeeded" })
+
+    const detail = await request("GET", `/v1/features/${feature.id}`)
+    const body = (await detail.json()) as {
+      feature: { status: string; jobs: Record<string, { steps: Record<string, { status: string; prompt?: string }> }> }
+    }
+    expect(body.feature.status).toBe("waiting_human")
+    expect(body.feature.jobs["main"]!.steps["merge_gate"]!.status).toBe("waiting_human")
+    expect("prompt" in body.feature.jobs["main"]!.steps["merge_gate"]!).toBe(false)
+  })
+
   it("truncates oversized step outputs in the detail and points at the newest run", async () => {
     const { request, project } = await makeApi()
     const feature = await startFeature(request, project)
