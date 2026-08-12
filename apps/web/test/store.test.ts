@@ -281,8 +281,13 @@ describe("invalidation store: error handling", () => {
       "/v1/features": () =>
         new Response(JSON.stringify({ error: { code: "internal", message: "boom", requestId: "req-9" } }), { status: 500 }),
     })
-    const store = new DataSource({ client })
+    const scheduler = new FakeScheduler()
+    const store = new DataSource({ client, setTimeoutFn: scheduler.set, clearTimeoutFn: scheduler.clear })
     store.ensureFeaturesLoaded()
+    for (let i = 0; i < 4; i++) {
+      await settle()
+      scheduler.tick()
+    }
     await settle()
     const state = store.getFeatures()
     expect(state.status).toBe("error")
@@ -300,5 +305,113 @@ describe("invalidation store: error handling", () => {
     store.ensureFeaturesLoaded()
     await settle()
     expect(unauthorized.length).toBe(1)
+  })
+})
+
+describe("invalidation store: ensure is load-once", () => {
+  it("repeated ensure calls after settle do not refetch (render loop guard)", async () => {
+    const { client, calls } = makeStack({
+      "/v1/features": () => ({ features: [listItem("f-1")] }),
+      "/v1/health": () => ({ status: "ok" }),
+    })
+    const store = new DataSource({ client })
+    store.ensureFeaturesLoaded()
+    store.ensureHealthLoaded()
+    await settle()
+    for (let i = 0; i < 50; i++) {
+      store.ensureFeaturesLoaded()
+      store.ensureHealthLoaded()
+    }
+    await settle()
+    expect(calls.filter(c => c.path.startsWith("/v1/features")).length).toBe(1)
+    expect(calls.filter(c => c.path.startsWith("/v1/health")).length).toBe(1)
+  })
+
+  it("ensure after a settled error does not hot-loop the fetch", async () => {
+    const { client, calls } = makeStack({
+      "/v1/features": () =>
+        new Response(JSON.stringify({ error: { code: "internal", message: "boom", requestId: "r" } }), { status: 500 }),
+    })
+    const scheduler = new FakeScheduler()
+    const store = new DataSource({ client, setTimeoutFn: scheduler.set, clearTimeoutFn: scheduler.clear })
+    store.ensureFeaturesLoaded()
+    for (let i = 0; i < 4; i++) {
+      await settle()
+      scheduler.tick()
+    }
+    await settle()
+    const afterRetries = calls.filter(c => c.path.startsWith("/v1/features")).length
+    expect(store.getFeatures().status).toBe("error")
+    store.ensureFeaturesLoaded()
+    store.ensureFeaturesLoaded()
+    await settle()
+    expect(calls.filter(c => c.path.startsWith("/v1/features")).length).toBe(afterRetries)
+  })
+
+  it("a transient failure on the initial load is retried to success", async () => {
+    let attempts = 0
+    const { client, calls } = makeStack({
+      "/v1/features": () => {
+        attempts += 1
+        if (attempts === 1)
+          return new Response(JSON.stringify({ error: { code: "internal", message: "blip", requestId: "r" } }), { status: 500 })
+        return { features: [listItem("f-1")] }
+      },
+    })
+    const scheduler = new FakeScheduler()
+    const store = new DataSource({ client, setTimeoutFn: scheduler.set, clearTimeoutFn: scheduler.clear })
+    store.ensureFeaturesLoaded()
+    await settle()
+    expect(store.getFeatures().status).toBe("loading")
+    scheduler.tick()
+    await settle()
+    expect(store.getFeatures().status).toBe("ready")
+    expect(calls.filter(c => c.path.startsWith("/v1/features")).length).toBe(2)
+  })
+
+  it("a 401 fails immediately without retrying", async () => {
+    const { client, calls, unauthorized } = makeStack({
+      "/v1/features": () =>
+        new Response(JSON.stringify({ error: { code: "unauthorized", message: "no", requestId: "r" } }), { status: 401 }),
+    })
+    const scheduler = new FakeScheduler()
+    const store = new DataSource({ client, setTimeoutFn: scheduler.set, clearTimeoutFn: scheduler.clear })
+    store.ensureFeaturesLoaded()
+    await settle()
+    expect(store.getFeatures().status).toBe("error")
+    expect(unauthorized.length).toBe(1)
+    expect(calls.filter(c => c.path.startsWith("/v1/features")).length).toBe(1)
+    expect(scheduler.timers.length).toBe(0)
+  })
+
+  it("forced refresh still refetches a settled resource", async () => {
+    const { client, calls } = makeStack({
+      "/v1/health": () => ({ status: "ok" }),
+    })
+    const store = new DataSource({ client })
+    store.ensureHealthLoaded()
+    await settle()
+    store.refreshHealth()
+    await settle()
+    expect(calls.filter(c => c.path.startsWith("/v1/health")).length).toBe(2)
+  })
+})
+
+describe("invalidation store: retry timers are cancelled by stop()", () => {
+  it("stop() clears a pending load retry so it never fires", async () => {
+    const { client, calls } = makeStack({
+      "/v1/features": () =>
+        new Response(JSON.stringify({ error: { code: "internal", message: "blip", requestId: "r" } }), { status: 500 }),
+    })
+    const scheduler = new FakeScheduler()
+    const store = new DataSource({ client, setTimeoutFn: scheduler.set, clearTimeoutFn: scheduler.clear })
+    store.ensureFeaturesLoaded()
+    await settle()
+    expect(scheduler.timers.some(t => !t.cleared)).toBe(true)
+    store.stop()
+    expect(scheduler.timers.every(t => t.cleared)).toBe(true)
+    scheduler.tick()
+    await settle()
+    expect(calls.filter(c => c.path.startsWith("/v1/features")).length).toBe(1)
   })
 })
