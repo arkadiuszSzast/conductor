@@ -1031,3 +1031,69 @@ describe("CLI: start project default and unknown commands", () => {
     expect(h.err.join("\n")).not.toContain("daemon address is required")
   })
 })
+
+describe("CLI: daemon bind env overrides", () => {
+  const CONFIG = `
+databasePath: /db/state.db
+projects: []
+bind:
+  host: 127.0.0.1
+  port: 4400
+auth:
+  mode: none
+`
+
+  function harnessWithConfig(env: Record<string, string>) {
+    const files = new Map([["/daemon.yaml", CONFIG]])
+    const out: string[] = []
+    const err: string[] = []
+    const starts: DaemonStartInput[] = []
+    const deps: CliDeps = {
+      env,
+      stdout: line => out.push(line),
+      stderr: line => err.push(line),
+      readFile: path => {
+        const content = files.get(path)
+        if (content === undefined) throw new Error(`ENOENT: ${path}`)
+        return content
+      },
+      writeFile: (path, content) => files.set(path, content),
+      exists: path => files.has(path),
+      mkdir: () => {},
+      cwd: () => "/work",
+      startDaemon: input => {
+        starts.push(input)
+        return { started: Promise.resolve(), exited: Promise.resolve(0) }
+      },
+    }
+    return { deps, out, err, starts }
+  }
+
+  it("CONDUCTOR_BIND_HOST and CONDUCTOR_BIND_PORT override the config's bind", async () => {
+    const h = harnessWithConfig({ CONDUCTOR_BIND_HOST: "0.0.0.0", CONDUCTOR_BIND_PORT: "8080" })
+    expect(await runCli(["daemon", "--config", "/daemon.yaml"], h.deps)).toBe(EXIT.ok)
+    expect(h.starts[0]!.api.bind).toEqual({ host: "0.0.0.0", port: 8080 })
+    expect(h.out.some(line => line.includes("CONDUCTOR_BIND_HOST"))).toBe(true)
+    expect(h.out.some(line => line.includes("CONDUCTOR_BIND_PORT"))).toBe(true)
+  })
+
+  it("an invalid CONDUCTOR_BIND_PORT is a usage error", async () => {
+    const h = harnessWithConfig({ CONDUCTOR_BIND_PORT: "eighty" })
+    expect(await runCli(["daemon", "--config", "/daemon.yaml"], h.deps)).toBe(EXIT.usage)
+    expect(h.err.join("\n")).toContain("CONDUCTOR_BIND_PORT")
+    expect(h.starts.length).toBe(0)
+  })
+
+  it("warns loudly when auth none meets a non-loopback bind", async () => {
+    const h = harnessWithConfig({ CONDUCTOR_BIND_HOST: "0.0.0.0" })
+    expect(await runCli(["daemon", "--config", "/daemon.yaml"], h.deps)).toBe(EXIT.ok)
+    expect(h.out.some(line => line.includes("non-loopback"))).toBe(true)
+  })
+
+  it("no override leaves the config bind untouched and no non-loopback warning fires", async () => {
+    const h = harnessWithConfig({})
+    expect(await runCli(["daemon", "--config", "/daemon.yaml"], h.deps)).toBe(EXIT.ok)
+    expect(h.starts[0]!.api.bind).toEqual({ host: "127.0.0.1", port: 4400 })
+    expect(h.out.some(line => line.includes("non-loopback"))).toBe(false)
+  })
+})

@@ -101,6 +101,11 @@ heartbeatIntervalMs: 5000
 #   bundledPath: /path/to/conductor/packages/server/actions   # needed for the compiled binary
 ```
 
+`CONDUCTOR_BIND_HOST` / `CONDUCTOR_BIND_PORT` override the config's
+`bind` without editing the file (Docker/systemd/LAN exposure). Exposing a
+non-loopback host with `auth.mode: none` triggers an extra loud warning —
+switch to `bearer` first.
+
 Logs are JSON lines on stdout. Readiness: `GET /v1/readyz` → 200 once
 migrations ran, projects registered and the heartbeat is armed. The
 daemon stops gracefully on SIGINT/SIGTERM (drains in-flight work, closes
@@ -153,8 +158,11 @@ conductor logs <feature-id>          # transition timeline
 ## Troubleshooting
 
 - **Port already in use** — `conductor daemon` fails at startup with a
-  bind error. Change `bind.port` in the config, or find the occupant:
-  `lsof -i :4400`.
+  bind error. Change `bind.port` in the config (or `CONDUCTOR_BIND_PORT`),
+  or find the occupant: `lsof -i :4400`.
+- **UI/API not reachable from another machine** — the default bind is
+  loopback. Set `bind.host: 0.0.0.0` (or `CONDUCTOR_BIND_HOST=0.0.0.0`)
+  AND switch auth to `bearer`; open the port in the firewall.
 - **`conductor init` rewrote my daemon config comments** — the platform
   config file is machine-generated and regenerated on project
   registration; hand-crafted configs should live elsewhere and be used
