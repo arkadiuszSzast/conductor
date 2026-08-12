@@ -56,6 +56,9 @@ const ECHO_WINDOW_MS = 2_000
 const RECONNECT_HEALTH_POLL_MS = 5_000
 /** Cap on the reconnect backoff (brief rule 6). */
 const RECONNECT_BACKOFF_CAP_MS = 30_000
+/** Bounded retry for transient load failures (base delay, doubling). */
+const LOAD_RETRY_BASE_MS = 1_000
+const LOAD_RETRY_MAX_ATTEMPTS = 3
 
 export interface DataSourceInput {
   readonly client: ApiClient
@@ -221,7 +224,11 @@ export class DataSource {
     // refresh, retry). Without this check every React render re-triggers
     // a fetch — fetch → emit → render → ensure → fetch, a hot loop.
     if (!force && this.statusOf(key) !== "loading") return
-    const requestId = (existing?.id ?? 0) + 1
+    this.load(key, loader, force ? LOAD_RETRY_MAX_ATTEMPTS : 0)
+  }
+
+  private load(key: string, loader: () => Promise<unknown>, attempt: number): void {
+    const requestId = (this.inflight.get(key)?.id ?? 0) + 1
     this.inflight.set(key, { id: requestId })
     loader()
       .then(data => {
@@ -231,9 +238,26 @@ export class DataSource {
       })
       .catch((err: unknown) => {
         if (this.inflight.get(key)?.id !== requestId) return
-        this.inflight.delete(key)
         const error = err instanceof ApiError ? err : new ApiError(0, "internal", String(err), null)
-        if (error.status === 401) this.client.onUnauthorized?.()
+        if (error.status === 401) {
+          this.inflight.delete(key)
+          this.client.onUnauthorized?.()
+          this.setResource(key, { status: "error", data: this.dataOf(key), error })
+          return
+        }
+        // Transient failures on the initial (non-forced) load get a small
+        // bounded retry: without it a single blip would strand resources
+        // with no other refetch trigger (workflow: has no SSE kind) in a
+        // permanent error state. Forced refetches carry attempt 1+ and
+        // rely on their own trigger repeating instead.
+        if (attempt < LOAD_RETRY_MAX_ATTEMPTS) {
+          this.setTimeoutFn(() => {
+            if (this.inflight.get(key)?.id !== requestId) return
+            this.load(key, loader, attempt + 1)
+          }, LOAD_RETRY_BASE_MS * 2 ** attempt)
+          return
+        }
+        this.inflight.delete(key)
         this.setResource(key, { status: "error", data: this.dataOf(key), error })
       })
   }
