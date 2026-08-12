@@ -131,6 +131,13 @@ feature flips to `waiting_human`. Asking on a concluded run → 409
 `activeRun` prefers an asking run over the merely-newest one so answering
 surfaces always see the question.
 
+Asking is a per-step privilege: only agent steps declared
+`interactive: true` in the workflow may ask. An ask from any other step is
+refused with a 200 whose result text instructs the agent to decide
+autonomously and report an outcome — no state changes, the run stays
+running. The workflow-structure projection marks such steps with
+`interactive: true`.
+
 ### `POST /v1/runs/:id/answer`
 
 Bearer-authenticated. Body: `{notes: string}` (required, non-empty).

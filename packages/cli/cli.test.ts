@@ -74,6 +74,7 @@ jobs:
         agent:
           role: implementer
           prompt: "Implement it."
+          interactive: true
       - id: merge_gate
         human: {}
         outcomes:

@@ -550,11 +550,24 @@ export class Engine {
     if (run.status !== "running") return alreadyConcludedText(input.runId, run.status)
 
     if (input.ask !== undefined) {
+      // Asking is a privilege the workflow grants per step: only an
+      // `interactive: true` agent step may pause for a human. Refusal is
+      // NOT a failure — the run stays running and the agent is told to
+      // decide autonomously (or report failed with notes if truly stuck).
+      const state = store.getFeature(run.featureId)
+      const snapshot = state ? this.deps.workflows(state.projectDir) : null
+      const step = snapshot ? findStep(snapshot.workflow, run.jobId, run.stepId) : undefined
+      if (!step || step.type !== "agent" || step.interactive !== true) {
+        return (
+          `Step "${run.stepId}" is not interactive — asking is not available here. ` +
+          `Decide autonomously using your best judgment and report run_id="${input.runId}" with an outcome. ` +
+          `If human input is truly indispensable, report outcome "failed" with notes explaining exactly what is missing.`
+        )
+      }
       // An ask parks the run on a human question WITHOUT concluding it:
       // the session stays alive so the answer resumes with full context.
       const parked = store.setRunQuestion(input.runId, input.ask)
       if (!parked) return alreadyConcludedText(input.runId, store.getRunById(input.runId)?.status ?? run.status)
-      const state = store.getFeature(run.featureId)
       this.deps.notify?.(
         `Conductor: question — ${state?.slug ?? run.featureId}`,
         `Step "${run.stepId}" (job "${run.jobId}") is waiting for your answer.`,

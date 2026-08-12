@@ -596,11 +596,15 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     // expressions, `with:` payloads and retry policies never leave the
     // daemon through this route.
     const workflow = status.snapshot.workflow
-    const jobs: Record<string, { needs: readonly string[]; steps: Array<{ id: string; kind: string }> }> = {}
+    const jobs: Record<string, { needs: readonly string[]; steps: Array<{ id: string; kind: string; interactive?: boolean }> }> = {}
     for (const [jobId, job] of Object.entries(workflow.jobs)) {
       jobs[jobId] = {
         needs: job.needs,
-        steps: job.steps.map(step => ({ id: step.id, kind: step.type })),
+        steps: job.steps.map(step => ({
+          id: step.id,
+          kind: step.type,
+          ...(step.type === "agent" && step.interactive === true ? { interactive: true } : {}),
+        })),
       }
     }
     return json(

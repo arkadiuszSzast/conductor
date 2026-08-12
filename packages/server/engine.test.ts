@@ -150,7 +150,7 @@ const roles: WorkflowDef["roles"] = {
 const linearWorkflow: WorkflowDef = workflow(
   {
     main: job([
-      agentStep("implement", "implementer", "Implement {{ inputs.feature }}."),
+      agentStep("implement", "implementer", "Implement {{ inputs.feature }}.", { interactive: true }),
       commandStep("verify", ["bun test"]),
       humanStep("gate", { outcomes: { approved: next, rejected: rerunSteps(["implement"], 3) } }),
     ]),
@@ -1288,5 +1288,58 @@ describe("Engine: interactive steps — review findings (PR #35)", () => {
     const answered = await engine.answer(run.id, "Answered after resume")
     expect(answered.ok).toBe(true)
     expect(sessions.prompts.at(-1)!.sessionID).toBe(run.sessionId!)
+  })
+})
+
+describe("Engine: interactive opt-in", () => {
+  const autonomousWorkflow: WorkflowDef = workflow(
+    {
+      main: job([
+        agentStep("implement", "implementer", "Implement {{ inputs.feature }}."),
+        humanStep("gate", { outcomes: { approved: next } }),
+      ]),
+    },
+    roles,
+    "autonomous",
+  )
+
+  it("an ask from a non-interactive step is refused instructively with zero state change", async () => {
+    const engine = makeEngine(autonomousWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+
+    const refusal = await engine.report({ runId: run.id, ask: "May I ask anyway?" })
+    expect(refusal).toContain("not interactive")
+    expect(refusal).toContain(`run_id="${run.id}"`)
+
+    const after = store.getRunById(run.id)!
+    expect(after.status).toBe("running")
+    expect(after.pendingQuestion).toBeNull()
+    expect(store.getFeature(feature.id)!.status).toBe("running")
+
+    // The refused run continues and concludes normally.
+    expect(await engine.report({ runId: run.id, outcome: "succeeded", notes: "decided myself" })).toContain("succeeded")
+    expect(store.getFeature(feature.id)!.status).toBe("waiting_human")
+  })
+
+  it("an interactive step still asks fine (the grant path)", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+
+    expect(await engine.report({ runId: run.id, ask: "Granted?" })).toContain("waiting for a human answer")
+    expect(store.getFeature(feature.id)!.status).toBe("waiting_human")
+  })
+
+  it("an ask whose step vanished from the workflow is refused, not parked", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+
+    const changed = makeEngine(autonomousWorkflow)
+    const refusal = await changed.report({ runId: run.id, ask: "Still me?" })
+    // Same step id exists but is not interactive in the changed workflow.
+    expect(refusal).toContain("not interactive")
+    expect(store.getRunById(run.id)!.pendingQuestion).toBeNull()
   })
 })

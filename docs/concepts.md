@@ -95,8 +95,10 @@ stays alive while the feature waits (`waiting_human`). The answer is
 forwarded straight into that same session, so the agent continues with its
 full conversation context; no rerun, no fresh session. This is run-level
 state, not a workflow transition: the step stays `running` with the same
-active run, and the workflow YAML needs nothing special — any agent step
-may ask. While a question is pending the run is exempt from idle
+active run. Asking is **opt-in per step** — only an agent step declared
+`interactive: true` may ask; all other steps are autonomous by contract,
+and the daemon refuses their asks with an instruction to decide and
+report. While a question is pending the run is exempt from idle
 nudging/reaping (waiting on a human is not being stuck), but the overall
 run TTL still applies, so an abandoned question eventually fails the step
 through normal failure routing. Contrast with a `human` step: a gate is a

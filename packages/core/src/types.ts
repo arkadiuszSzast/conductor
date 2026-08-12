@@ -107,6 +107,10 @@ export interface AgentStep extends StepBase {
   readonly type: "agent"
   readonly role: string
   readonly prompt: string
+  /** Only an interactive step may pause mid-run to ask the human a
+   *  question (the ask/answer protocol). Absent means autonomous: the
+   *  engine refuses asks and the agent must decide and report. */
+  readonly interactive?: boolean
 }
 
 export interface ActionStep extends StepBase {

@@ -543,6 +543,17 @@ describe("API: project workflow structure", () => {
     ])
   })
 
+  it("marks interactive agent steps in the projection", async () => {
+    const interactiveWorkflow = gatedWorkflow.replace('prompt: "Implement it."', 'prompt: "Implement it."\n          interactive: true')
+    const { request, project } = await makeApi({ workflow: interactiveWorkflow })
+    const response = await request("GET", `/v1/projects/workflow?dir=${encodeURIComponent(project)}`)
+    const body = (await response.json()) as { jobs: Record<string, { steps: Array<{ id: string; kind: string; interactive?: boolean }> }> }
+    expect(body.jobs["main"]!.steps).toEqual([
+      { id: "implement", kind: "agent", interactive: true },
+      { id: "merge_gate", kind: "human" },
+    ])
+  })
+
   it("serves the last valid structure with stale=true and diagnostics after a broken reload", async () => {
     const { request, project, daemon } = await makeApi()
     writeFileSync(join(project, "conductor.yaml"), "name: [broken")
