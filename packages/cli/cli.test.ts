@@ -274,7 +274,6 @@ describe("CLI: usage and argument parsing", () => {
   it("rejects missing required arguments per command", async () => {
     const h = await makeHarness()
     expect(await h.run("start", "--project", h.project)).toBe(EXIT.usage)
-    expect(await h.run("start", "Title")).toBe(EXIT.usage)
     expect(await h.run("approve")).toBe(EXIT.usage)
     expect(await h.run("report", "some-run")).toBe(EXIT.usage)
     expect(await h.run("report", "some-run", "--outcome", "maybe")).toBe(EXIT.usage)
@@ -997,5 +996,30 @@ describe("CLI: init review fixes", () => {
     expect(h.files.has("/home/dev/.config/conductor/daemon.yaml")).toBe(false)
     expect(h.out.join("\n")).toContain("registering live only")
     expect(h.daemon.registry.getStatus(project).state).toBe("valid")
+  })
+})
+
+describe("CLI: start project default and unknown commands", () => {
+  it("start defaults --project to the working directory", async () => {
+    const h = await makeHarness()
+    const deps = { ...h.deps, cwd: () => h.project }
+    const code = await runCli(["start", "From inside the project", "--json"], deps)
+    expect(code).toBe(EXIT.ok)
+    const payload = JSON.parse(h.out.pop()!) as { feature: { id: string } }
+    expect(payload.feature.id).toBeTruthy()
+  })
+
+  it("start resolves a relative --project against cwd", async () => {
+    const h = await makeHarness()
+    expect(await h.run("start", "Bad relative", "--project", "nope", "--json")).toBe(EXIT.failure)
+    expect(h.err.join("\n")).toContain("/work/project/nope")
+  })
+
+  it("an unknown command is a usage error, not a connection error", async () => {
+    const h = await makeHarness()
+    const code = await runCli(["deamon"], { ...h.deps, env: {} })
+    expect(code).toBe(EXIT.usage)
+    expect(h.err.join("\n")).toContain('unknown command "deamon"')
+    expect(h.err.join("\n")).not.toContain("daemon address is required")
   })
 })

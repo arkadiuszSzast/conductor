@@ -80,7 +80,7 @@ then reports it available.
 **5. Drive a feature:**
 
 ```sh
-conductor start "Ship the thing" --project /path/to/my-project
+conductor start "Ship the thing"          # --project defaults to the current dir
 conductor status --active                 # the board
 conductor status <feature-id>             # detail: status, current step, run
 conductor approve <feature-id> --notes "ship it"   # when waiting_human
