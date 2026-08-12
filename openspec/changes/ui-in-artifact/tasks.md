@@ -13,7 +13,7 @@
 ## 3. Binary embedding
 
 - [x] 3.1 [cli] `scripts/build-binary.ts`: build SPA, generate embed manifest (file-type imports preserving dist structure), compile with `Bun.build`; root `build:binary` uses it.
-- [x] 3.2 [test] Smoke: binary serves `/` (SPA) and `/v1/readyz`; `--no-ui` binary 404s `/`.
+- [x] 3.2 [test] Manual smoke (no CI binary coverage yet — compiled-binary serving is verified by hand and pasted into the PR): binary serves `/` (SPA) and `/v1/readyz`; `--no-ui` binary 404s `/`.
 
 ## 4. Docs
 
