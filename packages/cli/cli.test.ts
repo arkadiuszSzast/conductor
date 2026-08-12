@@ -638,11 +638,49 @@ auth:
     return harness
   }
 
-  it("requires --config or --init-config (usage error, exit 2)", async () => {
+  it("zero-flag start without HOME or XDG is a usage error", async () => {
     const h = makeDaemonHarness()
     expect(await runCli(["daemon"], h.deps)).toBe(EXIT.usage)
     expect(h.err.join("\n")).toContain("--config")
-    expect(h.err.join("\n")).toContain("--init-config")
+    expect(h.starts.length).toBe(0)
+  })
+
+  it("zero-flag start generates the platform default config and starts", async () => {
+    const h = makeDaemonHarness()
+    const deps = { ...h.deps, env: { HOME: "/home/dev" } }
+    expect(await runCli(["daemon"], deps)).toBe(EXIT.ok)
+    const generated = h.files.get("/home/dev/.config/conductor/daemon.yaml")
+    expect(generated).toBeDefined()
+    expect(generated!).toContain("databasePath: /home/dev/.local/share/conductor/conductor.db")
+    expect(generated!).toContain("projects: []")
+    expect(h.starts.length).toBe(1)
+    expect(h.starts[0]!.api.bind).toEqual({ host: "127.0.0.1", port: 4400 })
+    expect(h.starts[0]!.daemon.projects).toEqual([])
+    const logged = h.out.find(line => line.includes("daemon config generated"))
+    expect(logged).toBeDefined()
+  })
+
+  it("zero-flag start honours XDG overrides", async () => {
+    const h = makeDaemonHarness()
+    const deps = { ...h.deps, env: { HOME: "/home/dev", XDG_CONFIG_HOME: "/xdg/cfg", XDG_DATA_HOME: "/xdg/data" } }
+    expect(await runCli(["daemon"], deps)).toBe(EXIT.ok)
+    expect(h.files.get("/xdg/cfg/conductor/daemon.yaml")).toContain("databasePath: /xdg/data/conductor/conductor.db")
+  })
+
+  it("zero-flag start reuses an existing platform config without modifying it", async () => {
+    const h = makeDaemonHarness()
+    h.files.set("/home/dev/.config/conductor/daemon.yaml", VALID_CONFIG)
+    const deps = { ...h.deps, env: { HOME: "/home/dev" } }
+    expect(await runCli(["daemon"], deps)).toBe(EXIT.ok)
+    expect(h.files.get("/home/dev/.config/conductor/daemon.yaml")).toBe(VALID_CONFIG)
+    expect(h.starts[0]!.daemon.databasePath).toBe("/var/lib/conductor/state.db")
+  })
+
+  it("an explicit --config path that does not exist is still an error", async () => {
+    const h = makeDaemonHarness()
+    const deps = { ...h.deps, env: { HOME: "/home/dev" } }
+    expect(await runCli(["daemon", "--config", "/missing.yaml"], deps)).toBe(EXIT.usage)
+    expect(h.files.has("/missing.yaml")).toBe(false)
     expect(h.starts.length).toBe(0)
   })
 
@@ -771,7 +809,7 @@ describe("CLI: daemon config parsing", () => {
   it.each([
     ["not a mapping", "just a string", "must be a YAML mapping"],
     ["missing databasePath", { ...base, databasePath: undefined }, "databasePath"],
-    ["empty projects", { ...base, projects: [] }, "projects"],
+    ["non-string projects", { ...base, projects: [42] }, "projects"],
     ["missing bind", { ...base, bind: undefined }, "bind"],
     ["bad port", { ...base, bind: { host: "127.0.0.1", port: "4400" } }, "bind.port"],
     ["port out of range", { ...base, bind: { host: "127.0.0.1", port: 70000 } }, "bind.port"],

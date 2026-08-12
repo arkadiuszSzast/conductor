@@ -23,7 +23,7 @@
 import { ApiClient, ApiError, type FetchLike, type TransitionView } from "./client.ts"
 import { resolveConnection, UsageError } from "./config.ts"
 import type { ApiConfig, DaemonConfig, DaemonLogEntry } from "@conductor/server"
-import { DAEMON_CONFIG_TEMPLATE, loadDaemonConfig } from "./daemon-config.ts"
+import { DAEMON_CONFIG_TEMPLATE, defaultDaemonConfig, loadDaemonConfig, platformPaths } from "./daemon-config.ts"
 
 /** Input for the `startDaemon` port — one assembled daemon + api config. */
 export interface DaemonStartInput {
@@ -348,28 +348,35 @@ async function commandDaemon(parsed: Parsed, deps: CliDeps): Promise<number> {
     return EXIT.ok
   }
 
-  if (configPath === undefined) {
-    deps.stderr("error: conductor daemon requires --config <path> (or --init-config <path> to write an example)")
-    deps.stderr("The config file is explicit — there are no default paths, ports or auth modes.")
-    deps.stderr("Example: conductor daemon --init-config ./conductor-daemon.yaml && conductor daemon --config ./conductor-daemon.yaml")
-    return EXIT.usage
-  }
-
-  let source: string
-  try {
-    source = deps.readFile(configPath)
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err)
-    deps.stderr(`error: cannot read daemon config "${configPath}": ${reason}`)
-    return EXIT.usage
-  }
-
-  const { daemon, api } = loadDaemonConfig(source)
-
   const log = (entry: DaemonLogEntry): void => {
     const line = { level: entry.level, message: entry.message, ...(entry.fields ?? {}) }
     deps.stdout(JSON.stringify(line))
   }
+
+  let effectivePath: string
+  if (configPath !== undefined) {
+    effectivePath = configPath
+  } else {
+    const paths = platformPaths(deps.env)
+    effectivePath = paths.configPath
+    if (!deps.exists(effectivePath)) {
+      const parent = parentPath(effectivePath)
+      if (parent !== "") deps.mkdir(parent)
+      deps.writeFile(effectivePath, defaultDaemonConfig(paths))
+      log({ level: "info", message: "daemon config generated", fields: { path: effectivePath } })
+    }
+  }
+
+  let source: string
+  try {
+    source = deps.readFile(effectivePath)
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    deps.stderr(`error: cannot read daemon config "${effectivePath}": ${reason}`)
+    return EXIT.usage
+  }
+
+  const { daemon, api } = loadDaemonConfig(source)
 
   if (api.auth.mode === "none") {
     log({

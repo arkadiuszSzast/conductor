@@ -216,6 +216,10 @@ export class ApiClient {
     return this.request("GET", "/v1/health")
   }
 
+  registerProject(dir: string): Promise<{ project: string; workflow: string }> {
+    return this.request("POST", "/v1/projects", { dir })
+  }
+
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const headers: Record<string, string> = { accept: "application/json" }
     if (body !== undefined) headers["content-type"] = "application/json"
