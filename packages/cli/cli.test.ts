@@ -784,6 +784,8 @@ describe("CLI: daemon config parsing", () => {
     ["negative heartbeat", { ...base, heartbeatIntervalMs: -5 }, "heartbeatIntervalMs"],
     ["bad ui", { ...base, ui: { staticDir: "" } }, "ui.staticDir"],
     ["bad localPaths", { ...base, actions: { localPaths: [""] } }, "actions.localPaths"],
+    ["fractional nudgeIdleCycles", { ...base, engine: { nudgeIdleCycles: 2.5 } }, "positive integer"],
+    ["fractional maxNudges", { ...base, engine: { maxNudges: 1.5 } }, "positive integer"],
   ])("rejects %s", (_name, raw, needle) => {
     expect(() => assembleDaemonConfig(raw)).toThrow(needle as string)
   })

@@ -145,6 +145,11 @@ export function assembleDaemonConfig(raw: unknown): DaemonFileConfig {
       if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
         throw new UsageError(`"engine.${field}" must be a positive number`)
       }
+      // Cycle/nudge counters are compared as whole cycles in the engine —
+      // a fractional count is a config mistake, not a tunable.
+      if (field !== "runTtlMs" && !Number.isInteger(value)) {
+        throw new UsageError(`"engine.${field}" must be a positive integer`)
+      }
       engineTuning = { ...engineTuning, [field]: value }
     }
   }
