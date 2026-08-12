@@ -214,14 +214,18 @@ describe("feature context in expressions", () => {
       down: job(
         [
           commandStep("run", ["echo {{ feature.slug }}"]),
-          actionStep("push", "git/push@v1"),
+          actionStep("push", "git/push@v1", { with: { branch: "feature/{{ feature.slug }}" } }),
           humanStep("gate", { prompt: "Merge {{ feature.title }}? PR: {{ feature.pr ?? 'none' }}" }),
         ],
         ["up"],
-        "always()",
+        "feature.pr == null || always()",
       ),
     })
-    expect(validateWorkflow(def).errors).toEqual([])
+    const result = validateWorkflow(def)
+    expect(result.errors).toEqual([])
+    // The job-if condition is validated (feature root accepted) even though
+    // only always()/failure() affect readiness today — hence the warning.
+    expect(result.warnings.join("\n")).toContain('job "down": if')
   })
 
   it("rejects unknown feature fields naming the available set", () => {
