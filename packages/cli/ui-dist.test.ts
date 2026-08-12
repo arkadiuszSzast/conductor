@@ -93,6 +93,8 @@ describe("uiDistStale", () => {
   })
 
   it("missing dist/index.html fails open as not-stale and reports the error", () => {
+    // The call site guards on dist existing, so in practice this path only
+    // fires for a race; the contract stays fail-open + report.
     const errors: unknown[] = []
     const fs = fakeFs({ web: { mtime: 0, children: { src: { mtime: 0, children: { "a.ts": { mtime: 1 } } } } } })
     expect(uiDistStale(fs, WEB, DIST, e => errors.push(e))).toBe(false)

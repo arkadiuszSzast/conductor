@@ -37,14 +37,17 @@ function resolveUiRoot(log: DaemonStartInput["log"]): string | null {
 
   const repoRoot = resolve(import.meta.dirname, "../../..")
   const dist = resolve(repoRoot, "apps/web/dist")
-  const stale = uiDistStale(uiDistFs, resolve(repoRoot, "apps/web"), dist, error =>
-    log({
-      level: "warn",
-      message: "ui staleness check failed — treating dist as fresh",
-      fields: { error: String(error) },
-    }),
-  )
-  if (existsSync(resolve(dist, "index.html")) && !stale) return dist
+  const hasDist = existsSync(resolve(dist, "index.html"))
+  const stale =
+    hasDist &&
+    uiDistStale(uiDistFs, resolve(repoRoot, "apps/web"), dist, error =>
+      log({
+        level: "warn",
+        message: "ui staleness check failed — treating dist as fresh",
+        fields: { error: String(error) },
+      }),
+    )
+  if (hasDist && !stale) return dist
 
   const webPackage = resolve(repoRoot, "apps/web/package.json")
   if (existsSync(webPackage) && existsSync(resolve(repoRoot, "node_modules"))) {
