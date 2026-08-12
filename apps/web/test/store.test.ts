@@ -430,6 +430,6 @@ describe("invalidation store: snapshot stability", () => {
     expect(store.getFindings("nope")).toBe(store.getFindings("nope"))
     expect(store.getTimeline("nope")).toBe(store.getTimeline("nope"))
     expect(store.getWorkflow("/some/dir")).toBe(store.getWorkflow("/other/dir"))
-    expect(store.getFeatureDetail("a")).toBe(store.getRuns("b") as unknown)
+    expect(store.getFeatureDetail("a") as unknown).toBe(store.getRuns("b") as unknown)
   })
 })
