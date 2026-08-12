@@ -56,14 +56,27 @@ Two things do **not** travel inside the binary:
 
 ## Running the daemon
 
-The daemon takes exactly one input: a YAML config file. There are no
-default paths, ports or auth modes — every setting is written down
-(config: see the annotated example below; the daemon refuses to guess).
+Zero-config start:
+
+```sh
+conductor daemon
+```
+
+Without `--config` the daemon uses the platform config at
+`$XDG_CONFIG_HOME/conductor/daemon.yaml` (falling back to
+`~/.config/conductor/daemon.yaml`). On first run the file is generated
+with working defaults — database under `$XDG_DATA_HOME/conductor`
+(fallback `~/.local/share/conductor`), bind `127.0.0.1:4400`,
+`auth.mode: none` (loopback-only; an explicit warning is logged — switch
+to `bearer` for anything non-local), empty project list — and the daemon
+starts from it. Edit the file and restart to change anything.
+
+Explicit config (operators who want full control):
 
 ```sh
 conductor daemon --init-config ./conductor-daemon.yaml   # write an annotated example
 $EDITOR ./conductor-daemon.yaml
-conductor daemon --config ./conductor-daemon.yaml
+conductor daemon --config ./conductor-daemon.yaml        # missing explicit file = error, never generated
 ```
 
 Minimal config:
@@ -115,9 +128,16 @@ start the plugin registers its callback endpoint with the daemon
 
 ```sh
 cd /path/to/my-project
-conductor init                       # scaffold conductor.yaml, commit it
-# register the project dir in the daemon config, restart the daemon
+conductor init      # scaffolds conductor.yaml AND registers the project:
+                    # it is added to the LOCAL daemon config (generated if absent) and,
+                    # when a daemon is running, registered live — no restart.
+                    # With an explicit connection (--url/CONDUCTOR_URL/--config) the
+                    # daemon of record may be remote: init registers live only and
+                    # never touches the local platform config.
+                    # --no-register: scaffold only.
 
+# Only needed for a REMOTE daemon or auth overrides — a local daemon's
+# generated config supplies the CLI's address and token automatically:
 export CONDUCTOR_URL=http://127.0.0.1:4400
 export CONDUCTOR_TOKEN=change-me
 
@@ -133,6 +153,10 @@ conductor logs <feature-id>          # transition timeline
 - **Port already in use** — `conductor daemon` fails at startup with a
   bind error. Change `bind.port` in the config, or find the occupant:
   `lsof -i :4400`.
+- **`conductor init` rewrote my daemon config comments** — the platform
+  config file is machine-generated and regenerated on project
+  registration; hand-crafted configs should live elsewhere and be used
+  via `conductor daemon --config <path>` (init never touches those).
 - **`error[unauthorized]` / exit code 3** — the client's token does not
   match the daemon's `auth.token`. Set `--token`/`CONDUCTOR_TOKEN` to the
   daemon's configured value. `auth.mode: none` daemons need no token.

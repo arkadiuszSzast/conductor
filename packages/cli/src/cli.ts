@@ -23,7 +23,7 @@
 import { ApiClient, ApiError, type FetchLike, type TransitionView } from "./client.ts"
 import { resolveConnection, UsageError } from "./config.ts"
 import type { ApiConfig, DaemonConfig, DaemonLogEntry } from "@conductor/server"
-import { DAEMON_CONFIG_TEMPLATE, loadDaemonConfig } from "./daemon-config.ts"
+import { DAEMON_CONFIG_TEMPLATE, addProjectToConfig, defaultDaemonConfig, loadDaemonConfig, platformPaths } from "./daemon-config.ts"
 
 /** Input for the `startDaemon` port — one assembled daemon + api config. */
 export interface DaemonStartInput {
@@ -74,19 +74,24 @@ export const EXIT = {
 
 const USAGE = `usage: conductor [--url <url>] [--token <token>] [--config <path>] [--json] <command> [args]
 
-connection (required for every command except init and daemon; no default address):
+connection (for every command except init and daemon):
   --url <url>          daemon API base URL (env: CONDUCTOR_URL)
   --token <token>      bearer token (env: CONDUCTOR_TOKEN)
   --config <path>      JSON config file {"url", "token"} (env: CONDUCTOR_CONFIG)
+                       fallback when all are absent: the local daemon's
+                       platform config supplies the address and token
   --json               print raw API JSON on stdout
 
 commands:
-  init [--dir <path>] [--force]
-                       scaffold <dir>/conductor.yaml (default: cwd)
-  daemon --config <path>
-                       run the daemon from a configuration file (YAML:
-                       databasePath, projects, bind, auth, ui, heartbeat,
-                       engine, actions)
+  init [--dir <path>] [--force] [--no-register]
+                       scaffold <dir>/conductor.yaml (default: cwd) and
+                       register the project with the local daemon
+                       (--no-register: scaffold only)
+  daemon [--config <path>]
+                       run the daemon; without --config uses (and generates
+                       on first run) the platform config at
+                       $XDG_CONFIG_HOME/conductor/daemon.yaml
+                       (~/.config/conductor/daemon.yaml)
   daemon --init-config <path> [--force]
                        write an example daemon config and exit
   start <title> --project <dir> [--description <text>] [--workflow <name>] [--pr <n>]
@@ -107,7 +112,7 @@ commands:
 exit codes: 0 ok, 1 failure, 2 usage, 3 unauthorized, 4 not found,
             5 conflict, 6 duplicate report, 7 daemon unreachable`
 
-const BOOLEAN_FLAGS = new Set(["json", "active", "force", "help"])
+const BOOLEAN_FLAGS = new Set(["json", "active", "force", "help", "no-register"])
 
 const VALUE_FLAGS = new Set([
   "url",
@@ -257,7 +262,7 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
   const json = parsed.flags.has("json")
 
   try {
-    if (parsed.command === "init") return commandInit(parsed, deps)
+    if (parsed.command === "init") return await commandInit(parsed, deps)
     if (parsed.command === "daemon") return await commandDaemon(parsed, deps)
 
     const connection = resolveConnection({
@@ -268,6 +273,7 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
       },
       env: deps.env,
       readFile: deps.readFile,
+      exists: deps.exists,
     })
     const client = new ApiClient(connection, deps.fetchImpl)
 
@@ -312,10 +318,14 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
   }
 }
 
-function commandInit(parsed: Parsed, deps: CliDeps): number {
-  requireFlags(parsed, ["dir", "force"])
+async function commandInit(parsed: Parsed, deps: CliDeps): Promise<number> {
+  requireFlags(parsed, ["dir", "force", "no-register"])
   if (parsed.positionals.length > 0) throw new UsageError(`unexpected argument "${parsed.positionals[0]}"`)
-  const dir = stringFlag(parsed, "dir") ?? deps.cwd()
+  const rawDir = stringFlag(parsed, "dir") ?? deps.cwd()
+  // The directory is persisted into the daemon config and sent to a
+  // separate daemon process — a relative path would resolve against THAT
+  // process's cwd, so it must become absolute here, against ours.
+  const dir = rawDir.startsWith("/") ? rawDir : joinPath(deps.cwd(), rawDir)
   const configPath = joinPath(dir, "conductor.yaml")
   if (deps.exists(configPath) && !parsed.flags.has("force")) {
     deps.stderr(`error: ${configPath} already exists (use --force to overwrite)`)
@@ -324,8 +334,86 @@ function commandInit(parsed: Parsed, deps: CliDeps): number {
   deps.mkdir(dir)
   deps.writeFile(configPath, INIT_TEMPLATE)
   deps.stdout(`Wrote ${configPath}`)
-  deps.stdout("Register this project in the daemon's configuration, then: conductor start <title> --project <dir>")
+
+  if (parsed.flags.has("no-register")) {
+    deps.stdout("Skipped daemon registration (--no-register). Add the directory to the daemon config's projects list yourself.")
+    return EXIT.ok
+  }
+
+  // An explicit connection (flags/env/client config) means the daemon of
+  // record is whatever that connection points at — possibly remote. The
+  // LOCAL platform config would never be read by that daemon, so writing
+  // the project there would fake durable registration. Only the
+  // zero-config local path owns the platform config.
+  const explicitConnection =
+    stringFlag(parsed, "url") !== undefined ||
+    stringFlag(parsed, "config") !== undefined ||
+    (deps.env["CONDUCTOR_URL"] ?? "") !== "" ||
+    (deps.env["CONDUCTOR_CONFIG"] ?? "") !== ""
+  if (explicitConnection) {
+    deps.stdout("Explicit daemon connection configured — registering live only (the daemon's own config is not touched).")
+  } else {
+    registerInDaemonConfig(dir, deps)
+  }
+  await registerWithRunningDaemon(dir, deps, parsed)
   return EXIT.ok
+}
+
+/** Idempotently add the project to the platform daemon config, generating the config with defaults when absent. */
+function registerInDaemonConfig(dir: string, deps: CliDeps): void {
+  let paths
+  try {
+    paths = platformPaths(deps.env)
+  } catch {
+    deps.stdout("No HOME/XDG environment — skipped daemon config registration; use conductor daemon --config explicitly.")
+    return
+  }
+  if (!deps.exists(paths.configPath)) {
+    const parent = parentPath(paths.configPath)
+    if (parent !== "") deps.mkdir(parent)
+    deps.writeFile(paths.configPath, defaultDaemonConfig(paths))
+    deps.stdout(`Generated daemon config ${paths.configPath}`)
+  }
+  const result = addProjectToConfig(deps.readFile(paths.configPath), dir)
+  if (result.changed) {
+    deps.writeFile(paths.configPath, result.source)
+    deps.stdout(`Registered ${dir} in ${paths.configPath}`)
+  } else {
+    deps.stdout(`${dir} already registered in ${paths.configPath}`)
+  }
+}
+
+/** Best-effort live registration: a reachable daemon picks the project up without restart; unreachable is a hint, not a failure. */
+async function registerWithRunningDaemon(dir: string, deps: CliDeps, parsed: Parsed): Promise<void> {
+  let client: ApiClient
+  try {
+    const connection = resolveConnection({
+      flags: {
+        ...(stringFlag(parsed, "url") !== undefined ? { url: stringFlag(parsed, "url")! } : {}),
+        ...(stringFlag(parsed, "token") !== undefined ? { token: stringFlag(parsed, "token")! } : {}),
+        ...(stringFlag(parsed, "config") !== undefined ? { config: stringFlag(parsed, "config")! } : {}),
+      },
+      env: deps.env,
+      readFile: deps.readFile,
+      exists: deps.exists,
+    })
+    client = new ApiClient(connection, deps.fetchImpl)
+  } catch {
+    deps.stdout("No daemon connection — start one with: conductor daemon")
+    return
+  }
+  try {
+    const registered = await client.registerProject(dir)
+    deps.stdout(`Daemon registered the project live (workflow "${registered.workflow}") — ready for: conductor start <title> --project ${dir}`)
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 0) {
+      deps.stdout("Daemon not reachable — start it with: conductor daemon (the project is already in its config)")
+      return
+    }
+    const reason = err instanceof Error ? err.message : String(err)
+    deps.stdout(`Daemon did not accept the project yet: ${reason}`)
+    deps.stdout("Fix conductor.yaml if invalid; the daemon will register it from its config on next start.")
+  }
 }
 
 async function commandDaemon(parsed: Parsed, deps: CliDeps): Promise<number> {
@@ -348,28 +436,35 @@ async function commandDaemon(parsed: Parsed, deps: CliDeps): Promise<number> {
     return EXIT.ok
   }
 
-  if (configPath === undefined) {
-    deps.stderr("error: conductor daemon requires --config <path> (or --init-config <path> to write an example)")
-    deps.stderr("The config file is explicit — there are no default paths, ports or auth modes.")
-    deps.stderr("Example: conductor daemon --init-config ./conductor-daemon.yaml && conductor daemon --config ./conductor-daemon.yaml")
-    return EXIT.usage
-  }
-
-  let source: string
-  try {
-    source = deps.readFile(configPath)
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err)
-    deps.stderr(`error: cannot read daemon config "${configPath}": ${reason}`)
-    return EXIT.usage
-  }
-
-  const { daemon, api } = loadDaemonConfig(source)
-
   const log = (entry: DaemonLogEntry): void => {
     const line = { level: entry.level, message: entry.message, ...(entry.fields ?? {}) }
     deps.stdout(JSON.stringify(line))
   }
+
+  let effectivePath: string
+  if (configPath !== undefined) {
+    effectivePath = configPath
+  } else {
+    const paths = platformPaths(deps.env)
+    effectivePath = paths.configPath
+    if (!deps.exists(effectivePath)) {
+      const parent = parentPath(effectivePath)
+      if (parent !== "") deps.mkdir(parent)
+      deps.writeFile(effectivePath, defaultDaemonConfig(paths))
+      log({ level: "info", message: "daemon config generated", fields: { path: effectivePath } })
+    }
+  }
+
+  let source: string
+  try {
+    source = deps.readFile(effectivePath)
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    deps.stderr(`error: cannot read daemon config "${effectivePath}": ${reason}`)
+    return EXIT.usage
+  }
+
+  const { daemon, api } = loadDaemonConfig(source)
 
   if (api.auth.mode === "none") {
     log({

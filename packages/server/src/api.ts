@@ -30,7 +30,7 @@ import { extname, resolve, sep } from "node:path"
 import type { FeatureState, FeatureStatus, StepRuntime } from "@conductor/core"
 import type { RunLogEntryInput, Store, StoreChange } from "./store.ts"
 import type { DaemonHealth, DaemonLogger } from "./daemon.ts"
-import type { WorkflowResolver, WorkflowStatus } from "./workflow-registry.ts"
+import type { LoadResult, WorkflowResolver, WorkflowStatus } from "./workflow-registry.ts"
 import type { RunnerRegistry } from "./runner-registry.ts"
 
 // ------------------------------------------------------------ configuration
@@ -94,6 +94,11 @@ export interface ApiDeps {
    * `workflowRef` hint. Absent → those projections report null/404.
    */
   readonly workflowStatus?: (projectDir: string) => WorkflowStatus
+  /**
+   * Runtime project registration (`POST /v1/projects`) — wired to the
+   * workflow registry's `register`. Absent → the route 404s.
+   */
+  readonly registerProject?: (projectDir: string) => LoadResult
   /** Runner endpoint registration (`/v1/runners`). Absent → those routes 404. */
   readonly runners?: RunnerRegistry
   readonly logger?: DaemonLogger
@@ -278,7 +283,7 @@ const STATIC_CONTENT_TYPES: Readonly<Record<string, string>> = {
 }
 
 export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
-  const { store, engine, health, resolveWorkflow, workflowStatus, runners, logger } = deps
+  const { store, engine, health, resolveWorkflow, workflowStatus, registerProject, runners, logger } = deps
   const staticRoot = config.ui !== undefined ? resolve(config.ui.staticDir) : null
   const sseClients = new Set<SseClient>()
   const inFlight = new Set<Promise<void>>()
@@ -458,6 +463,31 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
 
     if (path === "/v1/projects/workflow" && method === "GET") {
       return projectWorkflow(url, requestId)
+    }
+
+    if (path === "/v1/projects" && method === "POST" && registerProject !== undefined) {
+      const parsed = await readJsonBody(request)
+      if (!parsed.ok) return error(requestId, "invalid_json", "request body must be a JSON object")
+      const dir = parsed.body["dir"]
+      if (typeof dir !== "string" || dir.trim() === "") {
+        return error(requestId, "invalid_request", '"dir" is required (project directory path)')
+      }
+      const result = registerProject(dir)
+      if (!result.ok) {
+        return json(
+          422,
+          {
+            error: {
+              code: "project_not_configured",
+              message: `project "${dir}" failed to register`,
+              requestId,
+            },
+            diagnostics: result.diagnostics,
+          },
+          requestId,
+        )
+      }
+      return json(200, { project: dir, workflow: result.snapshot.workflow.name }, requestId)
     }
 
     if (path === "/v1/runners" && runners !== undefined) {

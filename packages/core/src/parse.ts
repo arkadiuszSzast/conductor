@@ -13,7 +13,7 @@
  * with their source location and the closest valid field.
  */
 
-import { LineCounter, isAlias, isMap, isScalar, isSeq, parseDocument, visit } from "yaml"
+import { LineCounter, isAlias, isMap, isScalar, isSeq, parseDocument, stringify as stringifyYaml, visit } from "yaml"
 import type { Node, YAMLMap, YAMLSeq } from "yaml"
 import type {
   BackoffDef,
@@ -839,4 +839,14 @@ function readBackoff(node: Node | null, where: string, reader: Reader): BackoffD
     max,
     ...(jitter !== undefined ? { jitter } : {}),
   }
+}
+
+/**
+ * Plain data → YAML text. The write-side counterpart of
+ * `parseYamlObject`, for tooling that round-trips configuration files
+ * (the CLI's daemon config updates). Comments are not preserved —
+ * callers own that trade-off.
+ */
+export function stringifyYamlObject(value: unknown): string {
+  return stringifyYaml(value)
 }

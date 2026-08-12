@@ -11,18 +11,16 @@
  */
 
 import type { ApiConnection } from "./client.ts"
+import { loadDaemonConfig, platformPaths, type DaemonFileConfig } from "./daemon-config.ts"
 
-export class UsageError extends Error {
-  constructor(message: string) {
-    super(message)
-    this.name = "UsageError"
-  }
-}
+import { UsageError } from "./errors.ts"
+export { UsageError } from "./errors.ts"
 
 export interface ConnectionInput {
   readonly flags: { readonly url?: string; readonly token?: string; readonly config?: string }
   readonly env: Readonly<Record<string, string | undefined>>
   readonly readFile: (path: string) => string
+  readonly exists?: (path: string) => boolean
 }
 
 interface FileConfig {
@@ -63,10 +61,19 @@ function readConfigFile(path: string, readFile: (path: string) => string): FileC
 export function resolveConnection(input: ConnectionInput): ApiConnection {
   const configPath = input.flags.config ?? input.env["CONDUCTOR_CONFIG"]
   const file: FileConfig = configPath !== undefined ? readConfigFile(configPath, input.readFile) : {}
-  const url = input.flags.url ?? input.env["CONDUCTOR_URL"] ?? file.url
+  let url = input.flags.url ?? input.env["CONDUCTOR_URL"] ?? file.url
+  let daemonFallbackToken: string | undefined
+  if (url === undefined || url.trim() === "") {
+    const fallback = daemonConfigConnection(input)
+    if (fallback !== undefined) {
+      url = fallback.url
+      daemonFallbackToken = fallback.token
+    }
+  }
   if (url === undefined || url.trim() === "") {
     throw new UsageError(
-      "daemon address is required: pass --url, set CONDUCTOR_URL, or provide a config file (--config / CONDUCTOR_CONFIG)",
+      "daemon address is required: pass --url, set CONDUCTOR_URL, provide a config file (--config / CONDUCTOR_CONFIG), " +
+        "or run a local daemon (its generated config supplies the address)",
     )
   }
   let parsedUrl: URL
@@ -78,6 +85,40 @@ export function resolveConnection(input: ConnectionInput): ApiConnection {
   if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
     throw new UsageError(`daemon address "${url}" must use http or https`)
   }
-  const token = input.flags.token ?? input.env["CONDUCTOR_TOKEN"] ?? file.token
+  const token = input.flags.token ?? input.env["CONDUCTOR_TOKEN"] ?? file.token ?? daemonFallbackToken
   return { url, ...(token !== undefined ? { token } : {}) }
+}
+
+/**
+ * Last-resort connection source: the local daemon's own config at the
+ * platform path. A machine running `conductor daemon` with generated
+ * defaults gets a working CLI with zero flags and zero env. Any explicit
+ * source (flags, env, client config file) takes precedence and prevents
+ * this lookup entirely.
+ */
+function daemonConfigConnection(input: ConnectionInput): { url: string; token?: string } | undefined {
+  let path: string
+  try {
+    path = platformPaths(input.env).configPath
+  } catch {
+    return undefined
+  }
+  if (input.exists !== undefined && !input.exists(path)) return undefined
+  let source: string
+  try {
+    source = input.readFile(path)
+  } catch {
+    return undefined
+  }
+  let config: DaemonFileConfig
+  try {
+    config = loadDaemonConfig(source)
+  } catch {
+    return undefined
+  }
+  const { host, port } = config.api.bind
+  return {
+    url: `http://${host}:${port}`,
+    ...(config.api.auth.mode === "bearer" ? { token: config.api.auth.token } : {}),
+  }
 }

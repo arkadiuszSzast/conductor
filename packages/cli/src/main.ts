@@ -67,6 +67,7 @@ function startDaemon(input: DaemonStartInput): DaemonProcessHandle {
       health: () => daemon.health(),
       resolveWorkflow: daemon.registry.resolver,
       workflowStatus: dir => daemon.registry.getStatus(dir),
+      registerProject: dir => daemon.registry.register(dir),
       runners,
       logger,
     })
