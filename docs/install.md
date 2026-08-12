@@ -141,7 +141,7 @@ conductor init      # scaffolds conductor.yaml AND registers the project:
 export CONDUCTOR_URL=http://127.0.0.1:4400
 export CONDUCTOR_TOKEN=change-me
 
-conductor start "Ship the thing" --project /path/to/my-project
+conductor start "Ship the thing"     # --project defaults to the current directory
 conductor status --active            # watch progress
 conductor status <feature-id>        # detail: status, current step, run
 conductor approve <feature-id> --notes "ship it"   # when waiting_human

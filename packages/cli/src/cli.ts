@@ -94,8 +94,9 @@ commands:
                        (~/.config/conductor/daemon.yaml)
   daemon --init-config <path> [--force]
                        write an example daemon config and exit
-  start <title> --project <dir> [--description <text>] [--workflow <name>] [--pr <n>]
+  start <title> [--project <dir>] [--description <text>] [--workflow <name>] [--pr <n>]
                        create a feature and start its pipeline
+                       (--project defaults to the current directory)
   status [<feature-id>] [--project <dir>] [--active]
                        show one feature, or list features
   approve <feature-id> [--notes <text|@file>]
@@ -260,6 +261,28 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
   }
 
   const json = parsed.flags.has("json")
+
+  // Reject unknown commands BEFORE the connection is resolved — a typo
+  // (`conductor deamon`) must say "unknown command", not demand a daemon
+  // address it would never use.
+  const KNOWN_COMMANDS = new Set([
+    "init",
+    "daemon",
+    "start",
+    "status",
+    "approve",
+    "request-changes",
+    "report",
+    "pause",
+    "resume",
+    "abandon",
+    "logs",
+  ])
+  if (!KNOWN_COMMANDS.has(parsed.command)) {
+    deps.stderr(`error: unknown command "${parsed.command}"`)
+    deps.stderr(USAGE)
+    return EXIT.usage
+  }
 
   try {
     if (parsed.command === "init") return await commandInit(parsed, deps)
@@ -516,8 +539,12 @@ async function commandStart(parsed: Parsed, deps: CliDeps, client: ApiClient, js
   const title = parsed.positionals[0]
   if (title === undefined || title.trim() === "") throw new UsageError("start requires a feature title")
   if (parsed.positionals.length > 1) throw new UsageError(`unexpected argument "${parsed.positionals[1]}"`)
-  const project = stringFlag(parsed, "project")
-  if (project === undefined) throw new UsageError("start requires --project <dir>")
+  // Default to the working directory — running `conductor start` inside
+  // the project is the common case; --project stays for driving another
+  // directory. Relative values resolve against cwd for the same
+  // cross-process reason as `init --dir`.
+  const rawProject = stringFlag(parsed, "project") ?? deps.cwd()
+  const project = rawProject.startsWith("/") ? rawProject : joinPath(deps.cwd(), rawProject)
   const prRaw = stringFlag(parsed, "pr")
   let pr: number | undefined
   if (prRaw !== undefined) {
