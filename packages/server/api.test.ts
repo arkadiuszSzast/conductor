@@ -135,6 +135,7 @@ async function makeApi(input?: {
       health: () => daemon.health(),
       resolveWorkflow: daemon.registry.resolver,
       workflowStatus: (dir) => daemon.registry.getStatus(dir),
+      registerProject: dir => daemon.registry.register(dir),
       logger,
     },
   )
@@ -1106,5 +1107,52 @@ describe("API: real listener on an ephemeral loopback port", () => {
       await server.stop()
     }
     expect(logger.entries.some(e => e.message === "api stopped")).toBe(true)
+  })
+})
+
+describe("API: runtime project registration", () => {
+  it("registers a valid project live and makes it startable", async () => {
+    const { request } = await makeApi()
+    const newProject = writeProject()
+    const response = await request("POST", "/v1/projects", { dir: newProject })
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { project: string; workflow: string }
+    expect(body.project).toBe(newProject)
+    expect(typeof body.workflow).toBe("string")
+
+    const started = await request("POST", "/v1/features", { title: "On the new project", project: newProject })
+    expect(started.status).toBe(201)
+  })
+
+  it("re-registering the same directory is idempotent", async () => {
+    const { request, project } = await makeApi()
+    const first = await request("POST", "/v1/projects", { dir: project })
+    expect(first.status).toBe(200)
+    const second = await request("POST", "/v1/projects", { dir: project })
+    expect(second.status).toBe(200)
+  })
+
+  it("rejects an invalid project with diagnostics and leaves the set unchanged", async () => {
+    const { request, daemon } = await makeApi()
+    const broken = tempDir("conductor-api-broken-")
+    writeFileSync(join(broken, "conductor.yaml"), "name: [")
+    const response = await request("POST", "/v1/projects", { dir: broken })
+    expect(response.status).toBe(422)
+    const body = (await response.json()) as { error: { code: string }; diagnostics: unknown[] }
+    expect(body.error.code).toBe("project_not_configured")
+    expect(body.diagnostics.length).toBeGreaterThan(0)
+    expect(daemon.registry.getStatus(broken).state).toBe("invalid")
+  })
+
+  it("requires a dir field", async () => {
+    const { request } = await makeApi()
+    const response = await request("POST", "/v1/projects", {})
+    expect(response.status).toBe(400)
+  })
+
+  it("is authenticated like every command route", async () => {
+    const { request } = await makeApi({ auth: { mode: "bearer", token: "tok" } })
+    const anonymous = await request("POST", "/v1/projects", { dir: "/x" })
+    expect(anonymous.status).toBe(401)
   })
 })

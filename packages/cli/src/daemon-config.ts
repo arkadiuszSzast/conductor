@@ -12,7 +12,7 @@
  * (the core-owned `yaml` dependency — the CLI adds none of its own).
  */
 
-import { parseYamlObject } from "@conductor/core"
+import { parseYamlObject, stringifyYamlObject } from "@conductor/core"
 import type { ApiAuth, ApiConfig, DaemonConfig } from "@conductor/server"
 import type { EngineOptions } from "@conductor/server"
 import { UsageError } from "./errors.ts"
@@ -307,4 +307,29 @@ auth:
 
 heartbeatIntervalMs: 5000
 `
+}
+
+export type AddProjectResult =
+  | { readonly changed: true; readonly source: string }
+  | { readonly changed: false }
+
+/**
+ * Add a project directory to a daemon config's `projects` list —
+ * idempotent, validation-first (a malformed file aborts loudly before
+ * any write decision). Returns the new YAML text; comments are not
+ * preserved (the file is machine-generated; hand-crafted configs are
+ * used via explicit `--config` and never touched by this path).
+ */
+export function addProjectToConfig(source: string, projectDir: string): AddProjectResult {
+  const parsed = parseYamlObject(source)
+  if (!parsed.ok) {
+    const detail = parsed.errors.map(error => `line ${error.line}: ${error.message}`).join("; ")
+    throw new UsageError(`daemon config is not valid YAML: ${detail}`)
+  }
+  assembleDaemonConfig(parsed.value)
+  const raw = parsed.value as { projects?: readonly string[] }
+  const projects = raw.projects ?? []
+  if (projects.includes(projectDir)) return { changed: false }
+  const next = { ...raw, projects: [...projects, projectDir] }
+  return { changed: true, source: stringifyYamlObject(next) }
 }

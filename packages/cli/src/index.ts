@@ -26,7 +26,10 @@ export type { CliDeps, DaemonProcessHandle, DaemonStartInput } from "./cli.ts"
 export {
   DAEMON_CONFIG_TEMPLATE,
   DEFAULT_HEARTBEAT_INTERVAL_MS,
+  addProjectToConfig,
   assembleDaemonConfig,
+  defaultDaemonConfig,
   loadDaemonConfig,
+  platformPaths,
 } from "./daemon-config.ts"
-export type { DaemonFileConfig } from "./daemon-config.ts"
+export type { AddProjectResult, DaemonFileConfig, PlatformPaths } from "./daemon-config.ts"

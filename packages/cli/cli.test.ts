@@ -21,8 +21,11 @@ import { ApiClient, ApiError } from "./src/client.ts"
 import { resolveConnection, UsageError } from "./src/config.ts"
 import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
+  addProjectToConfig,
   assembleDaemonConfig,
+  defaultDaemonConfig,
   loadDaemonConfig,
+  platformPaths,
 } from "./src/daemon-config.ts"
 
 class FakeSessions implements SessionClient {
@@ -118,6 +121,7 @@ async function makeHarness(input?: { workflow?: string; auth?: ApiConfig["auth"]
       engine: daemon.engine,
       health: () => daemon.health(),
       resolveWorkflow: daemon.registry.resolver,
+      registerProject: dir => daemon.registry.register(dir),
     },
   )
   apisToClose.push(api)
@@ -834,5 +838,143 @@ describe("CLI: daemon config parsing", () => {
 
   it("loadDaemonConfig rejects YAML aliases (safety posture matches parseWorkflow)", () => {
     expect(() => loadDaemonConfig("a: &x 1\ndatabasePath: *x")).toThrow()
+  })
+})
+
+describe("CLI: zero-config platform paths", () => {
+  it("platformPaths uses XDG variables and falls back to HOME", () => {
+    expect(platformPaths({ XDG_CONFIG_HOME: "/x/cfg", XDG_DATA_HOME: "/x/data" })).toEqual({
+      configPath: "/x/cfg/conductor/daemon.yaml",
+      dataDir: "/x/data/conductor",
+    })
+    expect(platformPaths({ HOME: "/home/u" })).toEqual({
+      configPath: "/home/u/.config/conductor/daemon.yaml",
+      dataDir: "/home/u/.local/share/conductor",
+    })
+    expect(() => platformPaths({})).toThrow(UsageError)
+  })
+
+  it("the generated default config assembles with empty projects", () => {
+    const source = defaultDaemonConfig(platformPaths({ HOME: "/home/u" }))
+    const config = loadDaemonConfig(source)
+    expect(config.daemon.projects).toEqual([])
+    expect(config.daemon.databasePath).toBe("/home/u/.local/share/conductor/conductor.db")
+    expect(config.api.bind).toEqual({ host: "127.0.0.1", port: 4400 })
+    expect(config.api.auth).toEqual({ mode: "none" })
+  })
+
+  it("addProjectToConfig is idempotent and validates before writing", () => {
+    const source = defaultDaemonConfig(platformPaths({ HOME: "/home/u" }))
+    const first = addProjectToConfig(source, "/work/app")
+    expect(first.changed).toBe(true)
+    const updated = (first as { changed: true; source: string }).source
+    expect(loadDaemonConfig(updated).daemon.projects).toEqual(["/work/app"])
+    expect(addProjectToConfig(updated, "/work/app")).toEqual({ changed: false })
+    const second = addProjectToConfig(updated, "/work/other")
+    expect(second.changed).toBe(true)
+    expect(loadDaemonConfig((second as { changed: true; source: string }).source).daemon.projects).toEqual([
+      "/work/app",
+      "/work/other",
+    ])
+    expect(() => addProjectToConfig("databasePath: [", "/work/app")).toThrow(UsageError)
+  })
+})
+
+describe("CLI: init registers the project", () => {
+  it("adds the project to the platform daemon config, generating it when absent, idempotently", async () => {
+    const h = await makeHarness({ env: { HOME: "/home/dev" } })
+    const deps = { ...h.deps, env: { HOME: "/home/dev" } }
+    expect(await runCli(["init", "--dir", "/work/app"], deps)).toBe(EXIT.ok)
+    const configPath = "/home/dev/.config/conductor/daemon.yaml"
+    expect(h.files.has(configPath)).toBe(true)
+    expect(loadDaemonConfig(h.files.get(configPath)!).daemon.projects).toEqual(["/work/app"])
+
+    expect(await runCli(["init", "--dir", "/work/app", "--force"], deps)).toBe(EXIT.ok)
+    expect(loadDaemonConfig(h.files.get(configPath)!).daemon.projects).toEqual(["/work/app"])
+  })
+
+  it("registers live with a reachable daemon through POST /v1/projects", async () => {
+    const h = await makeHarness()
+    const project = writeProject()
+    const deps = { ...h.deps, env: { HOME: "/home/dev", CONDUCTOR_URL: CLI_URL } }
+    expect(await runCli(["init", "--dir", project, "--force"], deps)).toBe(EXIT.ok)
+    expect(h.out.join("\n")).toContain("registered the project live")
+    expect(h.daemon.registry.getStatus(project).state).toBe("valid")
+  })
+
+  it("an unreachable daemon is a hint, not a failure", async () => {
+    const h = await makeHarness()
+    const deps: CliDeps = {
+      ...h.deps,
+      env: { HOME: "/home/dev", CONDUCTOR_URL: "http://down.test" },
+      fetchImpl: async () => {
+        throw new Error("connection refused")
+      },
+    }
+    expect(await runCli(["init", "--dir", "/work/app"], deps)).toBe(EXIT.ok)
+    expect(h.out.join("\n")).toContain("Daemon not reachable")
+  })
+
+  it("--no-register scaffolds only", async () => {
+    const h = await makeHarness()
+    const deps = { ...h.deps, env: { HOME: "/home/dev" } }
+    expect(await runCli(["init", "--dir", "/work/app", "--no-register"], deps)).toBe(EXIT.ok)
+    expect(h.files.has("/home/dev/.config/conductor/daemon.yaml")).toBe(false)
+    expect(h.files.has("/work/app/conductor.yaml")).toBe(true)
+  })
+})
+
+describe("CLI: connection fallback to the daemon config", () => {
+  const daemonYaml = defaultDaemonConfig(platformPaths({ HOME: "/home/dev" }))
+
+  it("uses the platform daemon config when no explicit source exists", () => {
+    const files = new Map([["/home/dev/.config/conductor/daemon.yaml", daemonYaml]])
+    const connection = resolveConnection({
+      flags: {},
+      env: { HOME: "/home/dev" },
+      readFile: path => {
+        const content = files.get(path)
+        if (content === undefined) throw new Error("ENOENT")
+        return content
+      },
+      exists: path => files.has(path),
+    })
+    expect(connection).toEqual({ url: "http://127.0.0.1:4400" })
+  })
+
+  it("carries the bearer token from the daemon config", () => {
+    const withBearer = daemonYaml.replace("auth:\n  mode: none", 'auth:\n  mode: bearer\n  token: "s3cret"')
+    const files = new Map([["/home/dev/.config/conductor/daemon.yaml", withBearer]])
+    const connection = resolveConnection({
+      flags: {},
+      env: { HOME: "/home/dev" },
+      readFile: path => files.get(path)!,
+      exists: path => files.has(path),
+    })
+    expect(connection).toEqual({ url: "http://127.0.0.1:4400", token: "s3cret" })
+  })
+
+  it("explicit sources keep precedence over the fallback", () => {
+    const files = new Map([["/home/dev/.config/conductor/daemon.yaml", daemonYaml]])
+    const connection = resolveConnection({
+      flags: { url: "http://explicit:9999" },
+      env: { HOME: "/home/dev" },
+      readFile: path => files.get(path)!,
+      exists: path => files.has(path),
+    })
+    expect(connection.url).toBe("http://explicit:9999")
+  })
+
+  it("no source anywhere stays a usage error", () => {
+    expect(() =>
+      resolveConnection({
+        flags: {},
+        env: { HOME: "/home/dev" },
+        readFile: () => {
+          throw new Error("ENOENT")
+        },
+        exists: () => false,
+      }),
+    ).toThrow(UsageError)
   })
 })
