@@ -16,9 +16,14 @@ import { tmpdir } from "node:os"
 import { Daemon, createApi, type ConductorApi, type ApiConfig } from "@conductor/server"
 import type { SessionClient } from "@conductor/server"
 import { validateWorkflow, parseWorkflow } from "@conductor/core"
-import { runCli, EXIT, type CliDeps } from "./src/cli.ts"
+import { runCli, EXIT, type CliDeps, type DaemonStartInput } from "./src/cli.ts"
 import { ApiClient, ApiError } from "./src/client.ts"
 import { resolveConnection, UsageError } from "./src/config.ts"
+import {
+  DEFAULT_HEARTBEAT_INTERVAL_MS,
+  assembleDaemonConfig,
+  loadDaemonConfig,
+} from "./src/daemon-config.ts"
 
 class FakeSessions implements SessionClient {
   prompts: Array<{ sessionID: string; text: string }> = []
@@ -569,5 +574,225 @@ describe("CLI: API client error handling", () => {
       expect((err as ApiError).code).toBe("http_502")
       expect((err as ApiError).status).toBe(502)
     }
+  })
+})
+
+describe("CLI: daemon command", () => {
+  const VALID_CONFIG = `
+databasePath: /var/lib/conductor/state.db
+projects:
+  - /work/project
+bind:
+  host: 127.0.0.1
+  port: 4400
+auth:
+  mode: none
+`
+
+  interface DaemonHarness {
+    deps: CliDeps
+    out: string[]
+    err: string[]
+    files: Map<string, string>
+    starts: DaemonStartInput[]
+    startError: Error | null
+    exitCode: number
+  }
+
+  function makeDaemonHarness(): DaemonHarness {
+    const files = new Map<string, string>()
+    const out: string[] = []
+    const err: string[] = []
+    const starts: DaemonStartInput[] = []
+    const harness: DaemonHarness = {
+      out,
+      err,
+      files,
+      starts,
+      startError: null,
+      exitCode: 0,
+      deps: {
+        env: {},
+        stdout: line => out.push(line),
+        stderr: line => err.push(line),
+        readFile: path => {
+          const content = files.get(path)
+          if (content === undefined) throw new Error(`ENOENT: ${path}`)
+          return content
+        },
+        writeFile: (path, content) => {
+          files.set(path, content)
+        },
+        exists: path => files.has(path),
+        mkdir: () => {},
+        cwd: () => "/work",
+        startDaemon: input => {
+          starts.push(input)
+          return {
+            started: harness.startError ? Promise.reject(harness.startError) : Promise.resolve(),
+            exited: Promise.resolve(harness.exitCode),
+          }
+        },
+      },
+    }
+    return harness
+  }
+
+  it("requires --config or --init-config (usage error, exit 2)", async () => {
+    const h = makeDaemonHarness()
+    expect(await runCli(["daemon"], h.deps)).toBe(EXIT.usage)
+    expect(h.err.join("\n")).toContain("--config")
+    expect(h.err.join("\n")).toContain("--init-config")
+    expect(h.starts.length).toBe(0)
+  })
+
+  it("rejects --config together with --init-config", async () => {
+    const h = makeDaemonHarness()
+    expect(await runCli(["daemon", "--config", "/a.yaml", "--init-config", "/b.yaml"], h.deps)).toBe(EXIT.usage)
+  })
+
+  it("errors with usage when the config file cannot be read", async () => {
+    const h = makeDaemonHarness()
+    expect(await runCli(["daemon", "--config", "/missing.yaml"], h.deps)).toBe(EXIT.usage)
+    expect(h.err.join("\n")).toContain("/missing.yaml")
+  })
+
+  it("writes the example config with --init-config and refuses to overwrite without --force", async () => {
+    const h = makeDaemonHarness()
+    expect(await runCli(["daemon", "--init-config", "/etc/conductor/daemon.yaml"], h.deps)).toBe(EXIT.ok)
+    const written = h.files.get("/etc/conductor/daemon.yaml")!
+    expect(written).toContain("databasePath:")
+    expect(written).toContain("bind:")
+    expect(written).toContain("auth:")
+
+    h.err.length = 0
+    expect(await runCli(["daemon", "--init-config", "/etc/conductor/daemon.yaml"], h.deps)).toBe(EXIT.failure)
+    expect(h.err.join("\n")).toContain("already exists")
+    expect(await runCli(["daemon", "--init-config", "/etc/conductor/daemon.yaml", "--force"], h.deps)).toBe(EXIT.ok)
+  })
+
+  it("the --init-config template itself parses and assembles", async () => {
+    const h = makeDaemonHarness()
+    expect(await runCli(["daemon", "--init-config", "/tmp/example.yaml"], h.deps)).toBe(EXIT.ok)
+    const template = h.files.get("/tmp/example.yaml")!
+    const config = loadDaemonConfig(template)
+    expect(config.daemon.databasePath).toBe("/var/lib/conductor/conductor.db")
+    expect(config.api.auth.mode).toBe("none")
+  })
+
+  it("assembles DaemonConfig + ApiConfig from the file and starts the daemon", async () => {
+    const h = makeDaemonHarness()
+    h.files.set("/daemon.yaml", VALID_CONFIG)
+    expect(await runCli(["daemon", "--config", "/daemon.yaml"], h.deps)).toBe(EXIT.ok)
+    expect(h.starts.length).toBe(1)
+    const input = h.starts[0]!
+    expect(input.daemon.databasePath).toBe("/var/lib/conductor/state.db")
+    expect(input.daemon.projects).toEqual(["/work/project"])
+    expect(input.daemon.heartbeatIntervalMs).toBe(DEFAULT_HEARTBEAT_INTERVAL_MS)
+    expect(input.api.bind).toEqual({ host: "127.0.0.1", port: 4400 })
+    expect(input.api.auth).toEqual({ mode: "none" })
+  })
+
+  it("logs an explicit warning for auth.mode none", async () => {
+    const h = makeDaemonHarness()
+    h.files.set("/daemon.yaml", VALID_CONFIG)
+    await runCli(["daemon", "--config", "/daemon.yaml"], h.deps)
+    const warning = h.out.map(line => JSON.parse(line) as { level: string; message: string })
+      .find(entry => entry.level === "warn" && entry.message.includes("authentication is disabled"))
+    expect(warning).toBeDefined()
+  })
+
+  it("does not warn for bearer auth and passes the token through", async () => {
+    const h = makeDaemonHarness()
+    h.files.set("/daemon.yaml", VALID_CONFIG.replace("auth:\n  mode: none", 'auth:\n  mode: bearer\n  token: "s3cret"'))
+    await runCli(["daemon", "--config", "/daemon.yaml"], h.deps)
+    expect(h.starts[0]!.api.auth).toEqual({ mode: "bearer", token: "s3cret" })
+    const warnings = h.out.filter(line => line.includes("authentication is disabled"))
+    expect(warnings).toEqual([])
+  })
+
+  it("propagates a startup failure as exit 1 with the reason", async () => {
+    const h = makeDaemonHarness()
+    h.files.set("/daemon.yaml", VALID_CONFIG)
+    h.startError = new Error("migration exploded")
+    expect(await runCli(["daemon", "--config", "/daemon.yaml"], h.deps)).toBe(EXIT.failure)
+    expect(h.err.join("\n")).toContain("migration exploded")
+  })
+
+  it("returns the daemon's exit code after shutdown", async () => {
+    const h = makeDaemonHarness()
+    h.files.set("/daemon.yaml", VALID_CONFIG)
+    h.exitCode = 0
+    expect(await runCli(["daemon", "--config", "/daemon.yaml"], h.deps)).toBe(0)
+  })
+
+  it("fails cleanly when no daemon runtime is wired", async () => {
+    const h = makeDaemonHarness()
+    h.files.set("/daemon.yaml", VALID_CONFIG)
+    const { startDaemon: _omitted, ...rest } = h.deps
+    expect(await runCli(["daemon", "--config", "/daemon.yaml"], rest)).toBe(EXIT.failure)
+    expect(h.err.join("\n")).toContain("cannot start a daemon")
+  })
+})
+
+describe("CLI: daemon config parsing", () => {
+  const base = {
+    databasePath: "/db/state.db",
+    projects: ["/p1"],
+    bind: { host: "127.0.0.1", port: 4400 },
+    auth: { mode: "none" },
+  }
+
+  it("accepts a full configuration", () => {
+    const config = assembleDaemonConfig({
+      ...base,
+      auth: { mode: "bearer", token: "t" },
+      ui: { staticDir: "/spa/dist" },
+      heartbeatIntervalMs: 250,
+      createDatabaseDirectory: false,
+      engine: { runTtlMs: 1000, nudgeIdleCycles: 2, maxNudges: 3 },
+      actions: { bundledPath: "/actions", localPaths: ["/more"] },
+    })
+    expect(config.daemon).toEqual({
+      databasePath: "/db/state.db",
+      projects: ["/p1"],
+      heartbeatIntervalMs: 250,
+      createDatabaseDirectory: false,
+      engine: { runTtlMs: 1000, nudgeIdleCycles: 2, maxNudges: 3 },
+      actions: { bundledPath: "/actions", localPaths: ["/more"] },
+    })
+    expect(config.api).toEqual({
+      bind: { host: "127.0.0.1", port: 4400 },
+      auth: { mode: "bearer", token: "t" },
+      ui: { staticDir: "/spa/dist" },
+    })
+  })
+
+  it.each([
+    ["not a mapping", "just a string", "must be a YAML mapping"],
+    ["missing databasePath", { ...base, databasePath: undefined }, "databasePath"],
+    ["empty projects", { ...base, projects: [] }, "projects"],
+    ["missing bind", { ...base, bind: undefined }, "bind"],
+    ["bad port", { ...base, bind: { host: "127.0.0.1", port: "4400" } }, "bind.port"],
+    ["port out of range", { ...base, bind: { host: "127.0.0.1", port: 70000 } }, "bind.port"],
+    ["missing auth", { ...base, auth: undefined }, "auth"],
+    ["unknown auth mode", { ...base, auth: { mode: "open" } }, "auth.mode"],
+    ["bearer without token", { ...base, auth: { mode: "bearer" } }, "auth.token"],
+    ["token with mode none", { ...base, auth: { mode: "none", token: "x" } }, "auth.token"],
+    ["unknown top-level field", { ...base, portt: 1 }, "portt"],
+    ["unknown engine field", { ...base, engine: { ttl: 5 } }, "engine.ttl"],
+    ["negative heartbeat", { ...base, heartbeatIntervalMs: -5 }, "heartbeatIntervalMs"],
+    ["bad ui", { ...base, ui: { staticDir: "" } }, "ui.staticDir"],
+    ["bad localPaths", { ...base, actions: { localPaths: [""] } }, "actions.localPaths"],
+  ])("rejects %s", (_name, raw, needle) => {
+    expect(() => assembleDaemonConfig(raw)).toThrow(needle as string)
+  })
+
+  it("loadDaemonConfig reports YAML syntax errors with line positions", () => {
+    expect(() => loadDaemonConfig("databasePath: [")).toThrow("not valid YAML")
+  })
+
+  it("loadDaemonConfig rejects YAML aliases (safety posture matches parseWorkflow)", () => {
+    expect(() => loadDaemonConfig("a: &x 1\ndatabasePath: *x")).toThrow()
   })
 })
