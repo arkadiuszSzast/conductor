@@ -216,6 +216,11 @@ export class DataSource {
   private ensure(key: string, loader: () => Promise<unknown>, force = false): void {
     const existing = this.inflight.get(key)
     if (existing !== undefined && !force) return
+    // "Ensure" means load-once: a resource that already settled (ready or
+    // error) is only refetched by an explicit force (SSE invalidation,
+    // refresh, retry). Without this check every React render re-triggers
+    // a fetch — fetch → emit → render → ensure → fetch, a hot loop.
+    if (!force && this.statusOf(key) !== "loading") return
     const requestId = (existing?.id ?? 0) + 1
     this.inflight.set(key, { id: requestId })
     loader()
@@ -272,6 +277,17 @@ export class DataSource {
       this.workflows.set(key.slice("workflow:".length), next as WorkflowResourceState)
     }
     this.emit(key)
+  }
+
+  private statusOf(key: string): ResourceStatus {
+    if (key === "features") return this.features.status
+    if (key === "health") return this.health.status
+    if (key.startsWith("detail:")) return this.details.get(key.slice(7))?.status ?? "loading"
+    if (key.startsWith("runs:")) return this.runs.get(key.slice(5))?.status ?? "loading"
+    if (key.startsWith("findings:")) return this.findings.get(key.slice(9))?.status ?? "loading"
+    if (key.startsWith("timeline:")) return this.timelines.get(key.slice(9))?.status ?? "loading"
+    if (key.startsWith("workflow:")) return this.workflows.get(key.slice(9))?.status ?? "loading"
+    return "loading"
   }
 
   private versionOf(key: string): number {

@@ -302,3 +302,50 @@ describe("invalidation store: error handling", () => {
     expect(unauthorized.length).toBe(1)
   })
 })
+
+describe("invalidation store: ensure is load-once", () => {
+  it("repeated ensure calls after settle do not refetch (render loop guard)", async () => {
+    const { client, calls } = makeStack({
+      "/v1/features": () => ({ features: [listItem("f-1")] }),
+      "/v1/health": () => ({ status: "ok" }),
+    })
+    const store = new DataSource({ client })
+    store.ensureFeaturesLoaded()
+    store.ensureHealthLoaded()
+    await settle()
+    for (let i = 0; i < 50; i++) {
+      store.ensureFeaturesLoaded()
+      store.ensureHealthLoaded()
+    }
+    await settle()
+    expect(calls.filter(c => c.path.startsWith("/v1/features")).length).toBe(1)
+    expect(calls.filter(c => c.path.startsWith("/v1/health")).length).toBe(1)
+  })
+
+  it("ensure after a settled error does not hot-loop the fetch", async () => {
+    const { client, calls } = makeStack({
+      "/v1/features": () =>
+        new Response(JSON.stringify({ error: { code: "internal", message: "boom", requestId: "r" } }), { status: 500 }),
+    })
+    const store = new DataSource({ client })
+    store.ensureFeaturesLoaded()
+    await settle()
+    store.ensureFeaturesLoaded()
+    store.ensureFeaturesLoaded()
+    await settle()
+    expect(calls.filter(c => c.path.startsWith("/v1/features")).length).toBe(1)
+    expect(store.getFeatures().status).toBe("error")
+  })
+
+  it("forced refresh still refetches a settled resource", async () => {
+    const { client, calls } = makeStack({
+      "/v1/health": () => ({ status: "ok" }),
+    })
+    const store = new DataSource({ client })
+    store.ensureHealthLoaded()
+    await settle()
+    store.refreshHealth()
+    await settle()
+    expect(calls.filter(c => c.path.startsWith("/v1/health")).length).toBe(2)
+  })
+})
