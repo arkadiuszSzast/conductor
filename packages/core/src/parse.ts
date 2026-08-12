@@ -46,6 +46,52 @@ const MAX_DEPTH = 64
 const INPUT_TYPES: readonly InputType[] = ["string", "number", "boolean"]
 const STEP_KINDS = ["agent", "command", "action", "human"] as const
 
+export interface YamlObjectParseError {
+  readonly message: string
+  readonly line: number
+  readonly col: number
+}
+
+export type ParseYamlObjectResult =
+  | { readonly ok: true; readonly value: unknown }
+  | { readonly ok: false; readonly errors: readonly YamlObjectParseError[] }
+
+/**
+ * Generic YAML → plain data, with the same safety posture as
+ * `parseWorkflow`: duplicate keys, multiple documents, anchors, aliases
+ * and custom tags are rejected, depth and size are bounded. The result
+ * is whatever the document contains (`null`, a scalar, an array or a
+ * plain object) — shape validation is the caller's job. Used by the CLI
+ * to load the daemon configuration file; `yaml` stays a core-owned
+ * dependency so no consumer needs it directly.
+ */
+export function parseYamlObject(source: string): ParseYamlObjectResult {
+  if (new TextEncoder().encode(source).length > MAX_SOURCE_LENGTH) {
+    return { ok: false, errors: [{ message: `document exceeds ${MAX_SOURCE_LENGTH} bytes`, line: 1, col: 1 }] }
+  }
+
+  const lineCounter = new LineCounter()
+  const doc = parseDocument(source, { lineCounter, prettyErrors: false, stringKeys: true, uniqueKeys: true })
+  const reader = new Reader(lineCounter)
+
+  for (const issue of [...doc.errors, ...doc.warnings]) {
+    reader.errorAtOffset(issue.pos[0], describeYamlIssue(issue.code, issue.message))
+  }
+  if (reader.errors.length > 0) return { ok: false, errors: reader.errors }
+
+  if (doc.contents === null) return { ok: true, value: null }
+
+  rejectUnsafeNodes(doc.contents, reader)
+  if (reader.errors.length > 0) return { ok: false, errors: reader.errors }
+
+  try {
+    const value = doc.toJS({ maxAliasCount: 0 })
+    return { ok: true, value }
+  } catch (error) {
+    return { ok: false, errors: [{ message: error instanceof Error ? error.message : String(error), line: 1, col: 1 }] }
+  }
+}
+
 export function parseWorkflow(source: string): ParseWorkflowResult {
   if (new TextEncoder().encode(source).length > MAX_SOURCE_LENGTH) {
     return { ok: false, errors: [{ message: `document exceeds ${MAX_SOURCE_LENGTH} bytes`, line: 1, col: 1 }] }

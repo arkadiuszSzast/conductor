@@ -22,6 +22,23 @@
 
 import { ApiClient, ApiError, type FetchLike, type TransitionView } from "./client.ts"
 import { resolveConnection, UsageError } from "./config.ts"
+import type { ApiConfig, DaemonConfig, DaemonLogEntry } from "@conductor/server"
+import { DAEMON_CONFIG_TEMPLATE, loadDaemonConfig } from "./daemon-config.ts"
+
+/** Input for the `startDaemon` port — one assembled daemon + api config. */
+export interface DaemonStartInput {
+  readonly daemon: DaemonConfig
+  readonly api: ApiConfig
+  /** Structured JSON log lines, `jsonLineLogger` shape. */
+  readonly log: (entry: DaemonLogEntry) => void
+}
+
+export interface DaemonProcessHandle {
+  /** Resolves once the daemon is ready; rejects on startup failure. */
+  readonly started: Promise<void>
+  /** Resolves with the process exit code once the daemon has stopped. */
+  readonly exited: Promise<number>
+}
 
 export interface CliDeps {
   readonly env: Readonly<Record<string, string | undefined>>
@@ -33,6 +50,15 @@ export interface CliDeps {
   readonly mkdir: (path: string) => void
   readonly cwd: () => string
   readonly fetchImpl?: FetchLike
+  /**
+   * Owns the real process for `conductor daemon`: instantiates `Daemon`,
+   * binds the API (`Bun.serve`), wires SIGINT/SIGTERM to a graceful stop
+   * and resolves `exited` with the exit code. Only `main.ts` provides the
+   * real implementation; tests inject a fake to drive the command without
+   * a socket. Optional so client-only harnesses need no daemon stub —
+   * the daemon command fails cleanly when absent.
+   */
+  readonly startDaemon?: (input: DaemonStartInput) => DaemonProcessHandle
 }
 
 export const EXIT = {
@@ -48,7 +74,7 @@ export const EXIT = {
 
 const USAGE = `usage: conductor [--url <url>] [--token <token>] [--config <path>] [--json] <command> [args]
 
-connection (required for every command except init; no default address):
+connection (required for every command except init and daemon; no default address):
   --url <url>          daemon API base URL (env: CONDUCTOR_URL)
   --token <token>      bearer token (env: CONDUCTOR_TOKEN)
   --config <path>      JSON config file {"url", "token"} (env: CONDUCTOR_CONFIG)
@@ -57,6 +83,12 @@ connection (required for every command except init; no default address):
 commands:
   init [--dir <path>] [--force]
                        scaffold <dir>/conductor.yaml (default: cwd)
+  daemon --config <path>
+                       run the daemon from a configuration file (YAML:
+                       databasePath, projects, bind, auth, ui, heartbeat,
+                       engine, actions)
+  daemon --init-config <path> [--force]
+                       write an example daemon config and exit
   start <title> --project <dir> [--description <text>] [--workflow <name>] [--pr <n>]
                        create a feature and start its pipeline
   status [<feature-id>] [--project <dir>] [--active]
@@ -89,6 +121,7 @@ const VALUE_FLAGS = new Set([
   "notes",
   "outcome",
   "verdict",
+  "init-config",
 ])
 
 interface Parsed {
@@ -225,6 +258,7 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
 
   try {
     if (parsed.command === "init") return commandInit(parsed, deps)
+    if (parsed.command === "daemon") return await commandDaemon(parsed, deps)
 
     const connection = resolveConnection({
       flags: {
@@ -292,6 +326,76 @@ function commandInit(parsed: Parsed, deps: CliDeps): number {
   deps.stdout(`Wrote ${configPath}`)
   deps.stdout("Register this project in the daemon's configuration, then: conductor start <title> --project <dir>")
   return EXIT.ok
+}
+
+async function commandDaemon(parsed: Parsed, deps: CliDeps): Promise<number> {
+  requireFlags(parsed, ["config", "init-config", "force"])
+  if (parsed.positionals.length > 0) throw new UsageError(`unexpected argument "${parsed.positionals[0]}"`)
+
+  const initPath = stringFlag(parsed, "init-config")
+  const configPath = stringFlag(parsed, "config")
+  if (initPath !== undefined) {
+    if (configPath !== undefined) throw new UsageError("--config and --init-config are mutually exclusive")
+    if (deps.exists(initPath) && !parsed.flags.has("force")) {
+      deps.stderr(`error: ${initPath} already exists (use --force to overwrite)`)
+      return EXIT.failure
+    }
+    const parent = parentPath(initPath)
+    if (parent !== "") deps.mkdir(parent)
+    deps.writeFile(initPath, DAEMON_CONFIG_TEMPLATE)
+    deps.stdout(`Wrote ${initPath}`)
+    deps.stdout("Start the daemon with: conductor daemon --config <path>")
+    return EXIT.ok
+  }
+
+  if (configPath === undefined) {
+    deps.stderr("error: conductor daemon requires --config <path> (or --init-config <path> to write an example)")
+    deps.stderr("The config file is explicit — there are no default paths, ports or auth modes.")
+    deps.stderr("Example: conductor daemon --init-config ./conductor-daemon.yaml && conductor daemon --config ./conductor-daemon.yaml")
+    return EXIT.usage
+  }
+
+  let source: string
+  try {
+    source = deps.readFile(configPath)
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    deps.stderr(`error: cannot read daemon config "${configPath}": ${reason}`)
+    return EXIT.usage
+  }
+
+  const { daemon, api } = loadDaemonConfig(source)
+
+  const log = (entry: DaemonLogEntry): void => {
+    const line = { level: entry.level, message: entry.message, ...(entry.fields ?? {}) }
+    deps.stdout(JSON.stringify(line))
+  }
+
+  if (api.auth.mode === "none") {
+    log({
+      level: "warn",
+      message: `API authentication is disabled (auth.mode: none) — the API is open on ${api.bind.host}:${api.bind.port}`,
+    })
+  }
+
+  if (deps.startDaemon === undefined) {
+    deps.stderr("error: this build cannot start a daemon (no daemon runtime wired)")
+    return EXIT.failure
+  }
+  const handle = deps.startDaemon({ daemon, api, log })
+  try {
+    await handle.started
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    deps.stderr(`error: daemon failed to start: ${reason}`)
+    return EXIT.failure
+  }
+  return await handle.exited
+}
+
+function parentPath(path: string): string {
+  const index = path.lastIndexOf("/")
+  return index <= 0 ? "" : path.slice(0, index)
 }
 
 function printFeature(

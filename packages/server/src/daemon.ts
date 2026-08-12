@@ -376,6 +376,18 @@ export class Daemon {
       return result.value
     }
     for (const diagnostic of result.diagnostics) this.logActionRegistryDiagnostic(diagnostic)
+    // The default bundled path resolves relative to this module — inside
+    // a compiled binary that directory does not exist on disk. Point the
+    // operator at the config field that restores it instead of leaving
+    // only a generic diagnostic.
+    if (this.config.actions?.bundledPath === undefined) {
+      this.log(
+        "warn",
+        "bundled action manifests are unavailable — workflows using \"action:\" steps will be invalid; " +
+          "set actions.bundledPath in the daemon config to a directory containing the manifests " +
+          "(e.g. a checkout's packages/server/actions) to restore them",
+      )
+    }
     return undefined
   }
 

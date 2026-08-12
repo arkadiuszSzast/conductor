@@ -29,8 +29,8 @@ export type {
   Value,
 } from "./expression.ts"
 export { DEFAULT_OUTCOME } from "./types.ts"
-export { parseWorkflow } from "./parse.ts"
-export type { ParseError, ParseWorkflowResult } from "./parse.ts"
+export { parseWorkflow, parseYamlObject } from "./parse.ts"
+export type { ParseError, ParseWorkflowResult, ParseYamlObjectResult, YamlObjectParseError } from "./parse.ts"
 export { validateWorkflow } from "./validate.ts"
 export {
   ACTION_CAPABILITIES,

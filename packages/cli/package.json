@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@conductor/core": "workspace:*",
     "@conductor/server": "workspace:*"
   }
 }
