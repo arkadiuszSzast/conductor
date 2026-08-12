@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { useApp } from "../app-context.ts"
 import { useCommand, useFeatureDetail } from "../api/hooks.ts"
 import { mapGateError, validateGateDecision, type GateAction, type GateDecision } from "./gate-logic.ts"
@@ -46,6 +46,16 @@ export function GateActions({ featureId, showChangeNoteInline = true }: GateActi
     [gatePrompt],
   )
   const [answers, setAnswers] = useState<readonly GateAnswer[]>([])
+
+  // Reset drafts when the feature or the gate's rendered prompt changes —
+  // the panel instance survives a board selection switch and a rerun
+  // re-arm, and stale answers must never be submittable against a
+  // different gate's questions.
+  useEffect(() => {
+    setAnswers([])
+    setNotes("")
+    setInlineError(null)
+  }, [featureId, gatePrompt])
 
   const setAnswer = (index: number, answer: GateAnswer): void => {
     setAnswers(previous => {
