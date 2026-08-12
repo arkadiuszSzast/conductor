@@ -21,6 +21,7 @@ import {
   type ApiServer,
 } from "@conductor/server"
 import { runCli, type DaemonProcessHandle, type DaemonStartInput } from "./cli.ts"
+import { uiDistStale, type UiDistFs } from "./ui-dist.ts"
 
 /**
  * The UI is a property of the artifact, never configuration. Resolution
@@ -36,8 +37,14 @@ function resolveUiRoot(log: DaemonStartInput["log"]): string | null {
 
   const repoRoot = resolve(import.meta.dirname, "../../..")
   const dist = resolve(repoRoot, "apps/web/dist")
-  const distFresh = existsSync(resolve(dist, "index.html")) && !uiDistStale(resolve(repoRoot, "apps/web"), dist)
-  if (distFresh) return dist
+  const stale = uiDistStale(uiDistFs, resolve(repoRoot, "apps/web"), dist, error =>
+    log({
+      level: "warn",
+      message: "ui staleness check failed — treating dist as fresh",
+      fields: { error: String(error) },
+    }),
+  )
+  if (existsSync(resolve(dist, "index.html")) && !stale) return dist
 
   const webPackage = resolve(repoRoot, "apps/web/package.json")
   if (existsSync(webPackage) && existsSync(resolve(repoRoot, "node_modules"))) {
@@ -63,40 +70,12 @@ function resolveUiRoot(log: DaemonStartInput["log"]): string | null {
   return null
 }
 
-/**
- * A checkout's dist is stale when any UI source file is newer than the
- * built index.html — `git pull` touches sources, not dist, so without
- * this check the daemon happily serves a build from before the fix the
- * user just pulled.
- */
-function uiDistStale(webRoot: string, dist: string): boolean {
-  const builtAt = statSync(resolve(dist, "index.html")).mtimeMs
-  const newerThanBuild = (dir: string): boolean => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const path = resolve(dir, entry.name)
-      if (entry.isDirectory()) {
-        if (newerThanBuild(path)) return true
-      } else if (statSync(path).mtimeMs > builtAt) {
-        return true
-      }
-    }
-    return false
-  }
-  try {
-    for (const probe of ["src", "index.html", "vite.config.ts"]) {
-      const path = resolve(webRoot, probe)
-      if (!existsSync(path)) continue
-      const stat = statSync(path)
-      if (stat.isDirectory()) {
-        if (newerThanBuild(path)) return true
-      } else if (stat.mtimeMs > builtAt) {
-        return true
-      }
-    }
-    return false
-  } catch {
-    return false
-  }
+const uiDistFs: UiDistFs = {
+  exists: existsSync,
+  mtimeMs: path => statSync(path).mtimeMs,
+  isDirectory: path => statSync(path).isDirectory(),
+  readdir: path => readdirSync(path),
+  join: (...parts) => resolve(...parts),
 }
 
 function startDaemon(input: DaemonStartInput): DaemonProcessHandle {
