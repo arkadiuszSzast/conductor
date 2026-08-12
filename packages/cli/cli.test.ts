@@ -1097,3 +1097,49 @@ auth:
     expect(h.out.some(line => line.includes("non-loopback"))).toBe(false)
   })
 })
+
+describe("CLI: loopback detection for the auth-none warning", () => {
+  const CONFIG_BASE = `
+databasePath: /db/state.db
+projects: []
+bind:
+  host: HOST_PLACEHOLDER
+  port: 4400
+auth:
+  mode: none
+`
+
+  async function warningFor(host: string): Promise<boolean> {
+    const files = new Map([["/daemon.yaml", CONFIG_BASE.replace("HOST_PLACEHOLDER", JSON.stringify(host))]])
+    const out: string[] = []
+    const deps: CliDeps = {
+      env: {},
+      stdout: line => out.push(line),
+      stderr: () => {},
+      readFile: path => files.get(path)!,
+      writeFile: () => {},
+      exists: path => files.has(path),
+      mkdir: () => {},
+      cwd: () => "/work",
+      startDaemon: () => ({ started: Promise.resolve(), exited: Promise.resolve(0) }),
+    }
+    await runCli(["daemon", "--config", "/daemon.yaml"], deps)
+    return out.some(line => line.includes("non-loopback"))
+  }
+
+  it.each([
+    ["127.0.0.1", false],
+    ["127.0.0.2", false],
+    ["localhost", false],
+    ["LOCALHOST", false],
+    ["::1", false],
+    ["[::1]", false],
+    ["0:0:0:0:0:0:0:1", false],
+    ["::ffff:127.0.0.1", false],
+    ["0.0.0.0", true],
+    ["192.168.1.50", true],
+    ["::", true],
+  ])("host %s → non-loopback warning: %p", async (host, expected) => {
+    expect(await warningFor(host as string)).toBe(expected as boolean)
+  })
+})

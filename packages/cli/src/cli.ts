@@ -524,7 +524,7 @@ async function commandDaemon(parsed: Parsed, deps: CliDeps): Promise<number> {
       level: "warn",
       message: `API authentication is disabled (auth.mode: none) — the API is open on ${api.bind.host}:${api.bind.port}`,
     })
-    if (api.bind.host !== "127.0.0.1" && api.bind.host !== "localhost" && api.bind.host !== "::1") {
+    if (!isLoopbackHost(api.bind.host)) {
       log({
         level: "warn",
         message: `auth.mode: none on a non-loopback bind (${api.bind.host}) — anyone on the network can drive this daemon; switch to auth.mode: bearer`,
@@ -550,6 +550,22 @@ async function commandDaemon(parsed: Parsed, deps: CliDeps): Promise<number> {
 function parentPath(path: string): string {
   const index = path.lastIndexOf("/")
   return index <= 0 ? "" : path.slice(0, index)
+}
+
+/**
+ * Loopback detection for the auth-none safety warning. Covers the whole
+ * 127.0.0.0/8 range, IPv6 loopback in expanded/bracketed forms, the
+ * IPv4-mapped IPv6 loopback and case-insensitive "localhost" — a false
+ * negative here silently defeats the warning.
+ */
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase().replace(/^\[|\]$/g, "")
+  if (normalized === "localhost") return true
+  if (normalized.startsWith("127.")) return true
+  const unmapped = normalized.startsWith("::ffff:") ? normalized.slice(7) : normalized
+  if (unmapped.startsWith("127.")) return true
+  const zeroStripped = unmapped.replace(/^(0+:)+/, "::").replace(/^::+/, "::")
+  return unmapped === "::1" || zeroStripped === "::1"
 }
 
 function printFeature(
