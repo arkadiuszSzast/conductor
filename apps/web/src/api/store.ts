@@ -60,6 +60,14 @@ const RECONNECT_BACKOFF_CAP_MS = 30_000
 const LOAD_RETRY_BASE_MS = 1_000
 const LOAD_RETRY_MAX_ATTEMPTS = 3
 
+/**
+ * The not-yet-loaded snapshot MUST be one stable reference: getSnapshot
+ * runs on every render, and useSyncExternalStore treats a fresh object
+ * as "the store changed" — a per-call literal makes React re-render in
+ * a loop and, under StrictMode's double render, blank the page.
+ */
+const EMPTY_RESOURCE = { status: "loading", data: null, error: null, version: 0 } as const
+
 export interface DataSourceInput {
   readonly client: ApiClient
   /** Base URL for the SSE stream, e.g. "/v1/events". */
@@ -126,23 +134,23 @@ export class DataSource {
   }
 
   getFeatureDetail(featureId: string): FeatureDetailState {
-    return this.details.get(featureId) ?? { status: "loading", data: null, error: null, version: 0 }
+    return this.details.get(featureId) ?? EMPTY_RESOURCE
   }
 
   getRuns(featureId: string): RunsState {
-    return this.runs.get(featureId) ?? { status: "loading", data: null, error: null, version: 0 }
+    return this.runs.get(featureId) ?? EMPTY_RESOURCE
   }
 
   getFindings(featureId: string): FindingsState {
-    return this.findings.get(featureId) ?? { status: "loading", data: null, error: null, version: 0 }
+    return this.findings.get(featureId) ?? EMPTY_RESOURCE
   }
 
   getTimeline(featureId: string): TimelineState {
-    return this.timelines.get(featureId) ?? { status: "loading", data: null, error: null, version: 0 }
+    return this.timelines.get(featureId) ?? EMPTY_RESOURCE
   }
 
   getWorkflow(projectDir: string): WorkflowResourceState {
-    return this.workflows.get(projectDir) ?? { status: "loading", data: null, error: null, version: 0 }
+    return this.workflows.get(projectDir) ?? EMPTY_RESOURCE
   }
 
   getHealth(): HealthState {

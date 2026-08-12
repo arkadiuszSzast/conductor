@@ -415,3 +415,21 @@ describe("invalidation store: retry timers are cancelled by stop()", () => {
     expect(calls.filter(c => c.path.startsWith("/v1/features")).length).toBe(1)
   })
 })
+
+describe("invalidation store: snapshot stability", () => {
+  it("the not-yet-loaded snapshot is one stable reference across getters and calls", () => {
+    const { client } = makeStack({})
+    const store = new DataSource({ client, setTimeoutFn: () => 0, clearTimeoutFn: () => {} })
+
+    // useSyncExternalStore compares snapshots by reference on EVERY
+    // render: a fresh `{status:"loading"}` literal per call is an
+    // infinite re-render loop (and a blank page) for any component that
+    // reads a resource before it loads.
+    expect(store.getFeatureDetail("nope")).toBe(store.getFeatureDetail("nope"))
+    expect(store.getRuns("nope")).toBe(store.getRuns("nope"))
+    expect(store.getFindings("nope")).toBe(store.getFindings("nope"))
+    expect(store.getTimeline("nope")).toBe(store.getTimeline("nope"))
+    expect(store.getWorkflow("/some/dir")).toBe(store.getWorkflow("/other/dir"))
+    expect(store.getFeatureDetail("a")).toBe(store.getRuns("b") as unknown)
+  })
+})
