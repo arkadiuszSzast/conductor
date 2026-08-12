@@ -37,31 +37,31 @@ bun install
 cd packages/cli && bun link && cd ../..   # global `conductor` (or: bun run build:binary → dist/conductor)
 ```
 
-**1. Configure and start the daemon.** One YAML file is the single source of
-truth — there are no default paths, ports or auth modes:
+**1. Start the daemon.** Zero config needed — on first run it generates
+its config at `~/.config/conductor/daemon.yaml` (XDG-aware) with working
+defaults (loopback bind `127.0.0.1:4400`, database under
+`~/.local/share/conductor`, open auth on loopback with a logged warning):
 
 ```sh
-conductor daemon --init-config ~/conductor-daemon.yaml   # annotated example
-$EDITOR ~/conductor-daemon.yaml                          # databasePath, projects, bind, auth
-conductor daemon --config ~/conductor-daemon.yaml        # JSON logs on stdout; /v1/readyz → 200
+conductor daemon          # JSON logs on stdout; /v1/readyz → 200
 ```
 
+Operators who want full control: `conductor daemon --config <path>`
+(explicit file, never generated). Edit the generated file and restart to
+change bind/auth/anything.
+
 **2. Adopt a project.** Each project carries its own workflow file,
-GHA-style:
+GHA-style. `init` scaffolds it **and** registers the project with the
+daemon (config + live API registration, no restart):
 
 ```sh
 cd /path/to/my-project
-conductor init            # scaffolds conductor.yaml (roles, steps, human gate)
-# add /path/to/my-project to `projects:` in the daemon config, restart the daemon
+conductor init            # scaffold conductor.yaml + register the project
 ```
 
-**3. Point the CLI at the daemon.** Every command except `init`/`daemon`
-needs an explicit address:
-
-```sh
-export CONDUCTOR_URL=http://127.0.0.1:4400
-export CONDUCTOR_TOKEN=change-me          # only for auth.mode: bearer
-```
+**3. CLI connection.** On the daemon's machine nothing to configure — the
+CLI reads the daemon's own config for address and token. For a remote
+daemon: `export CONDUCTOR_URL=http://<host>:<port>` (+ `CONDUCTOR_TOKEN`).
 
 **4. Connect a runner** (executes `agent:` steps — without one, gates and
 the API still work but agent steps wait). The opencode adapter is configured
