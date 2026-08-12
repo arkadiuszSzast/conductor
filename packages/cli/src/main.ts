@@ -10,7 +10,7 @@
  * SIGINT/SIGTERM → graceful stop. A second signal forces exit.
  */
 
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs"
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs"
 import { dirname, resolve } from "node:path"
 import { spawnSync } from "node:child_process"
 import {
@@ -36,11 +36,12 @@ function resolveUiRoot(log: DaemonStartInput["log"]): string | null {
 
   const repoRoot = resolve(import.meta.dirname, "../../..")
   const dist = resolve(repoRoot, "apps/web/dist")
-  if (existsSync(resolve(dist, "index.html"))) return dist
+  const distFresh = existsSync(resolve(dist, "index.html")) && !uiDistStale(resolve(repoRoot, "apps/web"), dist)
+  if (distFresh) return dist
 
   const webPackage = resolve(repoRoot, "apps/web/package.json")
   if (existsSync(webPackage) && existsSync(resolve(repoRoot, "node_modules"))) {
-    log({ level: "info", message: "building web ui (first run from this checkout)..." })
+    log({ level: "info", message: "building web ui..." })
     const build = spawnSync("bun", ["run", "--cwd", resolve(repoRoot, "apps/web"), "build:vite"], {
       stdio: "ignore",
       timeout: 300_000,
@@ -49,12 +50,53 @@ function resolveUiRoot(log: DaemonStartInput["log"]): string | null {
       log({ level: "info", message: "web ui built", fields: { dist } })
       return dist
     }
+    if (existsSync(resolve(dist, "index.html"))) {
+      log({ level: "warn", message: "web ui build failed — serving the previous (stale) build" })
+      return dist
+    }
     log({ level: "warn", message: "web ui build failed — continuing without UI" })
     return null
   }
 
+  if (existsSync(resolve(dist, "index.html"))) return dist
   log({ level: "info", message: "no web ui in this artifact — API only" })
   return null
+}
+
+/**
+ * A checkout's dist is stale when any UI source file is newer than the
+ * built index.html — `git pull` touches sources, not dist, so without
+ * this check the daemon happily serves a build from before the fix the
+ * user just pulled.
+ */
+function uiDistStale(webRoot: string, dist: string): boolean {
+  const builtAt = statSync(resolve(dist, "index.html")).mtimeMs
+  const newerThanBuild = (dir: string): boolean => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = resolve(dir, entry.name)
+      if (entry.isDirectory()) {
+        if (newerThanBuild(path)) return true
+      } else if (statSync(path).mtimeMs > builtAt) {
+        return true
+      }
+    }
+    return false
+  }
+  try {
+    for (const probe of ["src", "index.html", "vite.config.ts"]) {
+      const path = resolve(webRoot, probe)
+      if (!existsSync(path)) continue
+      const stat = statSync(path)
+      if (stat.isDirectory()) {
+        if (newerThanBuild(path)) return true
+      } else if (stat.mtimeMs > builtAt) {
+        return true
+      }
+    }
+    return false
+  } catch {
+    return false
+  }
 }
 
 function startDaemon(input: DaemonStartInput): DaemonProcessHandle {
