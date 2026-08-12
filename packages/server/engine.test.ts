@@ -1232,3 +1232,61 @@ describe("Engine: interactive steps (ask/answer)", () => {
     expect(store.getFeature(feature.id)!.status).toBe("running")
   })
 })
+
+describe("Engine: interactive steps — review findings (PR #35)", () => {
+  it("two racing answers deliver the prompt exactly once; the loser gets no_pending_question", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, ask: "Which storage?" })
+    const promptsBefore = sessions.prompts.length
+
+    const [first, second] = await Promise.all([
+      engine.answer(run.id, "SQLite"),
+      engine.answer(run.id, "Postgres"),
+    ])
+    const outcomes = [first, second]
+    expect(outcomes.filter(r => r.ok).length).toBe(1)
+    const loser = outcomes.find(r => !r.ok)!
+    if (!loser.ok) expect(loser.code).toBe("no_pending_question")
+    expect(sessions.prompts.length).toBe(promptsBefore + 1)
+    expect(store.getFeature(feature.id)!.status).toBe("running")
+  })
+
+  it("a serial duplicate answer is rejected without re-sending the prompt", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, ask: "Q" })
+
+    expect((await engine.answer(run.id, "A")).ok).toBe(true)
+    const promptsAfterFirst = sessions.prompts.length
+    const duplicate = await engine.answer(run.id, "A again")
+    expect(duplicate.ok).toBe(false)
+    if (!duplicate.ok) expect(duplicate.code).toBe("no_pending_question")
+    expect(sessions.prompts.length).toBe(promptsAfterFirst)
+  })
+
+  it("pause then resume during an ask never dispatches a second run for the step", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, ask: "Still deciding?" })
+
+    await engine.pause(feature.id)
+    await engine.resume(feature.id)
+
+    const active = store.listActiveRuns(feature.id)
+    expect(active.length).toBe(1)
+    expect(active[0]!.id).toBe(run.id)
+    expect(active[0]!.pendingQuestion).toBe("Still deciding?")
+
+    // The reconciler re-parks the feature so the question resurfaces.
+    await engine.reconcile()
+    expect(store.getFeature(feature.id)!.status).toBe("waiting_human")
+
+    const answered = await engine.answer(run.id, "Answered after resume")
+    expect(answered.ok).toBe(true)
+    expect(sessions.prompts.at(-1)!.sessionID).toBe(run.sessionId!)
+  })
+})

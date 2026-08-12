@@ -179,6 +179,17 @@ export class Engine {
           })
           return
         }
+        // One active run per job+step is an invariant: resume re-arms a
+        // running agent step (onResumed cannot know a run is live — e.g.
+        // mid-question on an interactive step), and dispatching a second
+        // run would orphan the first's session and its context.
+        const already = this.deps.store.getActiveRunForStep(featureId, decision.jobId, decision.stepId)
+        if (already) {
+          this.deps.log.log(
+            `feature=${featureId}: step "${decision.jobId}/${decision.stepId}" already has active run ${already.id} — skipping duplicate dispatch`,
+          )
+          return
+        }
         if (step.type === "agent") return this.executeAgent(featureId, snapshot, decision.jobId, step)
         if (step.type === "command") return this.executeCommand(featureId, snapshot, decision.jobId, step)
         if (step.type === "action") return this.executeAction(featureId, snapshot, decision.jobId, step)
@@ -585,20 +596,31 @@ export class Engine {
     const { store, log } = this.deps
     const run = store.getRunById(runId)
     if (!run) return { ok: false, code: "unknown_run", message: `Unknown run_id "${runId}".` }
-    if (run.status !== "running" || run.pendingQuestion === null) {
+
+    // Claim first, act after — the same discipline as concludeAndDispatch.
+    // clearRunQuestion is a guarded transaction (`status = 'running' AND
+    // pending_question IS NOT NULL`), so of two racing answers exactly one
+    // wins; the loser maps to the same conflict as answering a non-asking
+    // run and never re-sends the prompt into the session.
+    if (!store.clearRunQuestion(runId)) {
       return { ok: false, code: "no_pending_question", message: `Run "${runId}" has no pending question.` }
     }
 
-    const sessionAlive = run.sessionId !== null && (await this.deps.sessions.status(run.sessionId)) !== "missing"
-    if (!sessionAlive) {
-      const reason = `session ${run.sessionId ?? "(none)"} was lost while waiting for a human answer`
+    const failStep = async (reason: string, message: string): Promise<{ ok: false; code: "session_lost"; message: string }> => {
       log.log(`answer ${runId}: ${reason} — failing the step`)
-      store.clearRunQuestion(runId)
       await this.concludeAndDispatch(
         run.featureId, runId, "failed", { reason },
         { kind: "step.failed", jobId: run.jobId, stepId: run.stepId, reason },
       )
-      return { ok: false, code: "session_lost", message: `The run's session is gone — step "${run.stepId}" failed and normal failure routing applies.` }
+      return { ok: false, code: "session_lost", message }
+    }
+
+    const sessionAlive = run.sessionId !== null && (await this.deps.sessions.status(run.sessionId)) !== "missing"
+    if (!sessionAlive) {
+      return failStep(
+        `session ${run.sessionId ?? "(none)"} was lost while waiting for a human answer`,
+        `The run's session is gone — step "${run.stepId}" failed and normal failure routing applies.`,
+      )
     }
 
     try {
@@ -610,17 +632,12 @@ export class Engine {
           `run_id="${runId}" with the appropriate outcome when done (or ask again if a further decision is needed).`,
       })
     } catch (err) {
-      const reason = `failed to deliver the answer to session ${run.sessionId}: ${errorMessage(err)}`
-      log.log(`answer ${runId}: ${reason}`)
-      store.clearRunQuestion(runId)
-      await this.concludeAndDispatch(
-        run.featureId, runId, "failed", { reason },
-        { kind: "step.failed", jobId: run.jobId, stepId: run.stepId, reason },
+      return failStep(
+        `failed to deliver the answer to session ${run.sessionId}: ${errorMessage(err)}`,
+        `Delivering the answer failed — step "${run.stepId}" failed and normal failure routing applies.`,
       )
-      return { ok: false, code: "session_lost", message: `Delivering the answer failed — step "${run.stepId}" failed and normal failure routing applies.` }
     }
 
-    store.clearRunQuestion(runId)
     this.idleCycles.delete(runId)
     const after = store.getFeature(run.featureId)
     return { ok: true, message: `Answer delivered to step "${run.stepId}". Feature is now: ${after?.status ?? "running"}.` }
@@ -834,6 +851,12 @@ export class Engine {
     // idle reaping. The TTL below still bounds an abandoned question.
     if (active.pendingQuestion != null) {
       this.idleCycles.delete(active.id)
+      // A pause/resume cycle rewrites feature.status to `running` without
+      // knowing about the pending question — re-park so the answering
+      // surfaces reappear instead of the question silently aging out.
+      if (feature.status === "running") {
+        this.deps.store.setRunQuestion(active.id, active.pendingQuestion)
+      }
       await this.reconcileTtl(feature, snapshot, active)
       return
     }
