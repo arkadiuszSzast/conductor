@@ -26,5 +26,5 @@
 
 ## 5. Verification
 
-- [ ] 5.1 [test] `bun test && bun run typecheck && bun run lint` all green.
-- [ ] 5.2 [review] Grep new code for host-specific paths (`$HOME`, `homedir`, hardcoded paths) and opencode SDK imports outside `packages/runner-opencode`; run the manual smoke test (binary build, `--init-config`, temp project, daemon up + `/v1/readyz` 200, `status --url`, SIGINT graceful stop, exit 0) and paste results into the PR description.
+- [x] 5.1 [test] `bun test && bun run typecheck && bun run lint` all green.
+- [x] 5.2 [review] Grep new code for host-specific paths (`$HOME`, `homedir`, hardcoded paths) and opencode SDK imports outside `packages/runner-opencode`; run the manual smoke test (binary build, `--init-config`, temp project, daemon up + `/v1/readyz` 200, `status --url`, SIGINT graceful stop, exit 0) and paste results into the PR description.
