@@ -13,7 +13,8 @@
     "typecheck": "tsc --noEmit && bun run --cwd apps/web typecheck",
     "test": "bun test",
     "lint": "tsc --noEmit --noUnusedLocals && bun run --cwd apps/web lint",
-    "build": "bun run typecheck && bun run --cwd apps/web build:vite"
+    "build": "bun run typecheck && bun run --cwd apps/web build:vite",
+    "build:binary": "bun build --compile packages/cli/src/main.ts --outfile dist/conductor"
   },
   "engines": {
     "node": ">=24",
