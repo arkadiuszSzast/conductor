@@ -329,6 +329,7 @@ export class Daemon {
         clock: this.clock,
         log: engineLogger,
         actions: actionHost,
+        runnerAvailable: this.deps.runnerAvailability ?? (() => true),
         ...(this.deps.notify !== undefined ? { notify: this.deps.notify } : {}),
       },
       this.config.engine ?? {},

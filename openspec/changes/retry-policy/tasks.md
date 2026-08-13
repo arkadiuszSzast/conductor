@@ -15,8 +15,8 @@
 ## 3. Engine recovery and pause barrier
 
 - [ ] 3.1 [server] Map command, action, workflow-registry, runner and internal engine failures into the shared envelope; catch thrown execution-boundary failures.
-- [ ] 3.2 [server] Enter resource wait before creating a run when required infrastructure is unavailable and auto-dispatch when it returns.
-- [ ] 3.3 [server] Implement finite resource observation, deadline escalation and early wake-up from availability changes.
+- [x] 3.2 [server] Enter resource wait before creating a run when required infrastructure is unavailable and auto-dispatch when it returns.
+- [x] 3.3 [server] Implement finite resource observation, deadline escalation and early wake-up from availability changes.
 - [ ] 3.4 [server] Make pause block dispatch, due-work claims, action observation, nudge/reap and downstream outbox effects while preserving late conclusions.
 - [ ] 3.5 [server] Detect and repair or escalate stranded active features during reconciliation, including legacy all-terminal `running` records.
 - [ ] 3.6 [test] Simulate absent runner at submission, runner return, prolonged outage, daemon restart, pause/report races and deterministic immediate failure.

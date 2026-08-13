@@ -266,6 +266,55 @@ async function startedFeature(engine: Engine, projectDir = "/tmp/project") {
 
 // ---------------------------------------------------------------------------
 
+describe("Engine: runner resource waits", () => {
+  it("waits without creating a run and dispatches once when a runner returns", async () => {
+    let available = false
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => available })
+    const feature = await startedFeature(engine)
+
+    expect(store.listRuns(feature.id)).toHaveLength(0)
+    expect(store.listResourceWaits(feature.id)).toHaveLength(1)
+    expect(store.listResourceWaits(feature.id)[0]?.status).toBe("waiting")
+
+    available = true
+    clock.advance(5_000)
+    await engine.reconcile()
+    await engine.reconcile()
+
+    expect(store.listRuns(feature.id)).toHaveLength(1)
+    expect(sessions.prompts).toHaveLength(1)
+    expect(store.listResourceWaits(feature.id)[0]?.status).toBe("closed")
+  })
+
+  it("persists the wait across engine recreation and escalates after its deadline", async () => {
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => false })
+    const feature = await startedFeature(engine)
+    expect(store.listRuns(feature.id)).toHaveLength(0)
+
+    clock.advance(3_600_000)
+    const restarted = makeEngine(linearWorkflow, {}, { runnerAvailable: () => false })
+    await restarted.reconcile()
+
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    expect(store.listRuns(feature.id)).toHaveLength(0)
+    expect(store.listResourceWaits(feature.id)[0]?.closedReason).toBe("deadline_exhausted")
+  })
+
+  it("does not dispatch a satisfiable wait while paused", async () => {
+    let available = false
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => available })
+    const feature = await startedFeature(engine)
+    await engine.pause(feature.id)
+    available = true
+    clock.advance(5_000)
+
+    await engine.reconcile()
+
+    expect(store.listRuns(feature.id)).toHaveLength(0)
+    expect(store.listResourceWaits(feature.id)[0]?.status).toBe("waiting")
+  })
+})
+
 describe("Engine: linear happy path", () => {
   it("agent → command → human gate → approve → done", async () => {
     const engine = makeEngine(linearWorkflow)

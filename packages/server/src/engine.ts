@@ -50,6 +50,8 @@ import type { ResolvedActionBinding } from "./workflow-reservation.ts"
 const DEFAULT_RUN_TTL_MS = 3_600_000
 const DEFAULT_NUDGE_IDLE_CYCLES = 2
 const DEFAULT_MAX_NUDGES = 2
+const DEFAULT_RESOURCE_WAIT_OBSERVATION_MS = 5_000
+const DEFAULT_RESOURCE_WAIT_DEADLINE_MS = 3_600_000
 
 export interface EngineDeps {
   readonly store: Store
@@ -59,6 +61,7 @@ export interface EngineDeps {
   readonly clock: Clock
   readonly log: Logger
   readonly actions: ActionExecutor
+  readonly runnerAvailable?: () => boolean
   readonly notify?: (title: string, message: string) => void
 }
 
@@ -255,6 +258,22 @@ export class Engine {
     const role = snapshot.workflow.roles[step.role]
     if (!role) {
       await this.dispatch(featureId, { kind: "step.failed", jobId, stepId: step.id, reason: `role "${step.role}" not configured` })
+      return
+    }
+
+    if (this.deps.runnerAvailable?.() === false) {
+      const now = this.deps.clock.now()
+      store.upsertResourceWait({
+        featureId,
+        jobId,
+        stepId: step.id,
+        reason: "runner_unavailable",
+        observedAt: now,
+        nextObservationAt: now + DEFAULT_RESOURCE_WAIT_OBSERVATION_MS,
+        deadlineAt: now + DEFAULT_RESOURCE_WAIT_DEADLINE_MS,
+        diagnostic: "no runner registered with the daemon",
+      })
+      log.log(`feature=${state.slug} step=${jobId}/${step.id}: waiting for a runner`)
       return
     }
 
@@ -738,6 +757,39 @@ export class Engine {
     const { store, log, clock } = this.deps
     const snapshot = this.deps.workflows(input.projectDir)
     if (!snapshot) return
+
+    if (input.status === "paused") return
+
+    const waits = store.listResourceWaits(input.id).filter(wait => wait.status === "waiting")
+    for (const wait of waits) {
+      if (wait.deadlineAt <= clock.now()) {
+        const claimed = store.claimResourceWait(wait.id, clock.now())
+        if (!claimed) continue
+        store.closeResourceWait(wait.id, "deadline_exhausted")
+        await this.dispatch(input.id, {
+          kind: "step.failed",
+          jobId: wait.jobId,
+          stepId: wait.stepId,
+          reason: `${wait.reason} deadline exhausted: ${wait.diagnostic ?? "required resource unavailable"}`,
+        })
+        continue
+      }
+      if (this.deps.runnerAvailable?.() !== true || wait.nextObservationAt === null || wait.nextObservationAt > clock.now()) continue
+      const claimed = store.claimResourceWait(wait.id, clock.now())
+      if (!claimed) continue
+      store.closeResourceWait(wait.id, "resource_available")
+      const step = findStep(snapshot.workflow, wait.jobId, wait.stepId)
+      if (!step || step.type !== "agent") {
+        await this.dispatch(input.id, {
+          kind: "step.failed",
+          jobId: wait.jobId,
+          stepId: wait.stepId,
+          reason: `resource wait target "${wait.jobId}/${wait.stepId}" is no longer an agent step`,
+        })
+        continue
+      }
+      await this.executeAgent(input.id, snapshot, wait.jobId, step)
+    }
 
     // Restart recovery runs FIRST, unconditionally: decisions committed
     // by `concludeRun` but never acted on (process died in the gap) must
