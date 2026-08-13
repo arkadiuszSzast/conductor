@@ -585,25 +585,30 @@ function onJobFailed(
   // `propagate` only walks the failed job's dependents, so unrelated jobs are
   // invisible to it. Mirror `onJobComplete`'s all-jobs check before deciding
   // the failure is the end of the road.
-  const anyOtherActive = Object.keys(workflow.jobs).some(jobId => {
-    if (jobId === failedJobId) return false
+  const allTerminal = Object.keys(workflow.jobs).every(jobId => {
+    if (jobId === failedJobId) return true
     const patched = cascade.jobPatches[jobId]?.status
-    if (patched) return patched !== "skipped" && patched !== "succeeded"
+    if (patched) return patched === "skipped" || patched === "succeeded"
     const current = state.jobs[jobId]?.status ?? "pending"
-    return current !== "succeeded" && current !== "failed" && current !== "skipped"
+    return current === "succeeded" || current === "failed" || current === "skipped"
   })
 
-  if (cascade.decisions.length === 0) {
-    if (anyOtherActive) {
-      return buildTransition(
-        [{ kind: "noop", reason: `job "${failedJobId}" failed, other jobs still active` }],
-        patch,
-      )
-    }
-    // Nothing left to run anywhere: the failure is the end of the road.
+  // Nothing left to run anywhere: the failure is the end of the road. This
+  // must hold even when the cascade still produced skip_job decisions — a
+  // failure that skips every dependent (a parallel fan-out whose last branch
+  // died, dependents gated on all branches) would otherwise leave the feature
+  // hanging in "running" with every job terminal.
+  if (allTerminal) {
     return buildTransition(
-      [{ kind: "escalate", reason }],
+      [...cascade.decisions, { kind: "escalate", reason }],
       mergePatches(patch, { status: "escalated" }),
+    )
+  }
+
+  if (cascade.decisions.length === 0) {
+    return buildTransition(
+      [{ kind: "noop", reason: `job "${failedJobId}" failed, other jobs still active` }],
+      patch,
     )
   }
 
