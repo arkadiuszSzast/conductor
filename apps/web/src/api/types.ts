@@ -68,15 +68,29 @@ export interface Feedback {
   readonly message: string
 }
 
+export interface FeatureActivity {
+  readonly state: "active" | "waiting_retry" | "blocked" | "waiting_human" | "paused" | "escalated" | "terminal"
+  readonly activeCount: number
+  readonly targets: readonly { readonly jobId: string; readonly stepId: string }[]
+  readonly target: { readonly jobId: string; readonly stepId: string } | null
+  readonly reason: string | null
+  readonly diagnostic: string | null
+  readonly nextAt: number | null
+  readonly deadlineAt: number | null
+  readonly message: string
+}
+
 export interface FeatureDetail extends FeatureBase {
   readonly workflowRef: { readonly name: string; readonly stale: boolean } | null
   readonly feedback: Feedback | null
   readonly jobs: Readonly<Record<string, JobRuntimeProjection>>
+  readonly activity?: FeatureActivity
 }
 
 export interface FeatureDetailResponse {
   readonly feature: FeatureDetail
   readonly activeRun: RunSummary | null
+  readonly activeRuns?: readonly RunSummary[]
 }
 
 export interface RunSummary {

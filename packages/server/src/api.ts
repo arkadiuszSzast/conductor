@@ -354,9 +354,62 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     const record = store.getFeatureRecord(featureId)
     if (!record) return null
     const feature = record.state
+    const activeRuns = store.listActiveRuns(featureId)
+    const openWait = store.listResourceWaits(featureId).find(wait => wait.status !== "closed")
+    const openRetry = store.listRetryEpisodes(featureId).find(episode => episode.status !== "closed")
+    const activity = openWait
+      ? {
+          state: "blocked",
+          activeCount: activeRuns.length,
+          targets: activeRuns.map(run => ({ jobId: run.jobId, stepId: run.stepId })),
+          target: { jobId: openWait.jobId, stepId: openWait.stepId },
+          reason: openWait.reason,
+          diagnostic: openWait.diagnostic,
+          nextAt: openWait.nextObservationAt,
+          deadlineAt: openWait.deadlineAt,
+          message: activeRuns.length === 0 ? "No agent is active — waiting for a runner." : "Waiting for a runner.",
+        }
+      : openRetry
+        ? {
+            state: "waiting_retry",
+            activeCount: activeRuns.length,
+            targets: activeRuns.map(run => ({ jobId: run.jobId, stepId: run.stepId })),
+            target: { jobId: openRetry.jobId, stepId: openRetry.stepId },
+            reason: openRetry.lastFailure?.class ?? null,
+            diagnostic: openRetry.lastFailure?.diagnostic ?? null,
+            nextAt: openRetry.nextAttemptAt,
+            deadlineAt: openRetry.startedAt + openRetry.maxElapsedMs,
+            message: "No agent is active — waiting for the next retry.",
+          }
+        : {
+            state: feature.status === "waiting_human"
+              ? "waiting_human"
+              : feature.status === "paused"
+                ? "paused"
+                : feature.status === "escalated"
+                  ? "escalated"
+                  : feature.status === "done" || feature.status === "abandoned"
+                    ? "terminal"
+                    : "active",
+            activeCount: activeRuns.length,
+            targets: activeRuns.map(run => ({ jobId: run.jobId, stepId: run.stepId })),
+            target: null,
+            reason: null,
+            diagnostic: feature.status === "running" && activeRuns.length === 0 ? "No active agent or run is currently recorded." : null,
+            nextAt: null,
+            deadlineAt: null,
+            message: feature.status === "running" && activeRuns.length === 0
+              ? "No agent is active — orchestration is between steps or stalled."
+              : activeRuns.length > 0
+                ? `${activeRuns.length} active run${activeRuns.length === 1 ? "" : "s"}.`
+                : feature.status === "escalated"
+                  ? "Automation stopped and needs recovery."
+                  : `Feature is ${feature.status}.`,
+          }
     return {
       feature: {
         ...feature,
+        activity,
         escalation: store.getEscalation(featureId),
         currentStep: currentStepOf(feature),
         createdAt: record.createdAt,
@@ -366,6 +419,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         jobs: jobsDetail(feature, store.newestRunIdsByStep(featureId)),
       },
       activeRun: activeRunProjection(featureId),
+      activeRuns,
     }
   }
 

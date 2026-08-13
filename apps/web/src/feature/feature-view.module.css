@@ -40,6 +40,24 @@
   display: inline-flex;
   gap: 8px;
 }
+.activity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.activity strong {
+  color: var(--text);
+  text-transform: uppercase;
+}
+.activity_blocked, .activity_waiting_retry { border-color: var(--amber); }
+.activity_escalated { border-color: var(--red); }
+.activity_active strong { color: var(--blue); }
 .grid {
   display: flex;
   gap: 12px;

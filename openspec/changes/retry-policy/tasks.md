@@ -24,7 +24,7 @@
 ## 4. Operator recovery and visibility
 
 - [ ] 4.1 [server] Add status/version-guarded recover API with target, required note, idempotency key and finite default/override budget.
-- [ ] 4.2 [server] Project authoritative activity, active runs, block/failure cause, retry/wait budget, next timestamp, recoverability and allowed commands.
+- [x] 4.2 [server] Project authoritative activity, active runs, block/failure cause, retry/wait budget, next timestamp, recoverability and allowed commands.
 - [ ] 4.3 [cli] Add recover command and display active/waiting/blocked/escalated state with budget and diagnostics.
 - [ ] 4.4 [web] Show whether agents are active, waiting for retry/resource, paused or stopped; add direct Recover control for recoverable escalations.
 - [ ] 4.5 [test] Add API/CLI/UI contract tests for stale recovery rejection, idempotency, visibility and no false `running` indication.
