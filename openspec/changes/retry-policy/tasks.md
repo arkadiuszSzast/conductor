@@ -8,9 +8,9 @@
 ## 2. Pure scheduling and durable state
 
 - [x] 2.1 [core] Implement overflow-safe backoff, bounded jitter, retry-hint clamping, elapsed-budget and pause-time calculations with injected clock/random.
-- [ ] 2.2 [db] Add additive failure metadata, retry/resource-wait episode/history, pause accounting and due-work indexes.
-- [ ] 2.3 [db][server] Atomically persist attempt conclusion plus schedule, claim due retry/wait work and enforce one active attempt per target.
-- [ ] 2.4 [test][db] Cover crash boundaries, restart before/after due time, resource-wait persistence, clock skew and concurrent claim races.
+- [x] 2.2 [db] Add additive failure metadata, retry/resource-wait episode/history, pause accounting and due-work indexes.
+- [x] 2.3 [db][server] Atomically persist attempt conclusion plus schedule, claim due retry/wait work and enforce one active attempt per target.
+- [x] 2.4 [test][db] Cover crash boundaries, restart before/after due time, resource-wait persistence, clock skew and concurrent claim races.
 
 ## 3. Engine recovery and pause barrier
 

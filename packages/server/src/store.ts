@@ -2,7 +2,18 @@ import { randomUUID } from "node:crypto"
 import type { Database } from "./database.ts"
 import { applyPatch, initialFeatureState } from "./state.ts"
 import type { CreateFeatureInput } from "./state.ts"
-import type { Decision, Feedback, FeatureState, FeatureStatus, PipelineEvent, Transition } from "@conductor/core"
+import { accumulatePausedMs } from "@conductor/core"
+import type {
+  Decision,
+  FailureClass,
+  FailureEnvelope,
+  Feedback,
+  FeatureState,
+  FeatureStatus,
+  PipelineEvent,
+  ResourceReason,
+  Transition,
+} from "@conductor/core"
 
 /**
  * Post-commit change notification — the invalidation signal the API's
@@ -27,6 +38,8 @@ interface FeatureRow {
   escalation: string | null
   state: string
   feedback: string | null
+  paused_at: number | null
+  paused_ms: number
   time_created: number
   time_updated: number
 }
@@ -49,6 +62,19 @@ export interface FeatureRecord {
 
 function toFeatureRecord(row: FeatureRow): FeatureRecord {
   return { state: toFeatureState(row), createdAt: row.time_created, updatedAt: row.time_updated }
+}
+
+/** Pause-time accounting row (design.md: "budget clocks store accumulated
+ *  paused duration") — lives outside `FeatureState`, same as escalation. */
+export interface PauseAccounting {
+  /** Set the instant the feature entered `paused`; null while not paused. */
+  readonly pausedAt: number | null
+  /** Total ms accumulated across every CLOSED pause span so far. */
+  readonly pausedMs: number
+}
+
+function toPauseAccounting(row: { paused_at: number | null; paused_ms: number }): PauseAccounting {
+  return { pausedAt: row.paused_at, pausedMs: row.paused_ms }
 }
 
 export interface FeatureFilter {
@@ -92,6 +118,9 @@ interface RunRow {
   next_observation: number | null
   pending_question: string | null
   asked_at: number | null
+  failure_class: FailureClass | null
+  failure_source: string | null
+  failure_retry_hint_ms: number | null
   time_started: number
   time_finished: number | null
 }
@@ -125,6 +154,10 @@ export interface RunSummary {
   /** Question an interactive agent run asked; null when not waiting for an answer. */
   readonly pendingQuestion: string | null
   readonly askedAt: number | null
+  /** The classified failure envelope this run concluded with, if any —
+   *  null for a run that succeeded, is still running, or concluded
+   *  before the retry-policy failure taxonomy existed. */
+  readonly failure: FailureEnvelope | null
   readonly timeStarted: number
   readonly timeFinished: number | null
 }
@@ -147,8 +180,24 @@ function toRunSummary(row: RunRow): RunSummary {
     nextObservation: row.next_observation,
     pendingQuestion: row.pending_question,
     askedAt: row.asked_at,
+    failure: toFailureEnvelope(row.failure_class, row.failure_source, row.reason, row.failure_retry_hint_ms),
     timeStarted: row.time_started,
     timeFinished: row.time_finished,
+  }
+}
+
+function toFailureEnvelope(
+  failureClass: FailureClass | null,
+  source: string | null,
+  diagnostic: string | null,
+  retryHintMs: number | null,
+): FailureEnvelope | null {
+  if (failureClass === null || source === null) return null
+  return {
+    class: failureClass,
+    diagnostic: diagnostic ?? "",
+    source,
+    ...(retryHintMs !== null ? { retryHintMs } : {}),
   }
 }
 
@@ -204,6 +253,165 @@ export interface FindingView {
   readonly resolution: string | null
   readonly threadId: string | null
   readonly synced: boolean
+}
+
+// --------------------------------------------------------------- retry episodes
+
+export type RetryEpisodeStatus = "scheduled" | "claimed" | "closed"
+
+interface RetryEpisodeRow {
+  id: string
+  feature_id: string
+  job_id: string
+  step_id: string
+  status: RetryEpisodeStatus
+  attempts: number
+  started_at: number
+  paused_ms: number
+  next_attempt_at: number | null
+  delay_ms: number | null
+  schedule_source: "backoff" | "retry_hint" | null
+  max_attempts: number
+  max_elapsed_ms: number
+  last_failure_class: FailureClass | null
+  last_failure_source: string | null
+  last_failure_diagnostic: string | null
+  last_failure_retry_hint_ms: number | null
+  last_failure_at: number | null
+  recovered_from: string | null
+  version: number
+  closed_reason: string | null
+  time_created: number
+  time_updated: number
+}
+
+/**
+ * A durable retry episode — the persisted counterpart of
+ * `RetryEpisodeState`/`FailureRouteDecision` in
+ * `packages/core/src/lifecycle.ts`. `attempts`/`startedAt`/`pausedMs`
+ * round-trip straight into `decideFailureRoute`'s episode argument; the
+ * store never re-derives that arithmetic.
+ */
+export interface RetryEpisodeRecord {
+  readonly id: string
+  readonly featureId: string
+  readonly jobId: string
+  readonly stepId: string
+  readonly status: RetryEpisodeStatus
+  readonly attempts: number
+  readonly startedAt: number
+  readonly pausedMs: number
+  /** Null once claimed or closed — a claimed/closed episode is not "due". */
+  readonly nextAttemptAt: number | null
+  readonly delayMs: number | null
+  readonly scheduleSource: "backoff" | "retry_hint" | null
+  readonly maxAttempts: number
+  readonly maxElapsedMs: number
+  readonly lastFailure: FailureEnvelope | null
+  readonly lastFailureAt: number | null
+  /** The episode this one was recovered from (retry-budget spec: "old
+   *  failure history remains in the timeline"), null for a first episode. */
+  readonly recoveredFrom: string | null
+  readonly version: number
+  readonly closedReason: string | null
+  readonly createdAt: number
+  readonly updatedAt: number
+}
+
+function toRetryEpisodeRecord(row: RetryEpisodeRow): RetryEpisodeRecord {
+  return {
+    id: row.id,
+    featureId: row.feature_id,
+    jobId: row.job_id,
+    stepId: row.step_id,
+    status: row.status,
+    attempts: row.attempts,
+    startedAt: row.started_at,
+    pausedMs: row.paused_ms,
+    nextAttemptAt: row.next_attempt_at,
+    delayMs: row.delay_ms,
+    scheduleSource: row.schedule_source,
+    maxAttempts: row.max_attempts,
+    maxElapsedMs: row.max_elapsed_ms,
+    lastFailure: toFailureEnvelope(row.last_failure_class, row.last_failure_source, row.last_failure_diagnostic, row.last_failure_retry_hint_ms),
+    lastFailureAt: row.last_failure_at,
+    recoveredFrom: row.recovered_from,
+    version: row.version,
+    closedReason: row.closed_reason,
+    createdAt: row.time_created,
+    updatedAt: row.time_updated,
+  }
+}
+
+// --------------------------------------------------------------- resource waits
+
+export type ResourceWaitStatus = "waiting" | "claimed" | "closed"
+
+interface ResourceWaitRow {
+  id: string
+  feature_id: string
+  job_id: string
+  step_id: string
+  status: ResourceWaitStatus
+  reason: ResourceReason
+  first_observed_at: number
+  latest_observed_at: number
+  observation_count: number
+  next_observation_at: number | null
+  deadline_at: number
+  diagnostic: string | null
+  version: number
+  closed_reason: string | null
+  time_created: number
+  time_updated: number
+}
+
+/**
+ * A durable resource-wait observation episode — the persisted
+ * counterpart of `ResourceWaitState`/`ResourceWaitRouteDecision` in
+ * `packages/core/src/lifecycle.ts`. No executable attempt began for a
+ * resource wait (failure-classification spec: "distinct from an
+ * attempt failure"), so it never touches a step's retry budget.
+ */
+export interface ResourceWaitRecord {
+  readonly id: string
+  readonly featureId: string
+  readonly jobId: string
+  readonly stepId: string
+  readonly status: ResourceWaitStatus
+  readonly reason: ResourceReason
+  readonly firstObservedAt: number
+  readonly latestObservedAt: number
+  readonly observationCount: number
+  /** Null once claimed or closed. */
+  readonly nextObservationAt: number | null
+  readonly deadlineAt: number
+  readonly diagnostic: string | null
+  readonly version: number
+  readonly closedReason: string | null
+  readonly createdAt: number
+  readonly updatedAt: number
+}
+
+function toResourceWaitRecord(row: ResourceWaitRow): ResourceWaitRecord {
+  return {
+    id: row.id,
+    featureId: row.feature_id,
+    jobId: row.job_id,
+    stepId: row.step_id,
+    status: row.status,
+    reason: row.reason,
+    firstObservedAt: row.first_observed_at,
+    latestObservedAt: row.latest_observed_at,
+    observationCount: row.observation_count,
+    nextObservationAt: row.next_observation_at,
+    deadlineAt: row.deadline_at,
+    diagnostic: row.diagnostic,
+    version: row.version,
+    closedReason: row.closed_reason,
+    createdAt: row.time_created,
+    updatedAt: row.time_updated,
+  }
 }
 
 export class Store {
@@ -315,15 +523,17 @@ export class Store {
   }
 
   private applyTransitionTx(featureId: string, event: PipelineEvent, transition: Transition): void {
-    const current = this.getFeature(featureId)
-    if (!current) throw new Error(`conductor: feature ${featureId} not found`)
+    const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(featureId) as FeatureRow | null
+    if (!row) throw new Error(`conductor: feature ${featureId} not found`)
+    const current = toFeatureState(row)
     const next = applyPatch(current, transition.patch)
+    const now = Date.now()
     const escalation = transition.patch.status === "escalated"
       ? escalationReason(transition.decisions)
       : (transition.patch.status !== undefined ? null : undefined)
 
     const sets: string[] = ["time_updated = ?", "state = ?"]
-    const params: (string | number | null)[] = [Date.now(), JSON.stringify(next)]
+    const params: (string | number | null)[] = [now, JSON.stringify(next)]
     if (transition.patch.status !== undefined) {
       sets.push("status = ?")
       params.push(next.status)
@@ -336,13 +546,35 @@ export class Store {
       sets.push("feedback = ?")
       params.push(JSON.stringify(transition.feedback))
     }
+    // Pause-time accounting (design.md: "budget clocks store accumulated
+    // paused duration"): the ONLY place a feature's status flips
+    // paused↔other, so it is the single source of truth for both edges
+    // of the span — entering sets `paused_at`, leaving folds the closed
+    // span into `paused_ms` and clears it.
+    if (transition.patch.status !== undefined && next.status !== current.status) {
+      if (next.status === "paused" && row.paused_at === null) {
+        sets.push("paused_at = ?")
+        params.push(now)
+      } else if (current.status === "paused" && row.paused_at !== null) {
+        sets.push("paused_at = NULL", "paused_ms = ?")
+        params.push(accumulatePausedMs(row.paused_ms, row.paused_at, now))
+      }
+    }
     params.push(featureId)
     this.db.run(`UPDATE feature SET ${sets.join(", ")} WHERE id = ?`, params as never)
     this.db.run(
       `INSERT INTO transition_log (feature_id, event, decisions, time_created)
        VALUES (?, ?, ?, ?)`,
-      [featureId, JSON.stringify(event), JSON.stringify(transition.decisions), Date.now()],
+      [featureId, JSON.stringify(event), JSON.stringify(transition.decisions), now],
     )
+  }
+
+  /** Pause-time accounting for a feature — null if the feature does not exist. */
+  getPauseAccounting(featureId: string): PauseAccounting | null {
+    const row = this.db.query("SELECT paused_at, paused_ms FROM feature WHERE id = ?").get(featureId) as
+      | { paused_at: number | null; paused_ms: number }
+      | null
+    return row ? toPauseAccounting(row) : null
   }
 
   setFeatureFields(id: string, fields: Partial<{ sessionId: string | null; pr: number | null }>): void {
@@ -476,13 +708,89 @@ export class Store {
     return id
   }
 
-  finishRun(runId: string, status: "succeeded" | "failed" | "reaped", detail?: { outputs?: Readonly<Record<string, string>>; reason?: string }): void {
+  finishRun(
+    runId: string,
+    status: "succeeded" | "failed" | "reaped",
+    detail?: { outputs?: Readonly<Record<string, string>>; reason?: string; failure?: FailureEnvelope },
+  ): void {
     this.db.run(
-      "UPDATE run SET status = ?, outputs = ?, reason = ?, time_finished = ? WHERE id = ?",
-      [status, JSON.stringify(detail?.outputs ?? {}), detail?.reason ?? null, Date.now(), runId],
+      "UPDATE run SET status = ?, outputs = ?, reason = ?, failure_class = ?, failure_source = ?, failure_retry_hint_ms = ?, time_finished = ? WHERE id = ?",
+      [
+        status,
+        JSON.stringify(detail?.outputs ?? {}),
+        detail?.reason ?? null,
+        detail?.failure?.class ?? null,
+        detail?.failure?.source ?? null,
+        detail?.failure?.retryHintMs ?? null,
+        Date.now(),
+        runId,
+      ],
     )
     const featureId = (this.db.query("SELECT feature_id FROM run WHERE id = ?").get(runId) as { feature_id: string } | null)?.feature_id
     if (featureId) this.emit({ kind: "run", featureId })
+  }
+
+  /**
+   * Atomically concludes a failed/reaped attempt AND schedules its retry
+   * episode in ONE transaction (durable-retries spec: "persist attempt
+   * count, budget start, last failure class/time, computed delay and
+   * `next_attempt_at` in the SAME transaction as the failed attempt's
+   * terminal state"). `WHERE status = 'running'` guards the run update
+   * exactly like `concludeRun` — a duplicate/late conclusion loses the
+   * race and this returns null without writing a retry schedule for an
+   * attempt nobody claimed. The retry-episode insert then goes through
+   * the same one-open-episode-per-target uniqueness `scheduleRetry` uses;
+   * a caller racing a schedule for the same job+step loses that half and
+   * gets `episode: null` back with the run conclusion still recorded.
+   */
+  concludeRunWithRetry(
+    runId: string,
+    status: "failed" | "reaped",
+    detail: { outputs?: Readonly<Record<string, string>>; reason?: string; failure: FailureEnvelope },
+    schedule: {
+      attempts: number
+      startedAt: number
+      pausedMs?: number
+      nextAttemptAt: number
+      delayMs: number
+      scheduleSource: "backoff" | "retry_hint"
+      maxAttempts: number
+      maxElapsedMs: number
+    },
+  ): { readonly concluded: boolean; readonly episode: RetryEpisodeRecord | null } {
+    let featureId: string | null = null
+    const result = this.db.transaction((): { readonly concluded: boolean; readonly episode: RetryEpisodeRecord | null } => {
+      const now = Date.now()
+      const updated = this.db.run(
+        `UPDATE run SET status = ?, outputs = ?, reason = ?, failure_class = ?, failure_source = ?, failure_retry_hint_ms = ?, time_finished = ?
+         WHERE id = ? AND status = 'running'`,
+        [
+          status,
+          JSON.stringify(detail.outputs ?? {}),
+          detail.reason ?? null,
+          detail.failure.class,
+          detail.failure.source,
+          detail.failure.retryHintMs ?? null,
+          now,
+          runId,
+        ],
+      )
+      if (updated.changes === 0) return { concluded: false, episode: null }
+      const run = this.db.query("SELECT feature_id, job_id, step_id FROM run WHERE id = ?").get(runId) as
+        | { feature_id: string; job_id: string; step_id: string }
+        | null
+      if (!run) return { concluded: false, episode: null }
+      featureId = run.feature_id
+      const episode = this.scheduleRetry({
+        featureId: run.feature_id, jobId: run.job_id, stepId: run.step_id,
+        attempts: schedule.attempts, startedAt: schedule.startedAt, pausedMs: schedule.pausedMs,
+        nextAttemptAt: schedule.nextAttemptAt, delayMs: schedule.delayMs, scheduleSource: schedule.scheduleSource,
+        maxAttempts: schedule.maxAttempts, maxElapsedMs: schedule.maxElapsedMs, failure: detail.failure,
+      })
+      return { concluded: true, episode }
+    })()
+    if (result.concluded && featureId !== null) this.emit({ kind: "run", featureId })
+    return result
   }
 
   /**
@@ -531,19 +839,23 @@ export class Store {
   concludeRun(
     runId: string,
     status: "succeeded" | "failed" | "reaped",
-    detail: { outputs?: Readonly<Record<string, string>>; reason?: string } | undefined,
+    detail: { outputs?: Readonly<Record<string, string>>; reason?: string; failure?: FailureEnvelope } | undefined,
     event: PipelineEvent,
     transition: Transition,
   ): boolean {
     let featureId: string | null = null
     const claimed = this.db.transaction(() => {
       const result = this.db.run(
-        `UPDATE run SET status = ?, outputs = ?, reason = ?, completion_event = ?, completion_decisions = ?, action_handled = 0, time_finished = ?
+        `UPDATE run SET status = ?, outputs = ?, reason = ?, failure_class = ?, failure_source = ?, failure_retry_hint_ms = ?,
+                        completion_event = ?, completion_decisions = ?, action_handled = 0, time_finished = ?
          WHERE id = ? AND status = 'running'`,
         [
           status,
           JSON.stringify(detail?.outputs ?? {}),
           detail?.reason ?? null,
+          detail?.failure?.class ?? null,
+          detail?.failure?.source ?? null,
+          detail?.failure?.retryHintMs ?? null,
           JSON.stringify(event),
           JSON.stringify(transition.decisions),
           Date.now(),
@@ -640,6 +952,276 @@ export class Store {
   getRunById(runId: string): RunSummary | null {
     const row = this.db.query("SELECT * FROM run WHERE id = ?").get(runId) as RunRow | null
     return row ? toRunSummary(row) : null
+  }
+
+  // ------------------------------------------------------------- retry episodes
+
+  scheduleRetry(input: {
+    featureId: string
+    jobId: string
+    stepId: string
+    attempts: number
+    startedAt: number
+    pausedMs?: number
+    nextAttemptAt: number
+    delayMs: number
+    scheduleSource: "backoff" | "retry_hint"
+    maxAttempts: number
+    maxElapsedMs: number
+    failure: FailureEnvelope
+  }): RetryEpisodeRecord | null {
+    const id = randomUUID()
+    const now = Date.now()
+    // The partial unique index on (feature_id, job_id, step_id) WHERE
+    // status IN ('scheduled','claimed') enforces "one active attempt per
+    // target" (design.md risk: "database uniqueness invariant for one
+    // active attempt per target") — a caller racing another scheduler for
+    // the same job+step loses this insert and gets null back instead of
+    // a duplicate open episode.
+    const row = this.db.query(
+      `INSERT INTO retry_episode (
+         id, feature_id, job_id, step_id, status, attempts, started_at, paused_ms,
+         next_attempt_at, delay_ms, schedule_source, max_attempts, max_elapsed_ms,
+         last_failure_class, last_failure_source, last_failure_diagnostic, last_failure_retry_hint_ms, last_failure_at,
+         version, time_created, time_updated
+       ) VALUES (?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+       ON CONFLICT (feature_id, job_id, step_id) WHERE status IN ('scheduled','claimed') DO NOTHING
+       RETURNING *`,
+    ).get(
+      id, input.featureId, input.jobId, input.stepId,
+      input.attempts, input.startedAt, input.pausedMs ?? 0,
+      input.nextAttemptAt, input.delayMs, input.scheduleSource, input.maxAttempts, input.maxElapsedMs,
+      input.failure.class, input.failure.source, input.failure.diagnostic, input.failure.retryHintMs ?? null, now,
+      now, now,
+    ) as RetryEpisodeRow | null
+    return row ? toRetryEpisodeRecord(row) : null
+  }
+
+  getOpenRetryEpisode(featureId: string, jobId: string, stepId: string): RetryEpisodeRecord | null {
+    const row = this.db.query(
+      `SELECT * FROM retry_episode WHERE feature_id = ? AND job_id = ? AND step_id = ? AND status IN ('scheduled','claimed')`,
+    ).get(featureId, jobId, stepId) as RetryEpisodeRow | null
+    return row ? toRetryEpisodeRecord(row) : null
+  }
+
+  getRetryEpisode(episodeId: string): RetryEpisodeRecord | null {
+    const row = this.db.query("SELECT * FROM retry_episode WHERE id = ?").get(episodeId) as RetryEpisodeRow | null
+    return row ? toRetryEpisodeRecord(row) : null
+  }
+
+  /**
+   * Every `scheduled` episode whose `next_attempt_at` is due, EXCLUDING
+   * any feature currently `paused` — the pause scheduling barrier
+   * (durable-retries spec: "no attempt starts" during a pause) enforced
+   * at the read that feeds claiming, not merely at claim time, so a
+   * reconcile pass never even considers a paused feature's due work.
+   */
+  listDueRetryEpisodes(nowMs: number, limit = 50): RetryEpisodeRecord[] {
+    const rows = this.db.query(
+      `SELECT retry_episode.* FROM retry_episode
+       JOIN feature ON feature.id = retry_episode.feature_id
+       WHERE retry_episode.status = 'scheduled' AND retry_episode.next_attempt_at <= ?
+         AND feature.status != 'paused'
+       ORDER BY retry_episode.next_attempt_at ASC LIMIT ?`,
+    ).all(nowMs, limit) as RetryEpisodeRow[]
+    return rows.map(toRetryEpisodeRecord)
+  }
+
+  /**
+   * Atomically claims one due, unpaused episode by id: `scheduled` →
+   * `claimed`, guarded by the exact due time so a stale claim (the
+   * caller read it as due, then a racing claim already moved it) is
+   * rejected instead of double-dispatching. Two reconcile passes racing
+   * the same episode: one claims it, the other sees zero rows affected
+   * (durable-retries spec, "Two reconcile passes see due work").
+   */
+  claimRetryEpisode(episodeId: string, nowMs: number): RetryEpisodeRecord | null {
+    const row = this.db.query(
+      `UPDATE retry_episode SET status = 'claimed', version = version + 1, time_updated = ?
+       WHERE id = (
+         SELECT retry_episode.id FROM retry_episode
+         JOIN feature ON feature.id = retry_episode.feature_id
+         WHERE retry_episode.id = ? AND retry_episode.status = 'scheduled'
+           AND retry_episode.next_attempt_at <= ? AND feature.status != 'paused'
+       )
+       RETURNING *`,
+    ).get(nowMs, episodeId, nowMs) as RetryEpisodeRow | null
+    return row ? toRetryEpisodeRecord(row) : null
+  }
+
+  /** Closes an open (scheduled or claimed) episode — e.g. once its
+   *  attempt has been dispatched, or on escalation. Idempotent-safe:
+   *  a second close on an already-closed episode is a no-op. */
+  closeRetryEpisode(episodeId: string, reason: string): boolean {
+    return this.db.run(
+      `UPDATE retry_episode SET status = 'closed', closed_reason = ?, time_updated = ?
+       WHERE id = ? AND status IN ('scheduled','claimed')`,
+      [reason, Date.now(), episodeId],
+    ).changes > 0
+  }
+
+  /**
+   * Operator recovery (retry-budget spec: "recover SHALL … create a new
+   * audited episode … old failure history remains in the timeline"):
+   * closes the target episode (if still open) and inserts a fresh one
+   * chained to it via `recovered_from`, in one transaction. Version-
+   * guarded: `expectedVersion` must match the episode's current version
+   * or the whole recovery is rejected (stale-target CAS), matching
+   * `decideRecover`'s optimistic-concurrency contract in
+   * `packages/core/src/lifecycle.ts`.
+   */
+  recoverRetryEpisode(
+    episodeId: string,
+    expectedVersion: number,
+    input: { startedAt: number; maxAttempts: number; maxElapsedMs: number },
+  ): RetryEpisodeRecord | null {
+    return this.db.transaction(() => {
+      const prior = this.db.query("SELECT * FROM retry_episode WHERE id = ? AND version = ?").get(episodeId, expectedVersion) as RetryEpisodeRow | null
+      if (!prior) return null
+      const now = Date.now()
+      if (prior.status !== "closed") {
+        this.db.run(
+          "UPDATE retry_episode SET status = 'closed', closed_reason = 'recovered', version = version + 1, time_updated = ? WHERE id = ?",
+          [now, episodeId],
+        )
+      }
+      const id = randomUUID()
+      const row = this.db.query(
+        `INSERT INTO retry_episode (
+           id, feature_id, job_id, step_id, status, attempts, started_at, paused_ms,
+           max_attempts, max_elapsed_ms, recovered_from, version, time_created, time_updated
+         ) VALUES (?, ?, ?, ?, 'scheduled', 0, ?, 0, ?, ?, ?, 0, ?, ?)
+         ON CONFLICT (feature_id, job_id, step_id) WHERE status IN ('scheduled','claimed') DO NOTHING
+         RETURNING *`,
+      ).get(
+        id, prior.feature_id, prior.job_id, prior.step_id, input.startedAt,
+        input.maxAttempts, input.maxElapsedMs, episodeId, now, now,
+      ) as RetryEpisodeRow | null
+      return row ? toRetryEpisodeRecord(row) : null
+    })()
+  }
+
+  listRetryEpisodes(featureId: string): RetryEpisodeRecord[] {
+    const rows = this.db.query(
+      "SELECT * FROM retry_episode WHERE feature_id = ? ORDER BY time_created ASC",
+    ).all(featureId) as RetryEpisodeRow[]
+    return rows.map(toRetryEpisodeRecord)
+  }
+
+  // ------------------------------------------------------------- resource waits
+
+  /**
+   * Upsert a resource wait for one job+step target: the first
+   * observation creates it; a later observation while still `waiting`
+   * updates `latest_observed_at`/`observation_count`/`next_observation_at`/
+   * `diagnostic` in place (durable-retries spec: "persist … first/latest
+   * observation, next observation time and finite deadline" — one row
+   * per target, not one row per observation). A concurrent claim wins
+   * over a concurrent observation update by construction: the `DO
+   * UPDATE … WHERE status = 'waiting'` clause makes the update a no-op
+   * once another caller has claimed it, and the caller gets back the
+   * (now claimed) row unchanged rather than corrupting a claim in flight.
+   */
+  upsertResourceWait(input: {
+    featureId: string
+    jobId: string
+    stepId: string
+    reason: ResourceReason
+    observedAt: number
+    nextObservationAt: number
+    deadlineAt: number
+    diagnostic?: string
+  }): ResourceWaitRecord {
+    const id = randomUUID()
+    const now = Date.now()
+    const row = this.db.query(
+      `INSERT INTO resource_wait (
+         id, feature_id, job_id, step_id, status, reason,
+         first_observed_at, latest_observed_at, observation_count, next_observation_at, deadline_at,
+         diagnostic, version, time_created, time_updated
+       ) VALUES (?, ?, ?, ?, 'waiting', ?, ?, ?, 1, ?, ?, ?, 0, ?, ?)
+       ON CONFLICT (feature_id, job_id, step_id) WHERE status IN ('waiting','claimed')
+       DO UPDATE SET
+         latest_observed_at = excluded.latest_observed_at,
+         observation_count = resource_wait.observation_count + 1,
+         next_observation_at = excluded.next_observation_at,
+         diagnostic = excluded.diagnostic,
+         version = resource_wait.version + 1,
+         time_updated = excluded.time_updated
+       WHERE resource_wait.status = 'waiting'
+       RETURNING *`,
+    ).get(
+      id, input.featureId, input.jobId, input.stepId, input.reason,
+      input.observedAt, input.observedAt, input.nextObservationAt, input.deadlineAt,
+      input.diagnostic ?? null, now, now,
+    ) as ResourceWaitRow | null
+    // SQLite returns no row from an upsert whose DO UPDATE ... WHERE guard
+    // blocked the write (conflict hit, but the existing row is already
+    // 'claimed') — the insert never landed either, since the conflict
+    // target itself prevented it. Read back the current (claimed) row so
+    // the caller always gets the live state rather than null on a target
+    // that unambiguously exists.
+    if (row) return toResourceWaitRecord(row)
+    return this.getOpenResourceWait(input.featureId, input.jobId, input.stepId)!
+  }
+
+  getOpenResourceWait(featureId: string, jobId: string, stepId: string): ResourceWaitRecord | null {
+    const row = this.db.query(
+      `SELECT * FROM resource_wait WHERE feature_id = ? AND job_id = ? AND step_id = ? AND status IN ('waiting','claimed')`,
+    ).get(featureId, jobId, stepId) as ResourceWaitRow | null
+    return row ? toResourceWaitRecord(row) : null
+  }
+
+  getResourceWait(waitId: string): ResourceWaitRecord | null {
+    const row = this.db.query("SELECT * FROM resource_wait WHERE id = ?").get(waitId) as ResourceWaitRow | null
+    return row ? toResourceWaitRecord(row) : null
+  }
+
+  /** Every `waiting` row due for re-observation, excluding paused features
+   *  — same pause barrier as `listDueRetryEpisodes` (observation must not
+   *  advance while paused either, per the durable-retries scheduling
+   *  barrier). */
+  listDueResourceWaits(nowMs: number, limit = 50): ResourceWaitRecord[] {
+    const rows = this.db.query(
+      `SELECT resource_wait.* FROM resource_wait
+       JOIN feature ON feature.id = resource_wait.feature_id
+       WHERE resource_wait.status = 'waiting' AND resource_wait.next_observation_at <= ?
+         AND feature.status != 'paused'
+       ORDER BY resource_wait.next_observation_at ASC LIMIT ?`,
+    ).all(nowMs, limit) as ResourceWaitRow[]
+    return rows.map(toResourceWaitRecord)
+  }
+
+  /** Atomic due claim, same shape/guarantees as `claimRetryEpisode`. */
+  claimResourceWait(waitId: string, nowMs: number): ResourceWaitRecord | null {
+    const row = this.db.query(
+      `UPDATE resource_wait SET status = 'claimed', version = version + 1, time_updated = ?
+       WHERE id = (
+         SELECT resource_wait.id FROM resource_wait
+         JOIN feature ON feature.id = resource_wait.feature_id
+         WHERE resource_wait.id = ? AND resource_wait.status = 'waiting'
+           AND resource_wait.next_observation_at <= ? AND feature.status != 'paused'
+       )
+       RETURNING *`,
+    ).get(nowMs, waitId, nowMs) as ResourceWaitRow | null
+    return row ? toResourceWaitRecord(row) : null
+  }
+
+  /** Closes an open (waiting or claimed) resource wait — the resource became
+   *  available and a run was dispatched, or the wait deadline escalated. */
+  closeResourceWait(waitId: string, reason: string): boolean {
+    return this.db.run(
+      `UPDATE resource_wait SET status = 'closed', closed_reason = ?, time_updated = ?
+       WHERE id = ? AND status IN ('waiting','claimed')`,
+      [reason, Date.now(), waitId],
+    ).changes > 0
+  }
+
+  listResourceWaits(featureId: string): ResourceWaitRecord[] {
+    const rows = this.db.query(
+      "SELECT * FROM resource_wait WHERE feature_id = ? ORDER BY time_created ASC",
+    ).all(featureId) as ResourceWaitRow[]
+    return rows.map(toResourceWaitRecord)
   }
 
   // ------------------------------------------------------------- run logs
