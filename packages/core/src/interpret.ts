@@ -585,13 +585,7 @@ function onJobFailed(
   // `propagate` only walks the failed job's dependents, so unrelated jobs are
   // invisible to it. Mirror `onJobComplete`'s all-jobs check before deciding
   // the failure is the end of the road.
-  const allTerminal = Object.keys(workflow.jobs).every(jobId => {
-    if (jobId === failedJobId) return true
-    const patched = cascade.jobPatches[jobId]?.status
-    if (patched) return patched === "skipped" || patched === "succeeded"
-    const current = state.jobs[jobId]?.status ?? "pending"
-    return current === "succeeded" || current === "failed" || current === "skipped"
-  })
+  const allTerminal = allJobsTerminal(workflow, state, cascade, failedJobId)
 
   // Nothing left to run anywhere: the failure is the end of the road. This
   // must hold even when the cascade still produced skip_job decisions — a
@@ -710,6 +704,21 @@ interface Cascade {
   readonly terminal: Record<string, JobStatus>
 }
 
+function allJobsTerminal(
+  workflow: WorkflowDef,
+  state: FeatureState,
+  cascade: Cascade,
+  originJobId: string,
+): boolean {
+  return Object.keys(workflow.jobs).every(jobId => {
+    if (jobId === originJobId) return true
+    const patched = cascade.jobPatches[jobId]?.status
+    if (patched) return patched === "skipped" || patched === "succeeded"
+    const current = state.jobs[jobId]?.status ?? "pending"
+    return current === "succeeded" || current === "failed" || current === "skipped"
+  })
+}
+
 function propagate(
   workflow: WorkflowDef,
   state: FeatureState,
@@ -803,13 +812,7 @@ function onJobComplete(
   const cascade = propagate(workflow, state, completedJobId, "succeeded")
   const patch = mergePatches(completedPatch, { jobs: cascade.jobPatches })
 
-  const allTerminal = Object.keys(workflow.jobs).every(jobId => {
-    if (jobId === completedJobId) return true
-    const patched = cascade.jobPatches[jobId]?.status
-    if (patched) return patched === "skipped" || patched === "succeeded"
-    const current = state.jobs[jobId]?.status ?? "pending"
-    return current === "succeeded" || current === "failed" || current === "skipped"
-  })
+  const allTerminal = allJobsTerminal(workflow, state, cascade, completedJobId)
 
   if (allTerminal) {
     const anyFailed = Object.values(cascade.terminal).some(status => status === "failed")
