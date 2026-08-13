@@ -1,13 +1,13 @@
 ## 1. Failure model and lifecycle invariants
 
-- [ ] 1.1 [core] Define stable v1 failure envelopes, resource-unavailability reasons and finite normalized retry/resource-wait policies with per-class overrides.
-- [ ] 1.2 [core] Add pure lifecycle decisions for retry, resource wait, pause-aware resume and targeted recover without replaying workflow start.
-- [ ] 1.3 [core] Enforce that a non-terminal feature has a durable progress anchor and that terminal failed DAGs escalate.
-- [ ] 1.4 [test] Add exhaustive interpreter, classification and invalid-policy tests proving routing never parses human diagnostics.
+- [x] 1.1 [core] Define stable v1 failure envelopes, resource-unavailability reasons and finite normalized retry/resource-wait policies with per-class overrides.
+- [x] 1.2 [core] Add pure lifecycle decisions for retry, resource wait, pause-aware resume and targeted recover without replaying workflow start.
+- [x] 1.3 [core] Enforce that a non-terminal feature has a durable progress anchor and that terminal failed DAGs escalate.
+- [x] 1.4 [test] Add exhaustive interpreter, classification and invalid-policy tests proving routing never parses human diagnostics.
 
 ## 2. Pure scheduling and durable state
 
-- [ ] 2.1 [core] Implement overflow-safe backoff, bounded jitter, retry-hint clamping, elapsed-budget and pause-time calculations with injected clock/random.
+- [x] 2.1 [core] Implement overflow-safe backoff, bounded jitter, retry-hint clamping, elapsed-budget and pause-time calculations with injected clock/random.
 - [ ] 2.2 [db] Add additive failure metadata, retry/resource-wait episode/history, pause accounting and due-work indexes.
 - [ ] 2.3 [db][server] Atomically persist attempt conclusion plus schedule, claim due retry/wait work and enforce one active attempt per target.
 - [ ] 2.4 [test][db] Cover crash boundaries, restart before/after due time, resource-wait persistence, clock skew and concurrent claim races.
