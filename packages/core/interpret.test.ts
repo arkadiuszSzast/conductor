@@ -515,6 +515,35 @@ describe("DAG workflows", () => {
     expect(t.patch.jobs?.review?.status).toBe("skipped")
   })
 
+  it("escalates when the last failing job's cascade leaves nothing else active", () => {
+    // The failing job is the only thing that was running; its failure skips
+    // every dependent, so after the cascade ALL jobs are terminal. The feature
+    // must escalate rather than hang in "running" with nothing left to do.
+    const t = interpret(
+      dagWorkflow,
+      dagState({
+        jobs: {
+          build: job({ status: "running", currentStep: "compile", attempts: { compile: 1 } }),
+          "test-a": job({ status: "pending" }),
+          "test-b": job({ status: "pending" }),
+          review: job({ status: "pending" }),
+        },
+      }),
+      { kind: "step.failed", jobId: "build", stepId: "compile", reason: "exit 1" },
+    )
+
+    // Dependents still skip...
+    expect(t.decisions).toContainEqual({
+      kind: "skip_job", jobId: "test-a", reason: "a dependency failed or was skipped",
+    })
+    expect(t.decisions).toContainEqual({
+      kind: "skip_job", jobId: "review", reason: "a dependency failed or was skipped",
+    })
+    // ...but with nothing left to run, the feature escalates.
+    expect(t.decisions.some(d => d.kind === "escalate")).toBe(true)
+    expect(t.patch.status).toBe("escalated")
+  })
+
   it("escalates when a failure leaves nothing else to run", () => {
     const solo = mkWorkflow(
       { only: defineJob([commandStep("compile", ["make"])]) },

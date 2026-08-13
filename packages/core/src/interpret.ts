@@ -585,25 +585,24 @@ function onJobFailed(
   // `propagate` only walks the failed job's dependents, so unrelated jobs are
   // invisible to it. Mirror `onJobComplete`'s all-jobs check before deciding
   // the failure is the end of the road.
-  const anyOtherActive = Object.keys(workflow.jobs).some(jobId => {
-    if (jobId === failedJobId) return false
-    const patched = cascade.jobPatches[jobId]?.status
-    if (patched) return patched !== "skipped" && patched !== "succeeded"
-    const current = state.jobs[jobId]?.status ?? "pending"
-    return current !== "succeeded" && current !== "failed" && current !== "skipped"
-  })
+  const allTerminal = allJobsTerminal(workflow, state, cascade, failedJobId)
+
+  // Nothing left to run anywhere: the failure is the end of the road. This
+  // must hold even when the cascade still produced skip_job decisions — a
+  // failure that skips every dependent (a parallel fan-out whose last branch
+  // died, dependents gated on all branches) would otherwise leave the feature
+  // hanging in "running" with every job terminal.
+  if (allTerminal) {
+    return buildTransition(
+      [...cascade.decisions, { kind: "escalate", reason }],
+      mergePatches(patch, { status: "escalated" }),
+    )
+  }
 
   if (cascade.decisions.length === 0) {
-    if (anyOtherActive) {
-      return buildTransition(
-        [{ kind: "noop", reason: `job "${failedJobId}" failed, other jobs still active` }],
-        patch,
-      )
-    }
-    // Nothing left to run anywhere: the failure is the end of the road.
     return buildTransition(
-      [{ kind: "escalate", reason }],
-      mergePatches(patch, { status: "escalated" }),
+      [{ kind: "noop", reason: `job "${failedJobId}" failed, other jobs still active` }],
+      patch,
     )
   }
 
@@ -705,6 +704,21 @@ interface Cascade {
   readonly terminal: Record<string, JobStatus>
 }
 
+function allJobsTerminal(
+  workflow: WorkflowDef,
+  state: FeatureState,
+  cascade: Cascade,
+  originJobId: string,
+): boolean {
+  return Object.keys(workflow.jobs).every(jobId => {
+    if (jobId === originJobId) return true
+    const patched = cascade.jobPatches[jobId]?.status
+    if (patched) return patched === "skipped" || patched === "succeeded"
+    const current = state.jobs[jobId]?.status ?? "pending"
+    return current === "succeeded" || current === "failed" || current === "skipped"
+  })
+}
+
 function propagate(
   workflow: WorkflowDef,
   state: FeatureState,
@@ -798,13 +812,7 @@ function onJobComplete(
   const cascade = propagate(workflow, state, completedJobId, "succeeded")
   const patch = mergePatches(completedPatch, { jobs: cascade.jobPatches })
 
-  const allTerminal = Object.keys(workflow.jobs).every(jobId => {
-    if (jobId === completedJobId) return true
-    const patched = cascade.jobPatches[jobId]?.status
-    if (patched) return patched === "skipped" || patched === "succeeded"
-    const current = state.jobs[jobId]?.status ?? "pending"
-    return current === "succeeded" || current === "failed" || current === "skipped"
-  })
+  const allTerminal = allJobsTerminal(workflow, state, cascade, completedJobId)
 
   if (allTerminal) {
     const anyFailed = Object.values(cascade.terminal).some(status => status === "failed")
