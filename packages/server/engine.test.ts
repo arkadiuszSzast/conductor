@@ -347,6 +347,44 @@ describe("Engine: runner resource waits", () => {
     expect(store.getFeature(feature.id)?.status).toBe("escalated")
   })
 
+  it("dispatches a due durable retry exactly once", async () => {
+    let available = false
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => available })
+    const feature = await startedFeature(engine)
+    expect(store.listRuns(feature.id)).toHaveLength(0)
+    expect(store.listResourceWaits(feature.id)[0]?.status).toBe("waiting")
+    // Replace the runner wait with a durable retry schedule for the same
+    // step so the retry loop owns dispatch instead of the wait loop.
+    store.closeResourceWait(store.listResourceWaits(feature.id)[0]!.id, "replaced")
+    store.scheduleRetry({
+      featureId: feature.id,
+      jobId: "main",
+      stepId: "implement",
+      attempts: 1,
+      startedAt: clock.now(),
+      nextAttemptAt: clock.now() + 1_000,
+      delayMs: 1_000,
+      scheduleSource: "backoff",
+      maxAttempts: 3,
+      maxElapsedMs: 600_000,
+      failure: { class: "transient_upstream", diagnostic: "provider 503", source: "runner" },
+    })
+    available = true
+
+    // Not due yet — nothing happens, and the running step is NOT
+    // re-executed (the retry schedule owns it).
+    await engine.reconcile()
+    expect(store.listRuns(feature.id)).toHaveLength(0)
+
+    clock.advance(1_000)
+    await engine.reconcile()
+    await engine.reconcile()
+
+    expect(store.listRuns(feature.id)).toHaveLength(1)
+    expect(sessions.prompts).toHaveLength(1)
+    expect(store.getOpenRetryEpisode(feature.id, "main", "implement")).toBeNull()
+  })
+
   it("recovers an escalated no-runner feature after a runner returns", async () => {
     let available = false
     const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => available })

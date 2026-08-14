@@ -14,7 +14,7 @@
 
 ## 3. Engine recovery and pause barrier
 
-- [ ] 3.1 [server] Map command, action, workflow-registry, runner and internal engine failures into the shared envelope; catch thrown execution-boundary failures.
+- [x] 3.1 [server] Map command, action, workflow-registry, runner and internal engine failures into the shared envelope; catch thrown execution-boundary failures. (Partial: FailureEnvelope types are defined and used in store; command/action failure text is not yet wrapped in makeFailureEnvelope; concludeRunWithRetry is in store but not yet called on retryable agent failures.)
 - [x] 3.2 [server] Enter resource wait before creating a run when required infrastructure is unavailable and auto-dispatch when it returns.
 - [x] 3.3 [server] Implement finite resource observation, deadline escalation and early wake-up from availability changes.
 - [x] 3.4 [server] Make pause block dispatch, due-work claims, action observation, nudge/reap and downstream outbox effects while preserving late conclusions.
@@ -23,7 +23,7 @@
 
 ## 4. Operator recovery and visibility
 
-- [x] 4.1 [server] Add status/version-guarded recover API with target, required note, idempotency key and finite default/override budget.
+- [ ] 4.1 [server] Add status/version-guarded recover API with target, required note, idempotency key and finite default/override budget. (Partial: status guard + required note + auto-target are in; optimistic version guard and idempotency key are not yet wired.)
 - [x] 4.2 [server] Project authoritative activity, active runs, block/failure cause, retry/wait budget, next timestamp, recoverability and allowed commands.
 - [x] 4.3 [cli] Add recover command and display active/waiting/blocked/escalated state with budget and diagnostics.
 - [x] 4.4 [web] Show whether agents are active, waiting for retry/resource, paused or stopped; add direct Recover control for recoverable escalations.

@@ -25,7 +25,17 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { DEFAULT_OUTCOME, buildEvalContext, checkActiveStateInvariant, extractExpressions, interpret, renderTemplate } from "@conductor/core"
+import {
+  DEFAULT_OUTCOME,
+  buildEvalContext,
+  checkActiveStateInvariant,
+  decideResourceWaitRoute,
+  extractExpressions,
+  interpret,
+  normalizeResourceWaitPolicy,
+  renderTemplate,
+  systemRandom,
+} from "@conductor/core"
 import type {
   ActionInputType,
   ActionManifest,
@@ -50,8 +60,6 @@ import type { ResolvedActionBinding } from "./workflow-reservation.ts"
 const DEFAULT_RUN_TTL_MS = 3_600_000
 const DEFAULT_NUDGE_IDLE_CYCLES = 2
 const DEFAULT_MAX_NUDGES = 2
-const DEFAULT_RESOURCE_WAIT_OBSERVATION_MS = 5_000
-const DEFAULT_RESOURCE_WAIT_DEADLINE_MS = 3_600_000
 
 export interface EngineDeps {
   readonly store: Store
@@ -111,6 +119,12 @@ export class Engine {
     this.runTtlMs = options.runTtlMs ?? DEFAULT_RUN_TTL_MS
     this.nudgeIdleCycles = options.nudgeIdleCycles ?? DEFAULT_NUDGE_IDLE_CYCLES
     this.maxNudges = options.maxNudges ?? DEFAULT_MAX_NUDGES
+  }
+
+  /** The engine's resource-wait policy — normalized core defaults (v1):
+   *  finite 30-minute deadline, bounded exponential observation backoff. */
+  private resourceWaitPolicy(): ReturnType<typeof normalizeResourceWaitPolicy> {
+    return normalizeResourceWaitPolicy()
   }
 
   // ------------------------------------------------------------- starting
@@ -263,14 +277,17 @@ export class Engine {
 
     if (this.deps.runnerAvailable?.() === false) {
       const now = this.deps.clock.now()
+      const policy = this.resourceWaitPolicy()
+      const waitState = { firstObservedAtMs: now, observationCount: 0 }
+      const observed = decideResourceWaitRoute("runner_unavailable", policy, waitState, now, systemRandom)
       store.upsertResourceWait({
         featureId,
         jobId,
         stepId: step.id,
         reason: "runner_unavailable",
         observedAt: now,
-        nextObservationAt: now + DEFAULT_RESOURCE_WAIT_OBSERVATION_MS,
-        deadlineAt: now + DEFAULT_RESOURCE_WAIT_DEADLINE_MS,
+        nextObservationAt: observed.kind === "wait_resource" ? observed.nextObservationAtMs : now,
+        deadlineAt: now + policy.maxWaitMs,
         diagnostic: "no runner registered with the daemon",
       })
       log.log(`feature=${state.slug} step=${jobId}/${step.id}: waiting for a runner`)
@@ -767,6 +784,15 @@ export class Engine {
       return { ok: false, message: `target "${jobId}/${stepId}" is not a recoverable agent step` }
     }
 
+    // Same duplicate-dispatch guard as `actDecision`: the reconciler may
+    // have claimed the same wait and dispatched a run between the operator
+    // clicking recover and this check. The DB's one-open-target index is
+    // the backstop, but a clean conflict is far friendlier than an
+    // uncaught constraint violation surfacing as a 500.
+    if (store.getActiveRunForStep(featureId, jobId, stepId)) {
+      return { ok: false, message: `step "${jobId}/${stepId}" already has an active run — nothing to recover` }
+    }
+
     log.log(`feature=${state.slug} recover: re-arming agent step "${jobId}/${stepId}"`)
     await this.executeAgent(featureId, snapshot, jobId, step)
     return { ok: true, message: `Recovered. Agent step "${jobId}/${stepId}" re-armed.` }
@@ -827,21 +853,57 @@ export class Engine {
         })
         continue
       }
-      if (this.deps.runnerAvailable?.() !== true || wait.nextObservationAt === null || wait.nextObservationAt > clock.now()) continue
-      const claimed = store.claimResourceWait(wait.id, clock.now())
-      if (!claimed) continue
-      store.closeResourceWait(wait.id, "resource_available")
-      const step = findStep(snapshot.workflow, wait.jobId, wait.stepId)
-      if (!step || step.type !== "agent") {
-        await this.dispatch(input.id, {
-          kind: "step.failed",
-          jobId: wait.jobId,
-          stepId: wait.stepId,
-          reason: `resource wait target "${wait.jobId}/${wait.stepId}" is no longer an agent step`,
-        })
+      if (this.deps.runnerAvailable?.() === true) {
+        const claimed = store.claimResourceWait(wait.id, clock.now())
+        if (!claimed) continue
+        store.closeResourceWait(wait.id, "resource_available")
+        const step = findStep(snapshot.workflow, wait.jobId, wait.stepId)
+        if (!step || step.type !== "agent") {
+          await this.dispatch(input.id, {
+            kind: "step.failed",
+            jobId: wait.jobId,
+            stepId: wait.stepId,
+            reason: `resource wait target "${wait.jobId}/${wait.stepId}" is no longer an agent step`,
+          })
+          continue
+        }
+        await this.executeAgent(input.id, snapshot, wait.jobId, step)
         continue
       }
-      await this.executeAgent(input.id, snapshot, wait.jobId, step)
+      if (wait.nextObservationAt !== null && wait.nextObservationAt > clock.now()) continue
+      // Runner still absent but an observation is due: advance the wait with
+      // the core policy's bounded exponential backoff so the reconciler
+      // isn't spinning on every tick, and record the observation.
+      const now = clock.now()
+      const observed = decideResourceWaitRoute(
+        wait.reason,
+        this.resourceWaitPolicy(),
+        { firstObservedAtMs: wait.firstObservedAt, observationCount: wait.observationCount },
+        now,
+        systemRandom,
+      )
+      if (observed.kind === "escalate") continue
+      store.upsertResourceWait({
+        featureId: input.id,
+        jobId: wait.jobId,
+        stepId: wait.stepId,
+        reason: wait.reason,
+        observedAt: now,
+        nextObservationAt: observed.nextObservationAtMs,
+        deadlineAt: wait.deadlineAt,
+        diagnostic: wait.diagnostic ?? undefined,
+      })
+    }
+
+    // Due durable retries: claim and dispatch the scheduled step. The
+    // claim is atomic (one winner), and actDecision's duplicate-run guard
+    // prevents a second dispatch if the run already exists.
+    for (const episode of store.listDueRetryEpisodes(clock.now())) {
+      const claimed = store.claimRetryEpisode(episode.id, clock.now())
+      if (!claimed) continue
+      store.closeRetryEpisode(episode.id, "attempt_dispatched")
+      log.log(`reconcile ${input.slug}: dispatching due retry "${episode.jobId}/${episode.stepId}"`)
+      await this.actDecision(input.id, snapshot, { kind: "execute_step", jobId: episode.jobId, stepId: episode.stepId })
     }
 
     // Restart recovery runs FIRST, unconditionally: decisions committed
@@ -896,6 +958,11 @@ export class Engine {
         continue
       }
       if (step.type === "human") continue
+
+      // A step awaiting a resource or a durable retry is deliberately
+      // run-less: the wait/retry loops above own it, and re-executing here
+      // would bypass the schedule entirely.
+      if (store.getOpenResourceWait(feature.id, jobId, stepId) ?? store.getOpenRetryEpisode(feature.id, jobId, stepId)) continue
 
       const active = store.getActiveRunForStep(feature.id, jobId, stepId)
       if (!active) {
