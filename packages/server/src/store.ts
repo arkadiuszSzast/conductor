@@ -522,6 +522,37 @@ export class Store {
     this.emit({ kind: "transition", featureId })
   }
 
+  /**
+   * Reconciliation repair for legacy stranded records: a feature whose
+   * every job is terminal with at least one failure cannot reach
+   * `escalated` through any interpreter event (there is no running step
+   * left to fail), yet must not stay falsely `running`. This marks it
+   * escalated with the invariant reason and appends an audit entry —
+   * the only I/O repair path that bypasses the pure interpreter, and it
+   * is only invoked by the reconciler when the invariant check reports
+   * a stranded feature.
+   */
+  markEscalated(featureId: string, reason: string): boolean {
+    const now = Date.now()
+    const changed = this.db.transaction(() => {
+      const row = this.db.query("SELECT status, state FROM feature WHERE id = ?").get(featureId) as { status: string; state: string } | null
+      if (!row || row.status === "escalated" || row.status === "done" || row.status === "abandoned") return false
+      const stateObj = JSON.parse(row.state) as Record<string, unknown>
+      stateObj["status"] = "escalated"
+      this.db.run(
+        "UPDATE feature SET status = ?, escalation = ?, state = ?, time_updated = ? WHERE id = ?",
+        ["escalated", reason, JSON.stringify(stateObj), now, featureId],
+      )
+      this.db.run(
+        "INSERT INTO transition_log (feature_id, event, decisions, time_created) VALUES (?, ?, ?, ?)",
+        [featureId, JSON.stringify({ kind: "reconcile.repair" }), JSON.stringify([{ kind: "escalate", reason }]), now],
+      )
+      return true
+    })()
+    if (changed) this.emit({ kind: "transition", featureId })
+    return changed
+  }
+
   private applyTransitionTx(featureId: string, event: PipelineEvent, transition: Transition): void {
     const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(featureId) as FeatureRow | null
     if (!row) throw new Error(`conductor: feature ${featureId} not found`)

@@ -25,7 +25,7 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { DEFAULT_OUTCOME, buildEvalContext, extractExpressions, interpret, renderTemplate } from "@conductor/core"
+import { DEFAULT_OUTCOME, buildEvalContext, checkActiveStateInvariant, extractExpressions, interpret, renderTemplate } from "@conductor/core"
 import type {
   ActionInputType,
   ActionManifest,
@@ -719,6 +719,59 @@ export class Engine {
     return `${verb}${notes.length > 0 ? " (notes recorded)" : ""}. Feature "${state.title}" is now: ${after?.status ?? state.status}.`
   }
 
+  // ------------------------------------------------------------ recovery
+
+  /**
+   * Explicit operator recovery for an escalated feature: picks the first
+   * recoverable agent target (prefers a resource wait, else the latest
+   * failed run), requires a non-empty note, and re-arms exactly that
+   * step — never the whole workflow. A still-absent runner re-enters a
+   * fresh resource wait (the upsert's uniqueness keeps it to one open
+   * row per target); an available runner dispatches one new run.
+   */
+  async recover(featureId: string, input: { readonly notes?: string }): Promise<{ ok: boolean; message: string }> {
+    const { store, log } = this.deps
+    const state = store.getFeature(featureId)
+    if (!state) return { ok: false, message: `unknown feature "${featureId}"` }
+    if (state.status !== "escalated") {
+      return { ok: false, message: `feature is not escalated (status: ${state.status}) — recover only applies to escalated features` }
+    }
+    if (input.notes === undefined || input.notes.trim() === "") {
+      return { ok: false, message: "recover requires a non-empty note" }
+    }
+    const snapshot = this.deps.workflows(state.projectDir)
+    if (!snapshot) return { ok: false, message: `no valid workflow for ${state.projectDir}` }
+
+    const waits = store.listResourceWaits(featureId)
+    const openWait = waits.find(wait => wait.status !== "closed")
+    const lastWait = [...waits].reverse().find(wait => wait.status === "closed") ?? null
+    let jobId = openWait?.jobId ?? lastWait?.jobId ?? null
+    let stepId = openWait?.stepId ?? lastWait?.stepId ?? null
+
+    if (jobId === null || stepId === null) {
+      const failed = store
+        .listRuns(featureId)
+        .filter(run => run.status === "failed" || run.status === "reaped")
+        .sort((a, b) => (b.timeFinished ?? b.timeStarted) - (a.timeFinished ?? a.timeStarted))[0]
+      if (failed) {
+        jobId = failed.jobId
+        stepId = failed.stepId
+      }
+    }
+
+    if (jobId === null || stepId === null) {
+      return { ok: false, message: "no recoverable failed or blocked step found — nothing to recover" }
+    }
+    const step = findStep(snapshot.workflow, jobId, stepId)
+    if (!step || step.type !== "agent") {
+      return { ok: false, message: `target "${jobId}/${stepId}" is not a recoverable agent step` }
+    }
+
+    log.log(`feature=${state.slug} recover: re-arming agent step "${jobId}/${stepId}"`)
+    await this.executeAgent(featureId, snapshot, jobId, step)
+    return { ok: true, message: `Recovered. Agent step "${jobId}/${stepId}" re-armed.` }
+  }
+
   // ------------------------------------------------------------ lifecycle
 
   async pause(featureId: string): Promise<void> {
@@ -815,6 +868,18 @@ export class Engine {
 
     const feature = store.getFeature(input.id) ?? input
     if (feature.status === "done" || feature.status === "abandoned") return
+
+    const invariant = checkActiveStateInvariant(feature, {
+      hasActiveRun: store.getActiveRun(feature.id) !== null,
+      hasDueRetry: store.listRetryEpisodes(feature.id).some(episode => episode.status === "scheduled"),
+      hasResourceWait: store.listResourceWaits(feature.id).some(wait => wait.status === "waiting"),
+      hasUnhandledOutboxDecision: store.getPendingRunAction(feature.id) !== null,
+    })
+    if (invariant.kind === "stranded_legacy_failure" || invariant.kind === "stranded_no_anchor") {
+      log.log(`reconcile ${feature.slug}: ${invariant.reason} — marking escalated`)
+      store.markEscalated(feature.id, invariant.reason)
+      return
+    }
 
     for (const [jobId, jobRuntime] of Object.entries(feature.jobs)) {
       if (jobRuntime.status !== "running" || jobRuntime.currentStep === null) continue

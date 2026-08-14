@@ -199,6 +199,10 @@ export class ApiClient {
     return this.request("POST", `/v1/features/${encodeURIComponent(featureId)}/abandon`, {})
   }
 
+  recover(featureId: string, notes: string): Promise<CommandResult> {
+    return this.request("POST", `/v1/features/${encodeURIComponent(featureId)}/recover`, { notes })
+  }
+
   getRun(runId: string): Promise<{ run: RunDetail }> {
     return this.request("GET", `/v1/runs/${encodeURIComponent(runId)}`)
   }

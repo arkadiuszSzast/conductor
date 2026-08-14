@@ -84,6 +84,7 @@ export interface EngineControl {
   pause(featureId: string): Promise<void>
   resume(featureId: string): Promise<void>
   abandon(featureId: string): Promise<void>
+  recover(featureId: string, input: { readonly notes?: string }): Promise<{ ok: boolean; message: string }>
 }
 
 export interface ApiDeps {
@@ -834,6 +835,19 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       case "resume":
         await engine.resume(featureId)
         return json(200, featurePayload(featureId), requestId)
+      case "recover": {
+        if (feature.status !== "escalated") {
+          return error(requestId, "conflict", `feature is not escalated (status: ${feature.status}) — recover only applies to escalated features`)
+        }
+        if (notes === undefined || notes.trim() === "") {
+          return error(requestId, "invalid_request", "\"notes\" (non-empty string) is required for recover")
+        }
+        const result = await engine.recover(featureId, { notes })
+        if (!result.ok) {
+          return error(requestId, "conflict", result.message)
+        }
+        return json(200, { result: result.message, ...(featurePayload(featureId) as Record<string, unknown>) }, requestId)
+      }
       default:
         return error(requestId, "not_found", `no route for POST /v1/features/:id/${action}`)
     }

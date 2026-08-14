@@ -313,6 +313,59 @@ describe("Engine: runner resource waits", () => {
     expect(store.listRuns(feature.id)).toHaveLength(0)
     expect(store.listResourceWaits(feature.id)[0]?.status).toBe("waiting")
   })
+
+  it("normalizes a legacy all-terminal running feature to escalated", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    // Simulate the pre-persistence bug: status "running" with every job
+    // terminal and at least one failed, and no run/wait/retry/outbox.
+    const state = store.getFeature(feature.id)!
+    const stranded = {
+      ...state,
+      jobs: {
+        main: {
+          ...state.jobs["main"]!,
+          status: "failed",
+          currentStep: null,
+          attempts: { implement: 1 },
+          reruns: {},
+          outputs: {},
+          steps: {
+            implement: { status: "failed", outputs: {} },
+          },
+        },
+      },
+    }
+    connection.db.run("UPDATE feature SET status = ?, state = ? WHERE id = ?", [
+      "running",
+      JSON.stringify(stranded),
+      feature.id,
+    ])
+
+    await engine.reconcile()
+
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+  })
+
+  it("recovers an escalated no-runner feature after a runner returns", async () => {
+    let available = false
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => available })
+    const feature = await startedFeature(engine)
+    expect(store.listRuns(feature.id)).toHaveLength(0)
+
+    clock.advance(3_600_000)
+    await engine.reconcile()
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+
+    const rejected = await engine.recover(feature.id, { notes: "" })
+    expect(rejected.ok).toBe(false)
+
+    available = true
+    const result = await engine.recover(feature.id, { notes: "runner came back online" })
+    expect(result.ok).toBe(true)
+    expect(store.listRuns(feature.id)).toHaveLength(1)
+    expect(sessions.prompts).toHaveLength(1)
+  })
 })
 
 describe("Engine: linear happy path", () => {

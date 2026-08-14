@@ -98,9 +98,32 @@ export function FeatureView(): React.ReactNode {
               review gate
             </button>
           ) : null}
-          {feature.status === "running" || feature.status === "escalated" ? (
+          {feature.status === "running" ? (
             <button disabled={pendingLifecycle !== null} onClick={() => lifecycle("pause")}>
               {pendingLifecycle === "pause" ? "…" : "pause"}
+            </button>
+          ) : null}
+          {feature.status === "escalated" ? (
+            <button
+              className="primary"
+              disabled={pendingLifecycle !== null}
+              onClick={async () => {
+                const note = window.prompt("Recovery note (required)")
+                if (note === null || note.trim() === "") return
+                setPendingLifecycle("recover")
+                try {
+                  await runCommand(featureId, client => client.recover(featureId, note))
+                  store.refetchFeatureDetail(featureId)
+                } catch (err) {
+                  const handled = mapGateError(err)
+                  if (handled.toast !== "") pushToast(handled.toast)
+                  if (handled.refetch) store.refetchFeatureDetail(featureId)
+                } finally {
+                  setPendingLifecycle(null)
+                }
+              }}
+            >
+              {pendingLifecycle === "recover" ? "…" : "recover"}
             </button>
           ) : null}
           {feature.status === "paused" ? (
