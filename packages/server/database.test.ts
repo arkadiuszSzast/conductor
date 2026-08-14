@@ -31,17 +31,45 @@ describe("database lifecycle and migrations", () => {
   it("creates the graph-state schema and migration ledger", () => {
     const connection = openMigratedDatabase({ path: temporaryPath() })
     expect(tableNames(connection.db)).toEqual(expect.arrayContaining([
-      "feature", "finding", "review_thread", "run", "schema_migration", "transition_log",
+      "feature", "finding", "resource_wait", "retry_episode", "review_thread", "run", "schema_migration", "transition_log",
     ]))
     expect(tableNames(connection.db)).not.toContain("pr_head")
     expect(tableNames(connection.db)).not.toContain("step_run")
-    expect(columnNames(connection.db, "feature")).toEqual(expect.arrayContaining(["state", "feedback", "workflow", "description"]))
+    expect(columnNames(connection.db, "feature")).toEqual(expect.arrayContaining([
+      "state", "feedback", "workflow", "description", "paused_at", "paused_ms",
+    ]))
     expect(columnNames(connection.db, "run")).toEqual(expect.arrayContaining([
       "job_id", "step_id", "nudges", "completion_event", "completion_decisions", "action_handled",
-      "pending_state", "next_observation",
+      "pending_state", "next_observation", "failure_class", "failure_source", "failure_retry_hint_ms",
+    ]))
+    expect(columnNames(connection.db, "retry_episode")).toEqual(expect.arrayContaining([
+      "feature_id", "job_id", "step_id", "status", "attempts", "started_at", "paused_ms",
+      "next_attempt_at", "delay_ms", "schedule_source", "max_attempts", "max_elapsed_ms",
+      "last_failure_class", "recovered_from", "version",
+    ]))
+    expect(columnNames(connection.db, "resource_wait")).toEqual(expect.arrayContaining([
+      "feature_id", "job_id", "step_id", "status", "reason", "first_observed_at", "latest_observed_at",
+      "observation_count", "next_observation_at", "deadline_at", "version",
     ]))
     const ledger = connection.db.query("SELECT id FROM schema_migration ORDER BY position").all() as Array<{ id: string }>
     expect(ledger.map(row => row.id)).toEqual(migrations.map(migration => migration.id))
+    connection.close()
+  })
+
+  it("enforces one active run per job+step at the DB layer (idx_run_one_active_target)", () => {
+    const connection = openMigratedDatabase({ path: temporaryPath() })
+    connection.db.run(
+      `INSERT INTO feature (id, slug, project_dir, title, status, state, time_created, time_updated)
+       VALUES ('f1', 'f', '/p', 'F', 'running', '{}', 1, 1)`,
+    )
+    connection.db.run(
+      `INSERT INTO run (id, feature_id, job_id, step_id, step_type, time_started) VALUES ('r1', 'f1', 'main', 'implement', 'agent', 1)`,
+    )
+    expect(() =>
+      connection.db.run(
+        `INSERT INTO run (id, feature_id, job_id, step_id, step_type, time_started) VALUES ('r2', 'f1', 'main', 'implement', 'agent', 2)`,
+      ),
+    ).toThrow()
     connection.close()
   })
 

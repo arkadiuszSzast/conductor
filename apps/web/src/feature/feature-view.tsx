@@ -68,6 +68,17 @@ export function FeatureView(): React.ReactNode {
   }
 
   const pillClass = `${styles.statusPill} ${styles[feature.status]}`
+  const activity = feature.activity ?? {
+    state: feature.status === "running" ? "active" as const : feature.status === "done" || feature.status === "abandoned" ? "terminal" as const : feature.status,
+    activeCount: detail.activeRun === null ? 0 : 1,
+    targets: [],
+    target: null,
+    reason: null,
+    diagnostic: null,
+    nextAt: null,
+    deadlineAt: null,
+    message: detail.activeRun === null ? `Feature is ${feature.status}.` : "1 active run.",
+  }
   const workflowRes = workflowState.data
 
   return (
@@ -87,9 +98,32 @@ export function FeatureView(): React.ReactNode {
               review gate
             </button>
           ) : null}
-          {feature.status === "running" || feature.status === "escalated" ? (
+          {feature.status === "running" ? (
             <button disabled={pendingLifecycle !== null} onClick={() => lifecycle("pause")}>
               {pendingLifecycle === "pause" ? "…" : "pause"}
+            </button>
+          ) : null}
+          {feature.status === "escalated" ? (
+            <button
+              className="primary"
+              disabled={pendingLifecycle !== null}
+              onClick={async () => {
+                const note = window.prompt("Recovery note (required)")
+                if (note === null || note.trim() === "") return
+                setPendingLifecycle("recover")
+                try {
+                  await runCommand(featureId, client => client.recover(featureId, note))
+                  store.refetchFeatureDetail(featureId)
+                } catch (err) {
+                  const handled = mapGateError(err)
+                  if (handled.toast !== "") pushToast(handled.toast)
+                  if (handled.refetch) store.refetchFeatureDetail(featureId)
+                } finally {
+                  setPendingLifecycle(null)
+                }
+              }}
+            >
+              {pendingLifecycle === "recover" ? "…" : "recover"}
             </button>
           ) : null}
           {feature.status === "paused" ? (
@@ -103,6 +137,13 @@ export function FeatureView(): React.ReactNode {
             </button>
           ) : null}
         </div>
+      </div>
+      <div className={`${styles.activity} ${styles[`activity_${activity.state}`] ?? ""}`}>
+        <strong>{activity.activeCount > 0 ? "Agents working" : activity.state.replace("_", " ")}</strong>
+        <span>{activity.message}</span>
+        {activity.target !== null ? <code>{activity.target.jobId}/{activity.target.stepId}</code> : null}
+        {activity.reason !== null ? <span>reason: {activity.reason}</span> : null}
+        {activity.nextAt !== null ? <span>next check: {formatClock(activity.nextAt)}</span> : null}
       </div>
       <div className={styles.grid}>
         <div className={styles.graphCol}>

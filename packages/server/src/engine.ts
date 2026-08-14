@@ -25,7 +25,17 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { DEFAULT_OUTCOME, buildEvalContext, extractExpressions, interpret, renderTemplate } from "@conductor/core"
+import {
+  DEFAULT_OUTCOME,
+  buildEvalContext,
+  checkActiveStateInvariant,
+  decideResourceWaitRoute,
+  extractExpressions,
+  interpret,
+  normalizeResourceWaitPolicy,
+  renderTemplate,
+  systemRandom,
+} from "@conductor/core"
 import type {
   ActionInputType,
   ActionManifest,
@@ -59,6 +69,7 @@ export interface EngineDeps {
   readonly clock: Clock
   readonly log: Logger
   readonly actions: ActionExecutor
+  readonly runnerAvailable?: () => boolean
   readonly notify?: (title: string, message: string) => void
 }
 
@@ -108,6 +119,12 @@ export class Engine {
     this.runTtlMs = options.runTtlMs ?? DEFAULT_RUN_TTL_MS
     this.nudgeIdleCycles = options.nudgeIdleCycles ?? DEFAULT_NUDGE_IDLE_CYCLES
     this.maxNudges = options.maxNudges ?? DEFAULT_MAX_NUDGES
+  }
+
+  /** The engine's resource-wait policy — normalized core defaults (v1):
+   *  finite 30-minute deadline, bounded exponential observation backoff. */
+  private resourceWaitPolicy(): ReturnType<typeof normalizeResourceWaitPolicy> {
+    return normalizeResourceWaitPolicy()
   }
 
   // ------------------------------------------------------------- starting
@@ -255,6 +272,25 @@ export class Engine {
     const role = snapshot.workflow.roles[step.role]
     if (!role) {
       await this.dispatch(featureId, { kind: "step.failed", jobId, stepId: step.id, reason: `role "${step.role}" not configured` })
+      return
+    }
+
+    if (this.deps.runnerAvailable?.() === false) {
+      const now = this.deps.clock.now()
+      const policy = this.resourceWaitPolicy()
+      const waitState = { firstObservedAtMs: now, observationCount: 0 }
+      const observed = decideResourceWaitRoute("runner_unavailable", policy, waitState, now, systemRandom)
+      store.upsertResourceWait({
+        featureId,
+        jobId,
+        stepId: step.id,
+        reason: "runner_unavailable",
+        observedAt: now,
+        nextObservationAt: observed.kind === "wait_resource" ? observed.nextObservationAtMs : now,
+        deadlineAt: now + policy.maxWaitMs,
+        diagnostic: "no runner registered with the daemon",
+      })
+      log.log(`feature=${state.slug} step=${jobId}/${step.id}: waiting for a runner`)
       return
     }
 
@@ -700,6 +736,68 @@ export class Engine {
     return `${verb}${notes.length > 0 ? " (notes recorded)" : ""}. Feature "${state.title}" is now: ${after?.status ?? state.status}.`
   }
 
+  // ------------------------------------------------------------ recovery
+
+  /**
+   * Explicit operator recovery for an escalated feature: picks the first
+   * recoverable agent target (prefers a resource wait, else the latest
+   * failed run), requires a non-empty note, and re-arms exactly that
+   * step — never the whole workflow. A still-absent runner re-enters a
+   * fresh resource wait (the upsert's uniqueness keeps it to one open
+   * row per target); an available runner dispatches one new run.
+   */
+  async recover(featureId: string, input: { readonly notes?: string }): Promise<{ ok: boolean; message: string }> {
+    const { store, log } = this.deps
+    const state = store.getFeature(featureId)
+    if (!state) return { ok: false, message: `unknown feature "${featureId}"` }
+    if (state.status !== "escalated") {
+      return { ok: false, message: `feature is not escalated (status: ${state.status}) — recover only applies to escalated features` }
+    }
+    if (input.notes === undefined || input.notes.trim() === "") {
+      return { ok: false, message: "recover requires a non-empty note" }
+    }
+    const snapshot = this.deps.workflows(state.projectDir)
+    if (!snapshot) return { ok: false, message: `no valid workflow for ${state.projectDir}` }
+
+    const waits = store.listResourceWaits(featureId)
+    const openWait = waits.find(wait => wait.status !== "closed")
+    const lastWait = [...waits].reverse().find(wait => wait.status === "closed") ?? null
+    let jobId = openWait?.jobId ?? lastWait?.jobId ?? null
+    let stepId = openWait?.stepId ?? lastWait?.stepId ?? null
+
+    if (jobId === null || stepId === null) {
+      const failed = store
+        .listRuns(featureId)
+        .filter(run => run.status === "failed" || run.status === "reaped")
+        .sort((a, b) => (b.timeFinished ?? b.timeStarted) - (a.timeFinished ?? a.timeStarted))[0]
+      if (failed) {
+        jobId = failed.jobId
+        stepId = failed.stepId
+      }
+    }
+
+    if (jobId === null || stepId === null) {
+      return { ok: false, message: "no recoverable failed or blocked step found — nothing to recover" }
+    }
+    const step = findStep(snapshot.workflow, jobId, stepId)
+    if (!step || step.type !== "agent") {
+      return { ok: false, message: `target "${jobId}/${stepId}" is not a recoverable agent step` }
+    }
+
+    // Same duplicate-dispatch guard as `actDecision`: the reconciler may
+    // have claimed the same wait and dispatched a run between the operator
+    // clicking recover and this check. The DB's one-open-target index is
+    // the backstop, but a clean conflict is far friendlier than an
+    // uncaught constraint violation surfacing as a 500.
+    if (store.getActiveRunForStep(featureId, jobId, stepId)) {
+      return { ok: false, message: `step "${jobId}/${stepId}" already has an active run — nothing to recover` }
+    }
+
+    log.log(`feature=${state.slug} recover: re-arming agent step "${jobId}/${stepId}"`)
+    await this.executeAgent(featureId, snapshot, jobId, step)
+    return { ok: true, message: `Recovered. Agent step "${jobId}/${stepId}" re-armed.` }
+  }
+
   // ------------------------------------------------------------ lifecycle
 
   async pause(featureId: string): Promise<void> {
@@ -739,6 +837,75 @@ export class Engine {
     const snapshot = this.deps.workflows(input.projectDir)
     if (!snapshot) return
 
+    if (input.status === "paused") return
+
+    const waits = store.listResourceWaits(input.id).filter(wait => wait.status === "waiting")
+    for (const wait of waits) {
+      if (wait.deadlineAt <= clock.now()) {
+        const claimed = store.claimResourceWait(wait.id, clock.now())
+        if (!claimed) continue
+        store.closeResourceWait(wait.id, "deadline_exhausted")
+        await this.dispatch(input.id, {
+          kind: "step.failed",
+          jobId: wait.jobId,
+          stepId: wait.stepId,
+          reason: `${wait.reason} deadline exhausted: ${wait.diagnostic ?? "required resource unavailable"}`,
+        })
+        continue
+      }
+      if (this.deps.runnerAvailable?.() === true) {
+        const claimed = store.claimResourceWait(wait.id, clock.now())
+        if (!claimed) continue
+        store.closeResourceWait(wait.id, "resource_available")
+        const step = findStep(snapshot.workflow, wait.jobId, wait.stepId)
+        if (!step || step.type !== "agent") {
+          await this.dispatch(input.id, {
+            kind: "step.failed",
+            jobId: wait.jobId,
+            stepId: wait.stepId,
+            reason: `resource wait target "${wait.jobId}/${wait.stepId}" is no longer an agent step`,
+          })
+          continue
+        }
+        await this.executeAgent(input.id, snapshot, wait.jobId, step)
+        continue
+      }
+      if (wait.nextObservationAt !== null && wait.nextObservationAt > clock.now()) continue
+      // Runner still absent but an observation is due: advance the wait with
+      // the core policy's bounded exponential backoff so the reconciler
+      // isn't spinning on every tick, and record the observation.
+      const now = clock.now()
+      const observed = decideResourceWaitRoute(
+        wait.reason,
+        this.resourceWaitPolicy(),
+        { firstObservedAtMs: wait.firstObservedAt, observationCount: wait.observationCount },
+        now,
+        systemRandom,
+      )
+      if (observed.kind === "escalate") continue
+      store.upsertResourceWait({
+        featureId: input.id,
+        jobId: wait.jobId,
+        stepId: wait.stepId,
+        reason: wait.reason,
+        observedAt: now,
+        nextObservationAt: observed.nextObservationAtMs,
+        deadlineAt: wait.deadlineAt,
+        diagnostic: wait.diagnostic ?? undefined,
+      })
+    }
+
+    // Due durable retries: claim and dispatch the scheduled step. The
+    // claim is atomic (one winner), and actDecision's duplicate-run guard
+    // prevents a second dispatch if the run already exists.
+    for (const episode of store.listDueRetryEpisodes(clock.now())) {
+      const claimed = store.claimRetryEpisode(episode.id, clock.now())
+      if (!claimed) continue
+      store.closeRetryEpisode(episode.id, "attempt_dispatched")
+      log.log(`reconcile ${input.slug}: dispatching due retry "${episode.jobId}/${episode.stepId}"`)
+      await this.actDecision(input.id, snapshot, { kind: "execute_step", jobId: episode.jobId, stepId: episode.stepId })
+    }
+
     // Restart recovery runs FIRST, unconditionally: decisions committed
     // by `concludeRun` but never acted on (process died in the gap) must
     // be replayed before the normal per-job reconciliation below sees
@@ -764,6 +931,18 @@ export class Engine {
     const feature = store.getFeature(input.id) ?? input
     if (feature.status === "done" || feature.status === "abandoned") return
 
+    const invariant = checkActiveStateInvariant(feature, {
+      hasActiveRun: store.getActiveRun(feature.id) !== null,
+      hasDueRetry: store.listRetryEpisodes(feature.id).some(episode => episode.status === "scheduled"),
+      hasResourceWait: store.listResourceWaits(feature.id).some(wait => wait.status === "waiting"),
+      hasUnhandledOutboxDecision: store.getPendingRunAction(feature.id) !== null,
+    })
+    if (invariant.kind === "stranded_legacy_failure" || invariant.kind === "stranded_no_anchor") {
+      log.log(`reconcile ${feature.slug}: ${invariant.reason} — marking escalated`)
+      store.markEscalated(feature.id, invariant.reason)
+      return
+    }
+
     for (const [jobId, jobRuntime] of Object.entries(feature.jobs)) {
       if (jobRuntime.status !== "running" || jobRuntime.currentStep === null) continue
       const stepId = jobRuntime.currentStep
@@ -779,6 +958,11 @@ export class Engine {
         continue
       }
       if (step.type === "human") continue
+
+      // A step awaiting a resource or a durable retry is deliberately
+      // run-less: the wait/retry loops above own it, and re-executing here
+      // would bypass the schedule entirely.
+      if (store.getOpenResourceWait(feature.id, jobId, stepId) ?? store.getOpenRetryEpisode(feature.id, jobId, stepId)) continue
 
       const active = store.getActiveRunForStep(feature.id, jobId, stepId)
       if (!active) {

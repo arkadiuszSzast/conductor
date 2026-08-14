@@ -315,6 +315,143 @@ export const migrations: readonly Migration[] = [
       addColumn(db, "run", "asked_at", "INTEGER")
     },
   },
+  {
+    id: "0013_retry_resource_wait_pause",
+    up(db) {
+      // retry-policy durable state (openspec/changes/retry-policy): a
+      // classified failure's envelope on `run`, durable retry episodes/
+      // schedules, durable resource waits (no executable attempt begun —
+      // distinct from a failed run) and pause-time accounting on
+      // `feature`. Additive only: existing rows read back with nullable
+      // metadata, nothing here is required for the seed pipeline paths
+      // already committed to SQLite.
+
+      // The classified failure an attempt concluded with — `reason`
+      // (0008) already carries the bounded human diagnostic; these three
+      // add the machine-readable class/source/hint the retry-policy
+      // taxonomy defines (packages/core/src/failure.ts). CHECK mirrors
+      // FAILURE_CLASSES; kept in sync by convention since a shipped
+      // migration is never edited — a future class needs a new migration.
+      addColumn(
+        db, "run", "failure_class",
+        `TEXT CHECK(failure_class IS NULL OR failure_class IN (
+          'transient_upstream','transient_transport','capacity','timeout',
+          'deterministic_failure','invalid_config','missing_session','cancelled','internal'
+        ))`,
+      )
+      addColumn(db, "run", "failure_source", "TEXT")
+      addColumn(db, "run", "failure_retry_hint_ms", "INTEGER")
+
+      // One executing attempt per job+step, durable at the DB level —
+      // "enforce one active attempt per target" (durable-retries design).
+      // Existing dispatch already keeps this true in practice
+      // (getActiveRunForStep guards re-dispatch); this makes it a
+      // constraint instead of a convention.
+      db.run(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_run_one_active_target
+        ON run(feature_id, job_id, step_id) WHERE status = 'running'
+      `)
+
+      // A retry episode: the durable state behind decideFailureRoute's
+      // route intent (packages/core/src/lifecycle.ts). `attempts`/
+      // `started_at`/`paused_ms` mirror RetryEpisodeState so the engine
+      // can round-trip a row straight into the pure decision function.
+      // `next_attempt_at`/`delay_ms`/`schedule_source` are null once
+      // claimed or closed — a claimed/closed episode is not "due" by
+      // construction. `recovered_from` chains an operator-recovered
+      // episode to the one it replaced (retry-budget spec: "old failure
+      // history remains in the timeline").
+      db.run(`
+        CREATE TABLE IF NOT EXISTS retry_episode (
+          id                          TEXT PRIMARY KEY,
+          feature_id                  TEXT NOT NULL REFERENCES feature(id) ON DELETE CASCADE,
+          job_id                      TEXT NOT NULL,
+          step_id                     TEXT NOT NULL,
+          status                      TEXT NOT NULL DEFAULT 'scheduled'
+                                        CHECK(status IN ('scheduled','claimed','closed')),
+          attempts                    INTEGER NOT NULL,
+          started_at                  INTEGER NOT NULL,
+          paused_ms                   INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at             INTEGER,
+          delay_ms                    INTEGER,
+          schedule_source             TEXT CHECK(schedule_source IS NULL OR schedule_source IN ('backoff','retry_hint')),
+          max_attempts                INTEGER NOT NULL,
+          max_elapsed_ms              INTEGER NOT NULL,
+          last_failure_class          TEXT CHECK(last_failure_class IS NULL OR last_failure_class IN (
+                                         'transient_upstream','transient_transport','capacity','timeout',
+                                         'deterministic_failure','invalid_config','missing_session','cancelled','internal'
+                                       )),
+          last_failure_source         TEXT,
+          last_failure_diagnostic     TEXT,
+          last_failure_retry_hint_ms  INTEGER,
+          last_failure_at             INTEGER,
+          recovered_from              TEXT REFERENCES retry_episode(id),
+          version                     INTEGER NOT NULL DEFAULT 0,
+          closed_reason               TEXT,
+          time_created                INTEGER NOT NULL,
+          time_updated                INTEGER NOT NULL
+        )
+      `)
+      // "one active attempt per target" extends to scheduling: at most
+      // one open (not yet claimed-and-concluded) episode per job+step.
+      db.run(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_retry_episode_open_target
+        ON retry_episode(feature_id, job_id, step_id) WHERE status IN ('scheduled','claimed')
+      `)
+      db.run(`
+        CREATE INDEX IF NOT EXISTS idx_retry_episode_due
+        ON retry_episode(status, next_attempt_at) WHERE status = 'scheduled'
+      `)
+      db.run("CREATE INDEX IF NOT EXISTS idx_retry_episode_feature ON retry_episode(feature_id, time_created)")
+
+      // A resource wait: no executable attempt began (failure.ts:
+      // ResourceReason), so it is tracked separately from a failed run
+      // and never touches a step's retry-attempt budget. `deadline_at`
+      // and `first_observed_at` are fixed once at creation; only
+      // `latest_observed_at`/`observation_count`/`next_observation_at`/
+      // `diagnostic` move on repeated observation.
+      db.run(`
+        CREATE TABLE IF NOT EXISTS resource_wait (
+          id                    TEXT PRIMARY KEY,
+          feature_id            TEXT NOT NULL REFERENCES feature(id) ON DELETE CASCADE,
+          job_id                TEXT NOT NULL,
+          step_id                TEXT NOT NULL,
+          status                TEXT NOT NULL DEFAULT 'waiting'
+                                  CHECK(status IN ('waiting','claimed','closed')),
+          reason                TEXT NOT NULL
+                                  CHECK(reason IN ('runner_unavailable','binding_unavailable','dependency_unavailable')),
+          first_observed_at     INTEGER NOT NULL,
+          latest_observed_at    INTEGER NOT NULL,
+          observation_count     INTEGER NOT NULL DEFAULT 1,
+          next_observation_at   INTEGER,
+          deadline_at           INTEGER NOT NULL,
+          diagnostic            TEXT,
+          version               INTEGER NOT NULL DEFAULT 0,
+          closed_reason         TEXT,
+          time_created          INTEGER NOT NULL,
+          time_updated          INTEGER NOT NULL
+        )
+      `)
+      db.run(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_resource_wait_open_target
+        ON resource_wait(feature_id, job_id, step_id) WHERE status IN ('waiting','claimed')
+      `)
+      db.run(`
+        CREATE INDEX IF NOT EXISTS idx_resource_wait_due
+        ON resource_wait(status, next_observation_at) WHERE status = 'waiting'
+      `)
+      db.run("CREATE INDEX IF NOT EXISTS idx_resource_wait_feature ON resource_wait(feature_id, time_created)")
+
+      // Pause-time accounting (design.md: "budget clocks store
+      // accumulated paused duration"). `paused_at` is set the instant a
+      // feature enters `paused` and cleared on the instant it leaves;
+      // `paused_ms` accumulates the closed spans. Both live outside
+      // `FeatureState` (interpreter never writes them) same as
+      // `escalation`/timestamps already do.
+      addColumn(db, "feature", "paused_at", "INTEGER")
+      addColumn(db, "feature", "paused_ms", "INTEGER NOT NULL DEFAULT 0")
+    },
+  },
 ]
 
 function validateMigrations(ordered: readonly Migration[]): void {

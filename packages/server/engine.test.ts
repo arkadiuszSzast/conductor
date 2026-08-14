@@ -266,6 +266,146 @@ async function startedFeature(engine: Engine, projectDir = "/tmp/project") {
 
 // ---------------------------------------------------------------------------
 
+describe("Engine: runner resource waits", () => {
+  it("waits without creating a run and dispatches once when a runner returns", async () => {
+    let available = false
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => available })
+    const feature = await startedFeature(engine)
+
+    expect(store.listRuns(feature.id)).toHaveLength(0)
+    expect(store.listResourceWaits(feature.id)).toHaveLength(1)
+    expect(store.listResourceWaits(feature.id)[0]?.status).toBe("waiting")
+
+    available = true
+    clock.advance(5_000)
+    await engine.reconcile()
+    await engine.reconcile()
+
+    expect(store.listRuns(feature.id)).toHaveLength(1)
+    expect(sessions.prompts).toHaveLength(1)
+    expect(store.listResourceWaits(feature.id)[0]?.status).toBe("closed")
+  })
+
+  it("persists the wait across engine recreation and escalates after its deadline", async () => {
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => false })
+    const feature = await startedFeature(engine)
+    expect(store.listRuns(feature.id)).toHaveLength(0)
+
+    clock.advance(3_600_000)
+    const restarted = makeEngine(linearWorkflow, {}, { runnerAvailable: () => false })
+    await restarted.reconcile()
+
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    expect(store.listRuns(feature.id)).toHaveLength(0)
+    expect(store.listResourceWaits(feature.id)[0]?.closedReason).toBe("deadline_exhausted")
+  })
+
+  it("does not dispatch a satisfiable wait while paused", async () => {
+    let available = false
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => available })
+    const feature = await startedFeature(engine)
+    await engine.pause(feature.id)
+    available = true
+    clock.advance(5_000)
+
+    await engine.reconcile()
+
+    expect(store.listRuns(feature.id)).toHaveLength(0)
+    expect(store.listResourceWaits(feature.id)[0]?.status).toBe("waiting")
+  })
+
+  it("normalizes a legacy all-terminal running feature to escalated", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    // Simulate the pre-persistence bug: status "running" with every job
+    // terminal and at least one failed, and no run/wait/retry/outbox.
+    const state = store.getFeature(feature.id)!
+    const stranded = {
+      ...state,
+      jobs: {
+        main: {
+          ...state.jobs["main"]!,
+          status: "failed",
+          currentStep: null,
+          attempts: { implement: 1 },
+          reruns: {},
+          outputs: {},
+          steps: {
+            implement: { status: "failed", outputs: {} },
+          },
+        },
+      },
+    }
+    connection.db.run("UPDATE feature SET status = ?, state = ? WHERE id = ?", [
+      "running",
+      JSON.stringify(stranded),
+      feature.id,
+    ])
+
+    await engine.reconcile()
+
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+  })
+
+  it("dispatches a due durable retry exactly once", async () => {
+    let available = false
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => available })
+    const feature = await startedFeature(engine)
+    expect(store.listRuns(feature.id)).toHaveLength(0)
+    expect(store.listResourceWaits(feature.id)[0]?.status).toBe("waiting")
+    // Replace the runner wait with a durable retry schedule for the same
+    // step so the retry loop owns dispatch instead of the wait loop.
+    store.closeResourceWait(store.listResourceWaits(feature.id)[0]!.id, "replaced")
+    store.scheduleRetry({
+      featureId: feature.id,
+      jobId: "main",
+      stepId: "implement",
+      attempts: 1,
+      startedAt: clock.now(),
+      nextAttemptAt: clock.now() + 1_000,
+      delayMs: 1_000,
+      scheduleSource: "backoff",
+      maxAttempts: 3,
+      maxElapsedMs: 600_000,
+      failure: { class: "transient_upstream", diagnostic: "provider 503", source: "runner" },
+    })
+    available = true
+
+    // Not due yet — nothing happens, and the running step is NOT
+    // re-executed (the retry schedule owns it).
+    await engine.reconcile()
+    expect(store.listRuns(feature.id)).toHaveLength(0)
+
+    clock.advance(1_000)
+    await engine.reconcile()
+    await engine.reconcile()
+
+    expect(store.listRuns(feature.id)).toHaveLength(1)
+    expect(sessions.prompts).toHaveLength(1)
+    expect(store.getOpenRetryEpisode(feature.id, "main", "implement")).toBeNull()
+  })
+
+  it("recovers an escalated no-runner feature after a runner returns", async () => {
+    let available = false
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => available })
+    const feature = await startedFeature(engine)
+    expect(store.listRuns(feature.id)).toHaveLength(0)
+
+    clock.advance(3_600_000)
+    await engine.reconcile()
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+
+    const rejected = await engine.recover(feature.id, { notes: "" })
+    expect(rejected.ok).toBe(false)
+
+    available = true
+    const result = await engine.recover(feature.id, { notes: "runner came back online" })
+    expect(result.ok).toBe(true)
+    expect(store.listRuns(feature.id)).toHaveLength(1)
+    expect(sessions.prompts).toHaveLength(1)
+  })
+})
+
 describe("Engine: linear happy path", () => {
   it("agent → command → human gate → approve → done", async () => {
     const engine = makeEngine(linearWorkflow)

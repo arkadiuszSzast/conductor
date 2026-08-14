@@ -193,6 +193,14 @@ export class ApiClient {
       body: "{}",
     })
   }
+
+  async recover(featureId: string, notes: string): Promise<CommandResponse> {
+    return this.request<CommandResponse>(`/v1/features/${encodeURIComponent(featureId)}/recover`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ notes }),
+    })
+  }
 }
 
 async function toApiError(response: Response): Promise<ApiError> {

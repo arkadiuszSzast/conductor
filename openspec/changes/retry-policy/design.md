@@ -1,84 +1,77 @@
-# Design — retry-policy
-
 ## Context
 
-The seed increments `attempts[stepId]` and immediately routes/retries until
-`max_attempts`, while poll-style builtins re-run each reconcile. There is no
-`next_attempt_at`, failure taxonomy or wall-time budget. This works for
-correctness loops but fails operationally under provider weather.
+The pure interpreter currently emits immediate `execute_step` retries using only attempt count. All effect failures collapse to `step.failed(reason: string)`, runner absence fails dispatch immediately, and `human.resumed` doubles as both unpause and retry-budget reset. SQLite already provides atomic run conclusion, a completion-decision outbox and restart reconciliation; these are the foundation to extend rather than replace.
 
-Retries span layers: runner transport/provider calls, action observations,
-step attempts and workflow review/fix loops. They must not collapse into one
-counter. This change covers operation/step failure retries; review rounds remain
-workflow routing with their own explicit budget.
+This change owns generic failure, retry, block, pause and operator-recovery semantics. `runner-protocol` owns runner identity, leases, capability matching, idempotent session operations and maps runner observations into the shared types.
+
+## Goals / Non-Goals
+
+**Goals:**
+
+- Make every non-terminal state explain what can cause future progress.
+- Recover automatically from temporary unavailable infrastructure without burning executable attempts.
+- Keep policy decisions deterministic and I/O-free while making scheduling and claims durable.
+- Provide one explicit recovery operation across failure sources.
+- Make API, CLI and UI projections agree about whether work is active, delayed, blocked, paused or escalated.
+
+**Non-Goals:**
+
+- Infinite retries or waits, global circuit breakers, LLM-driven classification, distributed scheduling or automatic repair of invalid workflow definitions.
+- Cancelling every runtime effect synchronously on pause; pause guarantees orchestration suspension, while cancellation remains best-effort and runner-specific.
 
 ## Decisions
 
-### Failure taxonomy
+### Shared failure envelope and resource-block reason
 
-Define one closed v1 enum in core and require every effect boundary to map into
-it. The engine consumes class + diagnostic + optional provider retry hint.
-Human text never drives routing. Unknown/malformed maps to finite `internal`.
-Taxonomy evolution is additive by protocol version.
+Core defines closed v1 failure classes and resource reasons. A failure envelope carries class, bounded diagnostic, source and optional retry hint. Resource unavailability is represented separately because no executable attempt began. Unknown adapter values normalize to finite `internal`; human text never drives policy.
 
-### Policy model
+Alternative: treat no runner as `transient_transport`. Rejected because it consumes attempt budget before a runner accepted work and makes submission order observable.
 
-A normalized policy has:
+### Pure lifecycle decisions, durable scheduler I/O
 
-- `max_attempts` (total attempts including first),
-- `max_elapsed` (ISO-like duration),
-- backoff: `initial`, `multiplier`, `max`, `jitter` (full/equal/none),
-- `on_exhausted`: escalate/fail/goto,
-- per-class override: retry with optional backoff/budget changes or route now.
+The interpreter remains pure. It decides route intent (`retry`, `wait_resource`, `escalate`, workflow route) from normalized policy and state. The engine calculates timestamps using injected clock/random, and the store atomically concludes an attempt and creates its retry episode/schedule. Resource waits are created before a run exists. Reconciliation claims due rows transactionally before dispatch.
 
-Defaults are conservative: transient upstream/transport/capacity retry with
-patient minutes→tens-of-minutes→hours schedule; deterministic/invalid/cancelled
-do not sleep-retry. Exact defaults live in one documented config object and
-can be overridden project/workflow/step (specific wins).
+Alternative: sleep inside engine dispatch. Rejected because restart loses timers and concurrent reconcilers can duplicate work.
 
-### Durable state machine
+### Explicit active-state invariant
 
-Each retry episode has a persisted `retry_state` keyed by step execution
-identity: budget start, attempts used, next attempt time, last class,
-class-count summary and policy snapshot/digest. Attempt completion and retry
-schedule are one transaction. Reconciler queries due rows and claims them via
-conditional update/transaction before creating a new run.
+Every non-terminal feature must have at least one durable progress anchor: active run, human gate/question, due retry, resource wait, paused pending work or unhandled outbox decision. Reconciliation repairs a uniquely inferable missing run; otherwise it records an invariant escalation. A terminal DAG with failures is escalated even when the final failure also produced skip decisions.
 
-Store absolute UTC epoch timestamps for due/deadline and monotonic duration
-only inside one process operation. On wall-clock reversal, never dispatch
-before persisted due time; log skew. Tests inject `Clock` and `Random` into
-pure schedule calculation and engine.
+Alternative: let the board infer stuckness from timestamps. Rejected because the durable state machine, not UI heuristics, must own truth.
 
-### Backoff calculation
+### Resource waits are finite observation episodes
 
-`base = min(max, initial * multiplier^(attemptIndex-1))` with overflow-safe
-clamping. Jitter mode defaults to full jitter `[0, base]`; a configured minimum
-prevents hot-loop zero. Provider retry-after acts as a lower-bound suggestion,
-then the result is clamped by policy max and remaining elapsed budget. The
-calculation returns both timestamp and a reason record for audit.
+A blocked step persists target, reason, policy snapshot, first/latest observation, next observation and deadline. Runner registration/lease change may wake reconciliation early, but heartbeat polling remains the correctness path. Observation uses bounded exponential backoff and does not increment step attempts. Deadline expiry escalates with recover available.
 
-### Budget semantics
+Alternative: wait indefinitely for runner. Rejected because absent/misconfigured infrastructure would hide abandoned work forever.
 
-`max_attempts` includes the first attempt. `max_elapsed` starts immediately
-before first dispatch and includes execution/wait. Never schedule an attempt
-whose eligibility exceeds deadline. A running attempt that crosses deadline
-is governed by run timeout/cancellation; upon failure no new retry is allowed.
-Human resume starts a new episode but preserves old rows/history.
+### Retry episode and budget semantics
 
-## Alternatives considered
+`max_attempts` includes the first executable attempt. `max_elapsed` starts immediately before first dispatch and includes execution and unpaused waits. Backoff is overflow-safe, capped and jittered; `Retry-After` is a bounded lower hint. Every operator recover creates a new episode linked to prior history. All budgets remain finite.
 
-1. **Use an in-memory retry library** — rejected: sleeps vanish on restart and
-   duplicate under multiple reconcilers.
-2. **Only wall-time budget** — rejected: fast deterministic/internal loops can
-   hammer dependencies. Both tries and elapsed are necessary.
-3. **Only attempt budget with large fixed delay** — rejected: poor recovery
-   latency and synchronized load.
-4. **Global circuit breaker first** — deferred. It can optimize known shared
-   outages later, but per-step durable correctness cannot depend on it.
+### Resume, recover and pause are distinct
 
-## Observability
+`pause` places a barrier in engine/reconciler: no new dispatch, due-work claim, observation, nudge, reap or downstream outbox side effect. Late conclusions are atomically recorded but their decisions remain pending. Budget clocks store accumulated paused duration or shift due/deadline timestamps on resume.
 
-Each failure/retry emits class, attempt, elapsed/remaining budget, computed
-backoff, retry-hint influence and next timestamp. Metrics count failures/retries
-by class/action/runner (bounded labels), budget exhaustion and retry wait.
-Diagnostics redact secrets and truncate output without losing durable class.
+`resume` only removes that barrier. `recover` is allowed for escalated recoverable targets, requires note plus optimistic expected status/version, and chooses default reset or explicit finite override. It never falls through to replay workflow start.
+
+Alternative: preserve overloaded resume. Rejected because unpause must not silently grant a fresh failure budget.
+
+### Recovery API and projection
+
+Feature detail exposes a derived activity summary: `active`, `waiting_retry`, `blocked`, `waiting_human`, `paused`, `escalated` or terminal; active run count/targets; failure/resource envelope; retry/wait episode and next time; recoverability and allowed commands. Commands are idempotent and status/version-guarded. Web and CLI consume this projection rather than re-deriving it.
+
+### Migration and compatibility
+
+Additive migrations add failure metadata, retry/resource episodes, due-work indexes and pause accounting. Existing runs receive nullable metadata; legacy text failures normalize to `internal` only if retried. On first reconciliation, inconsistent active features are repaired or escalated. Workflow retry syntax remains valid and is normalized into finite policy defaults.
+
+Rollback can ignore new tables/columns after stopping the upgraded daemon, but features currently in new blocked/retry states require the upgraded binary to progress. No destructive migration or gloam config rewrite is required.
+
+## Risks / Trade-offs
+
+- **Retry/resource policy scope grows quickly** → ship shared model and no-runner recovery first, then map remaining boundaries behind exhaustive tests.
+- **Pause races with late reports** → atomically conclude runs but leave outbox decisions undispatched until resume.
+- **Two reconcilers duplicate due work** → use conditional transactional claims and a database uniqueness invariant for one active attempt per target.
+- **Misclassified deterministic failures retry patiently** → closed taxonomy, conservative finite `internal`, conformance tests and visible classification.
+- **Runner availability flaps wake many features** → jittered observations, bounded batches and transactional claims.
+- **Legacy stranded state is ambiguous** → only reconstruct when target is unique; otherwise escalate with diagnostics instead of guessing.

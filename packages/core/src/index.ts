@@ -65,3 +65,69 @@ export type { ParseActionManifestError, ParseActionManifestResult } from "./acti
 export type * from "./types.ts"
 export type { RenderResult } from "./template.ts"
 export type { ValidationResult } from "./validate.ts"
+export {
+  FAILURE_CLASSES,
+  RESOURCE_REASONS,
+  boundDiagnostic,
+  makeFailureEnvelope,
+  normalizeFailureClass,
+} from "./failure.ts"
+export type { FailureClass, FailureEnvelope, MakeFailureEnvelopeInput, ResourceReason } from "./failure.ts"
+export {
+  DEFAULT_RESOURCE_WAIT_MAX_MS,
+  DEFAULT_RESOURCE_WAIT_OBSERVATION,
+  DEFAULT_RETRY_BACKOFF,
+  DEFAULT_RETRY_BUDGET,
+  behaviourForClass,
+  normalizeResourceWaitPolicy,
+  normalizeRetryPolicy,
+  validateBackoffDef,
+  validateResourceWaitPolicyConfig,
+  validateRetryBudget,
+  validateRetryPolicyConfig,
+} from "./retry-policy.ts"
+export type {
+  NormalizedResourceWaitPolicy,
+  NormalizedRetryPolicy,
+  ResourceWaitPolicyConfig,
+  RetryBudget,
+  RetryClassBehaviour,
+  RetryPolicyConfig,
+  RetryPolicyOverride,
+} from "./retry-policy.ts"
+export {
+  applyJitter,
+  accumulatePausedMs,
+  baseDelayMs,
+  checkRetryBudget,
+  clampRetryHintMs,
+  computeDelayMs,
+  computeScheduledDelayMs,
+  elapsedBudgetMs,
+  nextAttemptAt,
+  systemRandom,
+} from "./scheduling.ts"
+export type { BudgetCheckInput, BudgetCheckResult, ElapsedBudgetState, Random } from "./scheduling.ts"
+export { decideFailureRoute, decidePauseAwareResume, decideRecover, decideResourceWaitRoute } from "./lifecycle.ts"
+export type {
+  DueSchedule,
+  DueScheduleKind,
+  FailureRouteDecision,
+  RecoverDecision,
+  RecoverRequest,
+  RecoverTarget,
+  RecoverableStatus,
+  ResourceWaitRouteDecision,
+  ResourceWaitState,
+  ResumeScheduleDecision,
+  RetryEpisodeState,
+} from "./lifecycle.ts"
+export {
+  NO_EXTERNAL_ANCHORS,
+  allJobsTerminalStatus,
+  anyJobFailed,
+  checkActiveStateInvariant,
+  isTerminalJobStatus,
+  progressAnchors,
+} from "./invariant.ts"
+export type { AnchorState, InvariantCheckResult, ProgressAnchor } from "./invariant.ts"

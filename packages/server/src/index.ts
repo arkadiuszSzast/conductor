@@ -15,6 +15,11 @@ export type {
   FeatureRecord,
   FindingCounts,
   FindingView,
+  PauseAccounting,
+  ResourceWaitRecord,
+  ResourceWaitStatus,
+  RetryEpisodeRecord,
+  RetryEpisodeStatus,
   RunActionMetadata,
   RunSummary,
   StoreChange,
@@ -127,4 +132,24 @@ export type {
   StepRuntime,
   StepStatus,
   Transition,
+} from "@conductor/core"
+
+// Re-export retry-policy's shared taxonomy/policy/decision types
+// (packages/core/src/failure.ts, retry-policy.ts, lifecycle.ts) —
+// consumers driving the store's retry/resource-wait accessors need
+// these without a separate @conductor/core dependency.
+export type {
+  FailureClass,
+  FailureEnvelope,
+  NormalizedResourceWaitPolicy,
+  NormalizedRetryPolicy,
+  RecoverDecision,
+  RecoverRequest,
+  RecoverTarget,
+  RecoverableStatus,
+  ResourceReason,
+  ResourceWaitRouteDecision,
+  ResourceWaitState,
+  RetryBudget,
+  RetryEpisodeState,
 } from "@conductor/core"

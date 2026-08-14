@@ -1,31 +1,34 @@
 ## Why
 
-The seed retries by counting failures: "N attempts, then escalate". During a
-provider outage this burns its entire budget in minutes and escalates work that
-would succeed if the system simply waited. We observed two ten-minute upstream
-model outages exhaust features that would have recovered twenty minutes later.
-
-Conductor needs resilience with patience: exponential backoff with jitter and
-a cap, budgets expressed in both tries and elapsed time, and policies selected
-by stable failure class. A transient provider 5xx should wait; a deterministic
-validation/gate failure should route to its fixer or fail immediately. This is
-part of the durable state machine, not an in-memory sleep loop.
+A Conductor task can currently consume its retries while required infrastructure is absent and can then remain labelled `running` even though no run, gate or future work exists. Operators need transient outages to recover automatically, terminal failures to expose an explicit recovery action, and the UI to state whether work is active, waiting, or needs intervention.
 
 ## What Changes
 
-- Stable failure taxonomy shared by actions, runners, engine and API.
-- Declarative retry policy: backoff strategy, base/factor/cap/jitter,
-  max-attempts, max-elapsed-time, optional per-class overrides.
-- Durable retry scheduling (`next_attempt_at`, budget start, failure history),
-  reconciled after restart without busy polling or duplicate dispatch.
-- Retry hints (`Retry-After`) are respected within policy bounds.
-- Escalation records the full budget/failure summary and remains resumable by a
-  human with an explicit budget reset/override.
-- Deterministic test clock and jitter source; no flaky wall-clock tests.
+- Introduce a stable failure taxonomy shared by commands, actions, runners, engine, persistence and API; policy never parses diagnostic text.
+- Add durable retry episodes with exponential backoff, bounded jitter, tries-and-elapsed budgets, per-class policy and restart-safe due-work claims.
+- Add a durable `blocked` lifecycle for work waiting on a recoverable resource such as a compatible runner. Waiting does not create a failed attempt or consume step retry budget.
+- Reconcile blocked work automatically when its resource becomes available; use bounded observation/backoff and escalation deadlines so waiting is finite and auditable.
+- Separate `resume` from `recover`: resume only leaves a deliberate pause, while recover starts a new audited retry episode for an escalated failure with a selected target and budget reset/override.
+- Make pause a scheduling barrier: Conductor records late conclusions but does not dispatch, observe, nudge, reap or advance downstream work until resumed.
+- Expose active runs, blocked cause, failure class, retry budget, next attempt/observation and available actions consistently through API, CLI and web UI.
+- Preserve the seed's durable reconciler, confirmation-of-effect, nudge/reap and human escalation behaviours, while replacing implicit immediate retries and overloaded resume semantics.
 
-## Non-goals
+## Capabilities
 
-- No infinite retries.
-- No LLM-based failure classification or recovery decisions.
-- No global circuit breaker in the first slice; policy/state is per run/step.
-- No hiding deterministic failures behind delay.
+### New Capabilities
+
+- `failure-classification`: Stable machine-readable failure and resource-unavailability vocabulary across all effect boundaries.
+- `durable-retries`: Restart-safe scheduling, resource waits, transactional claims and pause-aware reconciliation.
+- `retry-budget`: Finite tries-and-time budgets, explicit escalation and audited operator recovery.
+
+### Modified Capabilities
+
+_None._ Existing `feedback-loops` already requires failed DAGs to escalate, and the new capabilities define the additional lifecycle and visibility contract.
+
+## Impact
+
+- Affects core lifecycle/event/decision types and workflow retry validation; server engine, reconciler, store, migrations and API; CLI; web projections and controls; runner/action/command failure adapters.
+- Adds SQLite tables/columns and indexes additively. Existing features remain readable; inconsistent legacy `running` features with no active work are normalized to an actionable escalation during reconciliation.
+- Existing workflow files remain valid. New policy fields are optional and receive finite defaults. `gloam-idle` and dogfood workflows need no immediate configuration changes.
+- Coordinates with `runner-protocol`: this change owns generic retry/recovery semantics; runner-protocol owns runner leases, capability matching and mapping runner conditions into this model.
+- Does not change confirmed runtime, workflow-format, action-registry or explicit-report decisions and does not add LLM-based recovery decisions.

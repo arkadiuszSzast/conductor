@@ -290,6 +290,7 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
     "pause",
     "resume",
     "abandon",
+    "recover",
     "logs",
   ])
   if (!KNOWN_COMMANDS.has(parsed.command)) {
@@ -331,6 +332,8 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
       case "resume":
       case "abandon":
         return await commandLifecycle(parsed, deps, client, json)
+      case "recover":
+        return await commandRecover(parsed, deps, client, json)
       case "logs":
         return await commandLogs(parsed, deps, client, json)
       default:
@@ -751,6 +754,22 @@ async function commandAnswer(parsed: Parsed, deps: CliDeps, client: ApiClient, j
     return EXIT.ok
   }
   deps.stdout(payload.result)
+  return EXIT.ok
+}
+
+async function commandRecover(parsed: Parsed, deps: CliDeps, client: ApiClient, json: boolean): Promise<number> {
+  const featureId = requireId(parsed, "recover requires a feature id")
+  const notes = resolveNotes(stringFlag(parsed, "notes"), deps)
+  if (notes === undefined || notes.trim() === "") {
+    throw new UsageError("recover requires --notes explaining why you are recovering")
+  }
+  const payload = await client.recover(featureId, notes)
+  if (json) {
+    deps.stdout(JSON.stringify(payload))
+    return EXIT.ok
+  }
+  deps.stdout(payload.result ?? "Recovered")
+  printFeature(deps, payload)
   return EXIT.ok
 }
 

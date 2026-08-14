@@ -84,6 +84,7 @@ export interface EngineControl {
   pause(featureId: string): Promise<void>
   resume(featureId: string): Promise<void>
   abandon(featureId: string): Promise<void>
+  recover(featureId: string, input: { readonly notes?: string }): Promise<{ ok: boolean; message: string }>
 }
 
 export interface ApiDeps {
@@ -354,9 +355,62 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     const record = store.getFeatureRecord(featureId)
     if (!record) return null
     const feature = record.state
+    const activeRuns = store.listActiveRuns(featureId)
+    const openWait = store.listResourceWaits(featureId).find(wait => wait.status !== "closed")
+    const openRetry = store.listRetryEpisodes(featureId).find(episode => episode.status !== "closed")
+    const activity = openWait
+      ? {
+          state: "blocked",
+          activeCount: activeRuns.length,
+          targets: activeRuns.map(run => ({ jobId: run.jobId, stepId: run.stepId })),
+          target: { jobId: openWait.jobId, stepId: openWait.stepId },
+          reason: openWait.reason,
+          diagnostic: openWait.diagnostic,
+          nextAt: openWait.nextObservationAt,
+          deadlineAt: openWait.deadlineAt,
+          message: activeRuns.length === 0 ? "No agent is active — waiting for a runner." : "Waiting for a runner.",
+        }
+      : openRetry
+        ? {
+            state: "waiting_retry",
+            activeCount: activeRuns.length,
+            targets: activeRuns.map(run => ({ jobId: run.jobId, stepId: run.stepId })),
+            target: { jobId: openRetry.jobId, stepId: openRetry.stepId },
+            reason: openRetry.lastFailure?.class ?? null,
+            diagnostic: openRetry.lastFailure?.diagnostic ?? null,
+            nextAt: openRetry.nextAttemptAt,
+            deadlineAt: openRetry.startedAt + openRetry.maxElapsedMs,
+            message: "No agent is active — waiting for the next retry.",
+          }
+        : {
+            state: feature.status === "waiting_human"
+              ? "waiting_human"
+              : feature.status === "paused"
+                ? "paused"
+                : feature.status === "escalated"
+                  ? "escalated"
+                  : feature.status === "done" || feature.status === "abandoned"
+                    ? "terminal"
+                    : "active",
+            activeCount: activeRuns.length,
+            targets: activeRuns.map(run => ({ jobId: run.jobId, stepId: run.stepId })),
+            target: null,
+            reason: null,
+            diagnostic: feature.status === "running" && activeRuns.length === 0 ? "No active agent or run is currently recorded." : null,
+            nextAt: null,
+            deadlineAt: null,
+            message: feature.status === "running" && activeRuns.length === 0
+              ? "No agent is active — orchestration is between steps or stalled."
+              : activeRuns.length > 0
+                ? `${activeRuns.length} active run${activeRuns.length === 1 ? "" : "s"}.`
+                : feature.status === "escalated"
+                  ? "Automation stopped and needs recovery."
+                  : `Feature is ${feature.status}.`,
+          }
     return {
       feature: {
         ...feature,
+        activity,
         escalation: store.getEscalation(featureId),
         currentStep: currentStepOf(feature),
         createdAt: record.createdAt,
@@ -366,6 +420,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         jobs: jobsDetail(feature, store.newestRunIdsByStep(featureId)),
       },
       activeRun: activeRunProjection(featureId),
+      activeRuns,
     }
   }
 
@@ -780,6 +835,19 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       case "resume":
         await engine.resume(featureId)
         return json(200, featurePayload(featureId), requestId)
+      case "recover": {
+        if (feature.status !== "escalated") {
+          return error(requestId, "conflict", `feature is not escalated (status: ${feature.status}) — recover only applies to escalated features`)
+        }
+        if (notes === undefined || notes.trim() === "") {
+          return error(requestId, "invalid_request", "\"notes\" (non-empty string) is required for recover")
+        }
+        const result = await engine.recover(featureId, { notes })
+        if (!result.ok) {
+          return error(requestId, "conflict", result.message)
+        }
+        return json(200, { result: result.message, ...(featurePayload(featureId) as Record<string, unknown>) }, requestId)
+      }
       default:
         return error(requestId, "not_found", `no route for POST /v1/features/:id/${action}`)
     }

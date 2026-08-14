@@ -500,6 +500,7 @@ describe("API integration: graceful shutdown", () => {
         await gatePromise
         return daemon.engine.report(input)
       },
+      recover: (featureId: string, input: { readonly notes?: string }) => daemon.engine.recover(featureId, input),
     }
     const server = startApiServer(
       { bind: { host: "127.0.0.1", port: 0 }, auth: { mode: "none" } },
