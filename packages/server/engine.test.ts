@@ -494,12 +494,17 @@ describe("Engine: outcome routing", () => {
     expect(store.getFeature(feature.id)?.status).toBe("done")
   })
 
-  it("an unmapped outcome escalates", async () => {
+  it("an unmapped verdict bounces back to the agent instead of escalating", async () => {
     const engine = makeEngine(unmappedOutcomeWorkflow)
     const feature = await startedFeature(engine)
     const run = store.getActiveRunForStep(feature.id, "main", "review")!
-    await engine.report({ runId: run.id, verdict: "rejected" })
-    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    const result = await engine.report({ runId: run.id, verdict: "rejected" })
+    expect(result).toContain('Verdict "rejected" is not declared')
+    expect(store.getFeature(feature.id)?.status).toBe("running")
+    expect(store.getRunById(run.id)?.status).toBe("running")
+    // A declared verdict still concludes the run.
+    const retry = await engine.report({ runId: run.id, verdict: "approved" })
+    expect(retry).toContain('Verdict "approved"')
   })
 })
 

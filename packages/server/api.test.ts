@@ -844,8 +844,8 @@ jobs:
     const neither = await request("POST", `/v1/runs/${run.id}/report`, {})
     expect(neither.status).toBe(400)
 
-    const both = await request("POST", `/v1/runs/${run.id}/report`, { outcome: "succeeded", verdict: "approved" })
-    expect(both.status).toBe(400)
+    const contradictory = await request("POST", `/v1/runs/${run.id}/report`, { outcome: "failed", verdict: "approved" })
+    expect(contradictory.status).toBe(400)
 
     const badOutcome = await request("POST", `/v1/runs/${run.id}/report`, { outcome: "maybe" })
     expect(badOutcome.status).toBe(400)

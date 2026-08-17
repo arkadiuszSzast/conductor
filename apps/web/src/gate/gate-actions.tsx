@@ -142,7 +142,7 @@ export function GateActions({ featureId, showChangeNoteInline = true }: GateActi
   return (
     <div className={styles.gateRow}>
       <div className={styles.meta}>
-        ≡ {askingRun !== null ? `${askingRun.stepId} (question)` : detail?.currentStep ?? "gate"} · ⚑ {detail?.findingCounts.new ?? 0} new
+        ≡ {askingRun !== null ? `${askingRun.stepId} (question)` : detail?.currentStep ?? "gate"} · ⚑ {detail?.findingCounts?.new ?? 0} new
       </div>
       {parsedQuestions !== null ? (
         <>

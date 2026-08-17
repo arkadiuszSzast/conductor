@@ -264,26 +264,46 @@ describe("github/await-checks", () => {
 })
 
 describe("github/pr-merge", () => {
-  it("merges with the requested method and resolves the merge commit sha", async () => {
+  it("merges with the requested method, resolves the sha, then deletes the branch best-effort", async () => {
     const process_ = new FakeProcess()
     process_.handlers = [
       () => ok(),
-      () => ok(JSON.stringify({ mergeCommit: { oid: "deadbeef" } })),
+      () => ok(JSON.stringify({ state: "MERGED", mergeCommit: { oid: "deadbeef" } })),
+      () => ok("feature/x\n"),
+      () => ok(),
+      () => fail(1, "cannot delete branch used by worktree"),
     ]
     const result = await githubPrMerge(ctx({ pr: 9 }), deps(process_))
 
     expect(result).toEqual({ status: "succeeded", outputs: { merged_sha: "deadbeef" } })
     expect(process_.argv()).toEqual([
-      ["gh", "pr", "merge", "9", "--squash", "--delete-branch"],
-      ["gh", "pr", "view", "9", "--json", "mergeCommit"],
+      ["gh", "pr", "merge", "9", "--squash"],
+      ["gh", "pr", "view", "9", "--json", "state,mergeCommit"],
+      ["gh", "pr", "view", "9", "--json", "headRefName", "--jq", ".headRefName"],
+      ["git", "push", "origin", "--delete", "feature/x"],
+      ["git", "branch", "-D", "feature/x"],
     ])
   })
 
   it("honours method and delete_branch inputs", async () => {
     const process_ = new FakeProcess()
-    process_.handlers = [() => ok(), () => ok(JSON.stringify({ mergeCommit: { oid: "sha" } }))]
-    await githubPrMerge(ctx({ pr: 9, method: "rebase", delete_branch: false }), deps(process_))
-    expect(process_.argv()[0]).toEqual(["gh", "pr", "merge", "9", "--rebase"])
+    process_.handlers = [() => ok(), () => ok(JSON.stringify({ state: "MERGED", mergeCommit: { oid: "sha" } }))]
+    const result = await githubPrMerge(ctx({ pr: 9, method: "rebase", delete_branch: false }), deps(process_))
+    expect(result.status).toBe("succeeded")
+    expect(process_.argv()).toEqual([
+      ["gh", "pr", "merge", "9", "--rebase"],
+      ["gh", "pr", "view", "9", "--json", "state,mergeCommit"],
+    ])
+  })
+
+  it("an already-merged PR is a success, not a failure — merge is idempotent", async () => {
+    const process_ = new FakeProcess()
+    process_.handlers = [
+      () => fail(1, "! Pull request #9 was already merged"),
+      () => ok(JSON.stringify({ state: "MERGED", mergeCommit: { oid: "cafe" } })),
+    ]
+    const result = await githubPrMerge(ctx({ pr: 9, delete_branch: false }), deps(process_))
+    expect(result).toEqual({ status: "succeeded", outputs: { merged_sha: "cafe" } })
   })
 
   it("fails when gh pr merge exits non-zero", async () => {

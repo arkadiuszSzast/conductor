@@ -7,5 +7,5 @@ inputs:
   delete_branch:  { type: boolean, default: true }
 outputs:
   merged_sha: { type: string }
-capabilities: [process, network, credentials]
+capabilities: [process, network, credentials, git]
 run: { handler: github/pr-merge }

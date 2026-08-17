@@ -718,8 +718,8 @@ async function commandReport(parsed: Parsed, deps: CliDeps, client: ApiClient, j
   const runId = requireId(parsed, "report requires a run id")
   const outcome = stringFlag(parsed, "outcome")
   const verdict = stringFlag(parsed, "verdict")
-  if (outcome !== undefined && verdict !== undefined) {
-    throw new UsageError("--outcome and --verdict are mutually exclusive")
+  if (outcome === "failed" && verdict !== undefined) {
+    throw new UsageError("--outcome failed and --verdict are contradictory — a verdict implies successful completion")
   }
   if (outcome === undefined && verdict === undefined) {
     throw new UsageError("report requires --outcome succeeded|failed or --verdict <verdict>")

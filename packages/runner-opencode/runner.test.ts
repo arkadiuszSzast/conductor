@@ -52,6 +52,8 @@ interface FakeSession {
 class FakeOpencodeServer {
   sessions = new Map<string, FakeSession>()
   statuses = new Map<string, "busy" | "idle" | "retry">()
+  /** Message timelines per session for the status fallback probe. */
+  timelines = new Map<string, Array<{ info?: { role?: string; time?: { completed?: number } } }>>()
   statusEndpointBroken = false
   private counter = 0
 
@@ -84,6 +86,11 @@ class FakeOpencodeServer {
           const data: Record<string, { type: string }> = {}
           for (const [id, type] of this.statuses) data[id] = { type }
           return { data }
+        },
+        messages: async input => {
+          const session = this.sessions.get(input.path.id)
+          if (!session) throw new Error("not found")
+          return { data: this.timelines.get(input.path.id) ?? [] }
         },
         promptAsync: async input => {
           const session = this.sessions.get(input.path.id)
@@ -353,6 +360,25 @@ describe("session transport preserves the seed's opencode wire shape", () => {
     const { id } = await sessions.createSession({ title: "t", directory: "/p" })
     server.statusEndpointBroken = true
     expect(await sessions.status(id)).toBe("busy")
+  })
+
+  it("an unlisted session with an in-flight assistant turn is busy, not idle", async () => {
+    // /session/status is scoped to the daemon-owner's directory: a
+    // session working in another project is absent from the map even
+    // mid-turn. The timeline fallback must catch that.
+    const server = new FakeOpencodeServer("/fallback")
+    const sessions = createOpencodeSessions(server.api())
+    const { id } = await sessions.createSession({ title: "t", directory: "/other-project" })
+    server.timelines.set(id, [
+      { info: { role: "user", time: {} } },
+      { info: { role: "assistant", time: {} } },
+    ])
+    expect(await sessions.status(id)).toBe("busy")
+    server.timelines.set(id, [
+      { info: { role: "user", time: {} } },
+      { info: { role: "assistant", time: { completed: Date.now() } } },
+    ])
+    expect(await sessions.status(id)).toBe("idle")
   })
 })
 

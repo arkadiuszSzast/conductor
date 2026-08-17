@@ -25,8 +25,12 @@ export function StepInspector({ featureId, jobId, stepId, onClose, inline }: Ste
   const step = effectiveStepId !== null ? feature?.jobs[jobId]?.steps[effectiveStepId] : undefined
 
   const runs = runsState.data ?? []
+  // Latest run for the step, not just any: after nudge/reap/recover a
+  // step accumulates runs and the inspector must show the newest story.
   const run = effectiveStepId !== null
-    ? runs.find(r => r.jobId === jobId && r.stepId === effectiveStepId)
+    ? runs
+        .filter(r => r.jobId === jobId && r.stepId === effectiveStepId)
+        .sort((a, b) => b.timeStarted - a.timeStarted)[0] ?? null
     : null
   const runId = run?.id ?? step?.runId ?? null
 
@@ -78,7 +82,7 @@ export function StepInspector({ featureId, jobId, stepId, onClose, inline }: Ste
           </button>
         ) : null}
       </div>
-      {tab === "outputs" ? <OutputsTab step={step} runId={runId} full={fullOutputs} onFetchFull={setFullOutputs} /> : null}
+      {tab === "outputs" ? <OutputsTab step={step} run={run} runId={runId} full={fullOutputs} onFetchFull={setFullOutputs} /> : null}
       {tab === "logs" ? <LogsTab cursor={cursor} runId={runId} /> : null}
     </div>
   )
@@ -86,12 +90,13 @@ export function StepInspector({ featureId, jobId, stepId, onClose, inline }: Ste
 
 function OutputsTab(props: {
   readonly step: { readonly outputs: Readonly<Record<string, string>>; readonly truncated?: boolean; readonly runId?: string } | undefined
+  readonly run: { readonly status: string; readonly reason: string | null } | null
   readonly runId: string | null
   readonly full: Record<string, string> | null
   readonly onFetchFull: (v: Record<string, string> | null) => void
 }): React.ReactNode {
   const { client } = useApp()
-  const { step, runId, full, onFetchFull } = props
+  const { step, run, runId, full, onFetchFull } = props
   const candidates = full ?? step?.outputs ?? {}
   const entries = Object.entries(candidates)
   const truncated = step?.truncated === true && full === null
@@ -106,6 +111,11 @@ function OutputsTab(props: {
   }
   return (
     <div className={styles.outputs}>
+      {run !== null && (run.status === "failed" || run.status === "reaped") && run.reason !== null ? (
+        <div className={styles.error}>
+          <strong>{run.status}</strong> — {run.reason}
+        </div>
+      ) : null}
       {entries.length === 0 ? <div className={styles.empty}>no outputs reported for this step</div> : null}
       {entries.map(([name, value]) => (
         <div key={name} className={styles.row}>

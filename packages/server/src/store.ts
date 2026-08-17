@@ -10,6 +10,7 @@ import type {
   Feedback,
   FeatureState,
   FeatureStatus,
+  JobRuntime,
   PipelineEvent,
   ResourceReason,
   Transition,
@@ -546,6 +547,74 @@ export class Store {
       this.db.run(
         "INSERT INTO transition_log (feature_id, event, decisions, time_created) VALUES (?, ?, ?, ?)",
         [featureId, JSON.stringify({ kind: "reconcile.repair" }), JSON.stringify([{ kind: "escalate", reason }]), now],
+      )
+      return true
+    })()
+    if (changed) this.emit({ kind: "transition", featureId })
+    return changed
+  }
+
+  setFeatureStatus(featureId: string, status: FeatureStatus): boolean {
+    const now = Date.now()
+    const changed = this.db.transaction(() => {
+      const row = this.db.query("SELECT status, state FROM feature WHERE id = ?").get(featureId) as { status: string; state: string } | null
+      if (!row || row.status === status) return false
+      const stateObj = JSON.parse(row.state) as Record<string, unknown>
+      stateObj["status"] = status
+      this.db.run(
+        "UPDATE feature SET status = ?, state = ?, time_updated = ?, escalation = NULL WHERE id = ?",
+        [status, JSON.stringify(stateObj), now, featureId],
+      )
+      return true
+    })()
+    if (changed) this.emit({ kind: "transition", featureId })
+    return changed
+  }
+
+  /**
+   * Operator recovery: put the recovered targets back into a consistent
+   * DAG shape so completions land and the cascade can resume. Each
+   * target job goes back to running with its step as currentStep (the
+   * interpreter's completion guard requires `currentStep === stepId` —
+   * without this the recovered run's conclusion is "stale" and dropped).
+   * Jobs skipped by the original failure cascade reset to pending so
+   * the cascade re-evaluates them when the recovered jobs conclude.
+   */
+  recoverStepTargets(featureId: string, targets: readonly { jobId: string; stepId: string }[]): boolean {
+    const now = Date.now()
+    const changed = this.db.transaction(() => {
+      const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(featureId) as FeatureRow | null
+      if (!row || targets.length === 0) return false
+      const state = toFeatureState(row)
+      const jobs: Record<string, JobRuntime> = { ...state.jobs }
+      for (const target of targets) {
+        const runtime = jobs[target.jobId]
+        if (!runtime) continue
+        jobs[target.jobId] = {
+          ...runtime,
+          status: "running",
+          currentStep: target.stepId,
+          steps: { ...runtime.steps, [target.stepId]: { status: "running", outputs: {} } },
+        }
+      }
+      for (const [jobId, runtime] of Object.entries(jobs)) {
+        if (runtime.status === "skipped") {
+          jobs[jobId] = { ...runtime, status: "pending", currentStep: null, outputs: {}, steps: {} }
+        }
+      }
+      const next: FeatureState = { ...state, status: "running", jobs }
+      this.db.run(
+        "UPDATE feature SET status = 'running', escalation = NULL, state = ?, time_updated = ? WHERE id = ?",
+        [JSON.stringify(next), now, featureId],
+      )
+      this.db.run(
+        "INSERT INTO transition_log (feature_id, event, decisions, time_created) VALUES (?, ?, ?, ?)",
+        [
+          featureId,
+          JSON.stringify({ kind: "human.recovered" }),
+          JSON.stringify(targets.map(target => ({ kind: "execute_step", jobId: target.jobId, stepId: target.stepId }))),
+          now,
+        ],
       )
       return true
     })()

@@ -33,7 +33,18 @@ import { uiDistStale, type UiDistFs } from "./ui-dist.ts"
  */
 function resolveUiRoot(log: DaemonStartInput["log"]): string | null {
   const embedded = (globalThis as { CONDUCTOR_EMBEDDED_UI_INDEX?: string }).CONDUCTOR_EMBEDDED_UI_INDEX
-  if (embedded !== undefined) return dirname(embedded)
+  if (embedded !== undefined) {
+    // Bun's /$bunfs/ virtual filesystem is not accessible via statSync
+    // or Bun.file().size — check for a dist/ui/ directory alongside
+    // the binary (copied there by the build script).
+    const binDir = dirname(process.execPath)
+    const uiDist = resolve(binDir, "ui")
+    if (existsSync(resolve(uiDist, "index.html"))) {
+      log({ level: "info", message: "serving web UI from dist/ui/", fields: { uiDist } })
+      return uiDist
+    }
+    return dirname(embedded)
+  }
 
   const repoRoot = resolve(import.meta.dirname, "../../..")
   const dist = resolve(repoRoot, "apps/web/dist")

@@ -17,8 +17,12 @@ export interface RawOpencodeSessionApi {
       body: { title?: string; parentID?: string }
       query?: { directory?: string }
     }): Promise<{ data?: { id: string } }>
-    get(input: { path: { id: string } }): Promise<{ data?: { id: string } }>
+    get(input: { path: { id: string } }): Promise<{ data?: { id: string; directory?: string } }>
     status(input?: { query?: { directory?: string } }): Promise<{ data?: Record<string, { type: string }> }>
+    messages(input: {
+      path: { id: string }
+      query?: { directory?: string; limit?: number }
+    }): Promise<{ data?: Array<{ info?: { role?: string; time?: { completed?: number } } }> }>
     promptAsync(input: {
       path: { id: string }
       query?: { directory?: string }
@@ -86,18 +90,31 @@ export function createOpencodeSessions(rawClient: RawOpencodeSessionApi): Sessio
       })
     },
     async status(sessionID) {
-      // /session/status only lists sessions with live activity state; a
-      // session absent from the map is idle unless it no longer exists.
+      // /session/status only lists sessions with live activity state —
+      // but it is scoped to the daemon-owner's project directory, so a
+      // session created in ANOTHER directory (worktrees, multi-project)
+      // is invisible there even while an agent is mid-turn. Absence from
+      // the map is NOT idleness. Fall back to the session's message
+      // timeline: an assistant message without `time.completed` is a
+      // turn in flight (busy); a completed last message is idle.
       try {
         const result = await rawClient.session.status()
         const entry = result.data?.[sessionID]
         if (entry?.type === "busy") return "busy"
         if (entry?.type === "retry") return "retry"
         if (entry?.type === "idle") return "idle"
-        return (await this.sessionExists(sessionID)) ? "idle" : "missing"
+        if (!(await this.sessionExists(sessionID))) return "missing"
+        try {
+          const messages = await rawClient.session.messages({ path: { id: sessionID }, query: { limit: 5 } })
+          const last = messages.data?.at(-1)
+          if (last?.info?.role === "assistant" && typeof last.info.time?.completed !== "number") return "busy"
+        } catch {
+          // Timeline unreachable → claim busy: the safe direction
+          // (never nudge/reap on missing information).
+          return "busy"
+        }
+        return "idle"
       } catch {
-        // Status endpoint unavailable → claim busy: the safe direction
-        // (never nudge/reap on missing information).
         return "busy"
       }
     },

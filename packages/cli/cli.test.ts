@@ -278,7 +278,7 @@ describe("CLI: usage and argument parsing", () => {
     expect(await h.run("approve")).toBe(EXIT.usage)
     expect(await h.run("report", "some-run")).toBe(EXIT.usage)
     expect(await h.run("report", "some-run", "--outcome", "maybe")).toBe(EXIT.usage)
-    expect(await h.run("report", "some-run", "--outcome", "succeeded", "--verdict", "approved")).toBe(EXIT.usage)
+    expect(await h.run("report", "some-run", "--outcome", "failed", "--verdict", "approved")).toBe(EXIT.usage)
     expect(await h.run("request-changes", "some-feature")).toBe(EXIT.usage)
     expect(await h.run("start", "Title", "--project", h.project, "--pr", "zero")).toBe(EXIT.usage)
   })

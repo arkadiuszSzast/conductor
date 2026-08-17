@@ -621,6 +621,24 @@ export class Engine {
             outcome: input.verdict ?? DEFAULT_OUTCOME,
             outputs: { report: input.notes ?? "" },
           }
+    if (event.kind === "step.completed") {
+      // A step that declares outcomes routes on the verdict — concluding
+      // it with an unmapped one would escalate the whole feature over a
+      // mis-filed report. Bounce it back to the agent instead: the run
+      // stays running and the agent re-reports with a declared verdict.
+      const state = store.getFeature(run.featureId)
+      const snapshot = state ? this.deps.workflows(state.projectDir) : null
+      const step = snapshot ? findStep(snapshot.workflow, run.jobId, run.stepId) : undefined
+      if (step && step.type === "agent") {
+        const declared = Object.keys(step.outcomes)
+        if (declared.length > 0 && !declared.includes(event.outcome ?? DEFAULT_OUTCOME)) {
+          const options = declared.map(name => `"${name}"`).join(", ")
+          return input.verdict !== undefined
+            ? `Verdict "${input.verdict}" is not declared for step "${run.stepId}" — report again with one of: ${options}.`
+            : `Step "${run.stepId}" requires a verdict — report again with verdict set to one of: ${options}.`
+        }
+      }
+    }
     const status: "succeeded" | "failed" = input.outcome === "failed" ? "failed" : "succeeded"
     const detail = status === "failed" ? { reason: input.notes ?? "reported failed" } : { outputs: { report: input.notes ?? "" } }
 
@@ -759,43 +777,58 @@ export class Engine {
     const snapshot = this.deps.workflows(state.projectDir)
     if (!snapshot) return { ok: false, message: `no valid workflow for ${state.projectDir}` }
 
-    const waits = store.listResourceWaits(featureId)
-    const openWait = waits.find(wait => wait.status !== "closed")
-    const lastWait = [...waits].reverse().find(wait => wait.status === "closed") ?? null
-    let jobId = openWait?.jobId ?? lastWait?.jobId ?? null
-    let stepId = openWait?.stepId ?? lastWait?.stepId ?? null
-
-    if (jobId === null || stepId === null) {
+    // Collect EVERY recoverable agent target: open resource waits plus
+    // every failed job's failed agent step. Recovering only one of
+    // several failed siblings would leave the DAG re-escalating (all
+    // jobs terminal, one still failed) the moment the recovered step
+    // concludes. Only open waits count — a closed wait's job may have
+    // long succeeded, and re-arming it would redo finished work.
+    const targets = new Map<string, { jobId: string; stepId: string }>()
+    for (const wait of store.listResourceWaits(featureId)) {
+      if (wait.status === "closed") continue
+      targets.set(`${wait.jobId}\u0000${wait.stepId}`, { jobId: wait.jobId, stepId: wait.stepId })
+    }
+    for (const [jobId, jobRuntime] of Object.entries(state.jobs)) {
+      if (jobRuntime.status !== "failed") continue
+      for (const [stepId, stepRuntime] of Object.entries(jobRuntime.steps)) {
+        if (stepRuntime.status === "failed") targets.set(`${jobId}\u0000${stepId}`, { jobId, stepId })
+      }
+    }
+    if (targets.size === 0) {
       const failed = store
         .listRuns(featureId)
         .filter(run => run.status === "failed" || run.status === "reaped")
         .sort((a, b) => (b.timeFinished ?? b.timeStarted) - (a.timeFinished ?? a.timeStarted))[0]
-      if (failed) {
-        jobId = failed.jobId
-        stepId = failed.stepId
-      }
+      if (failed) targets.set(`${failed.jobId}\u0000${failed.stepId}`, { jobId: failed.jobId, stepId: failed.stepId })
     }
 
-    if (jobId === null || stepId === null) {
+    const recoverable: { jobId: string; stepId: string; step: AgentStep | CommandStep | ActionStep }[] = []
+    for (const target of targets.values()) {
+      const step = findStep(snapshot.workflow, target.jobId, target.stepId)
+      if (!step || step.type === "human") continue
+      if (store.getActiveRunForStep(featureId, target.jobId, target.stepId)) continue
+      recoverable.push({ jobId: target.jobId, stepId: target.stepId, step })
+    }
+    if (recoverable.length === 0) {
       return { ok: false, message: "no recoverable failed or blocked step found — nothing to recover" }
     }
-    const step = findStep(snapshot.workflow, jobId, stepId)
-    if (!step || step.type !== "agent") {
-      return { ok: false, message: `target "${jobId}/${stepId}" is not a recoverable agent step` }
-    }
 
-    // Same duplicate-dispatch guard as `actDecision`: the reconciler may
-    // have claimed the same wait and dispatched a run between the operator
-    // clicking recover and this check. The DB's one-open-target index is
-    // the backstop, but a clean conflict is far friendlier than an
-    // uncaught constraint violation surfacing as a 500.
-    if (store.getActiveRunForStep(featureId, jobId, stepId)) {
-      return { ok: false, message: `step "${jobId}/${stepId}" already has an active run — nothing to recover` }
-    }
+    // Repair the DAG state FIRST: recovered jobs go back to running with
+    // their step as currentStep (the interpreter's completion guard
+    // requires it), and cascade-skipped jobs reset to pending so the
+    // cascade re-fires when the recovered jobs conclude. Without this
+    // the recovered run's conclusion is dropped as "stale" and the
+    // reconciler re-escalates on its next pass.
+    store.recoverStepTargets(featureId, recoverable.map(({ jobId, stepId }) => ({ jobId, stepId })))
 
-    log.log(`feature=${state.slug} recover: re-arming agent step "${jobId}/${stepId}"`)
-    await this.executeAgent(featureId, snapshot, jobId, step)
-    return { ok: true, message: `Recovered. Agent step "${jobId}/${stepId}" re-armed.` }
+    for (const { jobId, stepId, step } of recoverable) {
+      log.log(`feature=${state.slug} recover: re-arming ${step.type} step "${jobId}/${stepId}"`)
+      if (step.type === "agent") await this.executeAgent(featureId, snapshot, jobId, step)
+      else if (step.type === "command") await this.executeCommand(featureId, snapshot, jobId, step)
+      else await this.executeAction(featureId, snapshot, jobId, step)
+    }
+    const summary = recoverable.map(({ jobId, stepId }) => `"${jobId}/${stepId}"`).join(", ")
+    return { ok: true, message: `Recovered. Step(s) ${summary} re-armed.` }
   }
 
   // ------------------------------------------------------------ lifecycle
@@ -930,6 +963,15 @@ export class Engine {
 
     const feature = store.getFeature(input.id) ?? input
     if (feature.status === "done" || feature.status === "abandoned") return
+
+    // Defensive: an escalated feature with an active run means recovery
+    // succeeded but the status wasn't cleared (e.g. crash between
+    // executeAgent and setFeatureFields). Transition to running.
+    if (feature.status === "escalated" && store.getActiveRun(feature.id) !== null) {
+      log.log(`reconcile ${feature.slug}: escalated but has active run — transitioning to running`)
+      store.setFeatureStatus(feature.id, "running")
+      return
+    }
 
     const invariant = checkActiveStateInvariant(feature, {
       hasActiveRun: store.getActiveRun(feature.id) !== null,

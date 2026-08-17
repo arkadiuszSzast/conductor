@@ -151,6 +151,15 @@
   color: var(--text-faint);
   margin-right: 8px;
 }
+.tlTarget {
+  margin-left: 8px;
+  color: var(--text);
+}
+.tlReason {
+  margin-left: 8px;
+  color: var(--red);
+  word-break: break-word;
+}
 .diagCard {
   padding: 12px;
   font-family: var(--font-mono);

@@ -101,3 +101,13 @@ body { }
   cursor: pointer;
   padding: 0;
 }
+.error {
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  border-left: 3px solid var(--red);
+  color: var(--red);
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  border-radius: 4px;
+  word-break: break-word;
+  white-space: pre-wrap;
+}

@@ -61,7 +61,7 @@ if (indexVar === null) {
 
 writeFileSync(
   join(buildDir, "ui-manifest.ts"),
-  `${imports.join("\n")}\n\n;(globalThis as Record<string, unknown>)["CONDUCTOR_EMBEDDED_UI_INDEX"] = ${indexVar}\n`,
+  `${imports.join("\n")}\n\n;(globalThis as Record<string, unknown>)["CONDUCTOR_EMBEDDED_UI_INDEX"] = ${indexVar}\n;(globalThis as Record<string, unknown>)["CONDUCTOR_EMBEDDED_ASSETS"] = ${JSON.stringify(assets.map(a => `./${relative(embeddedDist, a)}`))}\n`,
 )
 writeFileSync(
   join(buildDir, "entry.ts"),
@@ -76,4 +76,11 @@ const result = await Bun.build({
 })
 for (const log of result.logs) console.error(String(log))
 if (!result.success) process.exit(1)
-console.log("dist/conductor ready")
+
+// Copy the SPA dist alongside the binary so the running daemon can
+// serve static files from the real filesystem (Bun's /$bunfs/ virtual
+// filesystem is not accessible via statSync or Bun.file().size).
+const uiDir = join(repoRoot, "dist", "ui")
+rmSync(uiDir, { recursive: true, force: true })
+cpSync(embeddedDist, uiDir, { recursive: true })
+console.log(`dist/conductor ready (+ dist/ui/ with ${assets.length} assets)`)

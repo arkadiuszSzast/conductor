@@ -417,6 +417,8 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         updatedAt: record.updatedAt,
         workflowRef: workflowRefOf(feature.projectDir),
         feedback: store.getFeedback(featureId),
+        findingCounts: store.countFindingsByStatus([featureId]).get(featureId)
+          ?? { new: 0, fixed: 0, dismissed: 0, reopened: 0 },
         jobs: jobsDetail(feature, store.newestRunIdsByStep(featureId)),
       },
       activeRun: activeRunProjection(featureId),
@@ -679,13 +681,26 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     if (decoded === null) return null
     const candidate = resolve(root, `.${decoded}`)
     if (candidate !== root && !candidate.startsWith(root + sep)) return null
-    const file = pickStaticFile(candidate) ?? pickStaticFile(resolve(root, "index.html"))
-    if (file === null) return null
-    const contentType = STATIC_CONTENT_TYPES[extname(file).toLowerCase()] ?? "application/octet-stream"
-    return new Response(Bun.file(file), {
-      status: 200,
-      headers: { "content-type": contentType, "x-request-id": requestId },
-    })
+    const file = pickStaticFile(candidate)
+    if (file !== null) {
+      const contentType = STATIC_CONTENT_TYPES[extname(file).toLowerCase()] ?? "application/octet-stream"
+      return new Response(Bun.file(file), {
+        status: 200,
+        headers: { "content-type": contentType, "x-request-id": requestId },
+      })
+    }
+    // Bun-compiled binaries: /$bunfs/ paths are invisible to statSync
+    // but Bun.file() can read them.
+    const embedded = serveEmbeddedFile(candidate, requestId)
+    if (embedded !== null) return embedded
+    const fallback = pickStaticFile(resolve(root, "index.html"))
+    if (fallback !== null) {
+      return new Response(Bun.file(fallback), {
+        status: 200,
+        headers: { "content-type": "text/html; charset=utf-8", "x-request-id": requestId },
+      })
+    }
+    return null
   }
 
   async function registerRunner(request: Request, requestId: string): Promise<Response> {
@@ -947,8 +962,14 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     if (shapes === 0) {
       return error(requestId, "invalid_request", "one of \"outcome\", \"verdict\" or \"ask\" is required")
     }
-    if (shapes > 1) {
-      return error(requestId, "invalid_request", "\"outcome\", \"verdict\" and \"ask\" are mutually exclusive")
+    if (ask !== undefined && shapes > 1) {
+      return error(requestId, "invalid_request", "\"ask\" cannot be combined with \"outcome\" or \"verdict\"")
+    }
+    // outcome:"succeeded" + verdict is redundant, not contradictory —
+    // agents naturally send both and the verdict routes. Only a failed
+    // outcome contradicts a verdict (a verdict concludes successfully).
+    if (outcome === "failed" && verdict !== undefined) {
+      return error(requestId, "invalid_request", "\"outcome\": \"failed\" and \"verdict\" are contradictory — a verdict implies successful completion")
     }
     // Duplicate reports are rejected idempotently: the engine's atomic
     // conclusion claim is the authority; this pre-check only projects the
@@ -1057,6 +1078,22 @@ function safeDecode(path: string): string | null {
 function pickStaticFile(path: string): string | null {
   try {
     return statSync(path).isFile() ? path : null
+  } catch {
+    return null
+  }
+}
+
+function serveEmbeddedFile(path: string, requestId: string): Response | null {
+  if (!path.includes("/$bunfs/")) return null
+  try {
+    const f = Bun.file(path)
+    return new Response(f, {
+      status: 200,
+      headers: {
+        "content-type": STATIC_CONTENT_TYPES[extname(path).toLowerCase()] ?? "application/octet-stream",
+        "x-request-id": requestId,
+      },
+    })
   } catch {
     return null
   }
