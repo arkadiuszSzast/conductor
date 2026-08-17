@@ -84,7 +84,10 @@ export interface EngineControl {
   pause(featureId: string): Promise<void>
   resume(featureId: string): Promise<void>
   abandon(featureId: string): Promise<void>
-  recover(featureId: string, input: { readonly notes?: string }): Promise<{ ok: boolean; message: string }>
+  recover(
+    featureId: string,
+    input: { readonly notes?: string; readonly expectedVersion?: number; readonly idempotencyKey?: string },
+  ): Promise<{ ok: boolean; message: string; readonly stale?: boolean; readonly duplicate?: boolean }>
 }
 
 export interface ApiDeps {
@@ -119,6 +122,7 @@ export type ApiErrorCode =
   | "project_not_configured"
   | "unknown_workflow"
   | "conflict"
+  | "stale_version"
   | "run_already_concluded"
   | "no_pending_question"
   | "session_lost"
@@ -136,6 +140,7 @@ const ERROR_STATUS: Record<ApiErrorCode, number> = {
   project_not_configured: 422,
   unknown_workflow: 422,
   conflict: 409,
+  stale_version: 409,
   run_already_concluded: 409,
   no_pending_question: 409,
   session_lost: 409,
@@ -857,9 +862,21 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         if (notes === undefined || notes.trim() === "") {
           return error(requestId, "invalid_request", "\"notes\" (non-empty string) is required for recover")
         }
-        const result = await engine.recover(featureId, { notes })
+        const expectedVersion = parsed.body["expectedVersion"]
+        if (expectedVersion !== undefined && typeof expectedVersion !== "number") {
+          return error(requestId, "invalid_request", "\"expectedVersion\" must be a number (the feature's updatedAt your view was rendered from)")
+        }
+        const idempotencyKey = parsed.body["idempotencyKey"]
+        if (idempotencyKey !== undefined && (typeof idempotencyKey !== "string" || idempotencyKey.trim() === "")) {
+          return error(requestId, "invalid_request", "\"idempotencyKey\" must be a non-empty string")
+        }
+        const result = await engine.recover(featureId, {
+          notes,
+          ...(expectedVersion !== undefined ? { expectedVersion } : {}),
+          ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
+        })
         if (!result.ok) {
-          return error(requestId, "conflict", result.message)
+          return error(requestId, result.stale === true ? "stale_version" : "conflict", result.message)
         }
         return json(200, { result: result.message, ...(featurePayload(featureId) as Record<string, unknown>) }, requestId)
       }

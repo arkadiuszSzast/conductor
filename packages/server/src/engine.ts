@@ -27,12 +27,16 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
   DEFAULT_OUTCOME,
+  behaviourForClass,
   buildEvalContext,
   checkActiveStateInvariant,
+  computeScheduledDelayMs,
   decideResourceWaitRoute,
   extractExpressions,
   interpret,
+  makeFailureEnvelope,
   normalizeResourceWaitPolicy,
+  normalizeRetryPolicy,
   renderTemplate,
   systemRandom,
 } from "@conductor/core"
@@ -45,6 +49,8 @@ import type {
   CommandStep,
   Decision,
   EvalContext,
+  FailureClass,
+  FailureEnvelope,
   FeatureState,
   PipelineEvent,
   StepDef,
@@ -357,7 +363,11 @@ export class Engine {
       })
     } catch (err) {
       const reason = `failed to prompt session: ${errorMessage(err)}`
-      await this.concludeAndDispatch(featureId, runId, "failed", { reason }, { kind: "step.failed", jobId, stepId: step.id, reason })
+      await this.concludeAndDispatch(
+        featureId, runId, "failed",
+        { reason, failure: makeFailureEnvelope({ class: classifyThrownBoundary(err), diagnostic: reason, source: "runner" }) },
+        { kind: "step.failed", jobId, stepId: step.id, reason },
+      )
     }
   }
 
@@ -376,6 +386,7 @@ export class Engine {
     const outputPath = join(outputDir, "outputs")
     try {
       let failureReason: string | null = null
+      let failureClass: FailureClass = "deterministic_failure"
       for (const raw of step.run) {
         const command = renderTemplate(raw, context).text
         const result = await process.shell(command, {
@@ -389,6 +400,7 @@ export class Engine {
         if (result.output !== "") store.appendRunLog(runId, [{ source: "process", text: result.output }])
         if (result.code !== 0) {
           failureReason = `"${command}" exited ${result.code}: ${result.output.slice(-4000)}`
+          failureClass = classifyProcessExit(result.code)
           break
         }
       }
@@ -399,7 +411,11 @@ export class Engine {
           featureId,
           runId,
           "failed",
-          { outputs, reason: failureReason },
+          {
+            outputs,
+            reason: failureReason,
+            failure: makeFailureEnvelope({ class: failureClass, diagnostic: failureReason, source: "command" }),
+          },
           { kind: "step.failed", jobId, stepId: step.id, reason: failureReason },
         )
         return
@@ -507,8 +523,14 @@ export class Engine {
           return
         }
         if (!result.ok) {
+          const failureClass: FailureClass = result.error.startsWith("capability_denied:")
+            ? "invalid_config"
+            : /exited 127/.test(result.error)
+              ? "invalid_config"
+              : "deterministic_failure"
           await this.concludeAndDispatch(
-            featureId, runId, "failed", { reason: result.error },
+            featureId, runId, "failed",
+            { reason: result.error, failure: makeFailureEnvelope({ class: failureClass, diagnostic: result.error, source: "action" }) },
             { kind: "step.failed", jobId, stepId, reason: result.error },
           )
           return
@@ -521,7 +543,8 @@ export class Engine {
       } catch (err) {
         const reason = `action host error: ${errorMessage(err)}`
         await this.concludeAndDispatch(
-          featureId, runId, "failed", { reason },
+          featureId, runId, "failed",
+          { reason, failure: makeFailureEnvelope({ class: classifyThrownBoundary(err), diagnostic: reason, source: "action" }) },
           { kind: "step.failed", jobId, stepId, reason },
         )
       } finally {
@@ -547,12 +570,19 @@ export class Engine {
    * through. Returns whether the caller's conclusion attempt won the
    * atomic claim (false = a duplicate/concurrent conclusion already won
    * it — no further side effect should happen).
+   *
+   * When the conclusion is a classified failure and the interpreter
+   * decided to retry the same step, a non-zero backoff delay converts
+   * the immediate `execute_step` into a DURABLE scheduled retry (a
+   * `retry_episode` row the reconciler claims when due) — a daemon
+   * restart in the gap re-arms from the schedule instead of losing the
+   * attempt. Zero-delay policies keep the immediate dispatch.
    */
   private async concludeAndDispatch(
     featureId: string,
     runId: string,
     status: "succeeded" | "failed" | "reaped",
-    detail: { outputs?: Readonly<Record<string, string>>; reason?: string } | undefined,
+    detail: { outputs?: Readonly<Record<string, string>>; reason?: string; failure?: FailureEnvelope } | undefined,
     event: PipelineEvent,
   ): Promise<boolean> {
     const { store, log } = this.deps
@@ -564,13 +594,73 @@ export class Engine {
     const claimed = store.concludeRun(runId, status, detail, event, transition)
     if (!claimed) return false
     log.log(`feature=${state.slug} event=${event.kind} → ${transition.decisions.map(decisionLabel).join(",")}`)
+
+    let decisions = transition.decisions
+    if (detail?.failure !== undefined && event.kind === "step.failed") {
+      decisions = this.scheduleDurableRetries(featureId, snapshot, event, detail.failure, transition.decisions)
+    }
     // Dispatch, THEN mark the outbox entry handled: a crash mid-dispatch
     // (e.g. during an agent's session creation) leaves the entry pending
     // so a restarted reconciler recovers it — the normal path closes it
     // out here so it never lingers as a false "pending" forever.
-    await this.dispatchDecisions(featureId, snapshot, transition.decisions)
+    await this.dispatchDecisions(featureId, snapshot, decisions)
     store.markRunActionHandled(runId)
     return true
+  }
+
+  /**
+   * Converts an interpreter-decided immediate step retry into a durable
+   * scheduled one when its backoff delay is non-zero. The delay comes
+   * from the STEP's own `retry.backoff` when declared (the workflow
+   * author's word), else from the class-default policy — and an
+   * adapter's retry hint can only raise it within policy bounds. Returns
+   * the decision list with scheduled retries removed; everything else
+   * dispatches unchanged. Scheduling failure (a racing open episode)
+   * falls back to the immediate dispatch — never a lost attempt.
+   */
+  private scheduleDurableRetries(
+    featureId: string,
+    snapshot: WorkflowSnapshot,
+    event: Extract<PipelineEvent, { kind: "step.failed" }>,
+    failure: FailureEnvelope,
+    decisions: readonly Decision[],
+  ): readonly Decision[] {
+    const { store, log, clock } = this.deps
+    const state = store.getFeature(featureId)
+    if (!state) return decisions
+    const kept: Decision[] = []
+    for (const decision of decisions) {
+      if (decision.kind !== "execute_step" || decision.jobId !== event.jobId || decision.stepId !== event.stepId) {
+        kept.push(decision)
+        continue
+      }
+      const step = findStep(snapshot.workflow, event.jobId, event.stepId)
+      const attempts = state.jobs[event.jobId]?.attempts[event.stepId] ?? 1
+      const classBehaviour = behaviourForClass(normalizeRetryPolicy(), failure.class)
+      const backoff = step !== undefined && step.retry.strategy === "backoff" ? step.retry.backoff : classBehaviour.backoff
+      const maxAttempts = step !== undefined && step.retry.strategy === "backoff" ? step.retry.maxAttempts : classBehaviour.budget.maxAttempts
+      const schedule = computeScheduledDelayMs(backoff, attempts, systemRandom, failure.retryHintMs)
+      if (schedule.delayMs <= 0) {
+        kept.push(decision)
+        continue
+      }
+      const now = clock.now()
+      const episode = store.scheduleRetry({
+        featureId, jobId: event.jobId, stepId: event.stepId,
+        attempts, startedAt: now,
+        nextAttemptAt: now + schedule.delayMs, delayMs: schedule.delayMs, scheduleSource: schedule.source,
+        maxAttempts, maxElapsedMs: classBehaviour.budget.maxElapsedMs,
+        failure,
+      })
+      if (episode === null) {
+        kept.push(decision)
+        continue
+      }
+      log.log(
+        `feature=${state.slug}: retry of "${event.jobId}/${event.stepId}" scheduled in ${schedule.delayMs}ms (class ${failure.class}, ${schedule.source})`,
+      )
+    }
+    return kept
   }
 
   // --------------------------------------------------------------- reports
@@ -763,13 +853,35 @@ export class Engine {
    * step — never the whole workflow. A still-absent runner re-enters a
    * fresh resource wait (the upsert's uniqueness keeps it to one open
    * row per target); an available runner dispatches one new run.
+   *
+   * Optimistic concurrency (retry-policy 4.1): `expectedVersion` is the
+   * feature's `updatedAt` the operator's view was rendered from — a
+   * mismatch means the feature moved since (another operator recovered
+   * it, a late report landed) and the stale recover is rejected instead
+   * of double-arming. `idempotencyKey` dedupes retried deliveries of the
+   * SAME logical recover (client retry after a network timeout): a key
+   * already recorded on this feature returns success without re-arming.
    */
-  async recover(featureId: string, input: { readonly notes?: string }): Promise<{ ok: boolean; message: string }> {
+  async recover(
+    featureId: string,
+    input: { readonly notes?: string; readonly expectedVersion?: number; readonly idempotencyKey?: string },
+  ): Promise<{ ok: boolean; message: string; readonly stale?: boolean; readonly duplicate?: boolean }> {
     const { store, log } = this.deps
-    const state = store.getFeature(featureId)
-    if (!state) return { ok: false, message: `unknown feature "${featureId}"` }
+    const record = store.getFeatureRecord(featureId)
+    if (!record) return { ok: false, message: `unknown feature "${featureId}"` }
+    const state = record.state
+    if (input.idempotencyKey !== undefined && store.hasRecoverKey(featureId, input.idempotencyKey)) {
+      return { ok: true, duplicate: true, message: "Already recovered (idempotency key seen) — no new work armed." }
+    }
     if (state.status !== "escalated") {
       return { ok: false, message: `feature is not escalated (status: ${state.status}) — recover only applies to escalated features` }
+    }
+    if (input.expectedVersion !== undefined && input.expectedVersion !== record.updatedAt) {
+      return {
+        ok: false,
+        stale: true,
+        message: `feature changed since your view (version ${record.updatedAt} != expected ${input.expectedVersion}) — refresh and retry`,
+      }
     }
     if (input.notes === undefined || input.notes.trim() === "") {
       return { ok: false, message: "recover requires a non-empty note" }
@@ -818,8 +930,14 @@ export class Engine {
     // requires it), and cascade-skipped jobs reset to pending so the
     // cascade re-fires when the recovered jobs conclude. Without this
     // the recovered run's conclusion is dropped as "stale" and the
-    // reconciler re-escalates on its next pass.
-    store.recoverStepTargets(featureId, recoverable.map(({ jobId, stepId }) => ({ jobId, stepId })))
+    // reconciler re-escalates on its next pass. The idempotency key is
+    // recorded in the SAME transaction — a client retry after this
+    // commit is a duplicate, before it re-runs the whole recover.
+    store.recoverStepTargets(
+      featureId,
+      recoverable.map(({ jobId, stepId }) => ({ jobId, stepId })),
+      input.idempotencyKey,
+    )
 
     for (const { jobId, stepId, step } of recoverable) {
       log.log(`feature=${state.slug} recover: re-arming ${step.type} step "${jobId}/${stepId}"`)
@@ -1104,7 +1222,7 @@ export class Engine {
       if (status === "missing") {
         log.log(`reconcile ${feature.slug}: run ${active.id} session is gone — reaping immediately`)
         this.idleCycles.delete(active.id)
-        await this.reap(feature, active, "session disappeared before reporting")
+        await this.reap(feature, active, "session disappeared before reporting", "missing_session")
         return
       }
       if (status === "busy" || status === "retry") {
@@ -1156,12 +1274,13 @@ export class Engine {
     feature: FeatureState,
     active: { id: string; jobId: string; stepId: string },
     reason: string,
+    failureClass: FailureClass = "timeout",
   ): Promise<void> {
     await this.concludeAndDispatch(
       feature.id,
       active.id,
       "reaped",
-      { reason },
+      { reason, failure: makeFailureEnvelope({ class: failureClass, diagnostic: reason, source: "reaper" }) },
       { kind: "step.failed", jobId: active.jobId, stepId: active.stepId, reason },
     )
   }
@@ -1290,4 +1409,27 @@ function slugify(title: string): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Coarse execution-boundary classification for command/action/prompt
+ * failures — pattern-matching on transport-level symptoms only (exit
+ * codes and error shapes the engine itself produced), NEVER on an
+ * agent's or tool's human diagnostic prose. Anything unrecognized is
+ * `deterministic_failure` for process exits (a failing build stays
+ * failed) and `internal` for thrown boundaries.
+ */
+function classifyProcessExit(code: number): FailureClass {
+  if (code === 124 || code === 137) return "timeout"
+  if (code === 127) return "invalid_config"
+  return "deterministic_failure"
+}
+
+function classifyThrownBoundary(error: unknown): FailureClass {
+  const message = errorMessage(error)
+  if (/ECONNREFUSED|ECONNRESET|EPIPE|ETIMEDOUT|EAI_AGAIN|fetch failed|socket|network/i.test(message)) return "transient_transport"
+  if (/429|rate limit|overloaded|capacity/i.test(message)) return "capacity"
+  if (/502|503|504|bad gateway|service unavailable|gateway timeout/i.test(message)) return "transient_upstream"
+  if (/timeout|timed out/i.test(message)) return "timeout"
+  return "internal"
 }

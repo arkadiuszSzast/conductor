@@ -580,7 +580,11 @@ export class Store {
    * Jobs skipped by the original failure cascade reset to pending so
    * the cascade re-evaluates them when the recovered jobs conclude.
    */
-  recoverStepTargets(featureId: string, targets: readonly { jobId: string; stepId: string }[]): boolean {
+  recoverStepTargets(
+    featureId: string,
+    targets: readonly { jobId: string; stepId: string }[],
+    idempotencyKey?: string,
+  ): boolean {
     const now = Date.now()
     const changed = this.db.transaction(() => {
       const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(featureId) as FeatureRow | null
@@ -611,7 +615,7 @@ export class Store {
         "INSERT INTO transition_log (feature_id, event, decisions, time_created) VALUES (?, ?, ?, ?)",
         [
           featureId,
-          JSON.stringify({ kind: "human.recovered" }),
+          JSON.stringify({ kind: "human.recovered", ...(idempotencyKey !== undefined ? { idempotencyKey } : {}) }),
           JSON.stringify(targets.map(target => ({ kind: "execute_step", jobId: target.jobId, stepId: target.stepId }))),
           now,
         ],
@@ -620,6 +624,23 @@ export class Store {
     })()
     if (changed) this.emit({ kind: "transition", featureId })
     return changed
+  }
+
+  /** Whether a recover with this idempotency key already committed for
+   *  the feature — the dedup read for retried recover deliveries. */
+  hasRecoverKey(featureId: string, idempotencyKey: string): boolean {
+    const rows = this.db.query(
+      `SELECT event FROM transition_log WHERE feature_id = ? AND event LIKE '%"human.recovered"%'`,
+    ).all(featureId) as Array<{ event: string }>
+    for (const row of rows) {
+      try {
+        const event = JSON.parse(row.event) as { kind?: string; idempotencyKey?: string }
+        if (event.kind === "human.recovered" && event.idempotencyKey === idempotencyKey) return true
+      } catch {
+        // Malformed legacy row — never blocks a recover.
+      }
+    }
+    return false
   }
 
   private applyTransitionTx(featureId: string, event: PipelineEvent, transition: Transition): void {

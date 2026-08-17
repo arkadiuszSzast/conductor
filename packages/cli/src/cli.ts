@@ -119,6 +119,10 @@ commands:
   pause <feature-id>   pause the feature
   resume <feature-id>  resume a paused feature
   abandon <feature-id> abandon the feature
+  recover <feature-id> --notes <text|@file> [--expected-version <n>] [--idempotency-key <key>]
+                       re-arm an escalated feature's failed/blocked steps
+                       (--expected-version rejects a stale view; the key
+                       dedupes a retried delivery)
   logs <feature-id>    print the feature's transition timeline
 
 exit codes: 0 ok, 1 failure, 2 usage, 3 unauthorized, 4 not found,
@@ -138,6 +142,8 @@ const VALUE_FLAGS = new Set([
   "notes",
   "outcome",
   "verdict",
+  "expected-version",
+  "idempotency-key",
   "init-config",
 ])
 
@@ -763,7 +769,15 @@ async function commandRecover(parsed: Parsed, deps: CliDeps, client: ApiClient, 
   if (notes === undefined || notes.trim() === "") {
     throw new UsageError("recover requires --notes explaining why you are recovering")
   }
-  const payload = await client.recover(featureId, notes)
+  const versionText = stringFlag(parsed, "expected-version")
+  if (versionText !== undefined && !/^\d+$/.test(versionText)) {
+    throw new UsageError("--expected-version must be an integer (the feature's updatedAt from `conductor show`)")
+  }
+  const idempotencyKey = stringFlag(parsed, "idempotency-key")
+  const payload = await client.recover(featureId, notes, {
+    ...(versionText !== undefined ? { expectedVersion: Number(versionText) } : {}),
+    ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
+  })
   if (json) {
     deps.stdout(JSON.stringify(payload))
     return EXIT.ok

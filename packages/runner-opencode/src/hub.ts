@@ -47,6 +47,10 @@ export interface RunnerHubDeps {
   /** Callback listener binding. Injectable for tests. */
   readonly listen?: ListenFn
   readonly log?: (message: string) => void
+  /** Re-announce interval in ms; 0 disables the loop (tests drive announces manually). */
+  readonly reannounceMs?: number
+  readonly setInterval?: typeof globalThis.setInterval
+  readonly clearInterval?: typeof globalThis.clearInterval
 }
 
 function json(status: number, body: unknown): Response {
@@ -69,6 +73,12 @@ function isPathPrefix(prefix: string, directory: string): boolean {
 /** Bound on the session→run attribution map — evicted oldest-first. */
 const MAX_SESSION_RUN_IDS = 1024
 
+/** How often the hub re-POSTs its registration. The daemon's registry is
+ *  in-memory and starts empty after a restart; periodic re-announce heals
+ *  that gap without operator intervention (registration is an upsert, so
+ *  steady-state re-announces are no-ops server-side). */
+const DEFAULT_REANNOUNCE_MS = 15_000
+
 export const bunListen: ListenFn = (host, port, handler) => {
   const server = Bun.serve({ hostname: host, port, idleTimeout: 0, fetch: handler })
   return {
@@ -88,10 +98,14 @@ export class OpencodeRunnerHub {
   private listener: CallbackListener | null = null
   private runnerId: string | null = null
   private stopped = false
+  private reannounceTimer: ReturnType<typeof globalThis.setInterval> | null = null
 
   private readonly daemonFetch: DaemonFetch
   private readonly listen: ListenFn
   private readonly log: (message: string) => void
+  private readonly reannounceMs: number
+  private readonly setIntervalFn: typeof globalThis.setInterval
+  private readonly clearIntervalFn: typeof globalThis.clearInterval
 
   constructor(
     private readonly config: RunnerConfig,
@@ -100,6 +114,9 @@ export class OpencodeRunnerHub {
     this.daemonFetch = deps.daemonFetch ?? (request => fetch(request))
     this.listen = deps.listen ?? bunListen
     this.log = deps.log ?? (() => {})
+    this.reannounceMs = deps.reannounceMs ?? DEFAULT_REANNOUNCE_MS
+    this.setIntervalFn = deps.setInterval ?? globalThis.setInterval.bind(globalThis)
+    this.clearIntervalFn = deps.clearInterval ?? globalThis.clearInterval.bind(globalThis)
   }
 
   /** The callback handler — exposed for socketless tests. */
@@ -127,12 +144,30 @@ export class OpencodeRunnerHub {
     }
     this.projects.set(directory, sessions)
     await this.announce()
+    // A daemon restart wipes its in-memory runner registry; the loop
+    // re-announces until stop() so the gap heals itself. Failures are
+    // logged and retried on the next tick — the daemon may simply be
+    // down for a deploy.
+    if (this.reannounceTimer === null && this.reannounceMs > 0) {
+      this.reannounceTimer = this.setIntervalFn(() => {
+        void this.announce().catch(err => {
+          this.log(`runner re-announce failed (will retry): ${err instanceof Error ? err.message : String(err)}`)
+        })
+      }, this.reannounceMs)
+      if (typeof (this.reannounceTimer as { unref?: () => void }).unref === "function") {
+        ;(this.reannounceTimer as unknown as { unref: () => void }).unref()
+      }
+    }
   }
 
   /** Deregister from the daemon and stop the callback listener. Idempotent. */
   async stop(): Promise<void> {
     if (this.stopped) return
     this.stopped = true
+    if (this.reannounceTimer !== null) {
+      this.clearIntervalFn(this.reannounceTimer)
+      this.reannounceTimer = null
+    }
     if (this.runnerId !== null) {
       try {
         await this.callDaemon("DELETE", `/v1/runners/${encodeURIComponent(this.runnerId)}`)
@@ -178,8 +213,11 @@ export class OpencodeRunnerHub {
       throw new Error(`daemon rejected runner registration (status ${response.status})`)
     }
     const body = (await response.json()) as { runner?: { id?: string } }
+    const previousId = this.runnerId
     if (typeof body.runner?.id === "string") this.runnerId = body.runner.id
-    this.log(`runner registered with daemon as ${this.runnerId ?? "?"} (${this.registeredProjects.length} project(s))`)
+    if (this.runnerId !== previousId) {
+      this.log(`runner registered with daemon as ${this.runnerId ?? "?"} (${this.registeredProjects.length} project(s))`)
+    }
   }
 
   private callDaemon(method: string, path: string, body?: unknown): Promise<Response> {

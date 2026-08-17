@@ -93,6 +93,6 @@ export function useRunLogInvalidations(store: DataSource, featureId: string, lis
 /** Command runner bound to the store — applies fresh state, skips echo. */
 export function useCommand(
   store: DataSource,
-): (featureId: string, run: (client: ApiClient) => Promise<CommandResponse | FeatureDetailResponse>) => Promise<void> {
+): <T extends CommandResponse | FeatureDetailResponse>(featureId: string, run: (client: ApiClient) => Promise<T>) => Promise<T> {
   return useCallback((featureId, run) => store.command(featureId, run), [store])
 }

@@ -194,11 +194,19 @@ export class ApiClient {
     })
   }
 
-  async recover(featureId: string, notes: string): Promise<CommandResponse> {
+  async recover(
+    featureId: string,
+    notes: string,
+    options?: { readonly expectedVersion?: number; readonly idempotencyKey?: string },
+  ): Promise<CommandResponse> {
     return this.request<CommandResponse>(`/v1/features/${encodeURIComponent(featureId)}/recover`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ notes }),
+      body: JSON.stringify({
+        notes,
+        ...(options?.expectedVersion !== undefined ? { expectedVersion: options.expectedVersion } : {}),
+        ...(options?.idempotencyKey !== undefined ? { idempotencyKey: options.idempotencyKey } : {}),
+      }),
     })
   }
 }

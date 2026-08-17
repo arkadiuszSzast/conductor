@@ -199,8 +199,12 @@ export class ApiClient {
     return this.request("POST", `/v1/features/${encodeURIComponent(featureId)}/abandon`, {})
   }
 
-  recover(featureId: string, notes: string): Promise<CommandResult> {
-    return this.request("POST", `/v1/features/${encodeURIComponent(featureId)}/recover`, { notes })
+  recover(featureId: string, notes: string, options?: { readonly expectedVersion?: number; readonly idempotencyKey?: string }): Promise<CommandResult> {
+    return this.request("POST", `/v1/features/${encodeURIComponent(featureId)}/recover`, {
+      notes,
+      ...(options?.expectedVersion !== undefined ? { expectedVersion: options.expectedVersion } : {}),
+      ...(options?.idempotencyKey !== undefined ? { idempotencyKey: options.idempotencyKey } : {}),
+    })
   }
 
   getRun(runId: string): Promise<{ run: RunDetail }> {

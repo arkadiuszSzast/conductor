@@ -245,6 +245,7 @@ async function makeHarness(input?: { projects?: string[] }): Promise<Harness> {
     })
     const hub = new OpencodeRunnerHub(config, {
       daemonFetch,
+      reannounceMs: 0,
       listen: (host, _port, handler): CallbackListener => {
         const port = ++portCounter
         handlers.set(`${host}:${port}`, handler)
@@ -463,6 +464,44 @@ describe("runner registration and daemon health", () => {
     )
     expect(response.status).toBe(401)
   })
+
+  it("the re-announce loop heals a daemon-restart registry wipe", async () => {
+    const project = writeProject()
+    const h = await makeHarness({ projects: [project] })
+    let tick: (() => void) | null = null
+    const config = resolveRunnerConfig({
+      CONDUCTOR_URL: "http://daemon.test",
+      CONDUCTOR_RUNNER_HOST: RUNNER_ENDPOINT_HOST,
+      CONDUCTOR_RUNNER_TOKEN: RUNNER_TOKEN,
+    })
+    const hub = new OpencodeRunnerHub(config, {
+      daemonFetch: async request => h.api.handle(request),
+      reannounceMs: 1,
+      setInterval: ((fn: () => void) => {
+        tick = fn
+        return 0 as unknown as ReturnType<typeof setInterval>
+      }) as typeof setInterval,
+      clearInterval: (() => {
+        tick = null
+      }) as typeof clearInterval,
+      listen: (host): CallbackListener => ({ hostname: host, port: 1, stop: async () => {} }),
+    })
+    hubsToStop.push(hub)
+    await hub.registerProject(project, createOpencodeSessions(new FakeOpencodeServer(project).api()))
+    expect(h.registry.hasAny()).toBe(true)
+
+    // Simulate the daemon restart: its in-memory registry starts empty.
+    for (const runner of h.registry.list()) h.registry.deregister(runner.id)
+    expect(h.registry.hasAny()).toBe(false)
+
+    tick!()
+    await Bun.sleep(0)
+    expect(h.registry.hasAny()).toBe(true)
+    expect(h.registry.list()[0]!.projects).toEqual([project])
+
+    await hub.stop()
+    expect(tick).toBeNull()
+  })
 })
 
 describe("multi-project directory routing", () => {
@@ -578,8 +617,13 @@ jobs:
     expect(run.run.status).toBe("reaped")
     const feature = await h.client.getFeature(featureId)
     expect(feature.feature.status).toBe("running")
-    expect(feature.activeRun).not.toBeNull()
-    expect(feature.activeRun!.id).not.toBe(runId)
+    // The retry is durable now: a 10ms backoff schedules an episode
+    // instead of instantly re-arming; the next due pass dispatches it.
+    await Bun.sleep(15)
+    await h.daemon.beat()
+    const after = await h.client.getFeature(featureId)
+    expect(after.activeRun).not.toBeNull()
+    expect(after.activeRun!.id).not.toBe(runId)
   })
 
   it("busy and retry sessions are never nudged", async () => {

@@ -112,11 +112,16 @@ export function FeatureView(): React.ReactNode {
                 if (note === null || note.trim() === "") return
                 setPendingLifecycle("recover")
                 try {
-                  await runCommand(featureId, client => client.recover(featureId, note))
+                  const response = await runCommand(featureId, client =>
+                    client.recover(featureId, note, {
+                      expectedVersion: feature.updatedAt,
+                      idempotencyKey: crypto.randomUUID(),
+                    }))
+                  pushToast(`✓ ${response.result}`)
                   store.refetchFeatureDetail(featureId)
                 } catch (err) {
                   const handled = mapGateError(err)
-                  if (handled.toast !== "") pushToast(handled.toast)
+                  pushToast(handled.toast !== "" ? handled.toast : "recover failed")
                   if (handled.refetch) store.refetchFeatureDetail(featureId)
                 } finally {
                   setPendingLifecycle(null)

@@ -343,14 +343,15 @@ export class DataSource {
    * the echo invalidation for the feature, and refresh the board list.
    * The promise rejects with the typed ApiError on failure.
    */
-  async command(
+  async command<T extends FeatureDetailResponse | CommandResponse>(
     featureId: string,
-    run: (client: ApiClient) => Promise<FeatureDetailResponse | CommandResponse>,
-  ): Promise<void> {
+    run: (client: ApiClient) => Promise<T>,
+  ): Promise<T> {
     const payload = await run(this.client)
     this.echo.set(featureId, this.now())
     this.applyDetail(featureId, payload)
     this.refreshFeatures()
+    return payload
   }
 
   applyDetail(featureId: string, payload: FeatureDetailResponse): void {

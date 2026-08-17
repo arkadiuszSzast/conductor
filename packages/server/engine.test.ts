@@ -404,6 +404,45 @@ describe("Engine: runner resource waits", () => {
     expect(store.listRuns(feature.id)).toHaveLength(1)
     expect(sessions.prompts).toHaveLength(1)
   })
+
+  it("recover with a stale expectedVersion is rejected; the current version passes", async () => {
+    let available = false
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => available })
+    const feature = await startedFeature(engine)
+    clock.advance(3_600_000)
+    await engine.reconcile()
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    available = true
+
+    const stale = await engine.recover(feature.id, { notes: "go", expectedVersion: 1 })
+    expect(stale.ok).toBe(false)
+    expect(stale.stale).toBe(true)
+    expect(store.listRuns(feature.id)).toHaveLength(0)
+
+    const version = store.getFeatureRecord(feature.id)!.updatedAt
+    const result = await engine.recover(feature.id, { notes: "go", expectedVersion: version })
+    expect(result.ok).toBe(true)
+    expect(store.listRuns(feature.id)).toHaveLength(1)
+  })
+
+  it("a retried recover with the same idempotency key is a duplicate no-op, a new key re-recovers", async () => {
+    let available = false
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => available })
+    const feature = await startedFeature(engine)
+    clock.advance(3_600_000)
+    await engine.reconcile()
+    available = true
+
+    const first = await engine.recover(feature.id, { notes: "go", idempotencyKey: "op-123" })
+    expect(first.ok).toBe(true)
+    expect(store.listRuns(feature.id)).toHaveLength(1)
+
+    // The client retries the same delivery: success, no second run.
+    const retried = await engine.recover(feature.id, { notes: "go", idempotencyKey: "op-123" })
+    expect(retried.ok).toBe(true)
+    expect(retried.duplicate).toBe(true)
+    expect(store.listRuns(feature.id)).toHaveLength(1)
+  })
 })
 
 describe("Engine: linear happy path", () => {
@@ -519,6 +558,55 @@ describe("Engine: retry budget", () => {
     run = store.getActiveRunForStep(feature.id, "main", "implement")!
     await engine.report({ runId: run.id, outcome: "failed", notes: "attempt 2 failed" })
     expect(store.getFeature(feature.id)?.status).toBe("escalated")
+  })
+})
+
+describe("Engine: failure classification and durable retry schedules", () => {
+  it("a failed command run carries a classified envelope (exit 127 → invalid_config)", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    process_.handler = () => ({ code: 127, stdout: "", stderr: "", output: "command not found: gh" })
+    await engine.report({ runId: run.id, outcome: "succeeded", notes: "done" })
+
+    const commandRun = store.listRuns(feature.id).find(r => r.stepId === "verify")!
+    expect(commandRun.status).toBe("failed")
+    expect(commandRun.failure).toMatchObject({ class: "invalid_config", source: "command" })
+  })
+
+  it("a reaped missing session carries class missing_session; TTL reap carries timeout", async () => {
+    const engine = makeEngine(linearWorkflow, { runTtlMs: 1000 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    sessions.liveSessions.delete(run.sessionId!)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.failure).toMatchObject({ class: "missing_session", source: "reaper" })
+  })
+
+  it("a retry with a non-zero backoff becomes a durable scheduled episode, claimed when due", async () => {
+    const engine = makeEngine(retryWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    sessions.liveSessions.delete(run.sessionId!)
+    await engine.reconcile()
+
+    // The reap classified the failure; retryWorkflow's backoff (10ms) is
+    // non-zero, so no immediate re-dispatch — a scheduled episode instead.
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    expect(store.getActiveRunForStep(feature.id, "main", "implement")).toBeNull()
+    const episode = store.getOpenRetryEpisode(feature.id, "main", "implement")
+    expect(episode).toMatchObject({ status: "scheduled", scheduleSource: "backoff" })
+
+    // Not due yet — reconcile dispatches nothing.
+    await engine.reconcile()
+    expect(store.getActiveRunForStep(feature.id, "main", "implement")).toBeNull()
+
+    clock.advance(50)
+    await engine.reconcile()
+    const rearmed = store.getActiveRunForStep(feature.id, "main", "implement")
+    expect(rearmed).not.toBeNull()
+    expect(rearmed!.id).not.toBe(run.id)
+    expect(store.getOpenRetryEpisode(feature.id, "main", "implement")).toBeNull()
   })
 })
 
