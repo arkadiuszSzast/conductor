@@ -14,13 +14,16 @@
 
 import { ApiClient, ApiError, readSseStream, SseHttpError, type SseFrame } from "./client.ts"
 import type {
+  AnswerRunResponse,
   ChangeEvent,
   CommandResponse,
   DaemonHealth,
+  FeatureDetail,
   FeatureDetailResponse,
   FeatureListItem,
   FindingView,
   RunSummary,
+  StartFeatureRequest,
   TransitionEntry,
   WorkflowProjection,
 } from "./types.ts"
@@ -78,7 +81,14 @@ export interface DataSourceInput {
 }
 
 interface Inflight {
-  readonly id: number
+  readonly epoch: number
+  readonly promise: Promise<void>
+}
+
+interface EchoState {
+  at: number
+  readonly deferred: Set<string>
+  handle: unknown | null
 }
 
 export class DataSource {
@@ -99,8 +109,10 @@ export class DataSource {
   private readonly listeners = new Map<string, Set<() => void>>()
   private readonly runLogListeners = new Map<string, Set<() => void>>()
   private readonly inflight = new Map<string, Inflight>()
+  private readonly authority = new Map<string, number>()
   private readonly retryHandles = new Map<string, unknown>()
-  private readonly echo = new Map<string, number>()
+  private readonly echo = new Map<string, EchoState>()
+  private readonly commandChains = new Map<string, Promise<void>>()
 
   private readonly pending = new Map<string, ChangeEvent>()
   private coalesceTimer: unknown | null = null
@@ -200,57 +212,66 @@ export class DataSource {
     this.ensure(`workflow:${projectDir}`, () => this.client.workflowState(projectDir))
   }
 
+  /** Force-refetch one project's workflow projection — used after a
+   *  `unknown_workflow`/`invalid_input` start rejection so the start
+   *  surface's target metadata reflects whatever changed underneath it. */
+  refetchWorkflow(projectDir: string): Promise<void> {
+    if (projectDir === "") return Promise.resolve()
+    return this.ensure(`workflow:${projectDir}`, () => this.client.workflowState(projectDir), true)
+  }
+
   ensureHealthLoaded(): void {
     this.ensure("health", () => this.client.health())
   }
 
-  refreshHealth(): void {
-    this.ensure("health", () => this.client.health(), true)
+  refreshHealth(): Promise<void> {
+    return this.ensure("health", () => this.client.health(), true)
   }
 
   /** Force-refetch the feature detail (e.g. after a 409 race). */
-  refetchFeatureDetail(featureId: string): void {
-    this.ensure(`detail:${featureId}`, () => this.client.featureDetail(featureId), true)
+  refetchFeatureDetail(featureId: string): Promise<void> {
+    return this.ensure(`detail:${featureId}`, () => this.client.featureDetail(featureId), true)
   }
 
-  refetchRuns(featureId: string): void {
-    this.ensure(`runs:${featureId}`, () => this.client.runs(featureId), true)
+  refetchRuns(featureId: string): Promise<void> {
+    return this.ensure(`runs:${featureId}`, () => this.client.runs(featureId), true)
   }
 
-  refetchFindings(featureId: string): void {
-    this.ensure(`findings:${featureId}`, () => this.client.findings(featureId), true)
+  refetchFindings(featureId: string): Promise<void> {
+    return this.ensure(`findings:${featureId}`, () => this.client.findings(featureId), true)
   }
 
-  refetchTimeline(featureId: string): void {
-    this.ensure(`timeline:${featureId}`, () => this.client.timeline(featureId), true)
+  refetchTimeline(featureId: string): Promise<void> {
+    return this.ensure(`timeline:${featureId}`, () => this.client.timeline(featureId), true)
   }
 
-  private ensure(key: string, loader: () => Promise<unknown>, force = false): void {
+  private ensure(key: string, loader: () => Promise<unknown>, force = false): Promise<void> {
     const existing = this.inflight.get(key)
-    if (existing !== undefined && !force) return
+    if (existing !== undefined && !force) return existing.promise
     // "Ensure" means load-once: a resource that already settled (ready or
     // error) is only refetched by an explicit force (SSE invalidation,
     // refresh, retry). Without this check every React render re-triggers
     // a fetch — fetch → emit → render → ensure → fetch, a hot loop.
-    if (!force && this.statusOf(key) !== "loading") return
-    this.load(key, loader, force ? LOAD_RETRY_MAX_ATTEMPTS : 0)
+    if (!force && this.statusOf(key) !== "loading") return Promise.resolve()
+    return this.load(key, loader, force ? LOAD_RETRY_MAX_ATTEMPTS : 0)
   }
 
-  private load(key: string, loader: () => Promise<unknown>, attempt: number): void {
-    const requestId = (this.inflight.get(key)?.id ?? 0) + 1
-    this.inflight.set(key, { id: requestId })
-    loader()
+  private load(key: string, loader: () => Promise<unknown>, attempt: number): Promise<void> {
+    const epoch = this.bumpAuthority(key)
+    const promise = loader()
       .then(data => {
-        if (this.inflight.get(key)?.id !== requestId) return
+        if (!this.isAuthoritative(key, epoch)) return
         this.inflight.delete(key)
         this.setResource(key, { status: "ready", data, error: null })
       })
       .catch((err: unknown) => {
-        if (this.inflight.get(key)?.id !== requestId) return
+        if (!this.isAuthoritative(key, epoch)) return
         const error = err instanceof ApiError ? err : new ApiError(0, "internal", String(err), null)
         if (error.status === 401) {
+          // `ApiClient.request` already invoked `onUnauthorized` — the
+          // central 401 handler for every read and mutation — so this
+          // branch only needs to stop the retry loop and record the error.
           this.inflight.delete(key)
-          this.client.onUnauthorized?.()
           this.setResource(key, { status: "error", data: this.dataOf(key), error })
           return
         }
@@ -260,17 +281,33 @@ export class DataSource {
         // permanent error state. Forced refetches carry attempt 1+ and
         // rely on their own trigger repeating instead.
         if (attempt < LOAD_RETRY_MAX_ATTEMPTS) {
-          const handle = this.setTimeoutFn(() => {
-            this.retryHandles.delete(key)
-            if (this.inflight.get(key)?.id !== requestId) return
-            this.load(key, loader, attempt + 1)
-          }, LOAD_RETRY_BASE_MS * 2 ** attempt)
-          this.retryHandles.set(key, handle)
-          return
+          return new Promise<void>(resolve => {
+            const handle = this.setTimeoutFn(() => {
+              this.retryHandles.delete(key)
+              if (!this.isAuthoritative(key, epoch)) {
+                resolve()
+                return
+              }
+              void this.load(key, loader, attempt + 1).then(resolve)
+            }, LOAD_RETRY_BASE_MS * 2 ** attempt)
+            this.retryHandles.set(key, handle)
+          })
         }
         this.inflight.delete(key)
         this.setResource(key, { status: "error", data: this.dataOf(key), error })
       })
+    this.inflight.set(key, { epoch, promise })
+    return promise
+  }
+
+  private bumpAuthority(key: string): number {
+    const epoch = (this.authority.get(key) ?? 0) + 1
+    this.authority.set(key, epoch)
+    return epoch
+  }
+
+  private isAuthoritative(key: string, epoch: number): boolean {
+    return this.authority.get(key) === epoch && this.inflight.get(key)?.epoch === epoch
   }
 
   private dataOf(key: string): unknown {
@@ -347,14 +384,43 @@ export class DataSource {
     featureId: string,
     run: (client: ApiClient) => Promise<T>,
   ): Promise<T> {
-    const payload = await run(this.client)
-    this.echo.set(featureId, this.now())
-    this.applyDetail(featureId, payload)
-    this.refreshFeatures()
-    return payload
+    return this.enqueueCommand(featureId, async () => {
+      const payload = await run(this.client)
+      this.armEcho(featureId)
+      this.applyDetail(featureId, payload)
+      await this.refreshFeatures()
+      return payload
+    })
+  }
+
+  /**
+   * Answer a run's pending question. Unlike `command`, the server's
+   * response (`{result, run}`) is NOT a feature detail payload — it must
+   * never reach `applyDetail`. The feature's authoritative post-answer
+   * state (status flips back to `running`, the question clears) is only
+   * known through a real refetch, so this forces fresh detail and runs
+   * for the feature and still arms the echo suppression window: the
+   * server's own `transition`/`run`/`feature` invalidations for this
+   * answer would otherwise trigger a second, redundant refetch pass
+   * moments after the one this method already performed.
+   */
+  async answerRun(featureId: string, run: (client: ApiClient) => Promise<AnswerRunResponse>): Promise<AnswerRunResponse> {
+    return this.enqueueCommand(featureId, async () => {
+      const payload = await run(this.client)
+      this.armEcho(featureId)
+      await Promise.all([
+        this.refetchFeatureDetail(featureId),
+        this.refetchRuns(featureId),
+        this.refreshFeatures(),
+      ])
+      return payload
+    })
   }
 
   applyDetail(featureId: string, payload: FeatureDetailResponse): void {
+    const key = `detail:${featureId}`
+    this.bumpAuthority(key)
+    this.inflight.delete(key)
     const prev = this.details.get(featureId)
     this.details.set(featureId, {
       status: "ready",
@@ -365,8 +431,114 @@ export class DataSource {
     this.emit(`detail:${featureId}`)
   }
 
-  private refreshFeatures(): void {
-    this.ensure("features", () => this.client.listFeatures(), true)
+  private refreshFeatures(): Promise<void> {
+    return this.ensure("features", () => this.client.listFeatures(), true)
+  }
+
+  /**
+   * Start a feature — non-optimistic: there is no feature id, and
+   * therefore no cache entry, until the daemon's 201 response arrives.
+   * On success the response is applied as immediately-authoritative
+   * detail/list state:
+   *
+   *  1. authority for both the new detail resource and the feature list
+   *     is bumped BEFORE the request even starts, so any older in-flight
+   *     load for either — including one an early SSE `feature`
+   *     invalidation kicks off while this POST is still pending — cannot
+   *     land after and clobber the response;
+   *  2. the returned detail is applied directly (`applyDetail`) and, if
+   *     the list is already loaded, upserted into its projection so the
+   *     new feature appears without waiting for a refetch;
+   *  3. the echo-suppression window is armed for the new feature id,
+   *     same as any other command, so its own `feature`/`transition`
+   *     invalidation from the initial dispatch doesn't trigger a
+   *     redundant refetch moments later;
+   *  4. a list refresh is started best-effort — its failure is swallowed
+   *     and never turns a successful creation into a failed one (design.md
+   *     "Post-create list refresh fails").
+   *
+   * Rejects with the typed `ApiError` on failure; the cache is untouched
+   * on a rejected POST.
+   */
+  async startFeature(request: StartFeatureRequest): Promise<FeatureDetailResponse> {
+    const payload = await this.client.startFeature(request)
+    const featureId = payload.feature.id
+    // Bump list authority now, right as the response lands, before any
+    // further await: an older in-flight `features` GET — including one
+    // an early SSE `feature` invalidation kicked off while this POST was
+    // still pending (the daemon dispatches `feature.start` before
+    // responding) — carries an epoch this bump invalidates, so it can
+    // never land afterward and silently drop the feature this response
+    // just proved exists. `applyDetail` performs the equivalent bump for
+    // the detail resource itself.
+    this.bumpAuthority("features")
+    this.applyDetail(featureId, payload)
+    this.armEcho(featureId)
+    this.upsertFeatureListItem(payload.feature)
+    void this.refreshFeatures().catch(() => {
+      // Best-effort: a failed post-create list refresh never turns a
+      // successful creation into a failure. The list stays on whatever
+      // it already had (including the upsert above) until a later
+      // trigger (SSE, manual refresh) succeeds.
+    })
+    return payload
+  }
+
+  /** Insert or replace the new feature's row in the already-loaded list
+   *  projection, without waiting for `refreshFeatures`'s real refetch —
+   *  keeps the board/board-empty-state view honest immediately after a
+   *  browser-initiated start even if the follow-up list GET is slow or
+   *  fails. A no-op while the list has never loaded (its own `ensure`
+   *  will fetch the authoritative set once requested). */
+  private upsertFeatureListItem(feature: FeatureDetail): void {
+    if (this.features.status !== "ready" || this.features.data === null) return
+    const jobs: Record<string, { status: FeatureListItem["jobs"][string]["status"]; currentStep: string | null }> = {}
+    for (const [jobId, job] of Object.entries(feature.jobs)) {
+      jobs[jobId] = { status: job.status, currentStep: job.currentStep }
+    }
+    const item: FeatureListItem = {
+      id: feature.id,
+      title: feature.title,
+      slug: feature.slug,
+      projectDir: feature.projectDir,
+      workflow: feature.workflow,
+      description: feature.description,
+      status: feature.status,
+      sessionId: feature.sessionId,
+      worktree: feature.worktree,
+      branch: feature.branch,
+      pr: feature.pr,
+      escalation: feature.escalation,
+      currentStep: feature.currentStep,
+      createdAt: feature.createdAt,
+      updatedAt: feature.updatedAt,
+      findingCounts: feature.findingCounts,
+      jobs,
+    }
+    const existing = this.features.data
+    const next = existing.some(f => f.id === item.id) ? existing.map(f => (f.id === item.id ? item : f)) : [item, ...existing]
+    this.features = { ...this.features, data: next, version: this.features.version + 1 }
+    this.emit("features")
+  }
+
+  private enqueueCommand<T>(featureId: string, run: () => Promise<T>): Promise<T> {
+    const previous = this.commandChains.get(featureId) ?? Promise.resolve()
+    const current = previous.catch(() => {}).then(run)
+    const settled = current.then(() => {}, () => {})
+    this.commandChains.set(featureId, settled)
+    void settled.then(() => {
+      if (this.commandChains.get(featureId) === settled) this.commandChains.delete(featureId)
+    })
+    return current
+  }
+
+  private armEcho(featureId: string): void {
+    const existing = this.echo.get(featureId)
+    if (existing !== undefined) {
+      existing.at = this.now()
+      return
+    }
+    this.echo.set(featureId, { at: this.now(), deferred: new Set(), handle: null })
   }
 
   // ------------------------------------------------------------ SSE
@@ -480,34 +652,28 @@ export class DataSource {
   }
 
   private collectTargets(change: ChangeEvent, targets: Set<string>): void {
-    // A command response was applied for this feature moments ago: every
-    // invalidation kind echoing that write inside the window is suppressed
-    // (a transition+run burst is one echo, not one echo plus a refetch).
-    // The entry expires by time, never by first match.
-    const echoedAt = this.echo.get(change.featureId)
-    if (echoedAt !== undefined) {
-      if (this.now() - echoedAt < ECHO_WINDOW_MS) return
-      this.echo.delete(change.featureId)
-    }
+    const echoed = this.echo.get(change.featureId)
+    const inEchoWindow = echoed !== undefined && this.now() - echoed.at < ECHO_WINDOW_MS
+    if (echoed !== undefined && !inEchoWindow) this.releaseEcho(change.featureId, echoed)
     const onScreen = this.activeFeatureId !== null && change.featureId === this.activeFeatureId
     switch (change.kind) {
       case "feature":
-        targets.add("features")
-        if (onScreen) targets.add(`detail:${change.featureId}`)
+        this.addCoveredTarget(change.featureId, "features", inEchoWindow, targets)
+        if (onScreen) this.addCoveredTarget(change.featureId, `detail:${change.featureId}`, inEchoWindow, targets)
         break
       case "transition":
         if (onScreen) {
-          targets.add(`detail:${change.featureId}`)
+          this.addCoveredTarget(change.featureId, `detail:${change.featureId}`, inEchoWindow, targets)
           targets.add(`timeline:${change.featureId}`)
         }
-        targets.add("features")
+        this.addCoveredTarget(change.featureId, "features", inEchoWindow, targets)
         break
       case "run":
         if (onScreen) {
-          targets.add(`detail:${change.featureId}`)
+          this.addCoveredTarget(change.featureId, `detail:${change.featureId}`, inEchoWindow, targets)
           targets.add(`runs:${change.featureId}`)
         }
-        targets.add("features")
+        this.addCoveredTarget(change.featureId, "features", inEchoWindow, targets)
         break
       case "finding":
         if (onScreen) targets.add(`findings:${change.featureId}`)
@@ -517,6 +683,40 @@ export class DataSource {
         targets.add(`run_log:${change.featureId}`)
         break
     }
+  }
+
+  private addCoveredTarget(featureId: string, target: string, defer: boolean, targets: Set<string>): void {
+    if (!defer) {
+      targets.add(target)
+      return
+    }
+    const echo = this.echo.get(featureId)
+    if (echo === undefined) {
+      targets.add(target)
+      return
+    }
+    echo.deferred.add(target)
+    this.scheduleEchoRelease(featureId, echo)
+  }
+
+  private scheduleEchoRelease(featureId: string, echo: EchoState): void {
+    if (echo.handle !== null) return
+    const delay = Math.max(0, ECHO_WINDOW_MS - (this.now() - echo.at))
+    echo.handle = this.setTimeoutFn(() => {
+      echo.handle = null
+      if (this.echo.get(featureId) !== echo) return
+      if (this.now() - echo.at < ECHO_WINDOW_MS) {
+        this.scheduleEchoRelease(featureId, echo)
+        return
+      }
+      this.releaseEcho(featureId, echo)
+    }, delay)
+  }
+
+  private releaseEcho(featureId: string, echo: EchoState): void {
+    if (echo.handle !== null) this.clearTimeoutFn(echo.handle)
+    this.echo.delete(featureId)
+    for (const target of echo.deferred) this.executeTarget(target)
   }
 
   private executeTarget(target: string): void {
@@ -571,5 +771,9 @@ export class DataSource {
     }
     for (const handle of this.retryHandles.values()) this.clearTimeoutFn(handle)
     this.retryHandles.clear()
+    for (const echo of this.echo.values()) {
+      if (echo.handle !== null) this.clearTimeoutFn(echo.handle)
+    }
+    this.echo.clear()
   }
 }

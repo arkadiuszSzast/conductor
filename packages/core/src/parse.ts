@@ -393,7 +393,12 @@ function readSchedule(node: Node | null, where: string, reader: Reader): Trigger
 function readInputs(node: Node | null, reader: Reader): Readonly<Record<string, InputDef>> {
   const map = readMap(node, "inputs", reader)
   if (map === undefined) return {}
-  const inputs: Record<string, InputDef> = {}
+  // An input name is any YAML string key, including `constructor`,
+  // `toString` or `__proto__` — `Object.fromEntries` (rather than
+  // `inputs[key.value] = input`) keeps every one of them a genuine own
+  // property instead of silently reassigning `Object.prototype`'s
+  // `__proto__` accessor for the one name that collides with it.
+  const entries: Array<[string, InputDef]> = []
   for (const pair of map.items) {
     const key = pair.key as Node
     if (!isScalar(key) || typeof key.value !== "string") {
@@ -401,9 +406,9 @@ function readInputs(node: Node | null, reader: Reader): Readonly<Record<string, 
       continue
     }
     const input = readInput(key.value, (pair.value ?? null) as Node | null, reader)
-    if (input !== undefined) inputs[key.value] = input
+    if (input !== undefined) entries.push([key.value, input])
   }
-  return inputs
+  return Object.fromEntries(entries)
 }
 
 function readInput(name: string, node: Node | null, reader: Reader): InputDef | undefined {

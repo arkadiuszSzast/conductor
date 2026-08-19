@@ -11,6 +11,8 @@ import { FeatureView } from "./feature/feature-view.tsx"
 import { TopBar } from "./top-bar.tsx"
 import { Toasts } from "./ui/toasts.tsx"
 import { pushToast } from "./ui/toast-store.ts"
+import { StartWorkContext } from "./start-work/start-work-context.ts"
+import { StartWorkSheet } from "./start-work/start-work-sheet.tsx"
 
 async function probeHealth(token: string | null): Promise<number> {
   const headers: Record<string, string> = {}
@@ -63,6 +65,7 @@ export function App(): React.ReactNode {
 function Shell(): React.ReactNode {
   const { session, store } = useApp()
   const status = useAuthStatus(session)
+  const [startWorkOpen, setStartWorkOpen] = useState(false)
 
   useEffect(() => {
     if (status === "authenticated") {
@@ -75,13 +78,19 @@ function Shell(): React.ReactNode {
   if (status !== "authenticated") return <AuthGate />
 
   return (
-    <>
-      <TopBar />
-      <main>
-        <Route path="/" component={Board} />
-        <Route path="/feature/:id" component={FeatureView} />
-      </main>
-      <Toasts />
-    </>
+    <StartWorkContext.Provider value={() => setStartWorkOpen(true)}>
+      <div className="app-shell">
+        <a href="#main" className="skip-link">
+          skip to content
+        </a>
+        <TopBar />
+        <main id="main" tabIndex={-1}>
+          <Route path="/" component={Board} />
+          <Route path="/feature/:id" component={FeatureView} />
+        </main>
+        <Toasts />
+        {startWorkOpen ? <StartWorkSheet onClose={() => setStartWorkOpen(false)} /> : null}
+      </div>
+    </StartWorkContext.Provider>
   )
 }

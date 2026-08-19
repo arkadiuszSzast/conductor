@@ -373,6 +373,7 @@ function onStart(workflow: WorkflowDef): Transition {
 
   const decisions: Decision[] = []
   const jobPatches: Record<string, JobPatch> = {}
+  let waitsForHuman = false
 
   for (const jobId of readyJobs) {
     const job = findJob(workflow, jobId)!
@@ -383,6 +384,7 @@ function onStart(workflow: WorkflowDef): Transition {
     }
     const step = findStep(job, stepId)!
     if (step.type === "human") {
+      waitsForHuman = true
       decisions.push({ kind: "wait_human", jobId, stepId })
       jobPatches[jobId] = {
         status: "running",
@@ -399,7 +401,7 @@ function onStart(workflow: WorkflowDef): Transition {
     }
   }
 
-  return buildTransition(decisions, { status: "running", jobs: jobPatches })
+  return buildTransition(decisions, { status: waitsForHuman ? "waiting_human" : "running", jobs: jobPatches })
 }
 
 /**
@@ -683,7 +685,10 @@ function onResumed(workflow: WorkflowDef, state: FeatureState): Transition {
   }
 
   if (decisions.length === 0) return onStart(workflow)
-  return buildTransition(decisions, { status: "running", jobs: jobPatches })
+  const waitsForHuman = Object.values(jobPatches).some(jobPatch =>
+    Object.values(jobPatch.steps ?? {}).some(stepPatch => stepPatch.status === "waiting_human"),
+  )
+  return buildTransition(decisions, { status: waitsForHuman ? "waiting_human" : "running", jobs: jobPatches })
 }
 
 // ---------------------------------------------------------------------------

@@ -565,6 +565,14 @@ describe("API integration: interactive steps over HTTP", () => {
 
     const answered = await post(base, `/v1/runs/${state.activeRun.id}/answer`, { notes: "Q: Storage?\nA: SQLite" })
     expect(answered.status).toBe(200)
+    // Contract: {result, run} — NOT a feature-detail payload. A web
+    // client that mistakes this for {feature, activeRun} would apply
+    // garbage as feature state (see apps/web/src/api/store.ts:answerRun).
+    const answeredBody = (await answered.json()) as Record<string, unknown>
+    expect(typeof answeredBody.result).toBe("string")
+    expect((answeredBody.run as { id: string }).id).toBe(state.activeRun.id)
+    expect(answeredBody.feature).toBeUndefined()
+    expect(answeredBody.activeRun).toBeUndefined()
 
     expect(sessions.prompts.at(-1)!.sessionID).toBe(waiting.activeRun.sessionId)
     expect(sessions.prompts.at(-1)!.text).toContain("A: SQLite")

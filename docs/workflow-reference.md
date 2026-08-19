@@ -41,7 +41,7 @@ Triggers that start a feature:
 
 | Trigger | Form | Notes |
 |---|---|---|
-| Manual | `manual` | Started via API/CLI with `inputs`. |
+| Manual | `manual` | Started via `POST /v1/features` (or any typed daemon API client) with `inputs`; the `conductor start` CLI command has no `inputs` syntax of its own (see below). |
 | Schedule | `{ schedule: { cron: "0 6 * * *", missedFire: skip \| catch-up } }` | Durable cron; `missedFire` says what happens when the daemon was down at fire time. |
 | Event | `{ event: "<name>" }` | Validated vocabulary now; webhook ingress arrives in a later phase. |
 
@@ -70,6 +70,33 @@ Referenced in expressions as `{{ inputs.<name> }}`.
 > `{{ feature.title }}` / `{{ feature.slug }}` alongside; see
 > [Expressions](expressions.md#feature--the-features-own-fields)) instead
 > of declaring an input nothing populates.
+
+**Resolution and persistence.** A manual start over HTTP (`POST
+/v1/features`, or any other typed daemon API client — the CLI's own
+`ApiClient` internally, a future flag, or a hand-rolled integration) may
+supply an `inputs` payload matching this map. The `conductor start`
+**command itself has no `--inputs`-style syntax today**: a human running
+it starts a feature exactly as before, with no way to supply an `inputs`
+payload from the command line — it succeeds only when every declared
+input is optional (so an entirely omitted payload still resolves, same as
+any other caller that omits `inputs`); a workflow with a required input
+and no other client to supply it rejects the start. Before the feature —
+or any other durable state — is created, the daemon runs the canonical
+resolver
+(`@conductor/core`'s `resolveWorkflowInputs`, shared by every client)
+against it: an unknown input name, a missing required input, or a value
+whose JSON type does not exactly match its declared type is rejected with
+no side effects; an omitted optional input is filled from its declared
+`default`. **Only an OMITTED `inputs` field** is treated as `{}` this way
+— an explicit `null` (or any other non-object payload) is rejected the
+same as a string or array, never silently coalesced. The **fully resolved
+map — explicit values plus applied defaults — is what gets persisted** as
+the feature's durable `input` state before `feature.start` dispatches, so
+the first step's `{{ inputs.<name> }}` sees the same values a later
+restart/recovery would read back from SQLite, never a partially-applied or
+re-derived one. See [`POST /v1/features`](http-api.md#starting-a-feature)
+and [the discovery projection](http-api.md#workflow-structure) for the
+wire contract and error shape.
 
 ### `roles`
 

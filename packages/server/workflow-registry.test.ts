@@ -239,6 +239,46 @@ jobs:
     if (result.ok) return
     expect(result.diagnostics[0]!.message).toContain("git/push")
   })
+
+  it("the diagnostic's safeMessage omits the action manifest's source path and the daemon's configured registry search paths, while message keeps them", () => {
+    const project = writeProject(WORKFLOW_WITH_ACTION)
+    const actionRegistry: LoadedActionRegistry = {
+      registry: buildActionRegistry([
+        {
+          manifest: {
+            name: "other/action",
+            version: "1.0.0",
+            description: "",
+            inputs: {},
+            outputs: {},
+            capabilities: [],
+            run: { kind: "process", command: ["bun", "run", "main.ts"] },
+          },
+          sourcePath: "/opt/conductor/actions/bundled/other-action/action.yaml",
+        },
+      ]),
+      searchPaths: [
+        { kind: "bundled", path: "/opt/conductor/actions/bundled", precedence: 0 },
+        { kind: "local", path: "/home/daemon/.config/conductor/actions", precedence: 1 },
+      ],
+    }
+    const registry = new WorkflowRegistry({ actionRegistry })
+    const result = registry.register(project)
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    const [diagnostic] = result.diagnostics
+    expect(diagnostic!.message).toContain("/opt/conductor/actions")
+    expect(diagnostic!.message).toContain("/home/daemon/.config/conductor/actions")
+    expect(diagnostic!.safeMessage).not.toContain("/opt/conductor/actions")
+    expect(diagnostic!.safeMessage).not.toContain("/home/daemon/.config/conductor/actions")
+    expect(diagnostic!.safeMessage).not.toContain("searched paths")
+    expect(diagnostic!.safeMessage).not.toContain("configured registry paths")
+    // Useful context remains: the failing job/step/uses and what the
+    // registry actually provides.
+    expect(diagnostic!.safeMessage).toContain('job "main" step "push" (git/push@v1)')
+    expect(diagnostic!.safeMessage).toContain("git/push")
+    expect(diagnostic!.safeMessage).toContain("registry provides: other/action")
+  })
 })
 
 describe("WorkflowRegistry: list", () => {

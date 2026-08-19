@@ -1,64 +1,99 @@
-.row {
-  display: inline-flex;
-  gap: 8px;
-  align-items: flex-start;
-}
-.row > .note {
-  flex: 1;
-  min-width: 180px;
+.noteField {
+  display: block;
+  width: 100%;
 }
 .actions {
   display: inline-flex;
-  gap: 8px;
+  gap: var(--space-2);
+  flex-wrap: wrap;
 }
 .inlineError {
-  color: var(--red);
-  font-size: 11px;
+  color: var(--coral);
+  font-size: var(--text-xs);
 }
 .gateRow {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-2);
+}
+.navigator {
+  display: flex;
+  gap: var(--space-1);
+  flex-wrap: wrap;
+}
+.navItem {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-inset);
+  color: var(--text-dim);
+  cursor: pointer;
+  min-height: unset;
+}
+.navItemActive {
+  border-color: var(--cyan);
+  color: var(--text);
+}
+.disclosure {
+  font-size: var(--text-xs);
+  color: var(--amber);
 }
 .meta {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-dim);
 }
 .linkBtn {
   background: none;
   border: none;
-  color: var(--blue);
+  color: var(--cyan);
   cursor: pointer;
   padding: 0;
-  font-size: 12px;
+  font-size: var(--text-sm);
+  min-height: unset;
 }
 .prompt {
   white-space: pre-wrap;
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text);
-  border-left: 2px solid var(--blue);
-  padding: 4px 8px;
+  border-left: 2px solid var(--cyan);
+  padding: var(--space-2) var(--space-3);
   max-height: 240px;
   overflow-y: auto;
+  background: var(--bg-inset);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
 }
 .question {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  border: 0;
+  min-width: 0;
 }
 .questionText {
-  font-size: 12px;
+  font-size: var(--text-sm);
   font-weight: 600;
+  padding: 0;
+  margin-bottom: 2px;
 }
 .option {
   display: flex;
   gap: 6px;
   align-items: center;
-  font-size: 12px;
+  font-size: var(--text-sm);
   cursor: pointer;
 }
 .customInput {
   flex: 1;
   min-width: 160px;
+}
+
+@media (pointer: coarse) {
+  .navItem,
+  .linkBtn,
+  .option {
+    min-height: 40px;
+  }
 }

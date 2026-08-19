@@ -12,7 +12,8 @@
     "build:vite": "vite build",
     "check": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "lint": "tsc --noEmit --noUnusedLocals"
+    "lint": "tsc --noEmit --noUnusedLocals",
+    "test:mounted": "NODE_ENV=development bun test test/*-mounted.test.tsx"
   },
   "dependencies": {
     "react": "^19.2.0",
@@ -20,6 +21,7 @@
     "wouter": "^3.10.0"
   },
   "devDependencies": {
+    "@happy-dom/global-registrator": "20.11.2",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.0.0",

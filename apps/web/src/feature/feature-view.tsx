@@ -1,15 +1,20 @@
 import { useEffect, useState } from "react"
-import { Link, useParams } from "wouter"
+import { Link, useParams, useSearchParams } from "wouter"
 import { useApp } from "../app-context.ts"
-import { useCommand, useFeatureDetail, useFindings, useTimeline, useWorkflow } from "../api/hooks.ts"
+import { useCommand, useFeatureDetail, useWorkflow } from "../api/hooks.ts"
 import { WorkflowGraph } from "../graph/workflow-graph.tsx"
-import { StepInspector } from "./step-inspector.tsx"
+import { inspectorTitle, StepInspector } from "./step-inspector.tsx"
 import { GateModal } from "./gate-modal.tsx"
-import { projectBasename } from "../graph/merge.ts"
+import { RecoverySheet } from "./recovery-sheet.tsx"
+import { ConfirmSheet } from "../ui/confirm-sheet.tsx"
+import { ActionSheet } from "../ui/action-sheet.tsx"
+import { projectBasename, workflowCompatible } from "../graph/merge.ts"
+import { resolveInspectorStepId } from "./inspector-logic.ts"
 import { formatAge, formatClock } from "../lib/time.ts"
 import { mapGateError } from "../gate/gate-logic.ts"
 import { pushToast } from "../ui/toast-store.ts"
-import type { FindingView, RunSummary, TransitionEntry } from "../api/types.ts"
+import { useIsNarrowViewport } from "../lib/viewport.ts"
+import type { RunSummary } from "../api/types.ts"
 import styles from "./feature-view.module.css"
 
 const STATUS_PILL: Record<string, string> = {
@@ -21,6 +26,11 @@ const STATUS_PILL: Record<string, string> = {
   abandoned: "✕ abandoned",
 }
 
+interface Inspection {
+  readonly jobId: string
+  readonly stepId: string | null
+}
+
 export function FeatureView(): React.ReactNode {
   const { id } = useParams<{ id: string }>()
   const featureId = id ?? ""
@@ -28,16 +38,50 @@ export function FeatureView(): React.ReactNode {
   const detailState = useFeatureDetail(store, featureId)
   const projectDir = detailState.data?.feature.projectDir ?? ""
   const workflowState = useWorkflow(store, projectDir)
-  const findingsState = useFindings(store, featureId)
-  const timelineState = useTimeline(store, featureId)
   const runCommand = useCommand(store)
-  const [inspector, setInspector] = useState<{ jobId: string; stepId: string | null } | null>(null)
+  const [params, setParams] = useSearchParams()
+  const isNarrow = useIsNarrowViewport()
+
+  const [inspector, setInspector] = useState<Inspection | null>(null)
+  const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false)
   const [gateOpen, setGateOpen] = useState(false)
+  const [recoveryOpen, setRecoveryOpen] = useState(false)
+  const [abandonOpen, setAbandonOpen] = useState(false)
   const [pendingLifecycle, setPendingLifecycle] = useState<string | null>(null)
 
   useEffect(() => {
     store.setActiveFeature(featureId)
   }, [store, featureId])
+
+  // Consumes the `open=gate|recover` deep-link param once it has been
+  // acted on: leaving it in the URL would reopen the sheet on every
+  // remount/refresh (or after the operator closes it and navigates back
+  // via history). `job=` is a durable graph selection, not a one-shot
+  // trigger, so it is left in place — only `open` is stripped.
+  const consumeOpenParam = (): void => {
+    if (params.get("open") === null) return
+    setParams(
+      prev => {
+        const next = new URLSearchParams(prev)
+        next.delete("open")
+        return next
+      },
+      { replace: true },
+    )
+  }
+
+  // Deep-link support from board cards: ?job=<id> pre-selects the job on
+  // the graph, ?open=gate|recover opens the matching sheet immediately so
+  // the primary review/recover action is reachable directly from a card.
+  useEffect(() => {
+    const jobId = params.get("job")
+    if (jobId !== null) setInspector({ jobId, stepId: null })
+    const open = params.get("open")
+    if (open === "gate") setGateOpen(true)
+    if (open === "recover") setRecoveryOpen(true)
+    // Only consume the deep link once per feature mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [featureId])
 
   const detail = detailState.data
   const feature = detail?.feature
@@ -48,16 +92,10 @@ export function FeatureView(): React.ReactNode {
     return <div className={styles.loading}>loading feature…</div>
   }
 
-  const lifecycle = async (action: "pause" | "resume" | "abandon"): Promise<void> => {
+  const lifecycle = async (action: "pause" | "resume"): Promise<void> => {
     setPendingLifecycle(action)
     try {
-      await runCommand(featureId, client =>
-        action === "pause"
-          ? client.pause(featureId)
-          : action === "resume"
-            ? client.resume(featureId)
-            : client.abandon(featureId),
-      )
+      await runCommand(featureId, client => (action === "pause" ? client.pause(featureId) : client.resume(featureId)))
     } catch (err) {
       const handled = mapGateError(err)
       if (handled.toast !== "") pushToast(handled.toast)
@@ -67,9 +105,19 @@ export function FeatureView(): React.ReactNode {
     }
   }
 
+  const abandon = async (): Promise<void> => {
+    try {
+      await runCommand(featureId, client => client.abandon(featureId))
+    } catch (err) {
+      const handled = mapGateError(err)
+      if (handled.refetch) store.refetchFeatureDetail(featureId)
+      throw new Error(handled.toast !== "" ? handled.toast : "abandon failed")
+    }
+  }
+
   const pillClass = `${styles.statusPill} ${styles[feature.status]}`
   const activity = feature.activity ?? {
-    state: feature.status === "running" ? "active" as const : feature.status === "done" || feature.status === "abandoned" ? "terminal" as const : feature.status,
+    state: feature.status === "running" ? ("active" as const) : feature.status === "done" || feature.status === "abandoned" ? ("terminal" as const) : feature.status,
     activeCount: detail.activeRun === null ? 0 : 1,
     targets: [],
     target: null,
@@ -80,11 +128,26 @@ export function FeatureView(): React.ReactNode {
     message: detail.activeRun === null ? `Feature is ${feature.status}.` : "1 active run.",
   }
   const workflowRes = workflowState.data
+  // The endpoint serves one projection per project — the currently
+  // registered workflow, not one per historical name a feature's runtime
+  // may carry. A mismatch means this feature's `jobs`/`steps` belong to a
+  // workflow that no longer exists under that name: merging them against
+  // the current structure (job ids, step kinds) would be silently wrong,
+  // not merely stale, so the graph and inspector never see it.
+  const compatible = workflowRes?.ok === true && workflowCompatible(feature.workflow, workflowRes.workflow.name)
+  const compatibleWorkflow = compatible ? workflowRes.workflow : null
+
+  const selectNode = (jobId: string, stepId: string | null): void => {
+    setInspector({ jobId, stepId })
+    if (isNarrow) setMobileInspectorOpen(true)
+  }
 
   return (
     <div className={styles.page}>
       <div className={styles.header}>
-        <Link href="/" className={styles.back}>← board</Link>
+        <Link href="/" className={styles.back}>
+          ← board
+        </Link>
         <span className={styles.title}>{feature.title}</span>
         <span className={pillClass}>{STATUS_PILL[feature.status] ?? feature.status}</span>
         <span className={styles.meta}>
@@ -104,31 +167,8 @@ export function FeatureView(): React.ReactNode {
             </button>
           ) : null}
           {feature.status === "escalated" ? (
-            <button
-              className="primary"
-              disabled={pendingLifecycle !== null}
-              onClick={async () => {
-                const note = window.prompt("Recovery note (required)")
-                if (note === null || note.trim() === "") return
-                setPendingLifecycle("recover")
-                try {
-                  const response = await runCommand(featureId, client =>
-                    client.recover(featureId, note, {
-                      expectedVersion: feature.updatedAt,
-                      idempotencyKey: crypto.randomUUID(),
-                    }))
-                  pushToast(`✓ ${response.result}`)
-                  store.refetchFeatureDetail(featureId)
-                } catch (err) {
-                  const handled = mapGateError(err)
-                  pushToast(handled.toast !== "" ? handled.toast : "recover failed")
-                  if (handled.refetch) store.refetchFeatureDetail(featureId)
-                } finally {
-                  setPendingLifecycle(null)
-                }
-              }}
-            >
-              {pendingLifecycle === "recover" ? "…" : "recover"}
+            <button className="danger" disabled={pendingLifecycle !== null} onClick={() => setRecoveryOpen(true)}>
+              recover
             </button>
           ) : null}
           {feature.status === "paused" ? (
@@ -137,8 +177,8 @@ export function FeatureView(): React.ReactNode {
             </button>
           ) : null}
           {feature.status !== "done" && feature.status !== "abandoned" ? (
-            <button className="danger" disabled={pendingLifecycle !== null} onClick={() => lifecycle("abandon")}>
-              {pendingLifecycle === "abandon" ? "…" : "abandon"}
+            <button className="danger" disabled={pendingLifecycle !== null} onClick={() => setAbandonOpen(true)}>
+              abandon
             </button>
           ) : null}
         </div>
@@ -146,7 +186,11 @@ export function FeatureView(): React.ReactNode {
       <div className={`${styles.activity} ${styles[`activity_${activity.state}`] ?? ""}`}>
         <strong>{activity.activeCount > 0 ? "Agents working" : activity.state.replace("_", " ")}</strong>
         <span>{activity.message}</span>
-        {activity.target !== null ? <code>{activity.target.jobId}/{activity.target.stepId}</code> : null}
+        {activity.target !== null ? (
+          <code>
+            {activity.target.jobId}/{activity.target.stepId}
+          </code>
+        ) : null}
         {activity.reason !== null ? <span>reason: {activity.reason}</span> : null}
         {activity.nextAt !== null ? <span>next check: {formatClock(activity.nextAt)}</span> : null}
       </div>
@@ -158,39 +202,85 @@ export function FeatureView(): React.ReactNode {
             <div className={styles.diagCard}>
               {workflowRes.state === "unregistered" ? "no workflow registered" : `workflow invalid: ${workflowRes.message}`}
             </div>
+          ) : compatibleWorkflow === null ? (
+            <div className={styles.diagCard}>
+              ⚠ this feature started under workflow "{feature.workflow ?? "default"}", but the project is now registered
+              under "{workflowRes.workflow.name}" — its graph and history cannot be shown against a different workflow's
+              structure.
+            </div>
           ) : (
             <>
-              {feature.workflowRef?.stale || workflowRes.workflow.stale ? (
+              {feature.workflowRef?.stale || compatibleWorkflow.stale ? (
                 <div className={styles.stale}>⚠ workflow changed since this feature started</div>
               ) : null}
               <WorkflowGraph
-                workflow={workflowRes.workflow}
+                workflow={compatibleWorkflow}
                 detail={detail.feature}
                 selectedJobId={inspector?.jobId}
-                onNodeClick={(jobId, stepId) => setInspector({ jobId, stepId })}
+                onNodeClick={selectNode}
               />
             </>
           )}
           {detail.activeRun !== null ? <ActiveRunStrip run={detail.activeRun} /> : null}
         </div>
-        <aside className={styles.side}>
-          {inspector !== null ? (
+        {!isNarrow ? (
+          <aside className={styles.side}>
             <StepInspector
               featureId={featureId}
-              jobId={inspector.jobId}
-              stepId={inspector.stepId}
-              onClose={() => setInspector(null)}
+              jobId={inspector?.jobId ?? null}
+              stepId={inspector?.stepId ?? null}
+              workflow={compatibleWorkflow}
             />
-          ) : (
-            <div className={styles.empty}>select a node to inspect its outputs and logs</div>
+          </aside>
+        ) : null}
+      </div>
+      {isNarrow && mobileInspectorOpen ? (
+        <ActionSheet
+          title={inspectorTitle(
+            inspector?.jobId ?? null,
+            inspector?.jobId !== undefined
+              ? resolveInspectorStepId(compatibleWorkflow, feature, inspector.jobId, inspector.stepId)
+              : null,
           )}
-        </aside>
-      </div>
-      <div className={styles.lower}>
-        <FindingsList findings={findingsState.data ?? undefined} />
-        <Timeline entries={timelineState.data ?? undefined} />
-      </div>
-      {gateOpen ? <GateModal featureId={featureId} onClose={() => setGateOpen(false)} /> : null}
+          onClose={() => setMobileInspectorOpen(false)}
+        >
+          <StepInspector
+            featureId={featureId}
+            jobId={inspector?.jobId ?? null}
+            stepId={inspector?.stepId ?? null}
+            workflow={compatibleWorkflow}
+            hideHeader
+          />
+        </ActionSheet>
+      ) : null}
+      {gateOpen ? (
+        <GateModal
+          featureId={featureId}
+          onClose={() => {
+            setGateOpen(false)
+            consumeOpenParam()
+          }}
+        />
+      ) : null}
+      {recoveryOpen ? (
+        <RecoverySheet
+          featureId={featureId}
+          onClose={() => {
+            setRecoveryOpen(false)
+            consumeOpenParam()
+          }}
+        />
+      ) : null}
+      {abandonOpen ? (
+        <ConfirmSheet
+          title="Abandon feature"
+          context={feature.title}
+          body="This stops the feature permanently. Runs in progress are cancelled and the feature cannot be resumed."
+          confirmLabel="abandon"
+          onConfirm={abandon}
+          onClose={() => setAbandonOpen(false)}
+        />
+      ) : null}
     </div>
   )
 }
@@ -200,63 +290,6 @@ function ActiveRunStrip({ run }: { readonly run: RunSummary }): React.ReactNode 
     <div className={styles.activeRun}>
       ACTIVE RUN — session {run.sessionId ?? "—"} · nudges {run.nudges} · {formatAge(Date.now(), run.timeStarted)} · {run.status}
       {run.reason !== null ? ` · ${run.reason}` : ""}
-    </div>
-  )
-}
-
-function FindingsList({ findings }: { readonly findings: FindingView[] | undefined }): React.ReactNode {
-  return (
-    <div className={styles.findings}>
-      <h3>findings</h3>
-      {findings === undefined ? (
-        <div className={styles.empty}>loading…</div>
-      ) : findings.length === 0 ? (
-        <div className={styles.empty}>none</div>
-      ) : (
-        findings.map(finding => (
-          <div key={finding.id} className={styles.finding}>
-            <span className={`${styles.sev} ${styles[severityClass(finding.severity)]}`}>
-              {finding.severity}
-            </span>
-            <span className={styles.fstatus}>{finding.status}</span>
-            <span className={styles.fbody}>{finding.body}</span>
-          </div>
-        ))
-      )}
-    </div>
-  )
-}
-
-function severityClass(severity: string): string {
-  const v = severity.toLowerCase()
-  if (v === "high" || v === "critical") return "high"
-  if (v === "medium") return "medium"
-  return "low"
-}
-
-function Timeline({ entries }: { readonly entries: TransitionEntry[] | undefined }): React.ReactNode {
-  return (
-    <div className={styles.timeline}>
-      <h3>timeline</h3>
-      {entries === undefined ? (
-        <div className={styles.empty}>loading…</div>
-      ) : entries.length === 0 ? (
-        <div className={styles.empty}>none</div>
-      ) : (
-        entries.map((entry, i) => {
-          const jobId = typeof entry.event["jobId"] === "string" ? entry.event["jobId"] : null
-          const stepId = typeof entry.event["stepId"] === "string" ? entry.event["stepId"] : null
-          const reason = typeof entry.event["reason"] === "string" ? entry.event["reason"] : null
-          return (
-            <div key={i} className={styles.tlEntry}>
-              <span className={styles.tlTime}>{formatClock(entry.time)}</span>
-              {entry.event.kind}
-              {jobId !== null ? <code className={styles.tlTarget}>{jobId}{stepId !== null ? `/${stepId}` : ""}</code> : null}
-              {reason !== null ? <span className={styles.tlReason}>{reason}</span> : null}
-            </div>
-          )
-        })
-      )}
     </div>
   )
 }

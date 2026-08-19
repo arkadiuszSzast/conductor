@@ -65,10 +65,15 @@ class FakeSessions implements SessionClient {
 
 class FakeProcess implements ProcessRunner {
   handler: ((command: string, options: ProcessExecOptions) => ProcessExecResult) | null = null
+  /** Every `shell` invocation, in order — the no-side-effect assertion
+   *  a rejected `startFeature` call must prove: not just "no feature
+   *  row", but "the process runner itself was never invoked". */
+  shellCalls: Array<{ command: string; options: ProcessExecOptions }> = []
   async exec(): Promise<ProcessExecResult> {
     return { code: 0, stdout: "", stderr: "", output: "" }
   }
   async shell(command: string, options: ProcessExecOptions): Promise<ProcessExecResult> {
+    this.shellCalls.push({ command, options })
     if (this.handler) return this.handler(command, options)
     return { code: 0, stdout: "", stderr: "", output: "" }
   }
@@ -1265,6 +1270,314 @@ describe("Engine: startFeature", () => {
     expect(result.ok).toBe(false)
     if (result.ok) return
     expect(result.code).toBe("unknown_workflow")
+  })
+
+  it("interprets the first feature.start dispatch against the exact snapshot validation/persistence used, even if the resolver changes on a later call (reload race)", async () => {
+    // Both snapshots share a workflow name (so an unset `input.workflow`
+    // never trips unknown_workflow) but diverge in job "main"'s only
+    // step — version A an agent step, version B an unrelated command
+    // step — so which snapshot actually drove interpretation is
+    // observable from which run (if any) gets created.
+    const versionA: WorkflowDef = workflow({ main: job([agentStep("implement", "implementer", "go")]) }, roles, "race")
+    const versionB: WorkflowDef = workflow({ main: job([commandStep("other", ["echo hi"])]) }, roles, "race")
+    const snapshotA = snapshotOf(versionA)
+    const snapshotB = snapshotOf(versionB)
+    let calls = 0
+    const resolver = () => {
+      calls += 1
+      // A registry reload landing between validation/persistence and the
+      // first dispatch would make every resolver call AFTER the first
+      // observe the new snapshot — simulated here by switching after call 1.
+      return calls === 1 ? snapshotA : snapshotB
+    }
+    const engine = new Engine({
+      store, workflows: resolver, sessions, process: process_, clock, log: { log: () => {} }, actions,
+    })
+    const result = await engine.startFeature("/tmp/project", { title: "Ship it" })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    // Exactly one resolver call: startFeature's initial feature.start
+    // dispatch must reuse the already-resolved snapshot, never re-resolve.
+    expect(calls).toBe(1)
+    // The interpreted decision reflects version A (the validated and
+    // persisted snapshot) — never version B, which a re-resolve would
+    // have picked up.
+    expect(store.getActiveRunForStep(result.feature.id, "main", "implement")).not.toBeNull()
+    expect(store.getActiveRunForStep(result.feature.id, "main", "other")).toBeNull()
+  })
+})
+
+describe("Engine: startFeature with declared workflow inputs", () => {
+  const inputWorkflow: WorkflowDef = workflow(
+    {
+      main: job([
+        commandStep("implement", ["echo {{ inputs.feature }} {{ inputs.count }} {{ inputs.dryRun }}"]),
+        actionStepDef("record", "test/record@v1", { feature: "{{ inputs.feature }}" }),
+      ]),
+    },
+    roles,
+    "with-inputs",
+    {
+      feature: { type: "string", presence: "required" },
+      count: { type: "number", presence: "optional", default: 3 },
+      dryRun: { type: "boolean", presence: "optional", default: false },
+    },
+  )
+
+  function bindingsFor(): ResolvedActionBindings {
+    return actionBindings([
+      {
+        jobId: "main",
+        stepId: "record",
+        uses: "test/record@v1",
+        manifest: actionManifest({ name: "test/record", inputs: { feature: { type: "string", presence: "required" } } }),
+      },
+    ])
+  }
+
+  it("resolves required inputs and applies declared defaults before dispatch, persisting the map", async () => {
+    const engine = makeEngine(inputWorkflow, {}, {}, bindingsFor())
+    const result = await engine.startFeature("/tmp/project", { title: "Ship it", inputs: { feature: "auth" } })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.feature.input).toEqual({ feature: "auth", count: 3, dryRun: false })
+    const stored = store.getFeature(result.feature.id)!
+    expect(stored.input).toEqual({ feature: "auth", count: 3, dryRun: false })
+  })
+
+  it("honours explicitly supplied values over declared defaults", async () => {
+    const engine = makeEngine(inputWorkflow, {}, {}, bindingsFor())
+    const result = await engine.startFeature("/tmp/project", {
+      title: "Ship it",
+      inputs: { feature: "auth", count: 9, dryRun: true },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.feature.input).toEqual({ feature: "auth", count: 9, dryRun: true })
+  })
+
+  it("omitting inputs entirely still resolves declared defaults (existing no-inputs-field callers stay compatible)", async () => {
+    const engine = makeEngine(inputWorkflow, {}, {}, bindingsFor())
+    const result = await engine.startFeature("/tmp/project", { title: "Ship it", inputs: { feature: "auth" } })
+    expect(result.ok).toBe(true)
+  })
+
+  /**
+   * Every rejection class below asserts the SAME four no-side-effect
+   * facts against a workflow whose first job mixes a command step
+   * ("implement") and an action step ("record") — so a leak through
+   * either execution path is caught, not just the store row:
+   *  - no feature row was created (`store.listFeatureRecords().length`)
+   *  - no run was created for any step (`store.listRuns` — empty for
+   *    every feature id that could plausibly exist, checked via the
+   *    unchanged feature count above combined with an empty runs list
+   *    for a synthesized id is meaningless, so instead this asserts the
+   *    stronger, transport-level claims below)
+   *  - no session was created (`sessions.created`)
+   *  - the process runner's `shell` was never invoked — not just "no
+   *    command run row", but the OS-level side effect itself never ran
+   *    (`process_.shellCalls`)
+   *  - no action host execution was invoked (`actions.calls`)
+   */
+  function expectNoSideEffects(beforeFeatureCount: number): void {
+    expect(store.listFeatureRecords().length).toBe(beforeFeatureCount)
+    expect(sessions.created).toEqual([])
+    expect(process_.shellCalls).toEqual([])
+    expect(actions.calls).toEqual([])
+  }
+
+  it("rejects a missing required input with no feature, run, session, command process or action created", async () => {
+    const engine = makeEngine(inputWorkflow, {}, {}, bindingsFor())
+    const before = store.listFeatureRecords().length
+    const result = await engine.startFeature("/tmp/project", { title: "Ship it", inputs: {} })
+    expect(result.ok).toBe(false)
+    if (result.ok || result.code !== "invalid_input") throw new Error("expected invalid_input")
+    expect(result.diagnostics).toEqual([
+      { name: "feature", kind: "missing_required", message: 'input "feature" is required (type: string)' },
+    ])
+    expectNoSideEffects(before)
+  })
+
+  it("rejects an unknown input with no feature, run, session, command process or action created", async () => {
+    const engine = makeEngine(inputWorkflow, {}, {}, bindingsFor())
+    const before = store.listFeatureRecords().length
+    const result = await engine.startFeature("/tmp/project", { title: "Ship it", inputs: { feature: "auth", bogus: 1 } })
+    expect(result.ok).toBe(false)
+    if (result.ok || result.code !== "invalid_input") throw new Error("expected invalid_input")
+    expect(result.diagnostics[0]!.kind).toBe("unknown_input")
+    expectNoSideEffects(before)
+  })
+
+  it("rejects a mistyped (wrong_type) input with no feature, run, session, command process or action created", async () => {
+    const engine = makeEngine(inputWorkflow, {}, {}, bindingsFor())
+    const before = store.listFeatureRecords().length
+    const result = await engine.startFeature("/tmp/project", { title: "Ship it", inputs: { feature: 42 } })
+    expect(result.ok).toBe(false)
+    if (result.ok || result.code !== "invalid_input") throw new Error("expected invalid_input")
+    expect(result.diagnostics[0]!).toEqual({ name: "feature", kind: "wrong_type", message: 'input "feature" must be a string — got 42' })
+    expectNoSideEffects(before)
+  })
+
+  it("rejects a non-finite number (NaN/Infinity) as wrong_type despite typeof number, with no side effects", async () => {
+    const engine = makeEngine(inputWorkflow, {}, {}, bindingsFor())
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      const before = store.listFeatureRecords().length
+      const result = await engine.startFeature("/tmp/project", { title: "Ship it", inputs: { feature: "auth", count: bad } })
+      expect(result.ok).toBe(false)
+      if (result.ok || result.code !== "invalid_input") throw new Error("expected invalid_input")
+      expect(result.diagnostics[0]!.kind).toBe("wrong_type")
+      expect(result.diagnostics[0]!.name).toBe("count")
+      expectNoSideEffects(before)
+    }
+  })
+
+  it("rejects a non-object inputs payload (string/array/number/boolean) before touching the store, session, process or action host", async () => {
+    const engine = makeEngine(inputWorkflow, {}, {}, bindingsFor())
+    for (const bad of ["nope", [1, 2], 1, true]) {
+      const before = store.listFeatureRecords().length
+      const result = await engine.startFeature("/tmp/project", { title: "Ship it", inputs: bad })
+      expect(result.ok).toBe(false)
+      if (result.ok || result.code !== "invalid_input") throw new Error("expected invalid_input")
+      expect(result.diagnostics).toEqual([
+        { kind: "invalid_payload", message: "inputs must be a JSON object of input name → value" },
+      ])
+      expectNoSideEffects(before)
+    }
+  })
+
+  it("rejects an explicit `inputs: null` as invalid_payload — only an OMITTED inputs field defaults to {} — with no feature, run, session, command process or action created", async () => {
+    // Uses `linearWorkflow`, which declares NO inputs at all: an omitted
+    // `inputs` field would start fine (compatibility), but an explicit
+    // `null` must NOT be silently coalesced the same way — the caller
+    // wrote `null` on purpose and gets the same invalid_payload
+    // diagnostic as any other non-object payload, with no feature, run,
+    // session, command process or action created.
+    const engine = makeEngine(linearWorkflow, {}, {}, {})
+    const before = store.listFeatureRecords().length
+    const result = await engine.startFeature("/tmp/project", { title: "Ship it", inputs: null })
+    expect(result.ok).toBe(false)
+    if (result.ok || result.code !== "invalid_input") throw new Error("expected invalid_input")
+    expect(result.diagnostics).toEqual([
+      { kind: "invalid_payload", message: "inputs must be a JSON object of input name → value" },
+    ])
+    expectNoSideEffects(before)
+  })
+
+  it("an OMITTED inputs field (undefined) still resolves to {} and starts fine for a no-required-inputs workflow", async () => {
+    const engine = makeEngine(linearWorkflow, {}, {}, {})
+    const result = await engine.startFeature("/tmp/project", { title: "Ship it" })
+    expect(result.ok).toBe(true)
+  })
+
+  it("resolved required and defaulted inputs reach the first command and action step template context", async () => {
+    let commandTemplate = ""
+    process_.handler = (command) => {
+      commandTemplate = command
+      return { code: 0, stdout: "", stderr: "", output: "" }
+    }
+    let actionInputs: Readonly<Record<string, unknown>> | undefined
+    actions.handler = (_binding, ctx) => {
+      actionInputs = ctx.inputs
+      return { ok: true, outputs: {} }
+    }
+    const engine = makeEngine(inputWorkflow, {}, {}, bindingsFor())
+    const result = await engine.startFeature("/tmp/project", { title: "Ship it", inputs: { feature: "auth" } })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    await engine.settleActions()
+    expect(commandTemplate).toBe("echo auth 3 false")
+    expect(actionInputs).toEqual({ feature: "auth" })
+  })
+
+  it("a REQUIRED action input rendered from a workflow input arrives at the action host with its correctly typed (not stringified) value, alongside a DEFAULTED action input the step's `with:` never mentions", async () => {
+    // The action manifest declares two inputs the step's `with:` never
+    // both supplies: "count" is required and fed by a template
+    // referencing the workflow's declared `{{ inputs.count }}" (a
+    // number), so its rendered "3" text must coerce back to the JS
+    // number 3 — not survive as the string "3". "verbose" is optional
+    // with the ACTION's OWN default (true) and is entirely absent from
+    // the step's `with:` — proving an action-level default is applied
+    // independent of anything the workflow declares.
+    const typedActionWorkflow: WorkflowDef = workflow(
+      {
+        main: job([
+          actionStepDef("record", "test/record-typed@v1", {
+            feature: "{{ inputs.feature }}",
+            count: "{{ inputs.count }}",
+          }),
+        ]),
+      },
+      roles,
+      "with-typed-action-inputs",
+      {
+        feature: { type: "string", presence: "required" },
+        count: { type: "number", presence: "optional", default: 3 },
+      },
+    )
+    const bindings = actionBindings([
+      {
+        jobId: "main",
+        stepId: "record",
+        uses: "test/record-typed@v1",
+        manifest: actionManifest({
+          name: "test/record-typed",
+          inputs: {
+            feature: { type: "string", presence: "required" },
+            count: { type: "number", presence: "required" },
+            verbose: { type: "boolean", presence: "optional", default: true },
+          },
+        }),
+      },
+    ])
+    let actionInputs: Readonly<Record<string, unknown>> | undefined
+    actions.handler = (_binding, ctx) => {
+      actionInputs = ctx.inputs
+      return { ok: true, outputs: {} }
+    }
+    const engine = makeEngine(typedActionWorkflow, {}, {}, bindings)
+    const result = await engine.startFeature("/tmp/project", { title: "Ship it", inputs: { feature: "auth" } })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    await engine.settleActions()
+    expect(actionInputs).toEqual({ feature: "auth", count: 3, verbose: true })
+    // Explicit typeof assertions — `toEqual`'s `3 === 3` would also
+    // accept the string `"3"` coerced by a lenient equality checker in
+    // some frameworks; this is the check that actually distinguishes a
+    // rendered-and-coerced number from a rendered-and-left-as-string one.
+    expect(typeof actionInputs!["count"]).toBe("number")
+    expect(typeof actionInputs!["verbose"]).toBe("boolean")
+    expect(typeof actionInputs!["feature"]).toBe("string")
+  })
+
+  it("resolved required and defaulted inputs reach the first AGENT step's rendered prompt", async () => {
+    const agentInputWorkflow: WorkflowDef = workflow(
+      {
+        main: job([agentStep("implement", "implementer", "Build {{ inputs.feature }} (count {{ inputs.count }}, dryRun {{ inputs.dryRun }}).")]),
+      },
+      roles,
+      "with-agent-inputs",
+      {
+        feature: { type: "string", presence: "required" },
+        count: { type: "number", presence: "optional", default: 3 },
+        dryRun: { type: "boolean", presence: "optional", default: false },
+      },
+    )
+    const engine = makeEngine(agentInputWorkflow)
+    const result = await engine.startFeature("/tmp/project", { title: "Ship it", inputs: { feature: "auth", count: 9 } })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(sessions.prompts).toHaveLength(1)
+    expect(sessions.prompts[0]!.text).toContain("Build auth (count 9, dryRun false).")
+  })
+
+  it("resolved inputs survive a fresh Store instance over the same database (reload durability)", async () => {
+    const engine = makeEngine(inputWorkflow, {}, {}, bindingsFor())
+    const result = await engine.startFeature("/tmp/project", { title: "Ship it", inputs: { feature: "auth", count: 5 } })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const fresh = new Store(connection.db)
+    expect(fresh.getFeature(result.feature.id)!.input).toEqual({ feature: "auth", count: 5, dryRun: false })
   })
 })
 

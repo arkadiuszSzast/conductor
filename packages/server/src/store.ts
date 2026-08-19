@@ -49,6 +49,12 @@ function toFeatureState(row: FeatureRow): FeatureState {
   return JSON.parse(row.state) as FeatureState
 }
 
+function hasWaitingHumanStep(state: FeatureState): boolean {
+  return Object.values(state.jobs).some(job =>
+    Object.values(job.steps).some(step => step.status === "waiting_human"),
+  )
+}
+
 /**
  * A feature's interpreter state plus the row metadata the API projects
  * (creation/update timestamps). The timestamps deliberately live OUTSIDE
@@ -647,7 +653,8 @@ export class Store {
     const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(featureId) as FeatureRow | null
     if (!row) throw new Error(`conductor: feature ${featureId} not found`)
     const current = toFeatureState(row)
-    const next = applyPatch(current, transition.patch)
+    const patched = applyPatch(current, transition.patch)
+    const next = this.withAggregateHumanAttention(featureId, patched)
     const now = Date.now()
     const escalation = transition.patch.status === "escalated"
       ? escalationReason(transition.decisions)
@@ -655,7 +662,7 @@ export class Store {
 
     const sets: string[] = ["time_updated = ?", "state = ?"]
     const params: (string | number | null)[] = [now, JSON.stringify(next)]
-    if (transition.patch.status !== undefined) {
+    if (next.status !== current.status || transition.patch.status !== undefined) {
       sets.push("status = ?")
       params.push(next.status)
     }
@@ -672,7 +679,7 @@ export class Store {
     // paused↔other, so it is the single source of truth for both edges
     // of the span — entering sets `paused_at`, leaving folds the closed
     // span into `paused_ms` and clears it.
-    if (transition.patch.status !== undefined && next.status !== current.status) {
+    if (next.status !== current.status) {
       if (next.status === "paused" && row.paused_at === null) {
         sets.push("paused_at = ?")
         params.push(now)
@@ -688,6 +695,17 @@ export class Store {
        VALUES (?, ?, ?, ?)`,
       [featureId, JSON.stringify(event), JSON.stringify(transition.decisions), now],
     )
+  }
+
+  private withAggregateHumanAttention(featureId: string, state: FeatureState): FeatureState {
+    if (state.status === "done" || state.status === "abandoned" || state.status === "escalated" || state.status === "paused") {
+      return state
+    }
+    const pendingQuestion = this.db.query(
+      "SELECT 1 FROM run WHERE feature_id = ? AND status = 'running' AND pending_question IS NOT NULL LIMIT 1",
+    ).get(featureId) !== null
+    const status: FeatureStatus = hasWaitingHumanStep(state) || pendingQuestion ? "waiting_human" : "running"
+    return status === state.status ? state : { ...state, status }
   }
 
   /** Pause-time accounting for a feature — null if the feature does not exist. */
@@ -759,9 +777,9 @@ export class Store {
         "UPDATE run SET pending_question = ?, asked_at = ? WHERE id = ?",
         [question, now, runId],
       )
-      const row = this.db.query("SELECT state FROM feature WHERE id = ?").get(run.feature_id) as FeatureRow | null
+      const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(run.feature_id) as FeatureRow | null
       if (!row) return false
-      const next: FeatureState = { ...toFeatureState(row), status: "waiting_human" }
+      const next = this.withAggregateHumanAttention(run.feature_id, toFeatureState(row))
       this.db.run("UPDATE feature SET time_updated = ?, state = ?, status = ? WHERE id = ?", [now, JSON.stringify(next), next.status, run.feature_id])
       this.db.run(
         "INSERT INTO transition_log (feature_id, event, decisions, time_created) VALUES (?, ?, ?, ?)",
@@ -786,9 +804,9 @@ export class Store {
       featureId = run.feature_id
       const now = Date.now()
       this.db.run("UPDATE run SET pending_question = NULL, asked_at = NULL WHERE id = ?", [runId])
-      const row = this.db.query("SELECT state FROM feature WHERE id = ?").get(run.feature_id) as FeatureRow | null
+      const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(run.feature_id) as FeatureRow | null
       if (!row) return false
-      const next: FeatureState = { ...toFeatureState(row), status: "running" }
+      const next = this.withAggregateHumanAttention(run.feature_id, toFeatureState(row))
       this.db.run("UPDATE feature SET time_updated = ?, state = ?, status = ? WHERE id = ?", [now, JSON.stringify(next), next.status, run.feature_id])
       this.db.run(
         "INSERT INTO transition_log (feature_id, event, decisions, time_created) VALUES (?, ?, ?, ?)",

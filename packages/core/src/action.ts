@@ -153,7 +153,19 @@ export function parseActionRef(uses: string): ParseActionRefResult {
 
 export type ResolveActionResult =
   | { readonly ok: true; readonly manifest: ActionManifest; readonly digest: string }
-  | { readonly ok: false; readonly error: string }
+  | {
+      readonly ok: false
+      /** Full diagnostic — names every searched `sourcePath` (an absolute,
+       *  daemon-local filesystem path) for operator/log consumption. Never
+       *  forward this to a browser-facing route. */
+      readonly error: string
+      /** The same diagnostic with every `sourcePath` and configured
+       *  registry search path omitted — still names the action reference,
+       *  the reason (missing name vs. missing version), and (for a
+       *  missing version) the available versions, none of which are
+       *  filesystem paths. Safe for a client-facing projection. */
+      readonly safeError: string
+    }
 
 /** Resolve `uses` against the registry: exact name lookup, then the highest
  *  manifest matching the version reference (a major ref tracks the newest
@@ -161,16 +173,24 @@ export type ResolveActionResult =
  *  from the resolved manifest's canonical content. */
 export function resolveAction(uses: string, registry: ActionRegistry): ResolveActionResult {
   const parsed = parseActionRef(uses)
-  if (!parsed.ok) return { ok: false, error: parsed.error }
+  if (!parsed.ok) return { ok: false, error: parsed.error, safeError: parsed.error }
 
   const entries = registry[parsed.ref.name]
   if (entries === undefined) {
-    return { ok: false, error: missingActionDiagnostic(parsed.ref, uses, registry) }
+    return {
+      ok: false,
+      error: missingActionDiagnostic(parsed.ref, uses, registry),
+      safeError: missingActionDiagnostic(parsed.ref, uses, registry, { includePaths: false }),
+    }
   }
 
   const matched = matchVersion(entries, parsed.ref)
   if (matched === undefined) {
-    return { ok: false, error: missingVersionDiagnostic(parsed.ref, uses, entries) }
+    return {
+      ok: false,
+      error: missingVersionDiagnostic(parsed.ref, uses, entries),
+      safeError: missingVersionDiagnostic(parsed.ref, uses, entries, { includePaths: false }),
+    }
   }
 
   return { ok: true, manifest: matched.manifest, digest: computeActionDigest(matched.manifest) }
@@ -217,17 +237,39 @@ function compareVersions(a: readonly number[], b: readonly number[]): number {
 // Resolution diagnostics — built purely from the reference and the registry
 // ---------------------------------------------------------------------------
 
-function missingActionDiagnostic(ref: ActionRef, uses: string, registry: ActionRegistry): string {
+function missingActionDiagnostic(
+  ref: ActionRef,
+  uses: string,
+  registry: ActionRegistry,
+  options: { includePaths: boolean } = { includePaths: true },
+): string {
   const allEntries = Object.values(registry).flat()
   if (allEntries.length === 0) {
+    if (!options.includePaths) {
+      return `action "${uses}" is not in the registry — no entry named "${ref.name}"; the registry is empty; configure an action registry providing a "${ref.name}" action`
+    }
     return `action "${uses}" is not in the registry — no entry named "${ref.name}" (searched paths: none — the registry is empty); configure an action registry providing a "${ref.name}" action`
   }
   const names = [...new Set(allEntries.map(entry => entry.manifest.name))].sort().join(", ")
+  if (!options.includePaths) {
+    return `action "${uses}" is not in the registry — no entry named "${ref.name}"; registry provides: ${names}`
+  }
   return `action "${uses}" is not in the registry — no entry named "${ref.name}" (${describePaths(allEntries)}); registry provides: ${names}`
 }
 
-function missingVersionDiagnostic(ref: ActionRef, uses: string, entries: readonly ActionRegistryEntry[]): string {
+function missingVersionDiagnostic(
+  ref: ActionRef,
+  uses: string,
+  entries: readonly ActionRegistryEntry[],
+  options: { includePaths: boolean } = { includePaths: true },
+): string {
   const available = formatAvailableVersions(entries)
+  if (!options.includePaths) {
+    return (
+      `action "${uses}" is not in the registry — "${ref.name}" has no ${formatVersionRef(ref.versionRef)}; ` +
+      `available: ${available}`
+    )
+  }
   return (
     `action "${uses}" is not in the registry — "${ref.name}" has no ${formatVersionRef(ref.versionRef)} ` +
     `(${describePaths(entries)}); available: ${available}`

@@ -1,71 +1,78 @@
 .board {
-  padding: 12px 16px;
+  padding: var(--space-3) var(--space-4) var(--space-4);
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  height: calc(100vh - 42px);
+  gap: var(--space-3);
+  flex: 1;
+  min-height: 0;
 }
 .columns {
   display: flex;
-  gap: 12px;
+  gap: var(--space-3);
   overflow-x: auto;
   overflow-y: hidden;
   flex: 1;
   min-height: 0;
 }
-.column {
-  flex: 0 0 260px;
+.mobileBoard {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
+  flex: 1;
+  min-height: 0;
 }
-.columnHead {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-dim);
-  padding: 4px 2px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  white-space: nowrap;
-}
-.columnHead.attention {
-  color: var(--amber);
-}
-.columnHead .count {
-  color: var(--text-faint);
-}
-.pulse {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--amber);
-  animation: pulse 2s ease-in-out infinite;
-}
-@keyframes pulse {
-  0%, 100% { opacity: 0.35; }
-  50% { opacity: 1; }
-}
-.terminalHead {
-  color: var(--text-faint);
-}
-.cards {
+.mobileCards {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
   overflow-y: auto;
-}
-.dimcols {
-  color: var(--text-faint);
-}
-.stripWrap {
-  flex: 0 0 auto;
-  border-top: 1px solid var(--border);
-  background: var(--bg);
+  flex: 1;
+  min-height: 0;
 }
 .loading,
-.error {
+.error,
+.empty {
   color: var(--text-dim);
-  padding: 24px;
+  padding: var(--space-5);
+}
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+.diagCard {
+  padding: var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+}
+.unresolved {
+  flex: 0 0 auto;
+  border: 1px solid color-mix(in oklch, var(--amber) 35%, var(--border));
+  border-radius: var(--radius);
+  background: color-mix(in oklch, var(--amber) 5%, var(--bg-panel));
+  padding: var(--space-2) var(--space-3);
+  max-height: 140px;
+  overflow-y: auto;
+}
+.unresolvedHead {
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--amber);
+  margin-bottom: 4px;
+}
+.unresolvedList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.unresolvedRow {
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  color: var(--text-dim);
 }

@@ -197,6 +197,36 @@ describe("checkWorkflowReservation", () => {
     expect(result.diagnostics[1]?.message).toContain(`configured registry paths: ${join(root, "bundled")}`)
   })
 
+  it("safeMessage omits the action manifest's source path and the configured registry search paths, for both a missing action and a missing version", async () => {
+    const root = await temporaryRegistry()
+    const sourcePath = await writeManifest(root, "bundled/git-push", manifest("git/push", "1.0.0"))
+    const loaded = await load(root, "bundled")
+    const result = checkWorkflowReservation(workflow(
+      actionStep("missing", "git/worktree@v1"),
+      actionStep("version", "git/push@v2"),
+    ), loaded)
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.diagnostics).toHaveLength(2)
+    for (const diagnostic of result.diagnostics) {
+      expect(diagnostic.safeMessage).not.toContain(sourcePath)
+      expect(diagnostic.safeMessage).not.toContain(join(root, "bundled"))
+      expect(diagnostic.safeMessage).not.toContain("searched paths")
+      expect(diagnostic.safeMessage).not.toContain("configured registry paths")
+    }
+    // Useful context survives: the job/step/uses identity is on the
+    // diagnostic's own fields (the "job ... step ..." prose prefix is
+    // added one layer up, by `workflow-registry.ts`'s `loadWorkflow`),
+    // and `safeMessage` itself still names the reason.
+    expect(result.diagnostics[0]?.jobId).toBe("main")
+    expect(result.diagnostics[0]?.stepId).toBe("missing")
+    expect(result.diagnostics[0]?.uses).toBe("git/worktree@v1")
+    expect(result.diagnostics[0]?.safeMessage).toContain('no entry named "git/worktree"')
+    expect(result.diagnostics[1]?.uses).toBe("git/push@v2")
+    expect(result.diagnostics[1]?.safeMessage).toContain('"git/push" has no v2')
+  })
+
   it("validates with payloads and aggregates all action diagnostics", async () => {
     const root = await temporaryRegistry()
     await writeManifest(root, "bundled/git-push", manifest("git/push", "1.0.0", "  remote: { type: string, required: true }"))
@@ -214,6 +244,21 @@ describe("checkWorkflowReservation", () => {
     expect(result.diagnostics.map(diagnostic => diagnostic.message).join("\n")).toContain('input "remote" must be a string')
     expect(result.diagnostics.map(diagnostic => diagnostic.message).join("\n")).toContain('input "remote" is required')
     expect(result.diagnostics.map(diagnostic => diagnostic.message).join("\n")).toContain('no entry named "git/worktree"')
+  })
+
+  it("an input-validation diagnostic's safeMessage equals message — it never carried a path", async () => {
+    const root = await temporaryRegistry()
+    await writeManifest(root, "bundled/git-push", manifest("git/push", "1.0.0", "  remote: { type: string, required: true }"))
+    const loaded = await load(root, "bundled")
+    const result = checkWorkflowReservation(workflow(
+      actionStep("wrong", "git/push@v1", { remote: 42 }),
+    ), loaded)
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.diagnostics).toHaveLength(1)
+    expect(result.diagnostics[0]?.safeMessage).toBe(result.diagnostics[0]?.message)
+    expect(result.diagnostics[0]?.safeMessage).toContain('input "remote" must be a string')
   })
 })
 

@@ -1,28 +1,114 @@
+/**
+ * Signal-deck design tokens — dark operational surface, semantic status
+ * color (no purple bias), condensed technical type stacks with no network
+ * font dependency, spacing/radius/motion/safe-area primitives.
+ *
+ * Status hues: cyan = execution, amber = human attention, coral =
+ * escalation/failure, mint = success, slate = pending/paused. Every
+ * status color pairs with a glyph and label elsewhere — these tokens are
+ * never the only signal.
+ */
+
 :root {
-  --bg: #0b0e14;
-  --bg-raised: #11151d;
-  --bg-hover: #171c26;
-  --bg-active: #1b2330;
-  --border: #1e2430;
-  --border-strong: #2a3242;
+  color-scheme: dark;
 
-  --text: #e6e9ef;
-  --text-dim: #9aa4b2;
-  --text-faint: #6b7280;
+  /* ---- surfaces: deep navy canvas, elevated graphite panels ---- */
+  --bg: #070a10;
+  --bg-canvas: #080b12;
+  --bg-raised: #0e131c;
+  --bg-panel: #121927;
+  --bg-hover: #182031;
+  --bg-active: #1d2739;
+  --bg-inset: #060810;
+  --border: #1c2536;
+  --border-strong: #2c3a52;
+  --border-hairline: #161e2c;
 
-  --amber: #f5a623;
-  --red: #ff5c5c;
-  --blue: #4da3ff;
-  --green: #3fb68b;
-  --gray: #6b7280;
+  /* ---- text ---- */
+  --text: #e7ecf5;
+  --text-dim: #96a3ba;
+  --text-faint: #74839d;
+  --text-on-accent: #061013;
 
-  --radius: 8px;
+  /* ---- semantic status hues ---- */
+  --cyan: #35c7e8;
+  --cyan-dim: #1c6c82;
+  --amber: #f2a93c;
+  --amber-dim: #7a5719;
+  --coral: #ff6b5e;
+  --coral-dim: #7a2a24;
+  --mint: #3fd6a0;
+  --mint-dim: #1c6b50;
+  --slate: #7c8aa3;
+  --slate-dim: #3a4356;
+
+  /* status role aliases (semantic name → hue) */
+  --status-running: var(--cyan);
+  --status-waiting: var(--amber);
+  --status-escalated: var(--coral);
+  --status-done: var(--mint);
+  --status-paused: var(--slate);
+  --status-abandoned: var(--text-faint);
+
+  --danger: var(--coral);
+  --focus-ring: #6fd6ff;
+
+  /* ---- radius / elevation ---- */
   --radius-sm: 5px;
+  --radius: 9px;
+  --radius-lg: 14px;
+  --shadow-panel: 0 10px 30px -12px rgba(2, 4, 10, 0.7);
+  --shadow-overlay: 0 24px 64px -16px rgba(0, 0, 0, 0.65);
 
-  --font-ui: "Inter", system-ui, sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  /* ---- spacing scale ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
 
+  /* ---- typography: technical/condensed direction, no web-font fetch ----
+   * Named first-choice faces are distinctive technical/grotesque faces;
+   * every stack still resolves locally on machines that lack them, ending
+   * in a generic family so text always renders. */
+  --font-display: "Neue Haas Grotesk Display", "Departure Mono", "Chivo", "Barlow Semi Condensed", ui-sans-serif, sans-serif;
+  --font-ui: "IBM Plex Sans Condensed", "Barlow Semi Condensed", "Chivo", ui-sans-serif, sans-serif;
+  --font-mono: "Berkeley Mono", "JetBrains Mono", "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --text-xs: 11px;
+  --text-sm: 12.5px;
+  --text-base: 13.5px;
+  --text-md: 15px;
+  --text-lg: 18px;
+  --text-xl: 22px;
+  --tracking-label: 0.08em;
+
+  /* ---- motion: restrained, state-driven ---- */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --duration-fast: 120ms;
+  --duration-base: 200ms;
+  --duration-slow: 340ms;
+
+  /* ---- layout ---- */
+  --topbar-h: 46px;
+  --inspector-w: clamp(22rem, 32vw, 30rem);
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+
+  --z-sticky: 15;
+  --z-topbar: 20;
   --z-strip: 10;
-  --z-drawer: 30;
+  --z-overlay: 60;
   --z-toast: 100;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-fast: 0ms;
+    --duration-base: 0ms;
+    --duration-slow: 0ms;
+  }
 }

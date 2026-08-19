@@ -1,20 +1,22 @@
 .inspector {
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--bg-raised);
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 10px 12px;
+  gap: var(--space-2);
+  height: 100%;
+  min-height: 0;
 }
 .inspector.inline {
-  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  padding: var(--space-3);
+  margin-top: var(--space-1);
 }
 .head {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 12px;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
 }
 .head .title {
   font-weight: 600;
@@ -26,63 +28,69 @@
   border: none;
   color: var(--text-faint);
   cursor: pointer;
-  font-size: 11px;
+  font-size: var(--text-xs);
+  min-height: unset;
 }
 .tabs {
   display: inline-flex;
   gap: 4px;
-  margin-top: 4px;
+  flex-wrap: wrap;
 }
 .tab {
-  font-size: 11px;
+  font-size: var(--text-xs);
   background: none;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 3px 8px;
+  padding: 3px 10px;
   color: var(--text-dim);
+  min-height: 28px;
 }
 .tab.active {
   color: var(--text);
-  border-color: var(--border-strong);
-  background: var(--bg-hover);
+  border-color: var(--cyan);
+  background: color-mix(in oklch, var(--cyan) 10%, var(--bg-panel));
 }
-body { }
+.body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
 .panel {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 240px;
-  overflow: auto;
-  padding: 6px 8px;
+  padding: var(--space-2);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  background: var(--bg);
+  background: var(--bg-inset);
 }
 .line {
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
 }
 .line .src {
   color: var(--text-faint);
-  width: 64px;
-  flex: 0 0 64px;
+  width: 60px;
+  flex: 0 0 60px;
 }
 .line .time {
   color: var(--text-faint);
-  width: 64px;
-  flex: 0 0 64px;
+  width: 60px;
+  flex: 0 0 60px;
 }
 .line .text {
   flex: 1;
+  overflow-wrap: break-word;
 }
 .empty {
   color: var(--text-faint);
-  font-size: 11px;
+  font-size: var(--text-sm);
+  padding: var(--space-2) 0;
 }
 .outputs .row {
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
   padding: 2px 0;
 }
 .outputs .name {
@@ -94,20 +102,30 @@ body { }
   word-break: break-word;
 }
 .fetchFull {
-  font-size: 11px;
+  font-size: var(--text-xs);
   background: none;
   border: none;
-  color: var(--blue);
+  color: var(--cyan);
   cursor: pointer;
   padding: 0;
+  min-height: unset;
 }
 .error {
-  background: color-mix(in srgb, var(--red) 12%, transparent);
-  border-left: 3px solid var(--red);
-  color: var(--red);
-  padding: 6px 10px;
-  margin-bottom: 8px;
-  border-radius: 4px;
+  background: color-mix(in oklch, var(--coral) 12%, transparent);
+  border-left: 3px solid var(--coral);
+  color: var(--coral);
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-2);
+  border-radius: var(--radius-sm);
   word-break: break-word;
   white-space: pre-wrap;
+}
+
+@media (pointer: coarse) {
+  .head .close,
+  .tab,
+  .fetchFull {
+    min-height: 40px;
+    min-width: 40px;
+  }
 }

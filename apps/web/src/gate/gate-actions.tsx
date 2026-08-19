@@ -1,157 +1,100 @@
-import { useEffect, useMemo, useState } from "react"
-import { useApp } from "../app-context.ts"
-import { useCommand, useFeatureDetail } from "../api/hooks.ts"
-import { mapGateError, selectGateSurface, validateGateDecision, type GateAction, type GateDecision } from "./gate-logic.ts"
-import {
-  answersComplete,
-  composeAnswerNotes,
-  parseGateQuestions,
-  type GateAnswer,
-} from "./gate-questions.ts"
-import { pushToast } from "../ui/toast-store.ts"
+import { useGateActions } from "./use-gate-actions.ts"
+import { surfaceItemKey } from "./gate-surfaces.ts"
 import styles from "./gate-actions.module.css"
 
 export interface GateActionsProps {
   readonly featureId: string
   readonly showChangeNoteInline?: boolean
+  /** Reports pending state to a wrapping container (e.g. an `ActionSheet`)
+   *  so it can disable Escape/backdrop dismissal while a command is in
+   *  flight, without this component knowing anything about the shell it
+   *  renders inside. */
+  readonly onPendingChange?: (pending: boolean) => void
+  /** Fires after a decision or answer is accepted by the server — lets a
+   *  wrapping sheet close itself and show success feedback without this
+   *  component duplicating that container's close/toast logic. `remaining`
+   *  is how many attention surfaces are still outstanding. */
+  readonly onSuccess?: (message: string, remaining: number) => void
 }
 
-export function GateActions({ featureId, showChangeNoteInline = true }: GateActionsProps): React.ReactNode {
-  const { store } = useApp()
-  const detailState = useFeatureDetail(store, featureId)
-  const runCommand = useCommand(store)
-  const [pending, setPending] = useState(false)
-  const [notes, setNotes] = useState("")
-  const [pendingAction, setPendingAction] = useState<GateAction | null>(null)
-  const [inlineError, setInlineError] = useState<string | null>(null)
-
-  const detail = detailState.data?.feature
-  const waiting = detail?.status === "waiting_human"
-
-  // The rendered prompt of the waiting gate step, when one exists.
-  const gatePrompt = useMemo(() => {
-    if (!waiting || !detail) return null
-    for (const jobRuntime of Object.values(detail.jobs)) {
-      for (const stepRuntime of Object.values(jobRuntime.steps)) {
-        if (stepRuntime.status === "waiting_human" && stepRuntime.prompt !== undefined) {
-          return stepRuntime.prompt
-        }
-      }
-    }
-    return null
-  }, [waiting, detail])
-
-  const activeRun = detailState.data?.activeRun ?? null
-  const surface = selectGateSurface(waiting, gatePrompt, activeRun)
-  const askingRun = surface?.kind === "ask" ? surface : null
-  const panelPrompt = surface?.prompt ?? null
-
-  const parsedQuestions = useMemo(
-    () => (panelPrompt !== null ? parseGateQuestions(panelPrompt) : null),
-    [panelPrompt],
-  )
-  const [answers, setAnswers] = useState<readonly GateAnswer[]>([])
-
-  // Reset drafts when the feature or the gate's rendered prompt changes —
-  // the panel instance survives a board selection switch and a rerun
-  // re-arm, and stale answers must never be submittable against a
-  // different gate's questions.
-  useEffect(() => {
-    setAnswers([])
-    setNotes("")
-    setInlineError(null)
-  }, [featureId, panelPrompt])
-
-  const setAnswer = (index: number, answer: GateAnswer): void => {
-    setAnswers(previous => {
-      const next = [...previous]
-      while (next.length <= index) next.push({ chosen: null, custom: "" })
-      next[index] = answer
-      return next
-    })
-  }
-
-  const submitAnswer = async (): Promise<void> => {
-    if (askingRun === null) return
-    const composed = parsedQuestions !== null
-      ? [composeAnswerNotes(parsedQuestions.questions, answers), notes.trim()].filter(part => part !== "").join("\n\n")
-      : notes.trim()
-    if (composed === "") {
-      setInlineError("an answer is required")
-      return
-    }
-    setInlineError(null)
-    setPending(true)
-    try {
-      await runCommand(featureId, client => client.answerRun(askingRun.runId, composed))
-      setNotes("")
-      setAnswers([])
-    } catch (err) {
-      const handled = mapGateError(err)
-      if (handled.inline) {
-        setInlineError(handled.toast !== "" ? handled.toast : "invalid request")
-      } else if (handled.toast !== "") {
-        pushToast(handled.toast)
-      }
-      if (handled.refetch) store.refetchFeatureDetail(featureId)
-    } finally {
-      setPending(false)
-    }
-  }
-
-  const submit = async (action: GateAction): Promise<void> => {
-    const composed = parsedQuestions !== null && action === "approve"
-      ? [composeAnswerNotes(parsedQuestions.questions, answers), notes.trim()].filter(part => part !== "").join("\n\n")
-      : notes
-    const decision: GateDecision = { action, notes: composed }
-    const validationError = validateGateDecision(decision)
-    if (validationError !== null) {
-      setInlineError(validationError)
-      return
-    }
-    setInlineError(null)
-    setPending(true)
-    setPendingAction(action)
-    try {
-      await runCommand(featureId, client =>
-        action === "approve"
-          ? client.approve(featureId, composed.trim() !== "" ? composed.trim() : undefined)
-          : client.requestChanges(featureId, composed.trim()),
-      )
-      setNotes("")
-      setAnswers([])
-    } catch (err) {
-      const handled = mapGateError(err)
-      if (handled.inline) {
-        setInlineError(handled.toast !== "" ? handled.toast : "invalid request")
-      } else if (handled.toast !== "") {
-        pushToast(handled.toast)
-      }
-      if (handled.refetch) store.refetchFeatureDetail(featureId)
-    } finally {
-      setPending(false)
-      setPendingAction(null)
-    }
-  }
-
-  if (!waiting) return null
-
-  const questionsIncomplete =
-    parsedQuestions !== null && !answersComplete(parsedQuestions.questions, answers)
+/**
+ * Self-contained gate panel: prompt/questions body plus its own inline
+ * action row. Callers that need the actions rendered separately (e.g. in
+ * an `ActionSheet`'s sticky footer) use `useGateActions` directly with
+ * `GateQuestionBody` and `GateActionButtons` instead of this component —
+ * see `GateModal`.
+ */
+export function GateActions({ featureId, showChangeNoteInline = true, onPendingChange, onSuccess }: GateActionsProps): React.ReactNode {
+  const gate = useGateActions({ featureId, onPendingChange, onSuccess })
+  if (!gate.waiting) return null
 
   return (
     <div className={styles.gateRow}>
+      <SurfaceNavigator gate={gate} />
+      <GateQuestionBody gate={gate} showChangeNoteInline={showChangeNoteInline} />
+      <GateActionButtons gate={gate} showChangeNoteInline={showChangeNoteInline} />
+      {gate.inlineError !== null ? <div className={styles.inlineError} role="alert">{gate.inlineError}</div> : null}
+    </div>
+  )
+}
+
+export interface GateBodyProps {
+  readonly gate: ReturnType<typeof useGateActions>
+  readonly showChangeNoteInline?: boolean
+}
+
+/**
+ * Only rendered once there is more than one concurrent attention surface
+ * — a lone gate keeps today's simple UX with no navigator chrome at all.
+ */
+export function SurfaceNavigator({ gate }: { readonly gate: ReturnType<typeof useGateActions> }): React.ReactNode {
+  const { items, selected, selectItem } = gate
+  if (items.length <= 1) return null
+  return (
+    <div className={styles.navigator} role="group" aria-label="Attention surfaces">
+      {items.map(item => {
+        const key = surfaceItemKey(item)
+        const label = item.kind === "gate" ? `${item.jobId}/${item.stepId}` : `${item.jobId}/${item.stepId} (question)`
+        const isSelected = selected !== null && surfaceItemKey(selected) === key
+        return (
+          <button
+            key={key}
+            type="button"
+            aria-pressed={isSelected}
+            className={`${styles.navItem} ${isSelected ? styles.navItemActive : ""}`}
+            onClick={() => selectItem(item)}
+          >
+            {label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+/** The prompt/structured-question/notes body — no action buttons. */
+export function GateQuestionBody({ gate, showChangeNoteInline = true }: GateBodyProps): React.ReactNode {
+  const { detail, selected, surfaces, panelPrompt, parsedQuestions, answers, setAnswer, notes, setNotes, pending } = gate
+  const askingRun = selected?.kind === "ask" ? selected : null
+  return (
+    <>
       <div className={styles.meta}>
         ≡ {askingRun !== null ? `${askingRun.stepId} (question)` : detail?.currentStep ?? "gate"} · ⚑ {detail?.findingCounts?.new ?? 0} new
       </div>
+      {askingRun === null && surfaces.gates.length > 1 ? (
+        <div className={styles.disclosure}>
+          approving or requesting changes here resolves all {surfaces.gates.length} waiting gates:{" "}
+          {surfaces.gates.map(g => `${g.jobId}/${g.stepId}`).join(", ")}
+        </div>
+      ) : null}
       {parsedQuestions !== null ? (
         <>
           {parsedQuestions.text !== "" ? <div className={styles.prompt}>{parsedQuestions.text}</div> : null}
           {parsedQuestions.questions.map((question, index) => {
             const answer = answers[index] ?? { chosen: null, custom: "" }
             return (
-              <div key={index} className={styles.question}>
-                <div className={styles.questionText}>{question.question}</div>
+              <fieldset key={index} className={styles.question}>
+                <legend className={styles.questionText}>{question.question}</legend>
                 {question.options.map((option, optionIndex) => (
                   <label key={optionIndex} className={styles.option}>
                     <input
@@ -175,12 +118,13 @@ export function GateActions({ featureId, showChangeNoteInline = true }: GateActi
                   <input
                     className={styles.customInput}
                     placeholder="your own answer"
+                    aria-label={`Custom answer for ${question.question}`}
                     value={answer.custom}
                     onChange={e => setAnswer(index, { chosen: null, custom: e.target.value })}
                     disabled={pending}
                   />
                 </label>
-              </div>
+              </fieldset>
             )
           })}
         </>
@@ -188,7 +132,8 @@ export function GateActions({ featureId, showChangeNoteInline = true }: GateActi
         <div className={styles.prompt}>{panelPrompt}</div>
       ) : null}
       {showChangeNoteInline ? (
-        <div className={styles.row}>
+        <label className={styles.noteField}>
+          <span className="visually-hidden">{askingRun !== null ? "Free-text answer" : "Decision note"}</span>
           <input
             className={styles.note}
             placeholder={askingRun !== null ? "answer (free text)" : "note (required to request changes)"}
@@ -196,37 +141,37 @@ export function GateActions({ featureId, showChangeNoteInline = true }: GateActi
             onChange={e => setNotes(e.target.value)}
             disabled={pending}
           />
-        </div>
+        </label>
       ) : null}
-      {askingRun !== null ? (
-        <div className={styles.actions}>
-          <button
-            className="primary"
-            disabled={pending || questionsIncomplete}
-            onClick={() => void submitAnswer()}
-          >
-            {pending ? "…" : "↩ Send answer"}
-          </button>
-        </div>
-      ) : (
-        <div className={styles.actions}>
-          <button
-            className="primary"
-            disabled={pending || questionsIncomplete}
-            onClick={() => submit("approve")}
-          >
-            {pending && pendingAction === "approve" ? "…" : "✓ Approve"}
-          </button>
-          <button
-            className="danger"
-            disabled={pending || (showChangeNoteInline && notes.trim() === "")}
-            onClick={() => submit("request-changes")}
-          >
-            {pending && pendingAction === "request-changes" ? "…" : "✎ Request changes"}
-          </button>
-        </div>
-      )}
-      {inlineError !== null ? <div className={styles.inlineError}>{inlineError}</div> : null}
+    </>
+  )
+}
+
+/** The decision/answer buttons alone — placeable in a sticky action row. */
+export function GateActionButtons({ gate, showChangeNoteInline = true }: GateBodyProps): React.ReactNode {
+  const { selected, pending, pendingAction, questionsIncomplete, notes, submit, submitAnswer } = gate
+  const askingRun = selected?.kind === "ask" ? selected : null
+  if (askingRun !== null) {
+    return (
+      <div className={styles.actions}>
+        <button className="primary" disabled={pending || questionsIncomplete} onClick={() => void submitAnswer()}>
+          {pending ? "…" : "↩ Send answer"}
+        </button>
+      </div>
+    )
+  }
+  return (
+    <div className={styles.actions}>
+      <button className="primary" disabled={pending || questionsIncomplete} onClick={() => void submit("approve")}>
+        {pending && pendingAction === "approve" ? "…" : "✓ Approve"}
+      </button>
+      <button
+        className="danger"
+        disabled={pending || (showChangeNoteInline && notes.trim() === "")}
+        onClick={() => void submit("request-changes")}
+      >
+        {pending && pendingAction === "request-changes" ? "…" : "✎ Request changes"}
+      </button>
     </div>
   )
 }

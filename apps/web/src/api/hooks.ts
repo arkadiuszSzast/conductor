@@ -6,7 +6,7 @@
 
 import { useCallback, useEffect, useSyncExternalStore } from "react"
 import type { ApiClient } from "./client.ts"
-import type { CommandResponse, FeatureDetailResponse } from "./types.ts"
+import type { AnswerRunResponse, CommandResponse, FeatureDetailResponse, StartFeatureRequest } from "./types.ts"
 import type {
   DataSource,
   FeaturesState,
@@ -95,4 +95,18 @@ export function useCommand(
   store: DataSource,
 ): <T extends CommandResponse | FeatureDetailResponse>(featureId: string, run: (client: ApiClient) => Promise<T>) => Promise<T> {
   return useCallback((featureId, run) => store.command(featureId, run), [store])
+}
+
+/** Bound `answerRun` runner — refetches detail/runs instead of treating
+ *  the response as a feature detail payload (see `DataSource.answerRun`). */
+export function useAnswerRun(
+  store: DataSource,
+): (featureId: string, run: (client: ApiClient) => Promise<AnswerRunResponse>) => Promise<AnswerRunResponse> {
+  return useCallback((featureId, run) => store.answerRun(featureId, run), [store])
+}
+
+/** Bound `startFeature` runner — non-optimistic authoritative creation
+ *  (see `DataSource.startFeature`). */
+export function useStartFeature(store: DataSource): (request: StartFeatureRequest) => Promise<FeatureDetailResponse> {
+  return useCallback((request: StartFeatureRequest) => store.startFeature(request), [store])
 }

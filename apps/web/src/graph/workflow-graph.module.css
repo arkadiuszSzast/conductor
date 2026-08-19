@@ -1,31 +1,49 @@
 .svg {
   display: block;
   font-family: var(--font-ui);
+  overflow: visible;
 }
 .jobGroup {
   cursor: pointer;
 }
+.jobGroup:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
 .jobRect {
-  fill: var(--bg-raised);
+  fill: var(--bg-panel);
   stroke: var(--border-strong);
   stroke-width: 1;
+  transition: stroke var(--duration-fast) var(--ease-out);
 }
 .jobRectCurrent {
-  stroke: var(--amber);
+  stroke: var(--status-waiting);
   stroke-width: 2;
 }
 .jobRectSelected {
-  stroke: var(--blue);
+  stroke: var(--cyan);
   stroke-width: 2;
 }
 .jobHeader {
   fill: var(--text);
   font-size: 12px;
   font-weight: 600;
+  font-family: var(--font-display);
 }
 .roundChip {
   fill: var(--text-faint);
   font-size: 10px;
+  font-family: var(--font-mono);
+}
+.stepHit {
+  fill: transparent;
+  cursor: pointer;
+}
+.stepHit:hover {
+  fill: color-mix(in oklch, var(--cyan) 8%, transparent);
+}
+g[tabindex]:focus-visible .stepHit {
+  outline: 1px solid var(--focus-ring);
 }
 .stepText {
   fill: var(--text-dim);
@@ -33,15 +51,15 @@
   font-family: var(--font-mono);
 }
 .stepTextCurrent {
-  fill: var(--amber);
+  fill: var(--status-waiting);
 }
 .edgeDone {
-  stroke: var(--green);
+  stroke: var(--mint);
   stroke-width: 1.5;
   fill: none;
 }
 .edgeCurrent {
-  stroke: var(--amber);
+  stroke: var(--status-waiting);
   stroke-width: 2;
   fill: none;
 }
@@ -52,21 +70,17 @@
   stroke-dasharray: 4 4;
 }
 .loopEdge {
-  stroke: var(--amber);
+  stroke: var(--status-waiting);
   stroke-width: 1.5;
   fill: none;
   stroke-dasharray: 5 3;
 }
 .loopLabel {
-  fill: var(--amber);
+  fill: var(--status-waiting);
   font-size: 10px;
   font-family: var(--font-mono);
 }
 .halo {
-  fill: var(--amber);
-  opacity: 0.12;
-}
-.scroller {
-  overflow: auto;
-  padding: 8px;
+  fill: var(--status-waiting);
+  opacity: 0.14;
 }

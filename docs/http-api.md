@@ -17,7 +17,7 @@ Authentication is explicit (`auth.mode: "none"` or `"bearer"`); only
 | `GET /v1/health` | Full daemon health snapshot: heartbeat, per-project workflow state (`valid`/`stale`/`invalid`/`unregistered`) with diagnostics, runner availability. |
 | `GET /v1/events` | SSE invalidation stream: `{kind: feature\|transition\|run\|finding\|run_log, featureId}`; subscribers refetch over REST. `run_log` notifications are throttled at the source (at most one per run per second). |
 | `GET /v1/features` | Feature list. Filters: `?project=<dir>`, `?active=true`, `?status=a,b` (comma list of feature statuses; unknown value → 400). |
-| `POST /v1/features` | Start a feature. |
+| `POST /v1/features` | Start a feature (below). |
 | `GET /v1/features/:id` | Feature detail (see payloads below). |
 | `GET /v1/features/:id/runs` · `/findings` · `/timeline` | Per-feature resources. Timeline entries carry `event` as a parsed object. |
 | `POST /v1/features/:id/approve` · `/request-changes` · `/pause` · `/resume` · `/abandon` | Gate and lifecycle commands; responses carry the fresh feature payload. |
@@ -67,6 +67,77 @@ A client that needs "is a rerun loop in flight right now" must therefore
 combine the snapshot with live job state (a job named in `feedback.jobs`
 is active again with `reruns > 0`) — the snapshot's mere presence only
 means "at least one rerun has ever happened".
+
+## Starting a feature
+
+`POST /v1/features` body:
+
+```json
+{
+  "title": "Add dark mode",
+  "project": "/path/to/project",
+  "description": "optional task text",
+  "workflow": "optional — the workflow name the caller observed",
+  "pr": 123,
+  "inputs": { "feature": "auth", "count": 5 }
+}
+```
+
+`title` and `project` are required; every other field is optional. `inputs`
+is a JSON object of input name → value matching the workflow's declared
+`InputDef`s (see [Workflow structure](#workflow-structure) below) —
+**omitting the field entirely** is equivalent to `{}`, so existing requests
+against a workflow with no required inputs remain valid unchanged. An
+explicit `"inputs": null` is NOT the same as omitting the field: it is a
+non-object payload like any other and is rejected (see below), never
+silently treated as `{}`.
+
+Any typed HTTP/API client (the browser Control Room, the daemon-client
+`ApiClient` the CLI uses internally, or a hand-rolled integration) may
+send `inputs` on this request — the wire contract and the resolution
+behaviour below are the same regardless of caller. The `conductor start`
+CLI **command's own syntax is unchanged**: it has no `--inputs`-style flag
+today, so a human running it starts a feature exactly as before (defaults
+apply for any declared optional inputs; a workflow with required inputs
+and no other client to supply them rejects the start, same as any other
+caller that omits them).
+
+Before any feature, run, session, command or action is created, the daemon
+resolves `inputs` against the project's currently valid (or retained-stale)
+workflow snapshot — the same canonical, deterministic resolver every client
+shares:
+
+- an unknown input name, a missing required input, or a value whose JSON
+  type does not exactly match its declared `string`/`number`/`boolean`
+  (a non-finite number counts as the wrong type) is rejected;
+- a non-object `inputs` payload (a string, array, `null`, or anything else
+  that is not a JSON object) is rejected outright, before any per-input
+  check runs;
+- an omitted optional input is filled from its declared default.
+
+A rejected request has **no side effects** — nothing is created — and
+responds `422` with the standard error envelope plus a `diagnostics` array
+naming every problem found (not just the first):
+
+```json
+{
+  "error": { "code": "invalid_input", "message": "...", "requestId": "..." },
+  "diagnostics": [
+    { "name": "feature", "kind": "missing_required", "message": "input \"feature\" is required (type: string)" }
+  ]
+}
+```
+
+`diagnostics[].kind` is one of `invalid_payload` | `unknown_input` |
+`missing_required` | `wrong_type`; `name` is absent only for
+`invalid_payload` (the payload itself, not a specific input, is wrong).
+This is distinct from `project_not_configured` (no valid workflow for the
+project) and `unknown_workflow` (the caller's observed `workflow` no
+longer matches what the project currently resolves to) — both unchanged
+by this validation and checked first. A successful start persists the
+fully resolved input map on the feature (`feature.input`) before
+`feature.start` dispatches, so the first agent/command/action step's
+`{{ inputs.<name> }}` template context sees it immediately.
 
 ## Run logs
 
@@ -165,16 +236,34 @@ cleared, and the feature returns to `running`. Errors:
       "steps": [{"id": "code", "kind": "agent"}, {"id": "approve", "kind": "human"}]
     }
   },
+  "inputs": {
+    "feature": { "type": "string", "presence": "required" },
+    "count": { "type": "number", "presence": "optional", "default": 3 }
+  },
   "diagnostics": []
 }
 ```
 
-Structure only — prompts, expressions, `with:` payloads and retry policies
-never appear. `stale: true` (with `diagnostics`) means the served snapshot
-survived a failed reload of an edited `conductor.yaml`. An unregistered
-project is 404; a registered project that never loaded validly is 409 with
-the load diagnostics. Workflow structure belongs to the project, not the
-feature — the graph view fetches here, not from the feature payload.
+Structure only — prompts, expressions, role/model bindings, `with:`
+payloads and retry policies never appear. `inputs` is the ONE exception to
+"structure only": it is the workflow's declared `InputDef` map (per input:
+`type`, `presence`, and `default` when `presence` is `optional`) — safe to
+expose because defaults and required/optional presence are user-facing
+start-form values, not authoring secrets. It is exactly what
+`POST /v1/features`'s `inputs` (see [Starting a feature](#starting-a-feature)
+above) resolves against, from the same snapshot served here — including a
+stale one. `stale: true` (with `diagnostics`) means the served snapshot
+survived a failed reload of an edited `conductor.yaml`; its `inputs` are
+the retained snapshot's, not any newer (possibly broken) edit.
+`diagnostics` here is an array of **plain message strings** — unlike
+`GET /v1/health`'s per-project diagnostics (`{sourcePath, message}`), this
+route never includes `sourcePath`: it is an absolute path on the daemon's
+own filesystem, and this route promises structure-only, browser-facing
+content. An unregistered project is 404; a registered project that never
+loaded validly is 409 with the load diagnostics (same messages, joined
+into the error's `message`). Workflow structure belongs to the project,
+not the feature — the graph view fetches here, not from the feature
+payload.
 
 ## Static UI serving
 

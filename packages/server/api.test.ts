@@ -13,6 +13,8 @@ import { tmpdir } from "node:os"
 import { Daemon, type DaemonLogEntry } from "./src/daemon.ts"
 import { createApi, startApiServer, type ApiConfig, type ConductorApi } from "./src/api.ts"
 import type { SessionClient } from "./src/ports.ts"
+import { buildActionRegistry } from "@conductor/core"
+import type { LoadedActionRegistry } from "./src/action-registry.ts"
 
 class FakeSessions implements SessionClient {
   prompts: Array<{ sessionID: string; text: string }> = []
@@ -88,6 +90,24 @@ jobs:
           rejected: { rerun: { scope: steps, stepIds: [implement], maxRounds: 3 } }
 `
 
+const inputWorkflow = `
+name: with-inputs
+on: [manual]
+inputs:
+  feature: { type: string, required: true }
+  count: { type: number, default: 3 }
+  dryRun: { type: boolean, default: false }
+roles:
+  implementer: { agent: build }
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Implement {{ inputs.feature }} (count {{ inputs.count }}, dryRun {{ inputs.dryRun }})."
+`
+
 function writeProject(source: string = agentWorkflow): string {
   const project = tempDir("conductor-api-project-")
   writeFileSync(join(project, "conductor.yaml"), source)
@@ -98,6 +118,7 @@ async function makeApi(input?: {
   workflow?: string
   auth?: ApiConfig["auth"]
   ui?: ApiConfig["ui"]
+  actionRegistry?: LoadedActionRegistry
 }): Promise<{
   api: ConductorApi
   daemon: Daemon
@@ -119,6 +140,7 @@ async function makeApi(input?: {
       sessions,
       logger,
       scheduler: { setInterval: () => ({}), clearInterval: () => {} },
+      ...(input?.actionRegistry !== undefined ? { actionRegistry: input.actionRegistry } : {}),
     },
   )
   daemonsToStop.push(daemon)
@@ -260,6 +282,71 @@ describe("API: feature resources", () => {
     const badWorkflow = await request("POST", "/v1/features", { title: "T", project, workflow: "missing" })
     expect(badWorkflow.status).toBe(422)
     expect(((await badWorkflow.json()) as { error: { code: string } }).error.code).toBe("unknown_workflow")
+  })
+
+  it("accepts optional inputs, resolving declared defaults for omitted values", async () => {
+    const { request, project, daemon } = await makeApi({ workflow: inputWorkflow })
+    const response = await request("POST", "/v1/features", {
+      title: "Add dark mode",
+      project,
+      inputs: { feature: "auth" },
+    })
+    expect(response.status).toBe(201)
+    const body = (await response.json()) as { feature: { id: string; input: Record<string, unknown> } }
+    expect(body.feature.input).toEqual({ feature: "auth", count: 3, dryRun: false })
+    expect(daemon.store.getFeature(body.feature.id)!.input).toEqual({ feature: "auth", count: 3, dryRun: false })
+  })
+
+  it("existing no-input requests remain compatible for a workflow with no required inputs", async () => {
+    const { request, project } = await makeApi()
+    const response = await request("POST", "/v1/features", { title: "T", project })
+    expect(response.status).toBe(201)
+  })
+
+  it("rejects malformed or semantically invalid inputs with an actionable, client-correctable 422 and no side effects", async () => {
+    const { request, project, daemon } = await makeApi({ workflow: inputWorkflow })
+    const before = daemon.store.listFeatureRecords().length
+
+    const missing = await request("POST", "/v1/features", { title: "T", project, inputs: {} })
+    expect(missing.status).toBe(422)
+    const missingBody = (await missing.json()) as { error: { code: string; message: string }; diagnostics: unknown[] }
+    expect(missingBody.error.code).toBe("invalid_input")
+    expect(missingBody.diagnostics).toEqual([
+      { name: "feature", kind: "missing_required", message: 'input "feature" is required (type: string)' },
+    ])
+
+    const unknown = await request("POST", "/v1/features", { title: "T", project, inputs: { feature: "auth", bogus: 1 } })
+    expect(unknown.status).toBe(422)
+    const unknownBody = (await unknown.json()) as { error: { code: string }; diagnostics: Array<{ kind: string }> }
+    expect(unknownBody.error.code).toBe("invalid_input")
+    expect(unknownBody.diagnostics[0]!.kind).toBe("unknown_input")
+
+    const mistyped = await request("POST", "/v1/features", { title: "T", project, inputs: { feature: 1 } })
+    expect(mistyped.status).toBe(422)
+    expect(((await mistyped.json()) as { diagnostics: Array<{ kind: string }> }).diagnostics[0]!.kind).toBe("wrong_type")
+
+    const malformed = await request("POST", "/v1/features", { title: "T", project, inputs: "nope" })
+    expect(malformed.status).toBe(422)
+    expect(((await malformed.json()) as { diagnostics: Array<{ kind: string }> }).diagnostics[0]!.kind).toBe("invalid_payload")
+
+    expect(daemon.store.listFeatureRecords().length).toBe(before)
+  })
+
+  it("rejects an explicit `inputs: null` as invalid_payload, distinct from an omitted inputs field", async () => {
+    // A workflow with NO required inputs: an omitted `inputs` field
+    // starts fine (compatibility, covered above), but a caller who sends
+    // `"inputs": null` on purpose gets the same invalid_payload rejection
+    // as any other malformed payload — never silently coalesced to {}.
+    const { request, project, daemon } = await makeApi()
+    const before = daemon.store.listFeatureRecords().length
+    const response = await request("POST", "/v1/features", { title: "T", project, inputs: null })
+    expect(response.status).toBe(422)
+    const body = (await response.json()) as { error: { code: string }; diagnostics: Array<{ kind: string; message: string }> }
+    expect(body.error.code).toBe("invalid_input")
+    expect(body.diagnostics).toEqual([
+      { kind: "invalid_payload", message: "inputs must be a JSON object of input name → value" },
+    ])
+    expect(daemon.store.listFeatureRecords().length).toBe(before)
   })
 
   it("lists features with active/project filters and reads a single feature", async () => {
@@ -531,16 +618,49 @@ describe("API: project workflow structure", () => {
       name: string
       stale: boolean
       jobs: Record<string, { needs: string[]; steps: Array<{ id: string; kind: string }> }>
+      inputs: Record<string, unknown>
       diagnostics: unknown[]
     }
     expect(body.name).toBe("gated")
     expect(body.stale).toBe(false)
     expect(body.diagnostics).toEqual([])
+    expect(body.inputs).toEqual({})
     expect(body.jobs["main"]!.needs).toEqual([])
     expect(body.jobs["main"]!.steps).toEqual([
       { id: "implement", kind: "agent" },
       { id: "merge_gate", kind: "human" },
     ])
+  })
+
+  it("exposes safe input definitions without leaking prompts, roles, models or with: payloads", async () => {
+    const { request, project } = await makeApi({ workflow: inputWorkflow })
+    const response = await request("GET", `/v1/projects/workflow?dir=${encodeURIComponent(project)}`)
+    expect(response.status).toBe(200)
+    const text = await response.text()
+    expect(text).not.toContain("Implement")
+    expect(text).not.toContain("implementer")
+    expect(text).not.toContain("build")
+    const body = (await new Response(text).json()) as { inputs: Record<string, unknown> }
+    expect(body.inputs).toEqual({
+      feature: { type: "string", presence: "required" },
+      count: { type: "number", presence: "optional", default: 3 },
+      dryRun: { type: "boolean", presence: "optional", default: false },
+    })
+  })
+
+  it("serves input definitions from the exact stale snapshot after a broken reload", async () => {
+    const { request, project, daemon } = await makeApi({ workflow: inputWorkflow })
+    writeFileSync(join(project, "conductor.yaml"), "name: [broken")
+    daemon.registry.reload(project)
+    const response = await request("GET", `/v1/projects/workflow?dir=${encodeURIComponent(project)}`)
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { stale: boolean; inputs: Record<string, unknown> }
+    expect(body.stale).toBe(true)
+    expect(body.inputs).toEqual({
+      feature: { type: "string", presence: "required" },
+      count: { type: "number", presence: "optional", default: 3 },
+      dryRun: { type: "boolean", presence: "optional", default: false },
+    })
   })
 
   it("marks interactive agent steps in the projection", async () => {
@@ -564,6 +684,122 @@ describe("API: project workflow structure", () => {
     expect(body.name).toBe("agent-only")
     expect(body.stale).toBe(true)
     expect(body.diagnostics.length).toBeGreaterThan(0)
+  })
+
+  it("projects stale diagnostics to plain message strings, never the daemon's absolute conductor.yaml path", async () => {
+    const { request, project, daemon } = await makeApi()
+    writeFileSync(join(project, "conductor.yaml"), "name: [broken")
+    daemon.registry.reload(project)
+    const response = await request("GET", `/v1/projects/workflow?dir=${encodeURIComponent(project)}`)
+    expect(response.status).toBe(200)
+    const text = await response.text()
+    // The daemon's on-disk project path (this route's stale diagnostics
+    // otherwise come from `WorkflowDiagnostic.sourcePath`, an absolute
+    // filesystem path) must never leak through this browser-facing route.
+    expect(text).not.toContain(project)
+    expect(text).not.toContain("sourcePath")
+    const body = (await new Response(text).json()) as { diagnostics: unknown[] }
+    expect(body.diagnostics.length).toBeGreaterThan(0)
+    for (const diagnostic of body.diagnostics) expect(typeof diagnostic).toBe("string")
+  })
+
+  it("returns an empty diagnostics array of strings for a valid (non-stale) workflow", async () => {
+    const { request, project } = await makeApi({ workflow: gatedWorkflow })
+    const response = await request("GET", `/v1/projects/workflow?dir=${encodeURIComponent(project)}`)
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { stale: boolean; diagnostics: unknown[] }
+    expect(body.stale).toBe(false)
+    expect(body.diagnostics).toEqual([])
+  })
+
+  const actionWorkflowValid = `
+name: with-action
+on: [manual]
+roles: {}
+jobs:
+  main:
+    steps:
+      - id: push
+        action:
+          uses: git/push@v1
+`
+
+  const actionWorkflowBroken = `
+name: with-action
+on: [manual]
+roles: {}
+jobs:
+  main:
+    steps:
+      - id: push
+        action:
+          uses: unknown/action@v1
+`
+
+  function actionRegistryWithLeakyPaths(): LoadedActionRegistry {
+    return {
+      registry: buildActionRegistry([
+        {
+          manifest: {
+            name: "git/push",
+            version: "1.0.0",
+            description: "",
+            inputs: {},
+            outputs: {},
+            capabilities: [],
+            run: { kind: "process", command: ["bun", "run", "main.ts"] },
+          },
+          sourcePath: "/opt/conductor/actions/bundled/git-push/action.yaml",
+        },
+      ]),
+      searchPaths: [
+        { kind: "bundled", path: "/opt/conductor/actions/bundled", precedence: 0 },
+        { kind: "local", path: "/home/daemon/.config/conductor/actions", precedence: 1 },
+      ],
+    }
+  }
+
+  it("an invalid workflow (unresolved action step) never leaks the action manifest's source path or the daemon's configured action registry search paths — but keeps useful context", async () => {
+    const { request, project } = await makeApi({
+      workflow: actionWorkflowBroken,
+      actionRegistry: actionRegistryWithLeakyPaths(),
+    })
+    const response = await request("GET", `/v1/projects/workflow?dir=${encodeURIComponent(project)}`)
+    expect(response.status).toBe(409)
+    const text = await response.text()
+    expect(text).not.toContain("/opt/conductor/actions")
+    expect(text).not.toContain("/home/daemon/.config/conductor/actions")
+    expect(text).not.toContain("sourcePath")
+    // Useful context remains: which uses reference failed, and (from the
+    // registry's own contents, not the filesystem) what it does provide.
+    expect(text).toContain("unknown/action@v1")
+    expect(text).toContain("git/push")
+  })
+
+  it("stale diagnostics from a broken action-step reload never leak the action manifest's source path or the daemon's configured action registry search paths — but keep useful context", async () => {
+    const { request, project, daemon } = await makeApi({
+      workflow: actionWorkflowValid,
+      actionRegistry: actionRegistryWithLeakyPaths(),
+    })
+    const before = await request("GET", `/v1/projects/workflow?dir=${encodeURIComponent(project)}`)
+    expect(before.status).toBe(200)
+
+    writeFileSync(join(project, "conductor.yaml"), actionWorkflowBroken)
+    daemon.registry.reload(project)
+
+    const response = await request("GET", `/v1/projects/workflow?dir=${encodeURIComponent(project)}`)
+    expect(response.status).toBe(200)
+    const text = await response.text()
+    expect(text).not.toContain("/opt/conductor/actions")
+    expect(text).not.toContain("/home/daemon/.config/conductor/actions")
+    expect(text).not.toContain("sourcePath")
+    const body = JSON.parse(text) as { stale: boolean; diagnostics: unknown[] }
+    expect(body.stale).toBe(true)
+    expect(body.diagnostics.length).toBeGreaterThan(0)
+    for (const diagnostic of body.diagnostics) expect(typeof diagnostic).toBe("string")
+    const joined = (body.diagnostics as string[]).join(" ")
+    expect(joined).toContain("unknown/action@v1")
+    expect(joined).toContain("git/push")
   })
 
   it("responds 409 with diagnostics for a never-valid project and 404 for an unregistered one", async () => {

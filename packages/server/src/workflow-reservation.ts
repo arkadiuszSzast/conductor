@@ -17,7 +17,18 @@ export interface WorkflowReservationDiagnostic {
   readonly jobId: string
   readonly stepId: string
   readonly uses: string
+  /** Full diagnostic — for an unresolved action, names every searched
+   *  `sourcePath` and the daemon's configured registry search paths
+   *  (both absolute, daemon-local filesystem paths). Operator/log use
+   *  only; never forward to a browser-facing route. */
   readonly message: string
+  /** The same diagnostic with every filesystem path omitted — still
+   *  names the job/step/`uses` reference, the reason, and (for an
+   *  unresolved action) the registry's available names/versions. An
+   *  input-validation diagnostic (`validateActionInputs`) never
+   *  contained a path to begin with, so `safeMessage` equals `message`
+   *  for that case. Safe for a client-facing projection. */
+  readonly safeMessage: string
 }
 
 export interface WorkflowReservation {
@@ -50,16 +61,24 @@ export function checkWorkflowReservation(
           stepId: step.id,
           uses: step.uses,
           message: addConfiguredPaths(resolved.error, loadedRegistry),
+          // `resolved.safeError` never mentions a `sourcePath`; the
+          // configured registry search paths (which DO leak filesystem
+          // layout) are deliberately never appended here either.
+          safeMessage: resolved.safeError,
         })
         continue
       }
       const inputErrors = validateActionInputs(resolved.manifest, step.with)
       if (inputErrors.length > 0) {
+        // `validateActionInputs` diagnostics never mention a filesystem
+        // path (they describe declared vs. supplied `with:` values), so
+        // `safeMessage` is the same string as `message`.
         diagnostics.push(...inputErrors.map(message => ({
           jobId,
           stepId: step.id,
           uses: step.uses,
           message,
+          safeMessage: message,
         })))
         continue
       }

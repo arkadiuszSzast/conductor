@@ -317,6 +317,54 @@ describe("CLI: start / status", () => {
     expect(h.err.join("\n")).toContain("project_not_configured")
   })
 
+  it("the daemon-client contract accepts optional typed inputs even though `conductor start` has no flag for them", async () => {
+    const h = await makeHarness({
+      workflow: `
+name: with-inputs
+on: [manual]
+inputs:
+  feature: { type: string, required: true }
+  count: { type: number, default: 3 }
+roles:
+  implementer: { agent: build }
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Implement {{ inputs.feature }} ({{ inputs.count }})."
+`,
+    })
+    const client = new ApiClient({ url: CLI_URL }, h.deps.fetchImpl!)
+    const payload = await client.startFeature({
+      title: "Ship it",
+      project: h.project,
+      inputs: { feature: "auth" },
+    })
+    expect(payload.feature.status).toBe("running")
+    expect((payload.feature as unknown as { input: Record<string, unknown> }).input).toEqual({ feature: "auth", count: 3 })
+  })
+
+  it("start still works for a workflow with no required inputs when the caller omits `inputs` entirely (existing compatibility)", async () => {
+    const h = await makeHarness()
+    const client = new ApiClient({ url: CLI_URL }, h.deps.fetchImpl!)
+    const payload = await client.startFeature({ title: "Ship it", project: h.project })
+    expect(payload.feature.status).toBe("running")
+  })
+
+  it("the daemon-client contract rejects an explicit `inputs: null`, distinct from an omitted inputs field", async () => {
+    const h = await makeHarness()
+    const client = new ApiClient({ url: CLI_URL }, h.deps.fetchImpl!)
+    try {
+      await client.startFeature({ title: "Ship it", project: h.project, inputs: null as unknown as Record<string, string> })
+      throw new Error("expected ApiError")
+    } catch (err) {
+      expect(err).toBeInstanceOf(ApiError)
+      expect((err as ApiError).code).toBe("invalid_input")
+    }
+  })
+
   it("status <id> shows one feature; status lists features", async () => {
     const h = await makeHarness()
     const { featureId } = await startFeature(h)
