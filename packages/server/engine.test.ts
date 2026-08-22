@@ -178,6 +178,41 @@ const reviewLoopWorkflow: WorkflowDef = workflow(
   "review-loop",
 )
 
+const recoveryLoopWorkflow: WorkflowDef = workflow(
+  {
+    deliver: job([
+      commandStep("implement", ["implement"]),
+      actionStepDef("pr_create", "test/pr-create@v1"),
+      {
+        ...actionStepDef("await_checks", "test/await-checks@v1", { pr: "{{ steps.pr_create.outputs.number }}" }),
+        onFail: rerunSteps(["implement"], 3),
+      },
+    ]),
+  },
+  roles,
+  "recovery-loop",
+)
+
+function recoveryLoopBindings(): ResolvedActionBindings {
+  return actionBindings([
+    {
+      jobId: "deliver",
+      stepId: "pr_create",
+      uses: "test/pr-create@v1",
+      manifest: actionManifest({ name: "test/pr-create", outputs: { number: "number" } }),
+    },
+    {
+      jobId: "deliver",
+      stepId: "await_checks",
+      uses: "test/await-checks@v1",
+      manifest: actionManifest({
+        name: "test/await-checks",
+        inputs: { pr: { type: "number", presence: "required" } },
+      }),
+    },
+  ])
+}
+
 /** onFail retry: implement has retry budget of 2, onFail goes nowhere (job fails → escalates, single job workflow) */
 const retryWorkflow: WorkflowDef = workflow(
   {
@@ -448,6 +483,308 @@ describe("Engine: runner resource waits", () => {
     expect(retried.duplicate).toBe(true)
     expect(store.listRuns(feature.id)).toHaveLength(1)
   })
+
+  it("a superseded failed routing step and its later failure are both currently-failed candidates — untargeted recover is rejected as ambiguous, targeted recover re-arms only the selected one", async () => {
+    let implementCalls = 0
+    process_.handler = () => {
+      implementCalls += 1
+      return { code: 0, stdout: "", stderr: "", output: "" }
+    }
+    const actionCalls: string[] = []
+    actions.handler = (binding) => {
+      actionCalls.push(binding.stepId)
+      return binding.stepId === "pr_create"
+        ? { ok: true, outputs: { number: 2 } }
+        : { ok: "pending", nextPollMs: 60_000, state: {} }
+    }
+    const engine = makeEngine(recoveryLoopWorkflow, {}, {}, recoveryLoopBindings())
+    const feature = store.createFeature({ title: "Ship it", slug: "ship-it", projectDir: "/tmp/project", workflow: recoveryLoopWorkflow.name })
+    const escalated = {
+      ...feature,
+      status: "escalated" as const,
+      jobs: {
+        deliver: {
+          status: "failed" as const,
+          currentStep: null,
+          attempts: { implement: 1, await_checks: 1, pr_create: 1 },
+          reruns: { await_checks: 1 },
+          outputs: {},
+          steps: {
+            implement: { status: "succeeded" as const, outputs: {} },
+            await_checks: { status: "failed" as const, outputs: {} },
+            pr_create: { status: "failed" as const, outputs: {} },
+          },
+        },
+      },
+    }
+    connection.db.run("UPDATE feature SET status = 'escalated', state = ? WHERE id = ?", [JSON.stringify(escalated), feature.id])
+    const checksRun = store.insertRun({ featureId: feature.id, jobId: "deliver", stepId: "await_checks", stepType: "action", attempt: 1 })
+    store.finishRun(checksRun, "failed", { reason: "checks unavailable" })
+    const prRun = store.insertRun({ featureId: feature.id, jobId: "deliver", stepId: "pr_create", stepType: "action", attempt: 1 })
+    store.finishRun(prRun, "failed", { reason: "github unavailable" })
+    connection.db.run("UPDATE run SET time_started = 1000, time_finished = 1100 WHERE id = ?", [checksRun])
+    connection.db.run("UPDATE run SET time_started = 2000, time_finished = 2100 WHERE id = ?", [prRun])
+
+    // Both `deliver/await_checks` and `deliver/pr_create` are currently
+    // "failed" in job runtime (the rerun's routing-step failure was never
+    // cleared) — the spec's "Parallel failures require a selected target":
+    // an untargeted recover must reject as ambiguous, not silently pick
+    // the most recent run.
+    const ambiguous = await engine.recover(feature.id, { notes: "GitHub restored" })
+    expect(ambiguous.ok).toBe(false)
+    expect(ambiguous.ambiguous).toBe(true)
+    expect(ambiguous.targets).toEqual(
+      expect.arrayContaining([
+        { jobId: "deliver", stepId: "await_checks" },
+        { jobId: "deliver", stepId: "pr_create" },
+      ]),
+    )
+    expect(ambiguous.targets).toHaveLength(2)
+    expect(store.getActiveRunForStep(feature.id, "deliver", "pr_create")).toBeNull()
+    expect(store.getActiveRunForStep(feature.id, "deliver", "await_checks")).toBeNull()
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+
+    const result = await engine.recover(feature.id, {
+      notes: "GitHub restored",
+      target: { jobId: "deliver", stepId: "pr_create" },
+    })
+    await engine.settleActions()
+
+    expect(result).toEqual({ ok: true, message: 'Recovered. Step "deliver/pr_create" re-armed.' })
+    expect(actionCalls).toEqual(["pr_create", "await_checks"])
+    expect(implementCalls).toBe(0)
+    expect(store.getActiveRunForStep(feature.id, "deliver", "pr_create")).toBeNull()
+    expect(store.getActiveRunForStep(feature.id, "deliver", "await_checks")).not.toBeNull()
+    expect(store.getFeature(feature.id)?.jobs["deliver"]?.currentStep).toBe("await_checks")
+    const recovery = store.getTransitions(feature.id).find(transition => (transition.event as { kind: string }).kind === "human.recovered")
+    expect(recovery?.event).toMatchObject({ kind: "human.recovered" })
+    expect(recovery?.decisions).toEqual([{ kind: "execute_step", jobId: "deliver", stepId: "pr_create" }])
+  })
+
+  it("a closed historical deadline-exhausted wait does not shadow a current failed step", async () => {
+    const engine = makeEngine(recoveryLoopWorkflow, {}, {}, recoveryLoopBindings())
+    const feature = store.createFeature({ title: "Ship it", slug: "ship-it", projectDir: "/tmp/project", workflow: recoveryLoopWorkflow.name })
+    const escalated = {
+      ...feature,
+      status: "escalated" as const,
+      jobs: {
+        deliver: {
+          status: "failed" as const,
+          currentStep: null,
+          attempts: { implement: 1, pr_create: 1 },
+          reruns: {},
+          outputs: {},
+          steps: {
+            implement: { status: "succeeded" as const, outputs: {} },
+            pr_create: { status: "failed" as const, outputs: {} },
+          },
+        },
+      },
+    }
+    connection.db.run("UPDATE feature SET status = 'escalated', state = ? WHERE id = ?", [JSON.stringify(escalated), feature.id])
+    // A historical resource wait on "implement" that expired long ago —
+    // implement's job later succeeded past it, so it must never surface
+    // as a recovery candidate alongside the CURRENT failure on pr_create.
+    store.upsertResourceWait({
+      featureId: feature.id, jobId: "deliver", stepId: "implement", reason: "runner_unavailable",
+      observedAt: 1000, nextObservationAt: 1000, deadlineAt: 1000, diagnostic: "no runner",
+    })
+    store.closeResourceWait(store.listResourceWaits(feature.id)[0]!.id, "deadline_exhausted")
+
+    const result = await engine.recover(feature.id, { notes: "GitHub restored" })
+    await engine.settleActions()
+    expect(result.ok).toBe(true)
+    expect(result.message).toBe('Recovered. Step "deliver/pr_create" re-armed.')
+  })
+
+  it("parallel failures in two independent jobs: untargeted recover rejects ambiguous; targeted recover leaves the other still recoverable", async () => {
+    const engine = makeEngine(fanInWorkflow)
+    const feature = await startedFeature(engine)
+    const runA = store.getActiveRunForStep(feature.id, "a", "work")!
+    const runB = store.getActiveRunForStep(feature.id, "b", "work")!
+    await engine.report({ runId: runA.id, outcome: "failed", notes: "a broke" })
+    await engine.report({ runId: runB.id, outcome: "failed", notes: "b broke" })
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+
+    const ambiguous = await engine.recover(feature.id, { notes: "retry both" })
+    expect(ambiguous.ok).toBe(false)
+    expect(ambiguous.ambiguous).toBe(true)
+    expect(ambiguous.targets).toEqual(
+      expect.arrayContaining([
+        { jobId: "a", stepId: "work" },
+        { jobId: "b", stepId: "work" },
+      ]),
+    )
+    expect(ambiguous.targets).toHaveLength(2)
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+
+    const recovered = await engine.recover(feature.id, { notes: "retry a", target: { jobId: "a", stepId: "work" } })
+    expect(recovered).toEqual({ ok: true, message: 'Recovered. Step "a/work" re-armed.' })
+    expect(store.getActiveRunForStep(feature.id, "a", "work")).not.toBeNull()
+    // Job b's failure is untouched and still independently a candidate —
+    // its runtime status stayed "failed" and there is no active run for it.
+    expect(store.getFeature(feature.id)?.jobs["b"]?.status).toBe("failed")
+    expect(store.getActiveRunForStep(feature.id, "b", "work")).toBeNull()
+  })
+
+  it("a stale selected target (its job already succeeded) is rejected with no fallback and no state change", async () => {
+    const engine = makeEngine(fanInWorkflow)
+    const feature = await startedFeature(engine)
+    const runA = store.getActiveRunForStep(feature.id, "a", "work")!
+    const runB = store.getActiveRunForStep(feature.id, "b", "work")!
+    await engine.report({ runId: runA.id, outcome: "succeeded", notes: "a done" })
+    await engine.report({ runId: runB.id, outcome: "failed", notes: "b broke" })
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    expect(store.getFeature(feature.id)?.jobs["a"]?.status).toBe("succeeded")
+
+    const before = store.getTransitions(feature.id).length
+    const stale = await engine.recover(feature.id, { notes: "retry a anyway", target: { jobId: "a", stepId: "work" } })
+    expect(stale.ok).toBe(false)
+    expect(stale.staleTarget).toBe(true)
+    expect(store.getTransitions(feature.id).length).toBe(before)
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    expect(store.getActiveRunForStep(feature.id, "a", "work")).toBeNull()
+
+    // The genuinely current target still recovers normally.
+    const recovered = await engine.recover(feature.id, { notes: "retry b", target: { jobId: "b", stepId: "work" } })
+    expect(recovered.ok).toBe(true)
+  })
+
+  it("recover grants a fresh retry budget: a post-recovery failure schedules a retry under a new chained episode instead of exhausting instantly", async () => {
+    const engine = makeEngine(retryWorkflow)
+    const feature = await startedFeature(engine)
+    let run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, outcome: "failed", notes: "attempt 1" })
+    run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, outcome: "failed", notes: "attempt 2" })
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    expect(store.getFeature(feature.id)?.jobs["main"]?.attempts["implement"]).toBe(2)
+
+    const result = await engine.recover(feature.id, { notes: "try again" })
+    expect(result.ok).toBe(true)
+    expect(store.getFeature(feature.id)?.jobs["main"]?.attempts["implement"] ?? 0).toBe(0)
+
+    // The fresh attempt fails once — with retryWorkflow's budget of 2, a
+    // truly fresh episode tolerates this (attempts=1 < maxAttempts=2)
+    // instead of immediately re-escalating as it would if the old
+    // exhausted attempt count had carried over.
+    const recoveredRun = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: recoveredRun.id, outcome: "failed", notes: "post-recovery attempt 1" })
+    expect(store.getFeature(feature.id)?.status).toBe("running")
+    expect(store.getFeature(feature.id)?.jobs["main"]?.attempts["implement"]).toBe(1)
+  })
+
+  it("two concurrent recovers with the same idempotencyKey: exactly one recovered, one duplicate", async () => {
+    let available = false
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => available })
+    const feature = await startedFeature(engine)
+    clock.advance(3_600_000)
+    await engine.reconcile()
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    available = true
+
+    const [first, second] = await Promise.all([
+      engine.recover(feature.id, { notes: "go", idempotencyKey: "race-1" }),
+      engine.recover(feature.id, { notes: "go", idempotencyKey: "race-1" }),
+    ])
+    const outcomes = [first, second].sort((a, b) => Number(a.duplicate ?? false) - Number(b.duplicate ?? false))
+    expect(outcomes[0]!.ok).toBe(true)
+    expect(outcomes[0]!.duplicate).toBeUndefined()
+    expect(outcomes[1]!.ok).toBe(true)
+    expect(outcomes[1]!.duplicate).toBe(true)
+    expect(store.listRuns(feature.id)).toHaveLength(1)
+  })
+})
+
+describe("Engine: durable recovery-dispatch replay", () => {
+  it("crash boundary: a recoverStepTargets commit with no dispatch yet is durably replayed by reconcile — one run, feature stays running (not invariant-escalated); a second reconcile is a no-op", async () => {
+    const engine = makeEngine(retryWorkflow)
+    const feature = await startedFeature(engine)
+    let run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, outcome: "failed", notes: "attempt 1" })
+    run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, outcome: "failed", notes: "attempt 2" })
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+
+    // The "winning tx" only: the DAG repair commits, but nothing ever
+    // dispatches the recovered step (simulating a crash right after
+    // `recoverStepTargets` returns and before `Engine.recover` calls
+    // `executeAgent`).
+    const txResult = store.recoverStepTargets(feature.id, [{ jobId: "main", stepId: "implement" }])
+    expect(txResult).toBe("recovered")
+    expect(store.getFeature(feature.id)?.status).toBe("running")
+    expect(store.getActiveRunForStep(feature.id, "main", "implement")).toBeNull()
+    expect(store.getUnhandledRecoveryDispatches(feature.id)).toHaveLength(1)
+
+    // A restarted daemon's first reconcile pass replays the dispatch
+    // instead of escalating the now-anchorless "running" feature.
+    await engine.reconcile()
+    const rearmed = store.getActiveRunForStep(feature.id, "main", "implement")
+    expect(rearmed).not.toBeNull()
+    expect(store.getFeature(feature.id)?.status).toBe("running")
+    expect(store.getUnhandledRecoveryDispatches(feature.id)).toHaveLength(0)
+
+    // A second reconcile pass must not double-dispatch: the run from the
+    // first pass is still active, and the dispatch row is already handled.
+    await engine.reconcile()
+    expect(store.getActiveRunForStep(feature.id, "main", "implement")?.id).toBe(rearmed!.id)
+    expect(store.listRuns(feature.id).filter(r => r.stepId === "implement" && r.status === "running")).toHaveLength(1)
+  })
+
+  it("crash boundary with no runner available: reconcile replays the recovery dispatch into a resource wait instead of escalating", async () => {
+    // linearWorkflow's implement step has no retry policy, so a no-runner
+    // deadline exhaustion escalates outright instead of looping back into
+    // another wait via a retry budget (unlike retryWorkflow).
+    let available = false
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => available })
+    const feature = await startedFeature(engine)
+    // Escalate via a resource-wait deadline (no runner ever showed up).
+    clock.advance(3_600_000)
+    await engine.reconcile()
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+
+    const txResult = store.recoverStepTargets(feature.id, [{ jobId: "main", stepId: "implement" }])
+    expect(txResult).toBe("recovered")
+    expect(store.getFeature(feature.id)?.status).toBe("running")
+    expect(store.getUnhandledRecoveryDispatches(feature.id)).toHaveLength(1)
+
+    // Runner is still absent: the replay re-arms a resource wait rather
+    // than a run, and the feature stays running (anchored by the wait)
+    // instead of being escalated by the invariant check.
+    await engine.reconcile()
+    expect(store.getActiveRunForStep(feature.id, "main", "implement")).toBeNull()
+    expect(store.getOpenResourceWait(feature.id, "main", "implement")).not.toBeNull()
+    expect(store.getFeature(feature.id)?.status).toBe("running")
+    expect(store.getUnhandledRecoveryDispatches(feature.id)).toHaveLength(0)
+
+    // Second pass: no duplicate wait.
+    await engine.reconcile()
+    expect(store.listResourceWaits(feature.id).filter(w => w.status === "waiting")).toHaveLength(1)
+  })
+
+  it("normal path: Engine.recover dispatches immediately as before; the recovery-dispatch row ends handled on the next reconcile with no double dispatch", async () => {
+    const engine = makeEngine(retryWorkflow)
+    const feature = await startedFeature(engine)
+    let run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, outcome: "failed", notes: "attempt 1" })
+    run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, outcome: "failed", notes: "attempt 2" })
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+
+    const result = await engine.recover(feature.id, { notes: "try again" })
+    expect(result.ok).toBe(true)
+    const rearmed = store.getActiveRunForStep(feature.id, "main", "implement")
+    expect(rearmed).not.toBeNull()
+    // `Engine.recover` dispatched directly — the durable row is still
+    // unhandled until reconcile next observes the anchor it created.
+    expect(store.getUnhandledRecoveryDispatches(feature.id)).toHaveLength(1)
+
+    await engine.reconcile()
+    expect(store.getUnhandledRecoveryDispatches(feature.id)).toHaveLength(0)
+    // No double dispatch: same run, still exactly one active run for the step.
+    expect(store.getActiveRunForStep(feature.id, "main", "implement")?.id).toBe(rearmed!.id)
+    expect(store.listRuns(feature.id).filter(r => r.stepId === "implement" && r.status === "running")).toHaveLength(1)
+  })
 })
 
 describe("Engine: linear happy path", () => {
@@ -588,6 +925,109 @@ describe("Engine: failure classification and durable retry schedules", () => {
     expect(store.getRunById(run.id)?.failure).toMatchObject({ class: "missing_session", source: "reaper" })
   })
 
+  it("conclusion and its durable retry schedule are atomic: the outbox never carries the bypassed immediate execute_step, and a restart before the due time does not dispatch early", async () => {
+    const engine = makeEngine(retryWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    sessions.liveSessions.delete(run.sessionId!)
+    await engine.reconcile()
+
+    // Single commit: the run is concluded AND a scheduled retry_episode
+    // exists — verified together, in the same assertion pass, exactly
+    // like the one transaction that produced them.
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    const episode = store.getOpenRetryEpisode(feature.id, "main", "implement")
+    expect(episode).toMatchObject({ status: "scheduled", scheduleSource: "backoff" })
+
+    // The durable outbox row `concludeRun` persisted must NOT contain the
+    // immediate execute_step for the retried step — that is exactly the
+    // atomicity this test guards: a crash-and-replay of this outbox
+    // entry must never bypass the schedule just recorded alongside it.
+    const outboxRow = connection.db.query("SELECT completion_decisions FROM run WHERE id = ?").get(run.id) as { completion_decisions: string }
+    const outboxDecisions = JSON.parse(outboxRow.completion_decisions) as Array<{ kind: string; jobId?: string; stepId?: string }>
+    expect(outboxDecisions.some(d => d.kind === "execute_step" && d.jobId === "main" && d.stepId === "implement")).toBe(false)
+
+    // Simulate a restart BEFORE the schedule is due: a fresh Engine over
+    // the same store must not dispatch anything — no stale outbox replay,
+    // no early claim.
+    const restarted = makeEngine(retryWorkflow)
+    await restarted.reconcile()
+    expect(store.getActiveRunForStep(feature.id, "main", "implement")).toBeNull()
+    expect(store.getPendingRunAction(feature.id)).toBeNull()
+
+    // Advance past due: exactly one dispatch, from the schedule.
+    clock.advance(50)
+    await restarted.reconcile()
+    const rearmed = store.getActiveRunForStep(feature.id, "main", "implement")
+    expect(rearmed).not.toBeNull()
+    expect(rearmed!.id).not.toBe(run.id)
+    expect(store.getOpenRetryEpisode(feature.id, "main", "implement")).toBeNull()
+    expect(sessions.prompts.filter(p => p.text.includes(rearmed!.id)).length).toBe(1)
+  })
+
+  it("budget-exhausted conclusion is atomic: one commit holds the run conclusion, the step.failed transition and the step.budget_exhausted transition, with no scheduled episode and no immediate execute_step in the outbox", async () => {
+    const engine = makeEngine(retryWorkflow, { runTtlMs: 1000 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    clock.advance(600_001)
+    await engine.reconcile()
+
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    expect(store.getOpenRetryEpisode(feature.id, "main", "implement")).toBeNull()
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+
+    // The outbox holds no immediate execute_step for the exhausted step —
+    // its retry never dispatches.
+    const outboxRow = connection.db.query("SELECT completion_decisions FROM run WHERE id = ?").get(run.id) as { completion_decisions: string }
+    const outboxDecisions = JSON.parse(outboxRow.completion_decisions) as Array<{ kind: string; jobId?: string; stepId?: string }>
+    expect(outboxDecisions.some(d => d.kind === "execute_step" && d.jobId === "main" && d.stepId === "implement")).toBe(false)
+
+    // Both the step.failed AND the step.budget_exhausted transitions landed
+    // in the SAME commit — the transition log carries both event kinds.
+    const kinds = store.getTransitions(feature.id).map(t => (t.event as { kind: string }).kind)
+    expect(kinds).toContain("step.failed")
+    expect(kinds).toContain("step.budget_exhausted")
+  })
+
+  it("schedule contention: a competing failed-run conclusion for a step with a pre-existing future scheduled episode concludes without an immediate dispatch, without a second episode, and leaves the original schedule intact", async () => {
+    // A command step's classified failure runs through `planFailureDisposition`
+    // synchronously inside `dispatch` — unlike the reaper's paths (only
+    // reachable via `reconcile()`'s per-job loop, which deliberately skips
+    // a job whose step already has an open episode and so cannot exercise
+    // this exact race), this lets the test seed a pre-existing episode
+    // for the target BEFORE the classified failure is even computed.
+    const commandRetryWorkflow: WorkflowDef = workflow(
+      { main: job([commandStep("implement", ["build"], { retry: backoff(5, 10) })]) },
+      roles,
+      "command-retry",
+    )
+    const engine = makeEngine(commandRetryWorkflow)
+    const feature = store.createFeature({ title: "Ship it", slug: "ship-it", projectDir: "/tmp/project", workflow: commandRetryWorkflow.name })
+
+    // A retry episode already owns "main/implement" (e.g. scheduled by an
+    // earlier concurrent conclusion that won the race).
+    const existing = store.scheduleRetry({
+      featureId: feature.id, jobId: "main", stepId: "implement",
+      attempts: 1, startedAt: clock.now(), nextAttemptAt: clock.now() + 5_000, delayMs: 5_000,
+      scheduleSource: "backoff", maxAttempts: 5, maxElapsedMs: 600_000,
+      failure: { class: "transient_upstream", diagnostic: "503", source: "runner" },
+    })!
+
+    process_.handler = () => ({ code: 1, stdout: "", stderr: "boom", output: "boom" })
+    await engine.dispatch(feature.id, { kind: "feature.start" })
+
+    const run = store.listRuns(feature.id).find(r => r.stepId === "implement")!
+    expect(run.status).toBe("failed")
+    // No immediate dispatch: the losing conclusion does NOT fall back to
+    // executing the step itself — that fallback was the schedule-
+    // contention bug (bypassing the owning episode's backoff).
+    expect(store.getActiveRunForStep(feature.id, "main", "implement")).toBeNull()
+    // No second episode: exactly the original one, untouched.
+    const episodes = store.listRetryEpisodes(feature.id)
+    expect(episodes).toHaveLength(1)
+    expect(episodes[0]).toMatchObject({ id: existing.id, nextAttemptAt: existing.nextAttemptAt, delayMs: 5_000 })
+  })
+
   it("a retry with a non-zero backoff becomes a durable scheduled episode, claimed when due", async () => {
     const engine = makeEngine(retryWorkflow)
     const feature = await startedFeature(engine)
@@ -612,6 +1052,257 @@ describe("Engine: failure classification and durable retry schedules", () => {
     expect(rearmed).not.toBeNull()
     expect(rearmed!.id).not.toBe(run.id)
     expect(store.getOpenRetryEpisode(feature.id, "main", "implement")).toBeNull()
+  })
+
+  it("elapsed budget exhausts during backoff: the next computed attempt would start past the deadline, so it is never scheduled and the step escalates immediately (retry-budget spec)", async () => {
+    // TTL reaps classify "timeout" (class-default budget: 5 attempts,
+    // 600_000ms elapsed) — retryWorkflow's own attempts budget (2) is
+    // reached well before 5, so this exercises the ELAPSED axis, not
+    // attempts. Advancing the clock past 600_000ms before the reap fires
+    // means the very first scheduled retry's candidate attempt already
+    // lands past the elapsed deadline.
+    const engine = makeEngine(retryWorkflow, { runTtlMs: 1000 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    clock.advance(600_001)
+    await engine.reconcile()
+
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    expect(store.getRunById(run.id)?.failure).toMatchObject({ class: "timeout" })
+    // No durable retry was scheduled — the budget check rejected it before
+    // `store.scheduleRetry` was ever called.
+    expect(store.getOpenRetryEpisode(feature.id, "main", "implement")).toBeNull()
+    // retryWorkflow has no `onFail` and a single job, so exhaustion routes
+    // straight to job failure → feature escalation, exactly like an
+    // attempts-exhausted failure would.
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    expect(store.getEscalation(feature.id)).toContain("exceeded")
+    expect(store.getEscalation(feature.id)).toContain("elapsed retry budget")
+  })
+
+  it("a due episode claimed past its elapsed deadline (e.g. a daemon outage spanning the due time) is escalated instead of dispatched", async () => {
+    const engine = makeEngine(retryWorkflow, { runTtlMs: 1000 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    // Reap within budget: a short TTL reap at t=2000ms is well inside the
+    // 600_000ms timeout deadline, so the retry schedules normally this time.
+    clock.advance(2000)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    const episode = store.getOpenRetryEpisode(feature.id, "main", "implement")
+    expect(episode).toMatchObject({ status: "scheduled" })
+
+    // The daemon is "down" for a very long time — long enough that by the
+    // time reconcile() next runs and claims the (now very much due)
+    // episode, the elapsed deadline measured from the ORIGINAL episode
+    // start has already passed even though the schedule's own
+    // next_attempt_at was always comfortably inside it.
+    clock.advance(600_000)
+    await engine.reconcile()
+
+    expect(store.getActiveRunForStep(feature.id, "main", "implement")).toBeNull()
+    expect(store.getOpenRetryEpisode(feature.id, "main", "implement")).toBeNull()
+    expect(store.getRetryEpisode(episode!.id)?.closedReason).toBe("elapsed_budget_exhausted_at_claim")
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    expect(store.getEscalation(feature.id)).toContain("elapsed retry budget")
+  })
+
+  it("pause time is excluded from the elapsed retry budget — a long pause spanning what would otherwise be the deadline does not burn it", async () => {
+    // Same TTL/class setup as the elapsed-exhaustion test above, but this
+    // time the long gap is spent PAUSED rather than the daemon being down
+    // — durable-retries spec: "Retry becomes due while paused ... pause
+    // time is excluded from the remaining elapsed budget".
+    const engine = makeEngine(retryWorkflow, { runTtlMs: 1000 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    clock.advance(2000)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    const episode = store.getOpenRetryEpisode(feature.id, "main", "implement")!
+    expect(episode.status).toBe("scheduled")
+
+    await engine.pause(feature.id)
+    clock.advance(600_000)
+    await engine.resume(feature.id)
+
+    // The 600_000ms gap happened entirely under pause — it must not count
+    // toward the episode's elapsed budget, so the already-due retry is
+    // claimed and dispatched normally instead of escalating.
+    await engine.reconcile()
+    const rearmed = store.getActiveRunForStep(feature.id, "main", "implement")
+    expect(rearmed).not.toBeNull()
+    expect(rearmed!.id).not.toBe(run.id)
+    expect(store.getOpenRetryEpisode(feature.id, "main", "implement")).toBeNull()
+    expect(store.getFeature(feature.id)?.status).toBe("running")
+  })
+
+  it("pause DURING the FIRST attempt's execution (no retry episode exists yet) is still excluded from the elapsed budget — the streak's pause snapshot anchors to the attempt's own dispatch, not to an episode that doesn't exist yet", async () => {
+    // Regression test for the pause-accounting gap `applyTransitionTx`'s
+    // per-episode fold could never close: a pause while an attempt is
+    // EXECUTING (before ANY retry_episode row exists for this streak) has
+    // no open row to fold into. Fix B's snapshot mechanism instead reads
+    // the RUN's own `pausedMsAtDispatch` as the streak anchor for a
+    // genuinely first episode (`planFailureDisposition`), so the pause is
+    // accounted for even though it happened before any episode existed.
+    const runTtlMs = 100_000
+    const engine = makeEngine(retryWorkflow, { runTtlMs })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    expect(run.pausedMsAtDispatch).toBe(0)
+
+    // Pause while the run is still genuinely RUNNING — no episode exists.
+    // applyTransitionTx's pause fold uses real Date.now() (see
+    // retry-store.test.ts's "pause accounting" suite), not the injected
+    // FakeClock, so the pause span itself is produced entirely by
+    // backdating `paused_at` in real-clock terms — the FakeClock is never
+    // advanced across the pause/resume pair, so it cannot itself drift
+    // away from the run's own real-clock `time_started` in the meantime.
+    await engine.pause(feature.id)
+    connection.db.run("UPDATE feature SET paused_at = paused_at - 700000 WHERE id = ?", [feature.id])
+    await engine.resume(feature.id)
+    expect(store.getPauseAccounting(feature.id)!.pausedMs).toBeGreaterThanOrEqual(700_000)
+
+    // Trip the TTL reap deterministically by backdating the run's own
+    // `time_started` (also real-clock, same split) rather than advancing
+    // the FakeClock — advancing the FakeClock here would itself desync it
+    // from the run's real-clock `time_started`, making every
+    // freshly-dispatched run look TTL-stale on the very next reconcile.
+    connection.db.run("UPDATE run SET time_started = time_started - ? WHERE id = ?", [runTtlMs + 100, run.id])
+    await engine.reconcile()
+    const episode = store.getOpenRetryEpisode(feature.id, "main", "implement")
+    expect(episode).not.toBeNull()
+    expect(episode!.status).toBe("scheduled")
+    // `pausedMs` is computed FRESH at schedule time (feature cumulative
+    // now − snapshot) and persisted for observability — it correctly
+    // reflects the 700_000ms span even though NO episode existed while
+    // that span happened; the old per-episode fold in `applyTransitionTx`
+    // could never have produced this (it only ever adds to an episode
+    // that is already open), proving this came from the new snapshot path.
+    expect(episode!.pausedMs).toBeGreaterThanOrEqual(700_000)
+    expect(episode!.featurePausedMsAtStart).toBe(0)
+
+    // Claim-time re-check: advance to the scheduled retry time (well
+    // inside the 600_000ms class budget once the 700_000ms pause is
+    // correctly excluded) and confirm it dispatches instead of escalating.
+    clock.advance(episode!.nextAttemptAt! - clock.now())
+    await engine.reconcile()
+    expect(store.getRetryEpisode(episode!.id)?.closedReason).toBe("attempt_dispatched")
+    expect(store.getFeature(feature.id)?.status).toBe("running")
+  })
+
+  it("pause DURING a LATER chained attempt's execution is excluded via the streak's snapshot, inherited unchanged across the chain", async () => {
+    // The chained-episode counterpart of the test above: the pause
+    // happens after episode 1 has already closed `attempt_dispatched`
+    // (so its run is executing with no OPEN episode row either) — same
+    // gap the per-episode fold could never close, this time on attempt 2
+    // instead of attempt 1.
+    const chainWorkflow: WorkflowDef = workflow(
+      { main: job([agentStep("implement", "implementer", "go", { retry: backoff(3, 10) })]) },
+      roles,
+      "chain",
+    )
+    const runTtlMs = 100_000
+    const engine = makeEngine(chainWorkflow, { runTtlMs })
+    const feature = await startedFeature(engine)
+    const run1 = store.getActiveRunForStep(feature.id, "main", "implement")!
+
+    // TTL-reap attempt 1 via a real-clock backdate of `time_started`
+    // (same reasoning as the first-attempt test above) rather than
+    // advancing the FakeClock, so the FakeClock stays at "now" and every
+    // freshly-dispatched run's real-clock `time_started` stays close to
+    // it — no accumulated desync across this multi-dispatch scenario.
+    connection.db.run("UPDATE run SET time_started = time_started - ? WHERE id = ?", [runTtlMs + 100, run1.id])
+    await engine.reconcile()
+    const episode1 = store.getOpenRetryEpisode(feature.id, "main", "implement")!
+    expect(episode1.attempts).toBe(1)
+    expect(episode1.featurePausedMsAtStart).toBe(0)
+
+    // Advance EXACTLY to the scheduled due time (not a moment more) so the
+    // freshly-dispatched run 2 does not itself look TTL-stale by the time
+    // this same reconcile pass evaluates it.
+    clock.advance(episode1.nextAttemptAt! - clock.now())
+    await engine.reconcile()
+    const run2 = store.getActiveRunForStep(feature.id, "main", "implement")!
+    expect(run2.id).not.toBe(run1.id)
+    expect(store.getRetryEpisode(episode1.id)?.closedReason).toBe("attempt_dispatched")
+
+    // Pause DURING run 2's execution — no episode is open right now.
+    await engine.pause(feature.id)
+    connection.db.run("UPDATE feature SET paused_at = paused_at - 500000 WHERE id = ?", [feature.id])
+    clock.advance(500_000)
+    await engine.resume(feature.id)
+
+    await engine.reconcile()
+    const episode2 = store.getOpenRetryEpisode(feature.id, "main", "implement")
+    expect(episode2).not.toBeNull()
+    expect(episode2!.attempts).toBe(2)
+    // Chained: the snapshot baseline is inherited unchanged from episode
+    // 1, NOT re-read at chain time — mirrors `startedAt`'s own
+    // inheritance rule (both stay fixed for the whole streak).
+    expect(episode2!.featurePausedMsAtStart).toBe(episode1.featurePausedMsAtStart)
+    expect(episode2!.pausedMs).toBeGreaterThanOrEqual(500_000)
+    expect(store.getFeature(feature.id)?.status).toBe("running")
+
+    // Claim-time re-check: well inside the 600_000ms budget once the
+    // 500_000ms pause is correctly excluded, so this dispatches instead
+    // of escalating (rather than asserting "running" after this dispatch:
+    // the freshly-created run 3's real-clock `time_started` would need
+    // its own FakeClock re-pin, same as run 2 above, to survive a further
+    // reconcile — the dispatch-not-escalate outcome itself is the
+    // assertion that matters here).
+    clock.advance(episode2!.nextAttemptAt! - clock.now())
+    await engine.reconcile()
+    expect(store.getRetryEpisode(episode2!.id)?.closedReason).toBe("attempt_dispatched")
+  })
+
+  it("multiple pause/resume spans across BOTH execution and backoff wait are each counted exactly once, never double-counted or dropped", async () => {
+    const runTtlMs = 100_000
+    const engine = makeEngine(retryWorkflow, { runTtlMs })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+
+    // Span 1: pause DURING execution (no episode exists yet). The pause
+    // span itself is produced via a FakeClock advance paired 1:1 with a
+    // matching `paused_at` backdate, so the two clocks agree on ITS
+    // duration — but that pairing necessarily leaves the FakeClock 300s
+    // ahead of the run's own real-clock `time_started`. Trip the TTL reap
+    // via a direct `time_started` backdate instead of a further
+    // FakeClock advance, so no additional desync accrues on top of it.
+    await engine.pause(feature.id)
+    connection.db.run("UPDATE feature SET paused_at = paused_at - 300000 WHERE id = ?", [feature.id])
+    clock.advance(300_000)
+    await engine.resume(feature.id)
+    connection.db.run("UPDATE run SET time_started = time_started - ? WHERE id = ?", [runTtlMs + 100, run.id])
+
+    // TTL-reap now schedules episode 1 — its snapshot baseline is the
+    // feature's cumulative paused_ms as of run 1's dispatch (0, since the
+    // pause above happened AFTER dispatch — see `pausedMsAtDispatch`'s
+    // doc comment: this baseline is fixed at dispatch time, so it does
+    // NOT itself already include span 1; span 1 is entirely part of the
+    // streak's accountable pause time, exactly like span 2 below).
+    await engine.reconcile()
+    const episode = store.getOpenRetryEpisode(feature.id, "main", "implement")!
+    expect(episode.featurePausedMsAtStart).toBe(0)
+
+    // Span 2: pause AGAIN, this time while the episode is open/scheduled
+    // (the OLD per-episode fold's own supported case) — both spans must
+    // land in the SAME cumulative total, counted once each.
+    await engine.pause(feature.id)
+    connection.db.run("UPDATE feature SET paused_at = paused_at - 200000 WHERE id = ?", [feature.id])
+    clock.advance(200_000)
+    await engine.resume(feature.id)
+
+    const cumulative = store.getPauseAccounting(feature.id)!.pausedMs
+    expect(cumulative).toBeGreaterThanOrEqual(500_000)
+    // Two independent readers of the same streak both see the SAME delta:
+    // the engine's own computation (mirrored here) and the store helper.
+    expect(store.getFeaturePausedMsAsOf(feature.id, clock.now())! - episode.featurePausedMsAtStart).toBe(cumulative)
+
+    clock.advance(episode.nextAttemptAt! - clock.now())
+    await engine.reconcile()
+    // Both 300_000ms + 200_000ms spans excluded: well inside the
+    // 600_000ms budget, so this dispatches instead of escalating.
+    expect(store.getRetryEpisode(episode.id)?.closedReason).toBe("attempt_dispatched")
   })
 })
 

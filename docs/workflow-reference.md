@@ -252,7 +252,7 @@ escalation event (install-wide); see the decision log in
 ```yaml
 retry:
   maxAttempts: 3            # total attempts INCLUDING the first
-  maxElapsed: PT10M         # optional ISO-8601 wall-clock cap
+  maxElapsed: PT10M         # optional ISO-8601 wall-clock cap (planned — see below)
   backoff:
     strategy: constant      # constant | exponential
     delay: 10000            # ms (constant)
@@ -268,7 +268,18 @@ backoff:
 ```
 
 Retry applies only to `step.failed` — an outcome never consumes retry
-budget.
+budget. See [Retries, failure classes and recovery](concepts.md#retries-failure-classes-and-recovery)
+for how a failure is classified and which elapsed deadline actually governs
+it — the step's own `maxAttempts`/`backoff` here take effect, but the
+**elapsed** deadline is currently always the classified failure's class
+default, not this field.
+
+**(planned)** `maxElapsed` is parsed and validated (a valid ISO-8601
+duration is required if present) but is not yet consulted by the engine —
+declaring it has no runtime effect today. The elapsed deadline the engine
+actually enforces always comes from the failure's classified class default
+(see the concepts page linked above); there is no YAML syntax yet to
+override it per step or per class.
 
 ---
 

@@ -76,6 +76,12 @@ export function SurfaceNavigator({ gate }: { readonly gate: ReturnType<typeof us
 export function GateQuestionBody({ gate, showChangeNoteInline = true }: GateBodyProps): React.ReactNode {
   const { detail, selected, surfaces, panelPrompt, parsedQuestions, answers, setAnswer, notes, setNotes, pending } = gate
   const askingRun = selected?.kind === "ask" ? selected : null
+  // harden-interactive-answer-delivery task 3.1: an accepted-pending
+  // delivery means a human answer already landed durably and is
+  // waiting on/being delivered to the runner session — resubmitting
+  // would be rejected as a conflict, so the input is replaced with a
+  // status line rather than left submittable.
+  const acceptedPending = askingRun?.answerDelivery !== undefined
   return (
     <>
       <div className={styles.meta}>
@@ -102,7 +108,7 @@ export function GateQuestionBody({ gate, showChangeNoteInline = true }: GateBody
                       name={`gate-q-${index}`}
                       checked={answer.chosen === optionIndex}
                       onChange={() => setAnswer(index, { chosen: optionIndex, custom: "" })}
-                      disabled={pending}
+                      disabled={pending || acceptedPending}
                     />
                     {option}
                   </label>
@@ -113,7 +119,7 @@ export function GateQuestionBody({ gate, showChangeNoteInline = true }: GateBody
                     name={`gate-q-${index}`}
                     checked={answer.chosen === null && answer.custom !== ""}
                     onChange={() => setAnswer(index, { chosen: null, custom: answer.custom })}
-                    disabled={pending}
+                    disabled={pending || acceptedPending}
                   />
                   <input
                     className={styles.customInput}
@@ -121,7 +127,7 @@ export function GateQuestionBody({ gate, showChangeNoteInline = true }: GateBody
                     aria-label={`Custom answer for ${question.question}`}
                     value={answer.custom}
                     onChange={e => setAnswer(index, { chosen: null, custom: e.target.value })}
-                    disabled={pending}
+                    disabled={pending || acceptedPending}
                   />
                 </label>
               </fieldset>
@@ -131,7 +137,11 @@ export function GateQuestionBody({ gate, showChangeNoteInline = true }: GateBody
       ) : panelPrompt !== null ? (
         <div className={styles.prompt}>{panelPrompt}</div>
       ) : null}
-      {showChangeNoteInline ? (
+      {acceptedPending ? (
+        <div className={styles.deliveryStatus} role="status">
+          ✓ answer accepted — delivering to agent…
+        </div>
+      ) : showChangeNoteInline ? (
         <label className={styles.noteField}>
           <span className="visually-hidden">{askingRun !== null ? "Free-text answer" : "Decision note"}</span>
           <input
@@ -152,6 +162,11 @@ export function GateActionButtons({ gate, showChangeNoteInline = true }: GateBod
   const { selected, pending, pendingAction, questionsIncomplete, notes, submit, submitAnswer } = gate
   const askingRun = selected?.kind === "ask" ? selected : null
   if (askingRun !== null) {
+    // harden-interactive-answer-delivery task 3.1: an accepted-pending
+    // delivery has nothing left to resubmit — the server would reject a
+    // second answer as a conflict, so the button is dropped rather than
+    // left clickable-but-doomed.
+    if (askingRun.answerDelivery !== undefined) return null
     return (
       <div className={styles.actions}>
         <button className="primary" disabled={pending || questionsIncomplete} onClick={() => void submitAnswer()}>

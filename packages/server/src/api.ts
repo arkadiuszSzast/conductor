@@ -28,7 +28,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto"
 import { statSync } from "node:fs"
 import { extname, resolve, sep } from "node:path"
 import type { FeatureState, FeatureStatus, InputDef, StepRuntime, WorkflowInputDiagnostic } from "@conductor/core"
-import type { RunLogEntryInput, Store, StoreChange } from "./store.ts"
+import type { RunLogEntryInput, RunSummary, Store, StoreChange } from "./store.ts"
 import type { DaemonHealth, DaemonLogger } from "./daemon.ts"
 import type { LoadResult, WorkflowResolver, WorkflowStatus } from "./workflow-registry.ts"
 import type { RunnerRegistry } from "./runner-registry.ts"
@@ -92,8 +92,27 @@ export interface EngineControl {
   abandon(featureId: string): Promise<void>
   recover(
     featureId: string,
-    input: { readonly notes?: string; readonly expectedVersion?: number; readonly idempotencyKey?: string },
-  ): Promise<{ ok: boolean; message: string; readonly stale?: boolean; readonly duplicate?: boolean }>
+    input: {
+      readonly notes?: string
+      readonly expectedVersion?: number
+      readonly idempotencyKey?: string
+      readonly target?: { readonly jobId: string; readonly stepId: string }
+    },
+  ): Promise<{
+    ok: boolean
+    message: string
+    readonly stale?: boolean
+    readonly duplicate?: boolean
+    readonly ambiguous?: boolean
+    readonly staleTarget?: boolean
+    readonly targets?: readonly { readonly jobId: string; readonly stepId: string }[]
+  }>
+  /** Every currently recoverable job/step target for an escalated
+   *  feature, in default-choice order; null when not escalated/no
+   *  resolvable workflow. Optional so a caller supplying a partial
+   *  structural `EngineControl` (tests) need not implement it — the
+   *  projection just omits `recoverableTargets` in that case. */
+  recoverableTargets?(featureId: string): readonly { readonly jobId: string; readonly stepId: string }[] | null
 }
 
 export interface ApiDeps {
@@ -420,6 +439,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
                   ? "Automation stopped and needs recovery."
                   : `Feature is ${feature.status}.`,
           }
+    const recoverableTargets = feature.status === "escalated" ? engine.recoverableTargets?.(featureId) ?? null : null
     return {
       feature: {
         ...feature,
@@ -433,9 +453,10 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         findingCounts: store.countFindingsByStatus([featureId]).get(featureId)
           ?? { new: 0, fixed: 0, dismissed: 0, reopened: 0 },
         jobs: jobsDetail(feature, store.newestRunIdsByStep(featureId)),
+        ...(recoverableTargets !== null ? { recoverableTargets } : {}),
       },
       activeRun: activeRunProjection(featureId),
-      activeRuns,
+      activeRuns: activeRuns.map(run => withAnswerDelivery(run)),
     }
   }
 
@@ -443,7 +464,25 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
    *  answering surfaces always see the pending question under fan-out. */
   function activeRunProjection(featureId: string) {
     const asking = store.listActiveRuns(featureId).find((run) => run.pendingQuestion !== null)
-    return asking ?? store.getActiveRun(featureId)
+    return withAnswerDelivery(asking ?? store.getActiveRun(featureId))
+  }
+
+  /**
+   * Additive projection (harden-interactive-answer-delivery task 3.1): a
+   * run with a non-terminal answer delivery gains `answerDelivery:
+   * {status, acceptedAt}` alongside `pendingQuestion` so an answering
+   * surface can tell "the question is still visible, but a human answer
+   * was already accepted and is pending/claimed for delivery" and
+   * disable resubmission without the client having to infer that from
+   * the feature staying `waiting_human`. Absent entirely once nothing is
+   * open (delivered/failed/cancelled, or never accepted) — existing
+   * consumers that only read `pendingQuestion` see no shape change.
+   */
+  function withAnswerDelivery(run: RunSummary | null): unknown {
+    if (run === null) return null
+    const delivery = store.getOpenAnswerDelivery(run.id)
+    if (delivery === null) return run
+    return { ...run, answerDelivery: { status: delivery.status, acceptedAt: delivery.createdAt } }
   }
 
   async function handle(request: Request): Promise<Response> {
@@ -634,7 +673,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       if (action === undefined && method === "GET") {
         const run = store.getRunById(runId)
         if (!run) return error(requestId, "not_found", `unknown run "${runId}"`)
-        return json(200, { run }, requestId)
+        return json(200, { run: withAnswerDelivery(run) }, requestId)
       }
       if (action === "report" && method === "POST") return reportRun(request, runId, requestId)
       if (action === "answer" && method === "POST") return answerRun(request, runId, requestId)
@@ -832,7 +871,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     if (!feature) return error(requestId, "not_found", `unknown feature "${featureId}"`)
     switch (resource) {
       case "runs":
-        return json(200, { runs: store.listRuns(featureId) }, requestId)
+        return json(200, { runs: store.listRuns(featureId).map(run => withAnswerDelivery(run)) }, requestId)
       case "findings":
         return json(200, { findings: store.listFindings(featureId) }, requestId)
       case "timeline":
@@ -911,12 +950,34 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         if (idempotencyKey !== undefined && (typeof idempotencyKey !== "string" || idempotencyKey.trim() === "")) {
           return error(requestId, "invalid_request", "\"idempotencyKey\" must be a non-empty string")
         }
+        const rawTarget = parsed.body["target"]
+        let target: { jobId: string; stepId: string } | undefined
+        if (rawTarget !== undefined) {
+          const candidate = rawTarget as Record<string, unknown>
+          const jobId = typeof candidate === "object" && candidate !== null ? candidate["jobId"] : undefined
+          const stepId = typeof candidate === "object" && candidate !== null ? candidate["stepId"] : undefined
+          if (typeof jobId !== "string" || jobId.trim() === "" || typeof stepId !== "string" || stepId.trim() === "") {
+            return error(requestId, "invalid_request", "\"target\" must be an object with non-empty string \"jobId\" and \"stepId\"")
+          }
+          target = { jobId, stepId }
+        }
         const result = await engine.recover(featureId, {
           notes,
           ...(expectedVersion !== undefined ? { expectedVersion } : {}),
           ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
+          ...(target !== undefined ? { target } : {}),
         })
         if (!result.ok) {
+          if (result.ambiguous === true) {
+            return json(
+              409,
+              { error: { code: "ambiguous_target", message: result.message, requestId }, targets: result.targets ?? [] },
+              requestId,
+            )
+          }
+          if (result.staleTarget === true) {
+            return json(409, { error: { code: "stale_target", message: result.message, requestId } }, requestId)
+          }
           return error(requestId, result.stale === true ? "stale_version" : "conflict", result.message)
         }
         return json(200, { result: result.message, ...(featurePayload(featureId) as Record<string, unknown>) }, requestId)
@@ -1051,7 +1112,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     if (result.startsWith(`Run ${runId} already concluded`)) {
       return error(requestId, "run_already_concluded", result)
     }
-    return json(200, { result, run: store.getRunById(runId) }, requestId)
+    return json(200, { result, run: withAnswerDelivery(store.getRunById(runId)) }, requestId)
   }
 
   async function answerRun(request: Request, runId: string, requestId: string): Promise<Response> {
@@ -1066,7 +1127,13 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       if (result.code === "unknown_run") return error(requestId, "not_found", result.message)
       return error(requestId, result.code, result.message)
     }
-    return json(200, { result: result.message, run: store.getRunById(runId) }, requestId)
+    // `result.ok` covers three outcomes with the SAME wire shape (unchanged
+    // contract): confirmed delivery (no open delivery left — the run
+    // carries only `pendingQuestion: null`), and accepted-but-not-yet-
+    // delivered (paused, or delivery still in flight) — the latter is
+    // where `withAnswerDelivery` adds the additive `answerDelivery` field
+    // so the caller can distinguish "accepted, delivering" from "resolved".
+    return json(200, { result: result.message, run: withAnswerDelivery(store.getRunById(runId)) }, requestId)
   }
 
   function sseResponse(requestId: string): Response {

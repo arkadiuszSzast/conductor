@@ -494,7 +494,7 @@ jobs:
       const state = store.getFeature(feature.id)!
       const event = { kind: "step.completed", jobId: "main", stepId: "review", outcome: "changes_requested", outputs: { report: "needs work" } } as const
       const transition = interpret(parsed.workflow, state, event)
-      expect(store.concludeRun(runId, "succeeded", { outputs: { report: "needs work" } }, event, transition)).toBe(true)
+      expect(store.concludeRun(runId, "succeeded", { outputs: { report: "needs work" } }, event, transition).claimed).toBe(true)
       expect(store.getPendingRunAction(feature.id)).not.toBeNull()
       connection.close()
     }

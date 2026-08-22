@@ -30,6 +30,9 @@ export interface ApiErrorBody {
   /** Present only on `POST /v1/features`'s 422 `invalid_input` response —
    *  one entry per rejected workflow input (or the payload itself). */
   readonly diagnostics?: readonly WorkflowInputDiagnostic[]
+  /** Present only on `POST .../recover`'s 409 `ambiguous_target` response —
+   *  the currently recoverable job/step candidates to choose from. */
+  readonly targets?: readonly { readonly jobId: string; readonly stepId: string }[]
 }
 
 export class ApiError extends Error {
@@ -39,14 +42,25 @@ export class ApiError extends Error {
   /** Per-input validation diagnostics — only set for a `422 invalid_input`
    *  response from `POST /v1/features`. */
   readonly diagnostics: readonly WorkflowInputDiagnostic[] | null
+  /** Recoverable target candidates — only set for a `409 ambiguous_target`
+   *  response from `POST .../recover`. */
+  readonly targets: readonly { readonly jobId: string; readonly stepId: string }[] | null
 
-  constructor(status: number, code: string, message: string, requestId: string | null, diagnostics: readonly WorkflowInputDiagnostic[] | null = null) {
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    requestId: string | null,
+    diagnostics: readonly WorkflowInputDiagnostic[] | null = null,
+    targets: readonly { readonly jobId: string; readonly stepId: string }[] | null = null,
+  ) {
     super(message)
     this.name = "ApiError"
     this.status = status
     this.code = code
     this.requestId = requestId
     this.diagnostics = diagnostics
+    this.targets = targets
   }
 }
 
@@ -236,7 +250,11 @@ export class ApiClient {
   async recover(
     featureId: string,
     notes: string,
-    options?: { readonly expectedVersion?: number; readonly idempotencyKey?: string },
+    options?: {
+      readonly expectedVersion?: number
+      readonly idempotencyKey?: string
+      readonly target?: { readonly jobId: string; readonly stepId: string }
+    },
   ): Promise<CommandResponse> {
     return this.request<CommandResponse>(`/v1/features/${encodeURIComponent(featureId)}/recover`, {
       method: "POST",
@@ -245,6 +263,7 @@ export class ApiClient {
         notes,
         ...(options?.expectedVersion !== undefined ? { expectedVersion: options.expectedVersion } : {}),
         ...(options?.idempotencyKey !== undefined ? { idempotencyKey: options.idempotencyKey } : {}),
+        ...(options?.target !== undefined ? { target: options.target } : {}),
       }),
     })
   }
@@ -275,7 +294,7 @@ async function toApiError(response: Response): Promise<ApiError> {
   const code = body?.error.code ?? "internal"
   const message = body?.error.message ?? `request failed with status ${response.status}`
   const requestId = body?.error.requestId ?? response.headers.get("x-request-id")
-  return new ApiError(response.status, code, message, requestId, body?.diagnostics ?? null)
+  return new ApiError(response.status, code, message, requestId, body?.diagnostics ?? null, body?.targets ?? null)
 }
 
 /** The frames a fetch-based SSE reader surfaces. */

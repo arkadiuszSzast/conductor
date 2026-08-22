@@ -21,6 +21,7 @@ Authentication is explicit (`auth.mode: "none"` or `"bearer"`); only
 | `GET /v1/features/:id` | Feature detail (see payloads below). |
 | `GET /v1/features/:id/runs` · `/findings` · `/timeline` | Per-feature resources. Timeline entries carry `event` as a parsed object. |
 | `POST /v1/features/:id/approve` · `/request-changes` · `/pause` · `/resume` · `/abandon` | Gate and lifecycle commands; responses carry the fresh feature payload. |
+| `POST /v1/features/:id/recover` | Re-arm an escalated feature's currently recoverable failed/blocked step (below). |
 | `GET /v1/runs/:id` | One run, with full (untruncated) `outputs`. |
 | `GET /v1/runs/:id/logs` | Cursor-incremental run-log tail: `?after=<seq>&limit=<n>`. |
 | `POST /v1/runs/:id/logs` | Append log lines to a running run (step authors and runner agent-log push). |
@@ -45,7 +46,56 @@ from the store row — not part of the core interpreter state).
   the full output stays available via `GET /v1/runs/:id`. The detail also
   carries `workflowRef: {name, stale} | null` — a hint at the workflow the
   feature's project currently resolves to — and `feedback` (detail only,
-  never on list items).
+  never on list items). When the feature is `escalated`, the detail
+  additionally carries `recoverableTargets: [{jobId, stepId}]` — every
+  currently recoverable job/step, in the order `POST .../recover` would
+  pick as its default (untargeted) choice; absent otherwise.
+
+### Activity projection
+
+Both list items and the detail carry `activity`, a derived summary a
+client can render directly without re-deriving "is anything actually
+happening" from raw job/run state:
+
+```json
+{
+  "state": "waiting_retry",
+  "activeCount": 0,
+  "targets": [],
+  "target": { "jobId": "main", "stepId": "implement" },
+  "reason": "transient_upstream",
+  "diagnostic": "provider 503",
+  "nextAt": 1732000030000,
+  "deadlineAt": 1732000600000,
+  "message": "No agent is active — waiting for the next retry."
+}
+```
+
+`state` is one of `active` | `waiting_retry` | `blocked` | `waiting_human`
+| `paused` | `escalated` | `terminal`:
+
+- `blocked` — a durable resource wait is open (no compatible runner /
+  binding yet); `target`/`reason`/`diagnostic` describe it, `nextAt` is
+  the next observation time, `deadlineAt` is the wait's finite deadline.
+- `waiting_retry` — a durable retry episode is scheduled; `reason` is the
+  classified failure class, `diagnostic` its bounded message, `nextAt` the
+  scheduled attempt time, and `deadlineAt` the retry's elapsed budget
+  deadline (`startedAt + maxElapsedMs` for that class — see
+  [Retries, failure classes and recovery](concepts.md#retries-failure-classes-and-recovery)).
+  An attempt past `deadlineAt` is never dispatched — the client should not
+  expect `nextAt` to still fire once `deadlineAt` has passed.
+- `waiting_human` | `paused` | `escalated` | `terminal` (`done`/
+  `abandoned`) mirror the feature's own status.
+- `active` — the fallback: the feature is `running` with no open
+  wait/retry; `activeCount`/`targets` list the live runs (empty
+  `activeCount` with `running` status and no wait/retry is itself worth
+  surfacing — the `message` calls this out explicitly rather than reading
+  as "everything is fine").
+
+`target`/`reason`/`diagnostic`/`nextAt`/`deadlineAt` are `null` outside
+`blocked`/`waiting_retry`. `message` is always a short, human-readable
+sentence version of the same information — safe to render directly
+without a client-side switch on `state`.
 
 ### Feedback lifecycle
 
@@ -67,6 +117,46 @@ A client that needs "is a rerun loop in flight right now" must therefore
 combine the snapshot with live job state (a job named in `feedback.jobs`
 is active again with `reruns > 0`) — the snapshot's mere presence only
 means "at least one rerun has ever happened".
+
+### Recovering an escalated feature
+
+`POST /v1/features/:id/recover` body:
+
+```json
+{
+  "notes": "the flaky provider is back — retry",
+  "target": { "jobId": "deliver", "stepId": "pr_create" },
+  "expectedVersion": 1732000000000,
+  "idempotencyKey": "op-123"
+}
+```
+
+- `notes` is required (non-empty).
+- `target` is optional and selects among the feature's currently
+  recoverable job/step candidates (`recoverableTargets` on the detail
+  payload, or GET the feature first). Candidates come from the CURRENT
+  durable failed/blocked frontier — open resource waits and failed jobs'
+  failed steps — never from run history alone; history only orders and
+  explains candidates.
+  - Zero candidates: `409 conflict`, "no recoverable failed or blocked
+    step found".
+  - Exactly one candidate and no `target`: recovers it (backwards
+    compatible).
+  - More than one candidate and no `target`: `409` with
+    `code: "ambiguous_target"` and a top-level `targets: [{jobId,
+    stepId}]` array to choose from.
+  - A `target` not among the current candidates: `409` with
+    `code: "stale_target"` — rejected with no fallback to another
+    candidate.
+- `expectedVersion` (the feature's `updatedAt` your view was rendered
+  from) rejects with `409 stale_version` if the feature moved since.
+- `idempotencyKey` dedupes a retried delivery of the same logical
+  recover: a repeat with the same key returns `200` with the fresh
+  feature payload and no new work armed.
+- On success, the recovered step's retry budget resets — a fresh finite
+  episode, chained to its prior one for audit history — so a subsequent
+  failure of the recovered step gets its own attempt/elapsed allowance
+  instead of inheriting the exhausted one's count.
 
 ## Starting a feature
 
@@ -212,15 +302,77 @@ running. The workflow-structure projection marks such steps with
 ### `POST /v1/runs/:id/answer`
 
 Bearer-authenticated. Body: `{notes: string}` (required, non-empty).
-Delivers a human's answer to an asking run: the notes are forwarded as a
-prompt **into the run's existing session**, the pending question is
-cleared, and the feature returns to `running`. Errors:
+
+Acceptance and delivery are two separately durable steps (see
+[Answer delivery](concepts.md#answer-delivery-accepted-durably-before-it-is-delivered)):
+the notes are persisted **before** any attempt to forward them into the
+run's session, so this call returning success never depends on the
+session actually receiving the prompt. Delivery is attempted immediately
+for low latency and, if it doesn't land right away, retried by the
+reconciler until confirmed — no new call to this endpoint is needed. The
+response's `run` field carries the fresh run projection with
+`answerDelivery` (below) reflecting whichever of the outcomes applied.
+Errors:
 
 - unknown run → 404 (`not_found`)
-- run not running or no pending question → 409 (`no_pending_question`)
-- session gone / prompt delivery failed → 409 (`session_lost`) — the step
-  is concluded `failed` through normal failure routing (retry/onFail),
-  never left as a zombie wait.
+- run not running, no pending question, **or a prior answer for the same
+  question is already accepted and awaiting delivery** → 409
+  (`no_pending_question` — the same code covers all three; a repeated
+  answer while the first is accepted-but-undelivered is a conflict, never
+  an idempotent replacement)
+- session gone, or the immediate delivery attempt hit a TERMINAL
+  (deterministic/invalid/internal) prompt error → 409 (`session_lost`) —
+  the step is concluded `failed` through normal failure routing
+  (retry/onFail), never left as a zombie wait. A TRANSIENT prompt error
+  (transport/capacity/upstream/timeout) on the immediate attempt does
+  **not** surface as `session_lost`: this call still returns 200 (see
+  [bounded delivery retries](concepts.md#answer-delivery-accepted-durably-before-it-is-delivered)
+  below), and only reconciler-driven retries exhausting that bounded
+  schedule eventually route to failure — which, like any LATER
+  reconciler-driven delivery attempt, obviously can't surface as this
+  request's response.
+
+#### `answerDelivery` projection
+
+Every run projection (`GET /v1/runs/:id`, the feature detail's
+`activeRun`/`activeRuns`, `GET /v1/features/:id/runs`, and the `run` field
+returned by this endpoint and by `/report`) additively carries
+`answerDelivery: {status: "pending" | "claimed", acceptedAt: <epoch ms>}`
+whenever an answer has been accepted for that run's question but not yet
+confirmed delivered. It sits alongside the run's existing
+`pendingQuestion` — the question stays visible, but `answerDelivery`'s
+presence tells a client the human has already acted and delivery is in
+flight, so the answer form should disable resubmission instead of
+offering it again or claiming the feature is already back to `running`.
+The field is **absent** once delivery is confirmed, fails, or was never
+accepted — existing clients that only read `pendingQuestion` see no shape
+change.
+
+#### Bounded delivery retry schedule and terminal behavior
+
+A delivery attempt that fails with a TRANSIENT classification
+(transport/capacity/upstream/timeout) is retried on a finite,
+exponentially-backed-off schedule — up to 5 attempts, 1s initial delay
+doubling to a 60s cap with full jitter, bounded by a 10-minute elapsed
+deadline measured from acceptance — the same class-default budget a
+step's own transient retries use. `answerDelivery.status` stays `pending`
+across these retries (a client sees no visible change between one and
+several transient retries); exhausting either bound concludes the step
+`failed` through the run's normal `retry`/`onFail` routing, exactly like
+a session-gone or terminal prompt error. A DETERMINISTIC/INVALID/INTERNAL
+prompt error is never retried — it routes to that same failure on its
+first attempt. This bound exists specifically so a persistently
+unreachable session/runner cannot keep a delivery `pending` — and,
+correspondingly, the feature `waiting_human` — forever.
+
+Confirming a delivery also verifies the run's currently open question is
+still the SAME one this delivery answers (not merely that some question
+is pending) — guarding against the delivery's at-least-once redelivery
+edge landing after the agent has already asked a newer question. A
+mismatch atomically cancels the stale delivery instead of confirming it,
+leaving the newer question completely untouched; the run's
+`pendingQuestion`/`answerDelivery` then reflect that newer question as
+normal.
 
 ## Workflow structure
 

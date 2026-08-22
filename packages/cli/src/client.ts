@@ -52,10 +52,23 @@ export class ApiError extends Error {
     readonly code: string,
     message: string,
     readonly requestId: string | null,
+    /** The full parsed JSON error body, when one was returned — carries
+     *  response-specific extra fields like `recover`'s `targets` on an
+     *  `ambiguous_target` 409. Null when the body was empty/unparseable. */
+    readonly body: unknown = null,
   ) {
     super(message)
     this.name = "ApiError"
   }
+}
+
+/** Present only while a durably accepted answer has not yet been
+ *  confirmed delivered — see `withAnswerDelivery` in
+ *  `packages/server/src/api.ts` (harden-interactive-answer-delivery task
+ *  3.1). Additive: an older daemon simply omits the field. */
+export interface RunAnswerDelivery {
+  readonly status: "pending" | "claimed"
+  readonly acceptedAt: number
 }
 
 export interface ActiveRun {
@@ -70,6 +83,8 @@ export interface ActiveRun {
   readonly outputs: Readonly<Record<string, string>>
   readonly reason: string | null
   readonly nudges: number
+  readonly pendingQuestion?: string | null
+  readonly answerDelivery?: RunAnswerDelivery
   readonly timeStarted: number
   readonly timeFinished: number | null
 }
@@ -203,11 +218,20 @@ export class ApiClient {
     return this.request("POST", `/v1/features/${encodeURIComponent(featureId)}/abandon`, {})
   }
 
-  recover(featureId: string, notes: string, options?: { readonly expectedVersion?: number; readonly idempotencyKey?: string }): Promise<CommandResult> {
+  recover(
+    featureId: string,
+    notes: string,
+    options?: {
+      readonly expectedVersion?: number
+      readonly idempotencyKey?: string
+      readonly target?: { readonly jobId: string; readonly stepId: string }
+    },
+  ): Promise<CommandResult> {
     return this.request("POST", `/v1/features/${encodeURIComponent(featureId)}/recover`, {
       notes,
       ...(options?.expectedVersion !== undefined ? { expectedVersion: options.expectedVersion } : {}),
       ...(options?.idempotencyKey !== undefined ? { idempotencyKey: options.idempotencyKey } : {}),
+      ...(options?.target !== undefined ? { target: options.target } : {}),
     })
   }
 
@@ -277,7 +301,7 @@ export class ApiClient {
           : null
       const code = typeof envelope?.code === "string" ? envelope.code : `http_${response.status}`
       const message = typeof envelope?.message === "string" ? envelope.message : `request failed with status ${response.status}`
-      throw new ApiError(response.status, code, message, requestId)
+      throw new ApiError(response.status, code, message, requestId, parsed)
     }
     return parsed as T
   }

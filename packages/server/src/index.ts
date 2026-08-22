@@ -11,6 +11,9 @@ export { migrations, runMigrations } from "./migrations.ts"
 export type { Migration } from "./migrations.ts"
 export { Store } from "./store.ts"
 export type {
+  AcceptAnswerResult,
+  AnswerDeliveryRecord,
+  AnswerDeliveryStatus,
   FeatureFilter,
   FeatureRecord,
   FindingCounts,

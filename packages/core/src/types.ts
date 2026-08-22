@@ -280,6 +280,16 @@ export type PipelineEvent =
   /** The step could NOT complete its work (crash, non-zero exit, timeout).
    *  Subject to the retry budget, then `onFail`. */
   | { readonly kind: "step.failed"; readonly jobId: string; readonly stepId: string; readonly reason: string }
+  /** The engine already scheduled (or was about to dispatch) a retry for
+   *  this step's last recorded failure, but the classified retry budget's
+   *  elapsed deadline (or, defensively, its attempt count) was exceeded
+   *  before the attempt could start — retry-budget spec: "the workflow
+   *  reaches its configured terminal route at the deadline without one
+   *  extra attempt". Routes exactly like an exhausted `step.failed`
+   *  (`onFail` if declared, else job failure) WITHOUT incrementing the
+   *  attempt counter again — the failed attempt this exhausts was already
+   *  recorded by the `step.failed` that scheduled it. */
+  | { readonly kind: "step.budget_exhausted"; readonly jobId: string; readonly stepId: string; readonly reason: string }
   | { readonly kind: "human.paused" }
   | { readonly kind: "human.resumed" }
   | { readonly kind: "human.abandoned" }

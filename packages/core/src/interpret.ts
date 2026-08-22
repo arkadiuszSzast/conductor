@@ -47,6 +47,7 @@ export function interpret(
     case "feature.start":     return onStart(workflow)
     case "step.completed":    return onCompleted(workflow, state, event.jobId, event.stepId, event.outcome ?? DEFAULT_OUTCOME, event.outputs)
     case "step.failed":       return onFailed(workflow, state, event.jobId, event.stepId, event.reason)
+    case "step.budget_exhausted": return onBudgetExhausted(workflow, state, event.jobId, event.stepId, event.reason)
     case "human.paused":      return buildTransition([{ kind: "pause" }], { status: "paused" })
     case "human.resumed":     return onResumed(workflow, state)
     case "human.abandoned":   return buildTransition([{ kind: "abandon" }], { status: "abandoned" })
@@ -557,6 +558,45 @@ function onFailed(
         },
       },
     },
+  )
+}
+
+/**
+ * The engine's durable retry-budget check (elapsed deadline, or defensively
+ * attempt count) exhausted before the scheduled attempt could start. Follows
+ * the EXACT SAME exhausted-budget route as `onFailed`'s attempts-exhausted
+ * branch (`onFail` if declared, else job failure) but does not touch the
+ * attempt counter — the attempt this exhausts already incremented it when
+ * the original `step.failed` scheduled the (now abandoned) retry.
+ */
+function onBudgetExhausted(
+  workflow: WorkflowDef,
+  state: FeatureState,
+  jobId: string,
+  stepId: string,
+  reason: string,
+): Transition {
+  const jobRuntime = state.jobs[jobId]
+  if (!jobRuntime || jobRuntime.currentStep !== stepId) {
+    return noopTransition(`stale budget exhaustion for "${jobId}/${stepId}"`)
+  }
+
+  const job = findJob(workflow, jobId)
+  const step = job && findStep(job, stepId)
+  if (!job || !step) {
+    return buildTransition(
+      [{ kind: "escalate", reason: `unknown step "${stepId}"` }],
+      { status: "escalated" },
+    )
+  }
+
+  const failedPatch: JobPatch = { steps: { [stepId]: { status: "failed" } } }
+  if (step.onFail === undefined) {
+    return onJobFailed(workflow, state, jobId, failedPatch, reason)
+  }
+  return applyRoute(
+    step.onFail, workflow, state, job, step, reason,
+    { jobs: { [jobId]: failedPatch } },
   )
 }
 
