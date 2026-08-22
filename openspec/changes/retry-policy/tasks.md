@@ -28,10 +28,12 @@
 - [x] 4.3 [cli] Add recover command and display active/waiting/blocked/escalated state with budget and diagnostics.
 - [x] 4.4 [web] Show whether agents are active, waiting for retry/resource, paused or stopped; add direct Recover control for recoverable escalations.
 - [x] 4.5 [test] Add API/CLI/UI contract tests for stale recovery rejection, idempotency, visibility and no false `running` indication.
+- [x] 4.6 [server][cli][web] Derive recovery choices from the current durable failed/blocked frontier, accept an explicit job/step target, and reject omitted ambiguous or stale targets without fallback.
+- [x] 4.7 [test] Cover historical deadline-exhausted waits, superseded failed runs, cross-kind history ordering, and parallel current failures so recovery never silently chooses the wrong target.
 
 ## 5. Migration, operations and review
 
 - [x] 5.1 [server][db] Normalize legacy inconsistent active features safely on reconciliation without replaying completed work.
-- [ ] 5.2 [docs] Document taxonomy, default policies, blocked/retry/recover semantics, pause barrier and operator runbook.
-- [ ] 5.3 [review] Review retry storms, clock and pause accounting, claim atomicity, secret-safe diagnostics and cross-change ownership with runner-protocol.
-- [ ] 5.4 [fix] Run full tests, typecheck, lint and build; resolve all regressions before dogfooding no-runner recovery.
+- [x] 5.2 [docs] Document taxonomy, default policies, blocked/retry/recover semantics, pause barrier and operator runbook. (Done: `docs/concepts.md` "Retries, failure classes and recovery", "Resume vs. recover" and "Operator runbook" sections; `docs/http-api.md` "Activity projection" and "Recovering an escalated feature"; `docs/workflow-reference.md` `steps[*].retry` notes the elapsed axis is class-default only, not yet YAML-overridable. Fixed a real engine gap found while writing this: the elapsed retry budget was persisted/displayed but never enforced — `packages/server/src/engine.ts`'s `scheduleDurableRetries` now calls `checkRetryBudget` before scheduling, and the reconciler's due-episode claim re-checks it defensively; both route through a new `step.budget_exhausted` pipeline event that reaches the same terminal route as an attempts-exhausted failure.)
+- [x] 5.3 [review] Review retry storms, clock and pause accounting, claim atomicity, secret-safe diagnostics and cross-change ownership with runner-protocol.
+- [x] 5.4 [fix] Run full tests, typecheck, lint and build; resolve all regressions before dogfooding no-runner recovery.

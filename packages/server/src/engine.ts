@@ -28,8 +28,10 @@ import { join } from "node:path"
 import {
   DEFAULT_OUTCOME,
   behaviourForClass,
+  boundDiagnostic,
   buildEvalContext,
   checkActiveStateInvariant,
+  checkRetryBudget,
   computeScheduledDelayMs,
   decideResourceWaitRoute,
   extractExpressions,
@@ -55,10 +57,12 @@ import type {
   FeatureState,
   PipelineEvent,
   StepDef,
+  Transition,
   WorkflowDef,
   WorkflowInputDiagnostic,
 } from "@conductor/core"
 import type { RunSummary, Store } from "./store.ts"
+import { applyPatch } from "./state.ts"
 import type { WorkflowResolver, WorkflowSnapshot } from "./workflow-registry.ts"
 import type { Clock, Logger, ProcessRunner, SessionClient } from "./ports.ts"
 import type { ActionExecutor } from "./action-host.ts"
@@ -68,6 +72,12 @@ import type { ResolvedActionBinding } from "./workflow-reservation.ts"
 const DEFAULT_RUN_TTL_MS = 3_600_000
 const DEFAULT_NUDGE_IDLE_CYCLES = 2
 const DEFAULT_MAX_NUDGES = 2
+/** Claim lease for an answer delivery attempt (harden-interactive-answer-
+ *  delivery): bounds how long a claimant has to confirm or fail delivery
+ *  before a crashed claimant's row becomes claimable again — same
+ *  purpose as the retry-episode/resource-wait claim, sized for a single
+ *  runner prompt round trip rather than a whole agent step. */
+const ANSWER_DELIVERY_LEASE_MS = 60_000
 
 export interface EngineDeps {
   readonly store: Store
@@ -112,6 +122,55 @@ export interface StartFeatureInput {
    *  the same as any other malformed payload a caller sends on purpose. */
   readonly inputs?: unknown
 }
+
+/** `Engine.answer`'s result contract — UNCHANGED wire shape across the
+ *  harden-interactive-answer-delivery durability rework (same codes, same
+ *  ok/message shape the API/CLI/web already handle). */
+export type AnswerResult =
+  | { readonly ok: true; readonly message: string }
+  | { readonly ok: false; readonly code: "unknown_run" | "no_pending_question" | "session_lost"; readonly message: string }
+
+/** Internal outcome of one `attemptAnswerDelivery` call — never exposed
+ *  across the engine boundary; `answer()`/`reconcile()` each map it to
+ *  their own caller-facing shape. */
+type AnswerDeliveryAttemptResult =
+  | { readonly kind: "delivered" }
+  | { readonly kind: "session_lost"; readonly message: string }
+  | { readonly kind: "transient"; readonly message: string }
+  | { readonly kind: "cancelled" }
+  | { readonly kind: "not_claimed" }
+
+/** `planFailureDisposition`'s pure computation result: what
+ *  `concludeAndDispatch` hands to `store.concludeRun` as ONE transaction
+ *  alongside the run's own conclusion. `decisions` always replaces the
+ *  interpreter's raw `transition.decisions` for both persistence and
+ *  dispatch; `retrySchedule`/`followUp` are the two disposition shapes
+ *  (durable retry vs. elapsed-budget exhaustion) and are mutually
+ *  exclusive. */
+type FailureDispositionPlan =
+  | {
+      readonly decisions: readonly Decision[]
+      readonly retrySchedule: {
+        readonly jobId: string
+        readonly stepId: string
+        readonly attempts: number
+        readonly startedAt: number
+        readonly pausedMs: number
+        readonly featurePausedMsAtStart: number
+        readonly nextAttemptAt: number
+        readonly delayMs: number
+        readonly scheduleSource: "backoff" | "retry_hint"
+        readonly maxAttempts: number
+        readonly maxElapsedMs: number
+        readonly failure: FailureEnvelope
+      }
+      readonly followUp?: never
+    }
+  | {
+      readonly decisions: readonly Decision[]
+      readonly retrySchedule?: never
+      readonly followUp: { readonly event: PipelineEvent; readonly transition: Transition }
+    }
 
 export class Engine {
   /**
@@ -414,7 +473,17 @@ export class Engine {
         ...(role.model !== undefined ? { model: role.model } : {}),
       })
     } catch (err) {
-      const reason = `failed to prompt session: ${errorMessage(err)}`
+      // Secret-safe diagnostics: a prompt exception's message can embed
+      // a huge upstream error body carrying a Bearer token/api_key/
+      // password (a proxy or provider echoing the failed request back)
+      // — `boundDiagnostic` redacts common credential shapes THEN
+      // truncates, applied here so the SAME bounded/redacted text lands
+      // in every downstream sink this `reason` reaches (run.reason,
+      // the `step.failed` event, and the transition-log entry
+      // `concludeAndDispatch`/`concludeRun` persist from it — never just
+      // the FailureEnvelope's own `diagnostic`, which `makeFailureEnvelope`
+      // already bounds separately).
+      const reason = boundDiagnostic(`failed to prompt session: ${errorMessage(err)}`)
       await this.concludeAndDispatch(
         featureId, runId, "failed",
         { reason, failure: makeFailureEnvelope({ class: classifyThrownBoundary(err), diagnostic: reason, source: "runner" }) },
@@ -451,7 +520,13 @@ export class Engine {
         // before; the log supplements it, never replaces it.
         if (result.output !== "") store.appendRunLog(runId, [{ source: "process", text: result.output }])
         if (result.code !== 0) {
-          failureReason = `"${command}" exited ${result.code}: ${result.output.slice(-4000)}`
+          // Secret-safe diagnostics: a failing command's captured output
+          // tail can carry a credential the command itself printed (a
+          // curl invocation logging its own Authorization header, a
+          // misconfigured tool dumping env). `boundDiagnostic` redacts
+          // common credential shapes before this becomes the durable
+          // run.reason/transition-log/API-visible failure text.
+          failureReason = boundDiagnostic(`"${command}" exited ${result.code}: ${result.output.slice(-4000)}`)
           failureClass = classifyProcessExit(result.code)
           break
         }
@@ -575,15 +650,26 @@ export class Engine {
           return
         }
         if (!result.ok) {
+          // Classification reads the RAW error text (never redacted —
+          // redaction only strips credential shapes, never the
+          // `capability_denied:`/exit-code markers classification keys
+          // on, but classifying on the post-redaction text would be one
+          // avoidable coupling between two independent concerns).
+          // Secret-safe diagnostics: an action's error can carry a
+          // credential (a bundled action's subprocess echoing a failed
+          // authenticated request) — bound/redact once here and reuse
+          // the SAME text for `run.reason`, the FailureEnvelope
+          // diagnostic, and the `step.failed` event reason.
           const failureClass: FailureClass = result.error.startsWith("capability_denied:")
             ? "invalid_config"
             : /exited 127/.test(result.error)
               ? "invalid_config"
               : "deterministic_failure"
+          const reason = boundDiagnostic(result.error)
           await this.concludeAndDispatch(
             featureId, runId, "failed",
-            { reason: result.error, failure: makeFailureEnvelope({ class: failureClass, diagnostic: result.error, source: "action" }) },
-            { kind: "step.failed", jobId, stepId, reason: result.error },
+            { reason, failure: makeFailureEnvelope({ class: failureClass, diagnostic: reason, source: "action" }) },
+            { kind: "step.failed", jobId, stepId, reason },
           )
           return
         }
@@ -593,7 +679,7 @@ export class Engine {
           { kind: "step.completed", jobId, stepId, outcome: DEFAULT_OUTCOME, outputs },
         )
       } catch (err) {
-        const reason = `action host error: ${errorMessage(err)}`
+        const reason = boundDiagnostic(`action host error: ${errorMessage(err)}`)
         await this.concludeAndDispatch(
           featureId, runId, "failed",
           { reason, failure: makeFailureEnvelope({ class: classifyThrownBoundary(err), diagnostic: reason, source: "action" }) },
@@ -624,11 +710,19 @@ export class Engine {
    * it — no further side effect should happen).
    *
    * When the conclusion is a classified failure and the interpreter
-   * decided to retry the same step, a non-zero backoff delay converts
-   * the immediate `execute_step` into a DURABLE scheduled retry (a
-   * `retry_episode` row the reconciler claims when due) — a daemon
-   * restart in the gap re-arms from the schedule instead of losing the
-   * attempt. Zero-delay policies keep the immediate dispatch.
+   * decided to retry the same step, `planFailureDisposition` computes
+   * (purely — no store writes) whether a non-zero backoff delay should
+   * convert the immediate `execute_step` into a DURABLE scheduled retry,
+   * or whether the elapsed retry budget is already exhausted and the
+   * step should instead route straight to its `step.budget_exhausted`
+   * terminal transition. Either way the plan's decisions/schedule/
+   * follow-up transition are handed to `store.concludeRun` as ONE
+   * transaction with the run's conclusion — a crash between "run
+   * concluded" and "its retry disposition recorded" is impossible: both
+   * land in the same commit, so a restarted reconciler never replays a
+   * stale immediate `execute_step` that bypasses backoff. Zero-delay
+   * policies (and non-failure conclusions) keep the plain immediate
+   * dispatch, unchanged.
    */
   private async concludeAndDispatch(
     featureId: string,
@@ -643,13 +737,32 @@ export class Engine {
     const snapshot = this.deps.workflows(state.projectDir)
     if (!snapshot) return false
     const transition = interpret(snapshot.workflow, state, event)
-    const claimed = store.concludeRun(runId, status, detail, event, transition)
-    if (!claimed) return false
+
+    const plan =
+      detail?.failure !== undefined && event.kind === "step.failed"
+        ? this.planFailureDisposition(featureId, runId, snapshot, state, event, detail.failure, transition)
+        : null
+    const decisions = plan?.decisions ?? transition.decisions
+
+    const result = store.concludeRun(runId, status, detail, event, transition, {
+      persistDecisions: decisions,
+      ...(plan?.retrySchedule ? { retrySchedule: plan.retrySchedule } : {}),
+      ...(plan?.followUp ? { followUp: plan.followUp } : {}),
+    })
+    if (!result.claimed) return false
     log.log(`feature=${state.slug} event=${event.kind} → ${transition.decisions.map(decisionLabel).join(",")}`)
 
-    let decisions = transition.decisions
-    if (detail?.failure !== undefined && event.kind === "step.failed") {
-      decisions = this.scheduleDurableRetries(featureId, snapshot, event, detail.failure, transition.decisions)
+    if (plan?.retrySchedule) {
+      log.log(
+        result.episode !== null
+          ? `feature=${state.slug}: retry of "${plan.retrySchedule.jobId}/${plan.retrySchedule.stepId}" scheduled in ${plan.retrySchedule.delayMs}ms (class ${plan.retrySchedule.failure.class}, ${plan.retrySchedule.scheduleSource})`
+          // A racing conclusion for the same job+step already owns the open
+          // episode: its own schedule fires the retry, so there is
+          // deliberately no immediate fallback dispatch here — that
+          // fallback was the schedule-contention bug (a second in-flight
+          // conclusion bypassing the owner's backoff).
+          : `feature=${state.slug}: "${plan.retrySchedule.jobId}/${plan.retrySchedule.stepId}" already has an open retry episode — its own schedule applies, no immediate dispatch`,
+      )
     }
     // Dispatch, THEN mark the outbox entry handled: a crash mid-dispatch
     // (e.g. during an agent's session creation) leaves the entry pending
@@ -661,58 +774,127 @@ export class Engine {
   }
 
   /**
-   * Converts an interpreter-decided immediate step retry into a durable
-   * scheduled one when its backoff delay is non-zero. The delay comes
-   * from the STEP's own `retry.backoff` when declared (the workflow
-   * author's word), else from the class-default policy — and an
-   * adapter's retry hint can only raise it within policy bounds. Returns
-   * the decision list with scheduled retries removed; everything else
-   * dispatches unchanged. Scheduling failure (a racing open episode)
-   * falls back to the immediate dispatch — never a lost attempt.
+   * Pure computation of a classified failure's retry disposition — no
+   * store writes, so `concludeAndDispatch` can hand the result straight
+   * to `store.concludeRun` as part of ONE transaction. Returns `null`
+   * when the transition has no matching `execute_step` decision to
+   * intercept (nothing to retry-schedule) OR the computed backoff delay
+   * is zero (immediate retry, unchanged behaviour) — both cases mean
+   * "dispatch `transition.decisions` exactly as the interpreter produced
+   * them", the caller's fallback.
+   *
+   * The delay comes from the STEP's own `retry.backoff` when declared
+   * (the workflow author's word), else from the class-default policy —
+   * an adapter's retry hint can only raise it within policy bounds.
+   *
+   * Before scheduling, the candidate attempt is checked against the
+   * class's elapsed retry budget via the pure `checkRetryBudget`
+   * (retry-budget spec: "the next computed attempt would start after the
+   * elapsed deadline ... it is not scheduled, and the workflow reaches
+   * its configured terminal route at the deadline without one extra
+   * attempt"). The interpreter already gates the ATTEMPTS bound before
+   * ever producing this `execute_step` decision, so this call's attempts
+   * axis is always satisfied here — only the elapsed axis can newly
+   * reject, and it routes through `step.budget_exhausted` (the SAME
+   * `onFail`/job-failure terminal route an attempts-exhausted failure
+   * takes) instead of scheduling — computed here as a `followUp`
+   * transition over `applyPatch(state, transition.patch)` (the state as
+   * it will read once the main transition lands) so it commits alongside
+   * the main transition instead of a second, separately-crashable step.
    */
-  private scheduleDurableRetries(
+  private planFailureDisposition(
     featureId: string,
+    runId: string,
     snapshot: WorkflowSnapshot,
+    state: FeatureState,
     event: Extract<PipelineEvent, { kind: "step.failed" }>,
     failure: FailureEnvelope,
-    decisions: readonly Decision[],
-  ): readonly Decision[] {
-    const { store, log, clock } = this.deps
-    const state = store.getFeature(featureId)
-    if (!state) return decisions
-    const kept: Decision[] = []
-    for (const decision of decisions) {
-      if (decision.kind !== "execute_step" || decision.jobId !== event.jobId || decision.stepId !== event.stepId) {
-        kept.push(decision)
-        continue
+    transition: Transition,
+  ): FailureDispositionPlan | null {
+    const { store, clock } = this.deps
+    const matchIndex = transition.decisions.findIndex(
+      decision => decision.kind === "execute_step" && decision.jobId === event.jobId && decision.stepId === event.stepId,
+    )
+    if (matchIndex === -1) return null
+
+    const step = findStep(snapshot.workflow, event.jobId, event.stepId)
+    const patchedState = applyPatch(state, transition.patch)
+    const attempts = patchedState.jobs[event.jobId]?.attempts[event.stepId] ?? 1
+    const classBehaviour = behaviourForClass(normalizeRetryPolicy(), failure.class)
+    const backoff = step !== undefined && step.retry.strategy === "backoff" ? step.retry.backoff : classBehaviour.backoff
+    const maxAttempts = step !== undefined && step.retry.strategy === "backoff" ? step.retry.maxAttempts : classBehaviour.budget.maxAttempts
+    const maxElapsedMs = classBehaviour.budget.maxElapsedMs
+    const schedule = computeScheduledDelayMs(backoff, attempts, systemRandom, failure.retryHintMs)
+    const now = clock.now()
+
+    // The streak's elapsed-budget anchor (`startedAt`) is inherited from
+    // the immediately preceding episode for this exact job+step when
+    // this failure continues an existing streak (attempts > 1) — never
+    // reset to "now" mid-streak, or the elapsed deadline could never be
+    // reached. With no prior episode (genuinely attempt 1, or every
+    // earlier attempt in the streak was an immediate zero-delay retry
+    // that never persisted a row) the anchor is the JUST-CONCLUDED run's
+    // own dispatch time (design.md: "max_elapsed starts immediately
+    // before first dispatch") — never "now", which would silently
+    // exclude however long that first attempt actually ran for from its
+    // own budget.
+    //
+    // `pausedMs` for the budget check is the streak's pause total
+    // computed FRESH here — feature cumulative paused_ms NOW (as of
+    // `now`, including any pause span still open at this instant) minus
+    // the streak's baseline snapshot — rather than trusting a stale
+    // per-episode column: the old per-episode `pausedMs` fold only ever
+    // covered spans while an episode was OPEN, silently losing pause
+    // time during an executing attempt (no open row for the pause-fold
+    // to land in, whether this is the first attempt with no episode yet
+    // or a later attempt whose previous episode already closed
+    // `attempt_dispatched`). Computing the delta at read time instead
+    // counts every pause span inside the streak exactly once, no matter
+    // when during the streak it happened.
+    const previousEpisode = store.listRetryEpisodes(featureId)
+      .filter(episode => episode.jobId === event.jobId && episode.stepId === event.stepId)
+      .at(-1)
+    const chained = attempts > 1 ? previousEpisode : undefined
+    const anchorRun = store.getRunById(runId)
+    const firstAttemptStartedAt = anchorRun?.timeStarted ?? now
+    const episodeStartedAtMs = chained?.startedAt ?? firstAttemptStartedAt
+    const featurePausedMsAtStart = chained?.featurePausedMsAtStart ?? anchorRun?.pausedMsAtDispatch ?? 0
+    const featurePausedMsNow = store.getFeaturePausedMsAsOf(featureId, now) ?? featurePausedMsAtStart
+    const pausedMs = Math.max(0, featurePausedMsNow - featurePausedMsAtStart)
+    const candidateAtMs = now + schedule.delayMs
+
+    const budget = checkRetryBudget({
+      attempts, maxAttempts, maxElapsedMs,
+      episodeStartedAtMs, pausedMs,
+      candidateAttemptAtMs: candidateAtMs,
+    })
+    const withoutRetriedStep = transition.decisions.filter((_, index) => index !== matchIndex)
+
+    if (!budget.ok) {
+      const elapsed = Math.max(0, now - episodeStartedAtMs - pausedMs)
+      const reason = budget.exhaustedBy === "attempts"
+        ? `"${event.jobId}/${event.stepId}" exhausted ${maxAttempts} attempt(s) for class "${failure.class}": ${failure.diagnostic}`
+        : `"${event.jobId}/${event.stepId}" exceeded ${maxElapsedMs}ms elapsed retry budget (${elapsed}ms elapsed) for class "${failure.class}": ${failure.diagnostic}`
+      const budgetEvent: PipelineEvent = { kind: "step.budget_exhausted", jobId: event.jobId, stepId: event.stepId, reason }
+      const budgetTransition = interpret(snapshot.workflow, patchedState, budgetEvent)
+      return {
+        decisions: [...withoutRetriedStep, ...budgetTransition.decisions],
+        followUp: { event: budgetEvent, transition: budgetTransition },
       }
-      const step = findStep(snapshot.workflow, event.jobId, event.stepId)
-      const attempts = state.jobs[event.jobId]?.attempts[event.stepId] ?? 1
-      const classBehaviour = behaviourForClass(normalizeRetryPolicy(), failure.class)
-      const backoff = step !== undefined && step.retry.strategy === "backoff" ? step.retry.backoff : classBehaviour.backoff
-      const maxAttempts = step !== undefined && step.retry.strategy === "backoff" ? step.retry.maxAttempts : classBehaviour.budget.maxAttempts
-      const schedule = computeScheduledDelayMs(backoff, attempts, systemRandom, failure.retryHintMs)
-      if (schedule.delayMs <= 0) {
-        kept.push(decision)
-        continue
-      }
-      const now = clock.now()
-      const episode = store.scheduleRetry({
-        featureId, jobId: event.jobId, stepId: event.stepId,
-        attempts, startedAt: now,
-        nextAttemptAt: now + schedule.delayMs, delayMs: schedule.delayMs, scheduleSource: schedule.source,
-        maxAttempts, maxElapsedMs: classBehaviour.budget.maxElapsedMs,
-        failure,
-      })
-      if (episode === null) {
-        kept.push(decision)
-        continue
-      }
-      log.log(
-        `feature=${state.slug}: retry of "${event.jobId}/${event.stepId}" scheduled in ${schedule.delayMs}ms (class ${failure.class}, ${schedule.source})`,
-      )
     }
-    return kept
+
+    if (schedule.delayMs <= 0) return null
+
+    return {
+      decisions: withoutRetriedStep,
+      retrySchedule: {
+        jobId: event.jobId, stepId: event.stepId,
+        attempts, startedAt: episodeStartedAtMs, pausedMs, featurePausedMsAtStart,
+        nextAttemptAt: candidateAtMs, delayMs: schedule.delayMs, scheduleSource: schedule.source,
+        maxAttempts, maxElapsedMs,
+        failure,
+      },
+    }
   }
 
   // --------------------------------------------------------------- reports
@@ -795,61 +977,190 @@ export class Engine {
   }
 
   /**
-   * Deliver a human's answer to an asking run: forward the notes into the
-   * run's LIVE session (that is the whole point — context is preserved),
-   * clear the pending question and return the feature to `running`. A
-   * dead session fails the step honestly through the normal step-failed
-   * path so retry/onFail semantics apply.
+   * Deliver a human's answer to an asking run. Acceptance is durable
+   * BEFORE any runner side effect (`store.acceptAnswer`) — the
+   * confirmation-of-effect split harden-interactive-answer-delivery adds
+   * ahead of the completion-decision outbox's existing discipline: a
+   * crash after this call returns cannot lose the operator's decision,
+   * only defer its delivery to reconciliation. Delivery itself (forward
+   * the notes into the run's LIVE session — that is the whole point,
+   * context is preserved) is attempted immediately for low latency via
+   * `attemptAnswerDelivery`, the SAME worker `reconcile()` uses to repair
+   * a crash or resume a paused delivery. A dead session or terminal
+   * prompt error fails the step honestly through the normal step-failed
+   * path so retry/onFail semantics apply; the accepted notes remain on
+   * the (now failed) delivery record for audit either way.
    */
-  async answer(runId: string, notes: string): Promise<{ ok: true; message: string } | { ok: false; code: "unknown_run" | "no_pending_question" | "session_lost"; message: string }> {
-    const { store, log } = this.deps
+  async answer(runId: string, notes: string): Promise<AnswerResult> {
+    const { store } = this.deps
     const run = store.getRunById(runId)
     if (!run) return { ok: false, code: "unknown_run", message: `Unknown run_id "${runId}".` }
 
-    // Claim first, act after — the same discipline as concludeAndDispatch.
-    // clearRunQuestion is a guarded transaction (`status = 'running' AND
-    // pending_question IS NOT NULL`), so of two racing answers exactly one
-    // wins; the loser maps to the same conflict as answering a non-asking
-    // run and never re-sends the prompt into the session.
-    if (!store.clearRunQuestion(runId)) {
+    const accepted = store.acceptAnswer(runId, notes)
+    if (accepted.kind === "not_asking" || accepted.kind === "run_not_active") {
       return { ok: false, code: "no_pending_question", message: `Run "${runId}" has no pending question.` }
     }
-
-    const failStep = async (reason: string, message: string): Promise<{ ok: false; code: "session_lost"; message: string }> => {
-      log.log(`answer ${runId}: ${reason} — failing the step`)
-      await this.concludeAndDispatch(
-        run.featureId, runId, "failed", { reason },
-        { kind: "step.failed", jobId: run.jobId, stepId: run.stepId, reason },
-      )
-      return { ok: false, code: "session_lost", message }
+    if (accepted.kind === "already_accepted") {
+      // Clarified decision ("Repeated answer while accepted-pending"): a
+      // second answer for the same question while the first is
+      // accepted-but-undelivered is a conflict, never an idempotent
+      // success and never a notes replacement — reuses the same wire
+      // code as "no pending question" since there is no caller
+      // idempotency key in the current contract to distinguish them.
+      return { ok: false, code: "no_pending_question", message: `Run "${runId}" already has an accepted answer awaiting delivery.` }
     }
 
-    const sessionAlive = run.sessionId !== null && (await this.deps.sessions.status(run.sessionId)) !== "missing"
+    // Clarified decision ("Pause interaction"): acceptance is durable
+    // regardless of pause, but the runner prompt side effect is never
+    // attempted while the feature is paused — the same scheduling
+    // barrier `listPendingAnswerDeliveries` enforces for reconciliation.
+    // The delivery stays pending; resuming and reconciling delivers it.
+    const feature = store.getFeature(run.featureId)
+    if (feature?.status === "paused") {
+      return {
+        ok: true,
+        message: `Answer accepted for step "${run.stepId}" — the feature is paused; delivery resumes once it is unpaused.`,
+      }
+    }
+
+    const attempt = await this.attemptAnswerDelivery(accepted.delivery.id)
+    if (attempt.kind === "session_lost") return { ok: false, code: "session_lost", message: attempt.message }
+    if (attempt.kind === "delivered") {
+      const after = store.getFeature(run.featureId)
+      return { ok: true, message: `Answer delivered to step "${run.stepId}". Feature is now: ${after?.status ?? "running"}.` }
+    }
+    // "transient" (a retryable prompt failure, released for the next
+    // attempt), "not_claimed" (a concurrent reconcile pass or another
+    // answer() call already claimed it) and "cancelled" (the run
+    // concluded in the gap) never fail the ANSWER call itself —
+    // acceptance already succeeded durably; reconciliation resolves the
+    // rest.
+    return { ok: true, message: `Answer accepted for step "${run.stepId}" — delivery to the session is in progress.` }
+  }
+
+  /**
+   * Claims and attempts one answer delivery — the shared worker
+   * `Engine.answer` (immediate, low-latency path) and `reconcile()`
+   * (restart/pause-resume/lease-expiry recovery path) both call. Returns
+   * a discriminated outcome instead of throwing so both callers can
+   * react without duplicating the classification logic.
+   */
+  private async attemptAnswerDelivery(deliveryId: string): Promise<AnswerDeliveryAttemptResult> {
+    const { store, log, clock } = this.deps
+    const claimed = store.claimAnswerDelivery(deliveryId, clock.now(), ANSWER_DELIVERY_LEASE_MS)
+    if (!claimed) return { kind: "not_claimed" }
+
+    const run = store.getRunById(claimed.runId)
+    if (!run || run.status !== "running") {
+      store.cancelAnswerDelivery(claimed.id, "run concluded before delivery could be attempted")
+      return { kind: "cancelled" }
+    }
+
+    const sessionId = claimed.targetSessionId ?? run.sessionId
+    const sessionAlive = sessionId !== null && (await this.deps.sessions.status(sessionId)) !== "missing"
     if (!sessionAlive) {
-      return failStep(
-        `session ${run.sessionId ?? "(none)"} was lost while waiting for a human answer`,
-        `The run's session is gone — step "${run.stepId}" failed and normal failure routing applies.`,
+      const reason = `session ${sessionId ?? "(none)"} was lost while waiting for a human answer`
+      store.failAnswerDelivery(claimed.id, reason)
+      log.log(`answer ${claimed.runId}: ${reason} — failing the step`)
+      await this.concludeAndDispatch(
+        run.featureId, run.id, "failed",
+        { reason, failure: makeFailureEnvelope({ class: "missing_session", diagnostic: reason, source: "answer" }) },
+        { kind: "step.failed", jobId: run.jobId, stepId: run.stepId, reason },
       )
+      return { kind: "session_lost", message: `The run's session is gone — step "${run.stepId}" failed and normal failure routing applies.` }
     }
 
     try {
       await this.deps.sessions.prompt({
-        sessionID: run.sessionId!,
+        sessionID: sessionId!,
         text:
-          `[conductor] The human answered your question:\n\n${notes}\n\n` +
+          `[conductor] The human answered your question:\n\n${claimed.notes}\n\n` +
           `Treat the answers as binding decisions. Continue step "${run.stepId}" and report ` +
-          `run_id="${runId}" with the appropriate outcome when done (or ask again if a further decision is needed).`,
+          `run_id="${run.id}" with the appropriate outcome when done (or ask again if a further decision is needed).\n\n` +
+          `[conductor delivery ${claimed.deliveryToken}]`,
       })
     } catch (err) {
-      return failStep(
-        `failed to deliver the answer to session ${run.sessionId}: ${errorMessage(err)}`,
-        `Delivering the answer failed — step "${run.stepId}" failed and normal failure routing applies.`,
+      const failureClass = classifyThrownBoundary(err)
+      // Secret-safe diagnostics: a prompt-delivery exception's message
+      // can embed a huge upstream error body carrying a credential —
+      // bound/redact once here so the SAME text lands in `run.reason`,
+      // the log line, the FailureEnvelope diagnostic, and (via
+      // `store.failAnswerDelivery`'s own `boundDiagnostic` call, applied
+      // again defense-in-depth) `answer_delivery.failure_detail`.
+      const reason = boundDiagnostic(`failed to deliver the answer to session ${sessionId}: ${errorMessage(err)}`)
+      // Transient weather (transport/capacity/upstream/timeout) keeps the
+      // delivery pending for BOUNDED reconciliation rather than clearing
+      // the question or failing the step — design.md risk: "Transient
+      // infrastructure errors keep the delivery pending". Review fix:
+      // bounded, not unconditional — the SAME class-default budget/
+      // backoff a step's own transient retries use
+      // (`behaviourForClass`/`computeScheduledDelayMs`/`checkRetryBudget`,
+      // matching `deadline_at`'s fixed acceptance-time deadline) caps how
+      // many attempts and how long this keeps retrying before it routes
+      // through normal run failure exactly like every other terminal
+      // delivery error. Everything else (deterministic/invalid/internal)
+      // is a terminal prompt error and routes through normal run
+      // conclusion immediately, unbudgeted.
+      if (isTransientFailureClass(failureClass)) {
+        const attempts = claimed.attemptCount + 1
+        const behaviour = behaviourForClass(normalizeRetryPolicy(), failureClass)
+        const now = clock.now()
+        const schedule = computeScheduledDelayMs(behaviour.backoff, attempts, systemRandom)
+        const candidateAtMs = now + schedule.delayMs
+        const budget = checkRetryBudget({
+          attempts,
+          maxAttempts: behaviour.budget.maxAttempts,
+          maxElapsedMs: behaviour.budget.maxElapsedMs,
+          episodeStartedAtMs: claimed.createdAt,
+          pausedMs: 0,
+          candidateAttemptAtMs: candidateAtMs,
+        })
+        if (budget.ok) {
+          store.scheduleAnswerDeliveryRetry(claimed.id, candidateAtMs)
+          log.log(`answer ${claimed.runId}: ${reason} — transient, retry ${attempts} scheduled in ${schedule.delayMs}ms`)
+          return { kind: "transient", message: reason }
+        }
+        const exhaustedReason = budget.exhaustedBy === "attempts"
+          ? `${reason} — exhausted ${behaviour.budget.maxAttempts} delivery attempt(s)`
+          : `${reason} — exceeded ${behaviour.budget.maxElapsedMs}ms elapsed delivery budget`
+        store.failAnswerDelivery(claimed.id, exhaustedReason)
+        log.log(`answer ${claimed.runId}: ${exhaustedReason} — failing the step`)
+        await this.concludeAndDispatch(
+          run.featureId, run.id, "failed",
+          { reason: exhaustedReason, failure: makeFailureEnvelope({ class: failureClass, diagnostic: exhaustedReason, source: "answer" }) },
+          { kind: "step.failed", jobId: run.jobId, stepId: run.stepId, reason: exhaustedReason },
+        )
+        return { kind: "session_lost", message: `Delivering the answer failed — step "${run.stepId}" failed and normal failure routing applies.` }
+      }
+      store.failAnswerDelivery(claimed.id, reason)
+      log.log(`answer ${claimed.runId}: ${reason} — failing the step`)
+      await this.concludeAndDispatch(
+        run.featureId, run.id, "failed",
+        { reason, failure: makeFailureEnvelope({ class: failureClass, diagnostic: reason, source: "answer" }) },
+        { kind: "step.failed", jobId: run.jobId, stepId: run.stepId, reason },
       )
+      return { kind: "session_lost", message: `Delivering the answer failed — step "${run.stepId}" failed and normal failure routing applies.` }
     }
 
-    this.idleCycles.delete(runId)
-    const after = store.getFeature(run.featureId)
-    return { ok: true, message: `Answer delivered to step "${run.stepId}". Feature is now: ${after?.status ?? "running"}.` }
+    const confirmed = store.confirmAnswerDelivered(claimed.id)
+    if (confirmed.kind === "not_claimed") {
+      // The prompt already landed in the session (an at-least-once edge
+      // — design.md: "Treat confirmation strength as a runner boundary"),
+      // but the run concluded in the gap before this could be confirmed.
+      // Cancel the record rather than leaving it claimed forever; there
+      // is no live question left to clear.
+      store.cancelAnswerDelivery(claimed.id, "run concluded before delivery could be confirmed")
+      return { kind: "cancelled" }
+    }
+    if (confirmed.kind === "stale_superseded") {
+      // `Store.confirmAnswerDelivered` already atomically cancelled this
+      // delivery WITHOUT touching the run's newer question — nothing left
+      // to do here but report it up.
+      log.log(`answer ${claimed.runId}: delivery superseded by a newer question — cancelled without clearing it`)
+      return { kind: "cancelled" }
+    }
+    this.idleCycles.delete(run.id)
+    return { kind: "delivered" }
   }
 
   /**
@@ -899,12 +1210,136 @@ export class Engine {
   // ------------------------------------------------------------ recovery
 
   /**
-   * Explicit operator recovery for an escalated feature: picks the first
-   * recoverable agent target (prefers a resource wait, else the latest
-   * failed run), requires a non-empty note, and re-arms exactly that
-   * step — never the whole workflow. A still-absent runner re-enters a
-   * fresh resource wait (the upsert's uniqueness keeps it to one open
-   * row per target); an available runner dispatches one new run.
+   * The API/CLI/web projection's read-only view of `recoveryCandidates`:
+   * every currently recoverable job/step target for an escalated
+   * feature, in the same order `recover()` would apply as the default
+   * (no-target) choice. Null when the feature is not escalated or has no
+   * resolvable workflow — recoverability is meaningless outside those.
+   */
+  recoverableTargets(featureId: string): readonly { readonly jobId: string; readonly stepId: string }[] | null {
+    const { store } = this.deps
+    const state = store.getFeature(featureId)
+    if (!state || state.status !== "escalated") return null
+    const snapshot = this.deps.workflows(state.projectDir)
+    if (!snapshot) return null
+    return this.recoveryCandidates(featureId, state, snapshot).map(({ jobId, stepId }) => ({ jobId, stepId }))
+  }
+
+  /**
+   * A currently recoverable job/step, derived from the DURABLE frontier
+   * (open resource waits, failed jobs' failed steps) — never from run
+   * history alone (retry-budget spec: "Historical resource wait is not
+   * the current failure"). `lastActivityAt` is history used ONLY to
+   * order/present candidates (most recent first); it never decides
+   * which candidate is selected.
+   */
+  private recoveryCandidates(
+    featureId: string,
+    state: FeatureState,
+    snapshot: WorkflowSnapshot,
+  ): Array<{ jobId: string; stepId: string; step: AgentStep | CommandStep | ActionStep; lastActivityAt: number }> {
+    const { store } = this.deps
+    const found = new Map<string, { jobId: string; stepId: string; step: AgentStep | CommandStep | ActionStep; lastActivityAt: number }>()
+    const add = (jobId: string, stepId: string, lastActivityAt: number): void => {
+      const key = `${jobId}\u0000${stepId}`
+      if (found.has(key)) return
+      const step = findStep(snapshot.workflow, jobId, stepId)
+      if (!step || step.type === "human") return
+      if (state.jobs[jobId]?.status === "succeeded") return
+      if (store.getActiveRunForStep(featureId, jobId, stepId)) return
+      found.set(key, { jobId, stepId, step, lastActivityAt })
+    }
+
+    for (const wait of store.listResourceWaits(featureId)) {
+      if (wait.status === "closed") continue
+      add(wait.jobId, wait.stepId, wait.updatedAt)
+    }
+    for (const [jobId, jobRuntime] of Object.entries(state.jobs)) {
+      if (jobRuntime.status !== "failed") continue
+      for (const [stepId, stepRuntime] of Object.entries(jobRuntime.steps)) {
+        if (stepRuntime.status !== "failed") continue
+        add(jobId, stepId, 0)
+      }
+    }
+
+    // The frontier is a durable projection of CURRENT job/step state, so
+    // it is empty only for legacy/stranded escalations that predate this
+    // projection (design.md: "Legacy stranded state is ambiguous — only
+    // reconstruct when target is unique; otherwise escalate with
+    // diagnostics instead of guessing"). Reconstruct from history ONLY
+    // when it points at exactly one job/step — never offer a guessed
+    // ambiguous set built from historical data alone.
+    if (found.size === 0) {
+      const legacy = new Map<string, { jobId: string; stepId: string; step: AgentStep | CommandStep | ActionStep; lastActivityAt: number }>()
+      const addLegacy = (jobId: string, stepId: string, lastActivityAt: number): void => {
+        const key = `${jobId}\u0000${stepId}`
+        if (legacy.has(key)) return
+        const step = findStep(snapshot.workflow, jobId, stepId)
+        if (!step || step.type === "human") return
+        if (state.jobs[jobId]?.status === "succeeded") return
+        if (store.getActiveRunForStep(featureId, jobId, stepId)) return
+        legacy.set(key, { jobId, stepId, step, lastActivityAt })
+      }
+      for (const wait of store.listResourceWaits(featureId)) {
+        if (wait.status === "closed" && wait.closedReason === "deadline_exhausted") addLegacy(wait.jobId, wait.stepId, wait.updatedAt)
+      }
+      for (const run of store.listRuns(featureId)) {
+        if (run.status === "failed" || run.status === "reaped") addLegacy(run.jobId, run.stepId, run.timeFinished ?? run.timeStarted)
+      }
+      if (legacy.size === 1) return [...legacy.values()]
+      return []
+    }
+
+    return [...found.values()].sort((a, b) => b.lastActivityAt - a.lastActivityAt)
+  }
+
+  /**
+   * Chains the target's latest retry episode (if any) into a fresh,
+   * finite-budget episode via `store.recoverRetryEpisode` (retry-budget
+   * spec: "the selected failed step receives a new finite budget…old
+   * failure history remains in the timeline"). Immediately closed: the
+   * attempt this recover dispatches happens directly (`executeAgent`/
+   * `executeCommand`/`executeAction`), not via the reconciler's due-
+   * schedule claim, so an OPEN episode row here would only block the
+   * next durable retry schedule for this job/step behind the "one open
+   * episode per target" uniqueness index. Best-effort: a missing prior
+   * episode or a lost CAS race never blocks the recover itself — the
+   * job-runtime attempt-counter reset in `recoverStepTargets` is the
+   * budget reset that actually governs the interpreter's next decision.
+   */
+  private resetRetryEpisodeForRecover(featureId: string, jobId: string, stepId: string, step: AgentStep | CommandStep | ActionStep): void {
+    const { store, clock } = this.deps
+    const latest = store
+      .listRetryEpisodes(featureId)
+      .filter(episode => episode.jobId === jobId && episode.stepId === stepId)
+      .at(-1)
+    if (!latest) return
+    const classBehaviour = behaviourForClass(normalizeRetryPolicy(), latest.lastFailure?.class ?? "internal")
+    const maxAttempts = step.retry.strategy === "backoff" ? step.retry.maxAttempts : classBehaviour.budget.maxAttempts
+    const recovered = store.recoverRetryEpisode(latest.id, latest.version, {
+      startedAt: clock.now(),
+      maxAttempts,
+      maxElapsedMs: classBehaviour.budget.maxElapsedMs,
+    })
+    if (recovered) store.closeRetryEpisode(recovered.id, "attempt_dispatched")
+  }
+
+  /**
+   * Explicit operator recovery for an escalated feature: derives the
+   * currently recoverable job/step target(s) from the durable frontier
+   * (`recoveryCandidates`), requires a non-empty note, and re-arms
+   * exactly ONE step — never the whole workflow. A still-absent runner
+   * re-enters a fresh resource wait (the upsert's uniqueness keeps it to
+   * one open row per target); an available runner dispatches one new
+   * run.
+   *
+   * `target` selects among several currently recoverable candidates
+   * (retry-budget spec: "Parallel failures require a selected target").
+   * Omitted with exactly one candidate recovers it (backwards
+   * compatible); omitted with several is rejected `ambiguous` listing
+   * them; a `target` absent from the candidate set is rejected
+   * `staleTarget` with NO fallback to another candidate (retry-budget
+   * spec: "Selected recovery target became stale").
    *
    * Optimistic concurrency (retry-policy 4.1): `expectedVersion` is the
    * feature's `updatedAt` the operator's view was rendered from — a
@@ -913,11 +1348,27 @@ export class Engine {
    * of double-arming. `idempotencyKey` dedupes retried deliveries of the
    * SAME logical recover (client retry after a network timeout): a key
    * already recorded on this feature returns success without re-arming.
+   * These checks run here as a fast preflight AND, authoritatively,
+   * inside `store.recoverStepTargets`'s own transaction — a race between
+   * the preflight and the commit is caught there, not silently missed.
    */
   async recover(
     featureId: string,
-    input: { readonly notes?: string; readonly expectedVersion?: number; readonly idempotencyKey?: string },
-  ): Promise<{ ok: boolean; message: string; readonly stale?: boolean; readonly duplicate?: boolean }> {
+    input: {
+      readonly notes?: string
+      readonly expectedVersion?: number
+      readonly idempotencyKey?: string
+      readonly target?: { readonly jobId: string; readonly stepId: string }
+    },
+  ): Promise<{
+    ok: boolean
+    message: string
+    readonly stale?: boolean
+    readonly duplicate?: boolean
+    readonly ambiguous?: boolean
+    readonly staleTarget?: boolean
+    readonly targets?: readonly { readonly jobId: string; readonly stepId: string }[]
+  }> {
     const { store, log } = this.deps
     const record = store.getFeatureRecord(featureId)
     if (!record) return { ok: false, message: `unknown feature "${featureId}"` }
@@ -941,64 +1392,70 @@ export class Engine {
     const snapshot = this.deps.workflows(state.projectDir)
     if (!snapshot) return { ok: false, message: `no valid workflow for ${state.projectDir}` }
 
-    // Collect EVERY recoverable agent target: open resource waits plus
-    // every failed job's failed agent step. Recovering only one of
-    // several failed siblings would leave the DAG re-escalating (all
-    // jobs terminal, one still failed) the moment the recovered step
-    // concludes. Only open waits count — a closed wait's job may have
-    // long succeeded, and re-arming it would redo finished work.
-    const targets = new Map<string, { jobId: string; stepId: string }>()
-    for (const wait of store.listResourceWaits(featureId)) {
-      if (wait.status === "closed") continue
-      targets.set(`${wait.jobId}\u0000${wait.stepId}`, { jobId: wait.jobId, stepId: wait.stepId })
-    }
-    for (const [jobId, jobRuntime] of Object.entries(state.jobs)) {
-      if (jobRuntime.status !== "failed") continue
-      for (const [stepId, stepRuntime] of Object.entries(jobRuntime.steps)) {
-        if (stepRuntime.status === "failed") targets.set(`${jobId}\u0000${stepId}`, { jobId, stepId })
-      }
-    }
-    if (targets.size === 0) {
-      const failed = store
-        .listRuns(featureId)
-        .filter(run => run.status === "failed" || run.status === "reaped")
-        .sort((a, b) => (b.timeFinished ?? b.timeStarted) - (a.timeFinished ?? a.timeStarted))[0]
-      if (failed) targets.set(`${failed.jobId}\u0000${failed.stepId}`, { jobId: failed.jobId, stepId: failed.stepId })
-    }
-
-    const recoverable: { jobId: string; stepId: string; step: AgentStep | CommandStep | ActionStep }[] = []
-    for (const target of targets.values()) {
-      const step = findStep(snapshot.workflow, target.jobId, target.stepId)
-      if (!step || step.type === "human") continue
-      if (store.getActiveRunForStep(featureId, target.jobId, target.stepId)) continue
-      recoverable.push({ jobId: target.jobId, stepId: target.stepId, step })
-    }
-    if (recoverable.length === 0) {
+    const candidates = this.recoveryCandidates(featureId, state, snapshot)
+    if (candidates.length === 0) {
       return { ok: false, message: "no recoverable failed or blocked step found — nothing to recover" }
     }
 
-    // Repair the DAG state FIRST: recovered jobs go back to running with
-    // their step as currentStep (the interpreter's completion guard
-    // requires it), and cascade-skipped jobs reset to pending so the
-    // cascade re-fires when the recovered jobs conclude. Without this
-    // the recovered run's conclusion is dropped as "stale" and the
-    // reconciler re-escalates on its next pass. The idempotency key is
-    // recorded in the SAME transaction — a client retry after this
-    // commit is a duplicate, before it re-runs the whole recover.
-    store.recoverStepTargets(
-      featureId,
-      recoverable.map(({ jobId, stepId }) => ({ jobId, stepId })),
-      input.idempotencyKey,
-    )
-
-    for (const { jobId, stepId, step } of recoverable) {
-      log.log(`feature=${state.slug} recover: re-arming ${step.type} step "${jobId}/${stepId}"`)
-      if (step.type === "agent") await this.executeAgent(featureId, snapshot, jobId, step)
-      else if (step.type === "command") await this.executeCommand(featureId, snapshot, jobId, step)
-      else await this.executeAction(featureId, snapshot, jobId, step)
+    let target = candidates[0]!
+    if (input.target !== undefined) {
+      const match = candidates.find(candidate => candidate.jobId === input.target!.jobId && candidate.stepId === input.target!.stepId)
+      if (!match) {
+        return {
+          ok: false,
+          staleTarget: true,
+          message: `target "${input.target.jobId}/${input.target.stepId}" is not currently recoverable (already resolved, active, or unknown) — refresh and select a current target`,
+        }
+      }
+      target = match
+    } else if (candidates.length > 1) {
+      const targets = candidates.map(candidate => ({ jobId: candidate.jobId, stepId: candidate.stepId }))
+      const list = targets.map(t => `"${t.jobId}/${t.stepId}"`).join(", ")
+      return {
+        ok: false,
+        ambiguous: true,
+        targets,
+        message: `multiple recoverable targets: ${list} — pass "target" ({jobId, stepId}) to select one`,
+      }
     }
-    const summary = recoverable.map(({ jobId, stepId }) => `"${jobId}/${stepId}"`).join(", ")
-    return { ok: true, message: `Recovered. Step(s) ${summary} re-armed.` }
+
+    // Repair the DAG state FIRST, atomically and authoritatively: recovered
+    // jobs go back to running with their step as currentStep (the
+    // interpreter's completion guard requires it), the recovered step's
+    // attempt counter resets to 0 (a fresh finite budget), and
+    // cascade-skipped jobs reset to pending so the cascade re-fires when
+    // the recovered jobs conclude. Without this the recovered run's
+    // conclusion is dropped as "stale" and the reconciler re-escalates on
+    // its next pass. The idempotency key is recorded in the SAME
+    // transaction — a client retry after this commit is a duplicate,
+    // before it re-runs the whole recover. Dispatch happens ONLY when
+    // this transaction actually won.
+    const txResult = store.recoverStepTargets(
+      featureId,
+      [{ jobId: target.jobId, stepId: target.stepId }],
+      { expectedVersion: input.expectedVersion, idempotencyKey: input.idempotencyKey },
+    )
+    switch (txResult) {
+      case "not_found":
+        return { ok: false, message: `unknown feature "${featureId}"` }
+      case "duplicate":
+        return { ok: true, duplicate: true, message: "Already recovered (idempotency key seen) — no new work armed." }
+      case "not_escalated":
+        return { ok: false, message: "feature is not escalated — recover only applies to escalated features" }
+      case "stale_version":
+        return { ok: false, stale: true, message: "feature changed since your view — refresh and retry" }
+      case "recovered":
+        break
+    }
+
+    this.resetRetryEpisodeForRecover(featureId, target.jobId, target.stepId, target.step)
+
+    const { jobId, stepId, step } = target
+    log.log(`feature=${state.slug} recover: re-arming ${step.type} step "${jobId}/${stepId}"`)
+    if (step.type === "agent") await this.executeAgent(featureId, snapshot, jobId, step)
+    else if (step.type === "command") await this.executeCommand(featureId, snapshot, jobId, step)
+    else await this.executeAction(featureId, snapshot, jobId, step)
+    return { ok: true, message: `Recovered. Step "${jobId}/${stepId}" re-armed.` }
   }
 
   // ------------------------------------------------------------ lifecycle
@@ -1030,7 +1487,9 @@ export class Engine {
       try {
         await this.reconcileFeature(feature)
       } catch (err) {
-        log.log(`reconcile ${feature.slug}: ${errorMessage(err)}`)
+        // Secret-safe diagnostics: an uncaught reconcile error could
+        // originate from a runner/process boundary carrying a credential.
+        log.log(`reconcile ${feature.slug}: ${boundDiagnostic(errorMessage(err))}`)
       }
     }
   }
@@ -1101,12 +1560,52 @@ export class Engine {
     // Due durable retries: claim and dispatch the scheduled step. The
     // claim is atomic (one winner), and actDecision's duplicate-run guard
     // prevents a second dispatch if the run already exists.
+    //
+    // Defensive elapsed-budget re-check at claim time (retry-budget spec:
+    // "the workflow reaches its configured terminal route at the
+    // deadline without one extra attempt"): `next_attempt_at` was inside
+    // the deadline when scheduled, but a daemon outage spanning the due
+    // time can leave `now()` past the elapsed deadline by the time this
+    // claim runs. Escalate instead of dispatching one attempt too many.
     for (const episode of store.listDueRetryEpisodes(clock.now())) {
       const claimed = store.claimRetryEpisode(episode.id, clock.now())
       if (!claimed) continue
+      const now = clock.now()
+      // Same snapshot-delta computation as `planFailureDisposition` —
+      // NOT `claimed.pausedMs` (the stale per-episode fold that misses
+      // pause spans during an executing attempt). The feature cannot be
+      // paused here (`listDueRetryEpisodes`/`claimRetryEpisode` both
+      // exclude a paused feature's episodes), so there is no in-progress
+      // span to worry about at this call site specifically — but reusing
+      // the same helper keeps the two call sites' arithmetic identical.
+      const featurePausedMsNow = store.getFeaturePausedMsAsOf(input.id, now) ?? claimed.featurePausedMsAtStart
+      const pausedMs = Math.max(0, featurePausedMsNow - claimed.featurePausedMsAtStart)
+      const elapsed = Math.max(0, now - claimed.startedAt - pausedMs)
+      if (elapsed > claimed.maxElapsedMs) {
+        store.closeRetryEpisode(episode.id, "elapsed_budget_exhausted_at_claim")
+        log.log(`reconcile ${input.slug}: due retry "${episode.jobId}/${episode.stepId}" claimed past its elapsed deadline (${elapsed}ms > ${claimed.maxElapsedMs}ms) — escalating instead of dispatching`)
+        await this.dispatch(input.id, {
+          kind: "step.budget_exhausted",
+          jobId: episode.jobId,
+          stepId: episode.stepId,
+          reason: `"${episode.jobId}/${episode.stepId}" exceeded ${claimed.maxElapsedMs}ms elapsed retry budget (${elapsed}ms elapsed) before the scheduled attempt could be claimed: ${claimed.lastFailure?.diagnostic ?? "no diagnostic"}`,
+        })
+        continue
+      }
       store.closeRetryEpisode(episode.id, "attempt_dispatched")
       log.log(`reconcile ${input.slug}: dispatching due retry "${episode.jobId}/${episode.stepId}"`)
       await this.actDecision(input.id, snapshot, { kind: "execute_step", jobId: episode.jobId, stepId: episode.stepId })
+    }
+
+    // Restart/pause-resume/lease-expiry recovery for accepted-but-
+    // undelivered answers: `listPendingAnswerDeliveries` already excludes
+    // paused features (the pause barrier), and `input.status === "paused"`
+    // above returns before reaching here anyway. Every branch of
+    // `attemptAnswerDelivery` is a durable state transition or a no-op —
+    // nothing here needs a caller-facing result.
+    for (const delivery of store.listPendingAnswerDeliveries(clock.now())) {
+      log.log(`reconcile ${input.slug}: attempting due answer delivery for run ${delivery.runId}`)
+      await this.attemptAnswerDelivery(delivery.id)
     }
 
     // Restart recovery runs FIRST, unconditionally: decisions committed
@@ -1131,6 +1630,30 @@ export class Engine {
       store.markRunActionHandled(pending.runId)
     }
 
+    // Replay durable recovery-dispatch intent: `recoverStepTargets`
+    // commits the DAG repair (feature → running, recovered step armed)
+    // BEFORE `Engine.recover` dispatches the run/wait that anchors it —
+    // a crash in that gap leaves a `running` feature with no anchor at
+    // all. Replayed here, BEFORE the invariant check below, so a crash
+    // right after `recoverStepTargets` never reaches the invariant as a
+    // stranded feature. `actDecision` supplies the active-run guard
+    // `executeAgent`/`executeCommand`/`executeAction` do NOT have
+    // themselves — calling it (rather than the execute* methods
+    // directly) makes replay safe to run again on every unhandled row
+    // until a durable anchor exists. Dispatch, THEN mark handled — same
+    // at-least-once discipline as the completion outbox: a second crash
+    // mid-replay leaves the row for the next pass, and re-dispatching a
+    // target that already has a run or wait is a guarded no-op.
+    for (const dispatch of store.getUnhandledRecoveryDispatches(input.id)) {
+      const hasActive = store.getActiveRunForStep(input.id, dispatch.jobId, dispatch.stepId) !== null
+      const hasWait = store.getOpenResourceWait(input.id, dispatch.jobId, dispatch.stepId) !== null
+      if (!hasActive && !hasWait) {
+        log.log(`reconcile ${input.slug}: replaying recovery dispatch for "${dispatch.jobId}/${dispatch.stepId}" (crash between recover's DAG repair and its own dispatch)`)
+        await this.actDecision(input.id, snapshot, { kind: "execute_step", jobId: dispatch.jobId, stepId: dispatch.stepId })
+      }
+      store.markRecoveryDispatchHandled(dispatch.id)
+    }
+
     const feature = store.getFeature(input.id) ?? input
     if (feature.status === "done" || feature.status === "abandoned") return
 
@@ -1147,7 +1670,13 @@ export class Engine {
       hasActiveRun: store.getActiveRun(feature.id) !== null,
       hasDueRetry: store.listRetryEpisodes(feature.id).some(episode => episode.status === "scheduled"),
       hasResourceWait: store.listResourceWaits(feature.id).some(wait => wait.status === "waiting"),
-      hasUnhandledOutboxDecision: store.getPendingRunAction(feature.id) !== null,
+      // The recovery-dispatch outbox above replays before this check
+      // runs, but its own dispatch can still leave a row unhandled here
+      // (e.g. the process crashed again mid-replay) — treated as the
+      // SAME kind of anchor the completion outbox already is, so the
+      // feature is not escalated out from under a recovery still in flight.
+      hasUnhandledOutboxDecision: store.getPendingRunAction(feature.id) !== null
+        || store.getUnhandledRecoveryDispatches(feature.id).length > 0,
     })
     if (invariant.kind === "stranded_legacy_failure" || invariant.kind === "stranded_no_anchor") {
       log.log(`reconcile ${feature.slug}: ${invariant.reason} — marking escalated`)
@@ -1296,7 +1825,9 @@ export class Engine {
                   `run_id="${active.id}" with the appropriate outcome.`,
               })
             } catch (err) {
-              log.log(`nudge failed: ${errorMessage(err)}`)
+              // Secret-safe diagnostics: a log line, but still built from
+              // a raw runner exception that could embed a credential.
+              log.log(`nudge failed: ${boundDiagnostic(errorMessage(err))}`)
             }
             return
           }
@@ -1484,4 +2015,12 @@ function classifyThrownBoundary(error: unknown): FailureClass {
   if (/502|503|504|bad gateway|service unavailable|gateway timeout/i.test(message)) return "transient_upstream"
   if (/timeout|timed out/i.test(message)) return "timeout"
   return "internal"
+}
+
+/** Transient weather classes keep an answer delivery pending for bounded
+ *  reconciliation instead of terminally failing the step — the same
+ *  transient/terminal split retry-policy's class-default budgets encode. */
+function isTransientFailureClass(failureClass: FailureClass): boolean {
+  return failureClass === "transient_upstream" || failureClass === "transient_transport"
+    || failureClass === "capacity" || failureClass === "timeout"
 }

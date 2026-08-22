@@ -530,6 +530,27 @@ describe("CLI: answer (interactive steps)", () => {
     expect(output).toContain("  Which storage?")
     expect(output).toContain("  SQLite or Postgres?")
   })
+
+  it("status <id> shows accepted-pending delivery instead of the answer hint, and a repeat answer maps to the conflict exit", async () => {
+    // harden-interactive-answer-delivery task 3.1: pausing first keeps
+    // the accepted answer undelivered (the runner prompt side effect is
+    // never attempted while paused) so the projection is observable.
+    const h = await makeHarness()
+    const { featureId, runId } = await startFeature(h)
+    await h.daemon.engine.report({ runId, ask: "Which storage?" })
+    await h.run("pause", featureId)
+
+    expect(await h.run("answer", runId, "--notes", "SQLite")).toBe(EXIT.ok)
+
+    h.out.length = 0
+    expect(await h.run("status", featureId)).toBe(EXIT.ok)
+    const output = h.out.join("\n")
+    expect(output).toContain("answer accepted, delivery in progress")
+    expect(output).not.toContain("conductor answer")
+
+    expect(await h.run("answer", runId, "--notes", "Postgres")).toBe(EXIT.conflict)
+    expect(h.err.join("\n")).toContain("no_pending_question")
+  })
 })
 
 describe("CLI: approve / request-changes", () => {
@@ -611,6 +632,65 @@ describe("CLI: pause / resume / abandon / logs", () => {
     expect(await h.run("logs", featureId, "--json")).toBe(EXIT.ok)
     const payload = JSON.parse(h.out.at(-1)!) as { timeline: Array<{ event: { kind: string } }> }
     expect(payload.timeline.some(t => t.event.kind === "feature.start")).toBe(true)
+  })
+})
+
+describe("CLI: recover", () => {
+  const fanInWorkflow = `
+name: fan-in
+on: [manual]
+roles:
+  implementer: { agent: build }
+jobs:
+  a:
+    steps:
+      - id: work
+        agent:
+          role: implementer
+          prompt: "work a"
+  b:
+    steps:
+      - id: work
+        agent:
+          role: implementer
+          prompt: "work b"
+`
+
+  it("--job requires --step and vice versa", async () => {
+    const h = await makeHarness()
+    const { featureId } = await startFeature(h)
+    expect(await h.run("recover", featureId, "--notes", "go", "--job", "main")).toBe(EXIT.usage)
+    expect(h.err.join("\n")).toContain("--job and --step must be given together")
+    h.err.length = 0
+    expect(await h.run("recover", featureId, "--notes", "go", "--step", "implement")).toBe(EXIT.usage)
+    expect(h.err.join("\n")).toContain("--job and --step must be given together")
+  })
+
+  it("an ambiguous recover across two parallel failed jobs prints the candidate targets and exits non-zero; --job/--step selects one", async () => {
+    const h = await makeHarness({ workflow: fanInWorkflow })
+    const code = await h.run("start", "Ship it", "--project", h.project, "--json")
+    expect(code).toBe(EXIT.ok)
+    const started = JSON.parse(h.out.pop()!) as { feature: { id: string } }
+    const featureId = started.feature.id
+
+    const runA = h.daemon.store.getActiveRunForStep(featureId, "a", "work")!
+    const runB = h.daemon.store.getActiveRunForStep(featureId, "b", "work")!
+    await h.daemon.engine.report({ runId: runA.id, outcome: "failed", notes: "a broke" })
+    await h.daemon.engine.report({ runId: runB.id, outcome: "failed", notes: "b broke" })
+    expect(h.daemon.store.getFeature(featureId)!.status).toBe("escalated")
+
+    h.out.length = 0
+    h.err.length = 0
+    expect(await h.run("recover", featureId, "--notes", "retry both")).toBe(EXIT.conflict)
+    expect(h.err.join("\n")).toContain("ambiguous_target")
+    expect(h.err.join("\n")).toContain("--job a --step work")
+    expect(h.err.join("\n")).toContain("--job b --step work")
+
+    h.out.length = 0
+    h.err.length = 0
+    expect(await h.run("recover", featureId, "--notes", "retry a", "--job", "a", "--step", "work")).toBe(EXIT.ok)
+    expect(h.out.join("\n")).toContain('Step "a/work" re-armed')
+    expect(h.daemon.store.getActiveRunForStep(featureId, "a", "work")).not.toBeNull()
   })
 })
 

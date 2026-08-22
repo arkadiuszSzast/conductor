@@ -11,6 +11,7 @@ export type {
   FindingView,
   ReportInput,
   ReportResult,
+  RunAnswerDelivery,
   RunDetail,
   RunSummary,
   StartFeatureInput,

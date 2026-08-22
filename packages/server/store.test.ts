@@ -183,11 +183,11 @@ describe("concludeRun", () => {
     const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
     const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 1 })
     const event: PipelineEvent = { kind: "step.completed", jobId: "main", stepId: "implement", outcome: "done", outputs: { report: "done" } }
-    const ok = store.concludeRun(runId, "succeeded", { outputs: { report: "done" } }, event, {
+    const result = store.concludeRun(runId, "succeeded", { outputs: { report: "done" } }, event, {
       decisions: [{ kind: "execute_step", jobId: "main", stepId: "review" }],
       patch: jobRunningPatch("main", "review"),
     })
-    expect(ok).toBe(true)
+    expect(result.claimed).toBe(true)
     expect(store.getRunById(runId)).toMatchObject({ status: "succeeded", outputs: { report: "done" } })
     expect(store.getFeature(feature.id)?.jobs["main"]?.currentStep).toBe("review")
     const log = store.getTransitions(feature.id)
@@ -203,13 +203,13 @@ describe("concludeRun", () => {
       decisions: [{ kind: "execute_step", jobId: "main", stepId: "review" }],
       patch: jobRunningPatch("main", "review"),
     }
-    expect(store.concludeRun(runId, "succeeded", { outputs: { report: "done" } }, event, transition)).toBe(true)
+    expect(store.concludeRun(runId, "succeeded", { outputs: { report: "done" } }, event, transition).claimed).toBe(true)
 
     const duplicate = store.concludeRun(runId, "succeeded", { outputs: { report: "duplicate" } }, event, {
       decisions: [{ kind: "execute_step", jobId: "main", stepId: "merge" }],
       patch: jobRunningPatch("main", "merge"),
     })
-    expect(duplicate).toBe(false)
+    expect(duplicate.claimed).toBe(false)
     expect(store.getFeature(feature.id)?.jobs["main"]?.currentStep).toBe("review")
     expect(store.getTransitions(feature.id)).toHaveLength(1)
     expect(store.getRunById(runId)?.outputs).toEqual({ report: "done" })

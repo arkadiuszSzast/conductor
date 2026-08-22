@@ -146,6 +146,30 @@ describe("deriveGateSurfaces", () => {
     expect(surfaces.askingRuns).toEqual([])
   })
 
+  it("carries answerDelivery through to the asking-run surface when accepted-pending (harden-interactive-answer-delivery 3.1)", () => {
+    const d = detail({ jobs: {} })
+    const surfaces = deriveGateSurfaces(d, [
+      run({
+        id: "run-1",
+        jobId: "explore",
+        stepId: "investigate",
+        pendingQuestion: "Which storage?",
+        answerDelivery: { status: "pending", acceptedAt: 100 },
+      }),
+    ])
+    expect(surfaces.askingRuns).toEqual([
+      { runId: "run-1", jobId: "explore", stepId: "investigate", prompt: "Which storage?", answerDelivery: { status: "pending", acceptedAt: 100 } },
+    ])
+  })
+
+  it("omits answerDelivery on the surface when the run carries none", () => {
+    const d = detail({ jobs: {} })
+    const surfaces = deriveGateSurfaces(d, [
+      run({ id: "run-1", jobId: "explore", stepId: "investigate", pendingQuestion: "Which storage?" }),
+    ])
+    expect(surfaces.askingRuns[0]!.answerDelivery).toBeUndefined()
+  })
+
   it("mixed scenario: waiting gates and asking runs coexist independently", () => {
     const d = detail({
       jobs: { review: jobRuntime({ status: "running", steps: { approve: { status: "waiting_human", outputs: {}, prompt: "merge?" } } }) },

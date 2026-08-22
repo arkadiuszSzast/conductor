@@ -108,6 +108,26 @@ jobs:
           prompt: "Implement {{ inputs.feature }} (count {{ inputs.count }}, dryRun {{ inputs.dryRun }})."
 `
 
+const fanInWorkflow = `
+name: fan-in
+on: [manual]
+roles:
+  implementer: { agent: build }
+jobs:
+  a:
+    steps:
+      - id: work
+        agent:
+          role: implementer
+          prompt: "work a"
+  b:
+    steps:
+      - id: work
+        agent:
+          role: implementer
+          prompt: "work b"
+`
+
 function writeProject(source: string = agentWorkflow): string {
   const project = tempDir("conductor-api-project-")
   writeFileSync(join(project, "conductor.yaml"), source)
@@ -1017,6 +1037,97 @@ describe("API: human gates", () => {
   })
 })
 
+describe("API: recover", () => {
+  it("an ambiguous recover across two parallel failed jobs returns 409 ambiguous_target with the candidate targets; a targeted recover passes target through and re-arms exactly one", async () => {
+    const { request, project, daemon } = await makeApi({ workflow: fanInWorkflow })
+    const feature = await startFeature(request, project)
+    const runA = daemon.store.getActiveRunForStep(feature.id, "a", "work")!
+    const runB = daemon.store.getActiveRunForStep(feature.id, "b", "work")!
+    expect((await request("POST", `/v1/runs/${runA.id}/report`, { outcome: "failed", notes: "a broke" })).status).toBe(200)
+    expect((await request("POST", `/v1/runs/${runB.id}/report`, { outcome: "failed", notes: "b broke" })).status).toBe(200)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("escalated")
+
+    const ambiguous = await request("POST", `/v1/features/${feature.id}/recover`, { notes: "retry both" })
+    expect(ambiguous.status).toBe(409)
+    const ambiguousBody = (await ambiguous.json()) as { error: { code: string }; targets: Array<{ jobId: string; stepId: string }> }
+    expect(ambiguousBody.error.code).toBe("ambiguous_target")
+    expect(ambiguousBody.targets).toEqual(
+      expect.arrayContaining([
+        { jobId: "a", stepId: "work" },
+        { jobId: "b", stepId: "work" },
+      ]),
+    )
+    expect(ambiguousBody.targets).toHaveLength(2)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("escalated")
+
+    const targeted = await request("POST", `/v1/features/${feature.id}/recover`, {
+      notes: "retry a",
+      target: { jobId: "a", stepId: "work" },
+    })
+    expect(targeted.status).toBe(200)
+    const targetedBody = (await targeted.json()) as { result: string }
+    expect(targetedBody.result).toContain('"a/work"')
+    expect(daemon.store.getActiveRunForStep(feature.id, "a", "work")).not.toBeNull()
+    expect(daemon.store.getFeature(feature.id)?.jobs["b"]?.status).toBe("failed")
+  })
+
+  it("a stale target (its job already succeeded) returns 409 stale_target and never re-arms anything", async () => {
+    const { request, project, daemon } = await makeApi({ workflow: fanInWorkflow })
+    const feature = await startFeature(request, project)
+    const runA = daemon.store.getActiveRunForStep(feature.id, "a", "work")!
+    const runB = daemon.store.getActiveRunForStep(feature.id, "b", "work")!
+    expect((await request("POST", `/v1/runs/${runA.id}/report`, { outcome: "succeeded", notes: "a done" })).status).toBe(200)
+    expect((await request("POST", `/v1/runs/${runB.id}/report`, { outcome: "failed", notes: "b broke" })).status).toBe(200)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("escalated")
+
+    const stale = await request("POST", `/v1/features/${feature.id}/recover`, {
+      notes: "retry a anyway",
+      target: { jobId: "a", stepId: "work" },
+    })
+    expect(stale.status).toBe(409)
+    const staleBody = (await stale.json()) as { error: { code: string } }
+    expect(staleBody.error.code).toBe("stale_target")
+    expect(daemon.store.getActiveRunForStep(feature.id, "a", "work")).toBeNull()
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("escalated")
+  })
+
+  it("rejects a malformed target shape with invalid_request", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    expect((await request("POST", `/v1/runs/${run.id}/report`, { outcome: "failed", notes: "broke" })).status).toBe(200)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("escalated")
+
+    const response = await request("POST", `/v1/features/${feature.id}/recover`, { notes: "go", target: { jobId: "main" } })
+    expect(response.status).toBe(400)
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe("invalid_request")
+  })
+
+  it("the feature detail exposes recoverableTargets only while escalated, listing every current candidate", async () => {
+    const { request, project, daemon } = await makeApi({ workflow: fanInWorkflow })
+    const feature = await startFeature(request, project)
+    const runA = daemon.store.getActiveRunForStep(feature.id, "a", "work")!
+    const runB = daemon.store.getActiveRunForStep(feature.id, "b", "work")!
+
+    const beforeDetail = await request("GET", `/v1/features/${feature.id}`)
+    const beforeBody = (await beforeDetail.json()) as { feature: { recoverableTargets?: unknown } }
+    expect(beforeBody.feature.recoverableTargets).toBeUndefined()
+
+    expect((await request("POST", `/v1/runs/${runA.id}/report`, { outcome: "failed", notes: "a broke" })).status).toBe(200)
+    expect((await request("POST", `/v1/runs/${runB.id}/report`, { outcome: "failed", notes: "b broke" })).status).toBe(200)
+
+    const afterDetail = await request("GET", `/v1/features/${feature.id}`)
+    const afterBody = (await afterDetail.json()) as { feature: { recoverableTargets?: Array<{ jobId: string; stepId: string }> } }
+    expect(afterBody.feature.recoverableTargets).toEqual(
+      expect.arrayContaining([
+        { jobId: "a", stepId: "work" },
+        { jobId: "b", stepId: "work" },
+      ]),
+    )
+    expect(afterBody.feature.recoverableTargets).toHaveLength(2)
+  })
+})
+
 describe("API: run reports", () => {
   it("reports an outcome through the engine and advances the feature", async () => {
     const { request, project, daemon } = await makeApi()
@@ -1097,6 +1208,78 @@ jobs:
     expect(response.status).toBe(200)
     const body = (await response.json()) as { run: { id: string; stepId: string; status: string } }
     expect(body.run).toMatchObject({ id: run.id, stepId: "implement", status: "running" })
+  })
+})
+
+describe("API: answer delivery projection (harden-interactive-answer-delivery 3.1)", () => {
+  const interactiveWorkflow = `
+name: interactive
+on: [manual]
+roles:
+  implementer: { agent: build }
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Implement it."
+          interactive: true
+`
+
+  it("adds answerDelivery while an accepted answer is not yet delivered, and it disappears once delivered", async () => {
+    const { request, project, daemon } = await makeApi({ workflow: interactiveWorkflow })
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    await request("POST", `/v1/runs/${run.id}/report`, { ask: "Which storage?" })
+
+    // Pause so the runner prompt side effect is never attempted — the
+    // delivery stays durably accepted-pending and the projection is
+    // observable rather than immediately delivered.
+    await request("POST", `/v1/features/${feature.id}/pause`, {})
+
+    const beforeAnswer = await request("GET", `/v1/runs/${run.id}`)
+    const beforeBody = (await beforeAnswer.json()) as { run: { pendingQuestion: string | null; answerDelivery?: unknown } }
+    expect(beforeBody.run.pendingQuestion).toBe("Which storage?")
+    expect(beforeBody.run.answerDelivery).toBeUndefined()
+
+    const answered = await request("POST", `/v1/runs/${run.id}/answer`, { notes: "SQLite" })
+    expect(answered.status).toBe(200)
+    const answeredBody = (await answered.json()) as { run: { pendingQuestion: string | null; answerDelivery?: { status: string; acceptedAt: number } } }
+    expect(answeredBody.run.pendingQuestion).toBe("Which storage?")
+    expect(answeredBody.run.answerDelivery).toBeDefined()
+    expect(answeredBody.run.answerDelivery!.status).toBe("pending")
+    expect(typeof answeredBody.run.answerDelivery!.acceptedAt).toBe("number")
+
+    // Same shape from GET /v1/runs/:id and from the feature detail's
+    // activeRun/activeRuns projections while accepted-pending.
+    const detailWhilePending = await request("GET", `/v1/features/${feature.id}`)
+    const detailPendingBody = (await detailWhilePending.json()) as {
+      activeRun: { answerDelivery?: { status: string } } | null
+      activeRuns: readonly { answerDelivery?: { status: string } }[]
+    }
+    expect(detailPendingBody.activeRun?.answerDelivery?.status).toBe("pending")
+    expect(detailPendingBody.activeRuns[0]?.answerDelivery?.status).toBe("pending")
+
+    const listRuns = await request("GET", `/v1/features/${feature.id}/runs`)
+    const listRunsBody = (await listRuns.json()) as { runs: readonly { id: string; answerDelivery?: { status: string } }[] }
+    expect(listRunsBody.runs.find(r => r.id === run.id)?.answerDelivery?.status).toBe("pending")
+
+    // An accepted-pending delivery must never be reported as the
+    // feature already running again — it stays whatever non-running
+    // state it was in (here, paused, since delivery is deferred).
+    const featureWhilePending = (await (await request("GET", `/v1/features/${feature.id}`)).json()) as { feature: { status: string } }
+    expect(featureWhilePending.feature.status).not.toBe("running")
+
+    // Resume so reconciliation can deliver the accepted answer.
+    await request("POST", `/v1/features/${feature.id}/resume`, {})
+    await daemon.engine.reconcile()
+
+    const afterDelivery = await request("GET", `/v1/runs/${run.id}`)
+    const afterBody = (await afterDelivery.json()) as { run: { pendingQuestion: string | null; answerDelivery?: unknown } }
+    expect(afterBody.run.pendingQuestion).toBeNull()
+    expect(afterBody.run.answerDelivery).toBeUndefined()
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("running")
   })
 })
 

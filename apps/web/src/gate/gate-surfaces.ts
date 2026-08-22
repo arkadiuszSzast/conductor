@@ -13,7 +13,7 @@
  * operator navigate between concurrent asking runs.
  */
 
-import type { FeatureDetail, RunSummary } from "../api/types.ts"
+import type { FeatureDetail, RunAnswerDelivery, RunSummary } from "../api/types.ts"
 
 export interface GateStepSurface {
   readonly jobId: string
@@ -27,6 +27,11 @@ export interface AskingRunSurface {
   readonly jobId: string
   readonly stepId: string
   readonly prompt: string
+  /** Set while a human answer was already accepted for this run and is
+   *  still pending/claimed for delivery — harden-interactive-answer-
+   *  delivery task 3.1. The answering surface uses this to disable
+   *  resubmission without the feature falsely reporting `running`. */
+  readonly answerDelivery?: RunAnswerDelivery
 }
 
 export interface GateSurfaces {
@@ -61,7 +66,13 @@ export function deriveGateSurfaces(
 
   const askingRuns: AskingRunSurface[] = activeRuns
     .filter((run): run is RunSummary & { pendingQuestion: string } => run.pendingQuestion != null)
-    .map(run => ({ runId: run.id, jobId: run.jobId, stepId: run.stepId, prompt: run.pendingQuestion }))
+    .map(run => ({
+      runId: run.id,
+      jobId: run.jobId,
+      stepId: run.stepId,
+      prompt: run.pendingQuestion,
+      ...(run.answerDelivery !== undefined ? { answerDelivery: run.answerDelivery } : {}),
+    }))
     .sort((a, b) => (a.jobId === b.jobId ? a.stepId.localeCompare(b.stepId) : a.jobId.localeCompare(b.jobId)))
 
   return { gates, askingRuns }

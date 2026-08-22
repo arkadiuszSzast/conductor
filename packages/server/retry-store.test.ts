@@ -4,7 +4,7 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { openMigratedDatabase, type DatabaseConnection } from "./src/database.ts"
 import { Store } from "./src/store.ts"
-import type { FailureEnvelope } from "@conductor/core"
+import type { FailureEnvelope, PipelineEvent, Transition } from "@conductor/core"
 
 let directory: string
 let connection: DatabaseConnection
@@ -586,6 +586,89 @@ describe("pause accounting", () => {
   })
 })
 
+describe("getFeaturePausedMsAsOf — cumulative pause total including an in-progress span", () => {
+  it("returns the closed cumulative total when not currently paused", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    expect(store.getFeaturePausedMsAsOf(feature.id, Date.now())).toBe(0)
+
+    store.applyTransition(feature.id, { kind: "human.paused" }, { decisions: [{ kind: "pause" }], patch: { status: "paused" } })
+    connection.db.run("UPDATE feature SET paused_at = paused_at - 5000 WHERE id = ?", [feature.id])
+    store.applyTransition(feature.id, { kind: "human.resumed" }, { decisions: [], patch: { status: "running" } })
+    const closed = store.getPauseAccounting(feature.id)!.pausedMs
+    expect(closed).toBeGreaterThanOrEqual(5000)
+    expect(store.getFeaturePausedMsAsOf(feature.id, Date.now())).toBe(closed)
+  })
+
+  it("includes the OPEN span (paused_at set, not yet folded) as of the given instant", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    store.applyTransition(feature.id, { kind: "human.paused" }, { decisions: [{ kind: "pause" }], patch: { status: "paused" } })
+    connection.db.run("UPDATE feature SET paused_at = paused_at - 5000 WHERE id = ?", [feature.id])
+    // Still paused — pausedMs (the closed-only column) is 0, but the
+    // cumulative-as-of reading must count the 5000ms open span.
+    expect(store.getPauseAccounting(feature.id)!.pausedMs).toBe(0)
+    expect(store.getFeaturePausedMsAsOf(feature.id, Date.now())).toBeGreaterThanOrEqual(5000)
+  })
+
+  it("returns null for a feature that does not exist", () => {
+    expect(store.getFeaturePausedMsAsOf("no-such-feature", Date.now())).toBeNull()
+  })
+})
+
+describe("streak pause-snapshot plumbing: insertRun/scheduleRetry/recoverRetryEpisode", () => {
+  it("insertRun snapshots the feature's cumulative paused_ms at dispatch time", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    store.applyTransition(feature.id, { kind: "human.paused" }, { decisions: [{ kind: "pause" }], patch: { status: "paused" } })
+    connection.db.run("UPDATE feature SET paused_at = paused_at - 4000 WHERE id = ?", [feature.id])
+    store.applyTransition(feature.id, { kind: "human.resumed" }, { decisions: [], patch: { status: "running" } })
+    const cumulative = store.getPauseAccounting(feature.id)!.pausedMs
+    expect(cumulative).toBeGreaterThanOrEqual(4000)
+
+    const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 1 })
+    expect(store.getRunById(runId)!.pausedMsAtDispatch).toBe(cumulative)
+  })
+
+  it("scheduleRetry persists an explicit featurePausedMsAtStart, defaulting to 0 when omitted", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const withSnapshot = store.scheduleRetry({
+      featureId: feature.id, jobId: "main", stepId: "implement",
+      attempts: 1, startedAt: 1000, featurePausedMsAtStart: 4200, nextAttemptAt: 2000, delayMs: 1000,
+      scheduleSource: "backoff", maxAttempts: 5, maxElapsedMs: 60_000, failure: failure(),
+    })
+    expect(withSnapshot).toMatchObject({ featurePausedMsAtStart: 4200 })
+
+    const feature2 = store.createFeature({ title: "F2", slug: "f2", projectDir: "/p", workflow: "wf" })
+    const withoutSnapshot = store.scheduleRetry({
+      featureId: feature2.id, jobId: "main", stepId: "implement",
+      attempts: 1, startedAt: 1000, nextAttemptAt: 2000, delayMs: 1000,
+      scheduleSource: "backoff", maxAttempts: 5, maxElapsedMs: 60_000, failure: failure(),
+    })
+    expect(withoutSnapshot).toMatchObject({ featurePausedMsAtStart: 0 })
+  })
+
+  it("recoverRetryEpisode resets featurePausedMsAtStart to the feature's cumulative paused_ms AT RECOVERY TIME, not 0 and not the recovered episode's old snapshot", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const original = store.scheduleRetry({
+      featureId: feature.id, jobId: "main", stepId: "implement",
+      attempts: 1, startedAt: 1000, featurePausedMsAtStart: 999, nextAttemptAt: 2000, delayMs: 1000,
+      scheduleSource: "backoff", maxAttempts: 1, maxElapsedMs: 1000, failure: failure(),
+    })!
+    store.closeRetryEpisode(original.id, "exhausted")
+
+    // Accumulate a REAL cumulative pause total on the feature, distinct
+    // from the original episode's stale 999 snapshot.
+    store.applyTransition(feature.id, { kind: "human.paused" }, { decisions: [{ kind: "pause" }], patch: { status: "paused" } })
+    connection.db.run("UPDATE feature SET paused_at = paused_at - 7000 WHERE id = ?", [feature.id])
+    store.applyTransition(feature.id, { kind: "human.resumed" }, { decisions: [], patch: { status: "running" } })
+    const cumulative = store.getPauseAccounting(feature.id)!.pausedMs
+    expect(cumulative).toBeGreaterThanOrEqual(7000)
+
+    const recovered = store.recoverRetryEpisode(original.id, original.version, {
+      startedAt: Date.now(), maxAttempts: 5, maxElapsedMs: 60_000,
+    })
+    expect(recovered).toMatchObject({ featurePausedMsAtStart: cumulative, recoveredFrom: original.id })
+  })
+})
+
 // ---------------------------------------------------------------------------
 // run: failure envelope persistence
 // ---------------------------------------------------------------------------
@@ -608,12 +691,12 @@ describe("run failure envelope", () => {
   it("concludeRun persists a classified failure envelope in the same transaction as the transition", () => {
     const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
     const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 1 })
-    const ok = store.concludeRun(
+    const result = store.concludeRun(
       runId, "failed", { reason: "exit 1", failure: failure({ class: "deterministic_failure", diagnostic: "exit 1" }) },
       { kind: "step.failed", jobId: "main", stepId: "implement", reason: "exit 1" },
       { decisions: [{ kind: "escalate", reason: "deterministic failure" }], patch: { status: "escalated" } },
     )
-    expect(ok).toBe(true)
+    expect(result.claimed).toBe(true)
     expect(store.getRunById(runId)?.failure).toMatchObject({ class: "deterministic_failure", diagnostic: "exit 1" })
     expect(store.getFeature(feature.id)?.status).toBe("escalated")
   })
@@ -628,14 +711,20 @@ describe("run failure envelope", () => {
 })
 
 // ---------------------------------------------------------------------------
-// concludeRunWithRetry: atomic attempt conclusion + schedule
+// concludeRun with a retrySchedule: atomic attempt conclusion + schedule
 // ---------------------------------------------------------------------------
 
-describe("concludeRunWithRetry", () => {
-  function scheduleInput(overrides: Partial<Parameters<Store["concludeRunWithRetry"]>[3]> = {}) {
+describe("concludeRun with retrySchedule", () => {
+  const event: PipelineEvent = { kind: "step.failed", jobId: "main", stepId: "implement", reason: "503" }
+  const noopTransition: Transition = { decisions: [], patch: {} }
+
+  type RetrySchedule = NonNullable<NonNullable<Parameters<Store["concludeRun"]>[5]>["retrySchedule"]>
+  function scheduleInput(overrides: Partial<RetrySchedule> = {}) {
     return {
+      jobId: "main", stepId: "implement",
       attempts: 1, startedAt: 0, nextAttemptAt: 5000, delayMs: 5000,
       scheduleSource: "backoff" as const, maxAttempts: 5, maxElapsedMs: 60_000,
+      failure: failure(),
       ...overrides,
     }
   }
@@ -643,21 +732,25 @@ describe("concludeRunWithRetry", () => {
   it("persists the failed attempt and its retry schedule in one call", () => {
     const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
     const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 1 })
-    const result = store.concludeRunWithRetry(runId, "failed", { reason: "503", failure: failure() }, scheduleInput())
+    const result = store.concludeRun(runId, "failed", { reason: "503", failure: failure() }, event, noopTransition, {
+      retrySchedule: scheduleInput(),
+    })
 
-    expect(result.concluded).toBe(true)
+    expect(result.claimed).toBe(true)
     expect(result.episode).toMatchObject({ featureId: feature.id, jobId: "main", stepId: "implement", status: "scheduled", nextAttemptAt: 5000 })
     expect(store.getRunById(runId)).toMatchObject({ status: "failed", failure: failure() })
     expect(store.getOpenRetryEpisode(feature.id, "main", "implement")?.id).toBe(result.episode!.id)
   })
 
-  it("returns concluded=false and schedules nothing for an already-concluded run (duplicate report)", () => {
+  it("returns claimed=false and schedules nothing for an already-concluded run (duplicate report)", () => {
     const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
     const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 1 })
     store.finishRun(runId, "succeeded", { outputs: {} })
 
-    const result = store.concludeRunWithRetry(runId, "failed", { reason: "late failure", failure: failure() }, scheduleInput())
-    expect(result).toEqual({ concluded: false, episode: null })
+    const result = store.concludeRun(runId, "failed", { reason: "late failure", failure: failure() }, event, noopTransition, {
+      retrySchedule: scheduleInput(),
+    })
+    expect(result).toEqual({ claimed: false, episode: null })
     expect(store.getRunById(runId)?.status).toBe("succeeded")
     expect(store.getOpenRetryEpisode(feature.id, "main", "implement")).toBeNull()
   })
@@ -670,7 +763,7 @@ describe("concludeRunWithRetry", () => {
       BEGIN SELECT RAISE(ABORT, 'schedule rejected'); END
     `)
     expect(() =>
-      store.concludeRunWithRetry(runId, "failed", { reason: "503", failure: failure() }, scheduleInput()),
+      store.concludeRun(runId, "failed", { reason: "503", failure: failure() }, event, noopTransition, { retrySchedule: scheduleInput() }),
     ).toThrow("schedule rejected")
     // Neither half landed — the run is still 'running', not half-concluded.
     expect(store.getRunById(runId)?.status).toBe("running")
@@ -681,10 +774,10 @@ describe("concludeRunWithRetry", () => {
     const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
     const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 1 })
     const results = [
-      store.concludeRunWithRetry(runId, "failed", { reason: "503", failure: failure() }, scheduleInput()),
-      store.concludeRunWithRetry(runId, "failed", { reason: "503 again", failure: failure() }, scheduleInput()),
+      store.concludeRun(runId, "failed", { reason: "503", failure: failure() }, event, noopTransition, { retrySchedule: scheduleInput() }),
+      store.concludeRun(runId, "failed", { reason: "503 again", failure: failure() }, event, noopTransition, { retrySchedule: scheduleInput() }),
     ]
-    const won = results.filter(r => r.concluded)
+    const won = results.filter(r => r.claimed)
     expect(won).toHaveLength(1)
     expect(store.listRetryEpisodes(feature.id)).toHaveLength(1)
   })
@@ -692,7 +785,9 @@ describe("concludeRunWithRetry", () => {
   it("restart before the schedule is due: a fresh Store over the same database still reports it not-yet-due", () => {
     const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
     const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 1 })
-    store.concludeRunWithRetry(runId, "failed", { reason: "503", failure: failure() }, scheduleInput({ nextAttemptAt: 999_000, delayMs: 999_000 }))
+    store.concludeRun(runId, "failed", { reason: "503", failure: failure() }, event, noopTransition, {
+      retrySchedule: scheduleInput({ nextAttemptAt: 999_000, delayMs: 999_000 }),
+    })
     connection.close()
 
     const reopened = openMigratedDatabase({ path: join(directory, "state.db") })
@@ -706,7 +801,9 @@ describe("concludeRunWithRetry", () => {
   it("restart after the schedule is due: reconstructs the wait and the attempt becomes claimable exactly once", () => {
     const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
     const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 1 })
-    const { episode } = store.concludeRunWithRetry(runId, "failed", { reason: "503", failure: failure() }, scheduleInput({ nextAttemptAt: 1000, delayMs: 1000 }))
+    const { episode } = store.concludeRun(runId, "failed", { reason: "503", failure: failure() }, event, noopTransition, {
+      retrySchedule: scheduleInput({ nextAttemptAt: 1000, delayMs: 1000 }),
+    })
     connection.close()
 
     const reopened = openMigratedDatabase({ path: join(directory, "state.db") })
@@ -722,7 +819,9 @@ describe("concludeRunWithRetry", () => {
     const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
     store.applyTransition(feature.id, { kind: "human.paused" }, { decisions: [{ kind: "pause" }], patch: { status: "paused" } })
     const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 1 })
-    const { episode } = store.concludeRunWithRetry(runId, "failed", { reason: "503", failure: failure() }, scheduleInput({ nextAttemptAt: 1000, delayMs: 1000 }))
+    const { episode } = store.concludeRun(runId, "failed", { reason: "503", failure: failure() }, event, noopTransition, {
+      retrySchedule: scheduleInput({ nextAttemptAt: 1000, delayMs: 1000 }),
+    })
     expect(episode).not.toBeNull()
 
     expect(store.listDueRetryEpisodes(2000)).toEqual([])

@@ -85,12 +85,29 @@ export interface FeatureDetail extends FeatureBase {
   readonly feedback: Feedback | null
   readonly jobs: Readonly<Record<string, JobRuntimeProjection>>
   readonly activity?: FeatureActivity
+  /** Every currently recoverable job/step target — present only while
+   *  `status` is `"escalated"`; the order `POST .../recover` would pick
+   *  as its default (untargeted) choice. */
+  readonly recoverableTargets?: readonly { readonly jobId: string; readonly stepId: string }[]
 }
 
 export interface FeatureDetailResponse {
   readonly feature: FeatureDetail
   readonly activeRun: RunSummary | null
   readonly activeRuns?: readonly RunSummary[]
+}
+
+/** Present only while a durably accepted answer has not yet been
+ *  confirmed delivered — `"pending"` (not yet claimed for delivery, e.g.
+ *  the feature is paused or a claim attempt is still in flight) or
+ *  `"claimed"` (a delivery attempt currently holds the lease). Absent
+ *  once delivered (the question is cleared then too), failed or
+ *  cancelled (normal failure routing takes over) — harden-interactive-
+ *  answer-delivery task 3.1: additive, so a client that only reads
+ *  `pendingQuestion` sees no shape change. */
+export interface RunAnswerDelivery {
+  readonly status: "pending" | "claimed"
+  readonly acceptedAt: number
 }
 
 export interface RunSummary {
@@ -106,6 +123,9 @@ export interface RunSummary {
   readonly reason: string | null
   readonly nudges: number
   readonly pendingQuestion?: string | null
+  /** An accepted-but-undelivered answer for this run's question, if any —
+   *  see `RunAnswerDelivery`. */
+  readonly answerDelivery?: RunAnswerDelivery
   readonly timeStarted: number
   readonly timeFinished: number | null
 }

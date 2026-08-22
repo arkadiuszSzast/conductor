@@ -44,6 +44,18 @@ A step SHALL have a default policy and MAY override behaviour per failure class.
 - **WHEN** a compatible runner now exists and the operator recovers a feature whose resource wait expired
 - **THEN** Conductor starts a new finite recovery episode and assigns the blocked step exactly once
 
+#### Scenario: Historical resource wait is not the current failure
+- **WHEN** an escalated feature has a closed historical resource wait but its current durable frontier identifies a different failed step
+- **THEN** recovery does not select the historical wait and only offers the current failed target
+
+#### Scenario: Parallel failures require a selected target
+- **WHEN** an escalated feature has more than one independent recoverable job/step target and the operator omits the target
+- **THEN** recovery rejects the ambiguous request without re-arming any step and exposes the current targets for explicit selection
+
+#### Scenario: Selected recovery target became stale
+- **WHEN** the operator selects a job/step that is no longer a current recoverable target
+- **THEN** recovery rejects the stale target without falling back to another historical or current candidate
+
 ### Requirement: Escalation explains available recovery
 Budget or resource-wait exhaustion SHALL persist attempts, elapsed time, class/reason counts, last diagnostic, failed or blocked targets and allowed next actions. API, CLI and UI SHALL expose that summary and SHALL NOT describe an escalated feature as actively running.
 

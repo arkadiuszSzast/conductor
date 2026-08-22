@@ -10,7 +10,7 @@ interpreter.
 | Document | What it covers |
 |---|---|
 | [Install](install.md) | Installing from the repo (dev `bun link`, compiled binary), running `conductor daemon`, connecting the opencode runner, first feature, troubleshooting. |
-| [Concepts](concepts.md) | The execution model: features, jobs, steps, outcomes vs failures, loops, escalation. Read this first. |
+| [Concepts](concepts.md) | The execution model: features, jobs, steps, outcomes vs failures, loops, retries/failure classes, pausing/escalation/recovery, interactive answer delivery. Read this first. |
 | [Workflow reference](workflow-reference.md) | Every YAML field, with types, defaults and examples — the `conductor.yaml` counterpart to GHA's workflow syntax reference. |
 | [Expressions](expressions.md) | The `{{ }}` template contexts: `inputs`, `steps`, `needs`, `feedback` — what resolves when, and what is validated. |
 | [HTTP API](http-api.md) | The daemon's REST + SSE control surface: routes, feature payload projections, workflow structure endpoint, static UI serving. |
@@ -32,3 +32,7 @@ For design rationale and the decision log, see the OpenSpec changes:
   action registry, triggers.
 - `openspec/changes/cross-job-loops/` — outcomes, `rerun` loops, feedback,
   the normalised IR, DAG failure semantics.
+- `openspec/changes/retry-policy/` — failure classification, retry/resource-wait
+  budgets, the pause scheduling barrier, and operator recovery.
+- `openspec/changes/harden-interactive-answer-delivery/` — the accepted/
+  delivered split for answering a mid-step question.

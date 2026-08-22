@@ -55,6 +55,8 @@ Alternative: wait indefinitely for runner. Rejected because absent/misconfigured
 
 `resume` only removes that barrier. `recover` is allowed for escalated recoverable targets, requires note plus optimistic expected status/version, and chooses default reset or explicit finite override. It never falls through to replay workflow start.
 
+Recoverable targets are derived from the current durable job/step frontier, with retry and resource-wait history used only to explain a matching current target. Closed historical waits and failures from superseded routing steps are never candidates by themselves. When more than one independent current target is recoverable, the operation requires an explicit job/step target and rejects an omitted or stale target rather than choosing by storage-query order. This keeps parallel failure recovery deliberate and prevents one historical `deadline_exhausted` wait from shadowing a newer failure.
+
 Alternative: preserve overloaded resume. Rejected because unpause must not silently grant a fresh failure budget.
 
 ### Recovery API and projection
@@ -75,3 +77,4 @@ Rollback can ignore new tables/columns after stopping the upgraded daemon, but f
 - **Misclassified deterministic failures retry patiently** → closed taxonomy, conservative finite `internal`, conformance tests and visible classification.
 - **Runner availability flaps wake many features** → jittered observations, bounded batches and transactional claims.
 - **Legacy stranded state is ambiguous** → only reconstruct when target is unique; otherwise escalate with diagnostics instead of guessing.
+- **Historical waits or failures shadow the current frontier** → join history to current failed/blocked job-step state and require explicit selection when multiple current targets remain.

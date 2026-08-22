@@ -125,3 +125,56 @@ describe("ApiClient.startFeature", () => {
     }
   })
 })
+
+describe("ApiClient.recover", () => {
+  it("POSTs the target alongside notes when supplied", async () => {
+    let capturedBody: unknown = null
+    const fetchImpl = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      capturedBody = JSON.parse(String(init?.body))
+      return jsonResponse(200, { result: "Recovered.", feature: { id: "f-1" }, activeRun: null })
+    }) as FetchLike
+    const client = new ApiClient({ token: () => null, fetch: fetchImpl })
+    await client.recover("f-1", "go", { expectedVersion: 5, target: { jobId: "deliver", stepId: "pr_create" } })
+    expect(capturedBody).toEqual({
+      notes: "go",
+      expectedVersion: 5,
+      target: { jobId: "deliver", stepId: "pr_create" },
+    })
+  })
+
+  it("surfaces a 409 ambiguous_target rejection with the candidate targets", async () => {
+    const fetchImpl = (async () =>
+      jsonResponse(409, {
+        error: { code: "ambiguous_target", message: "multiple recoverable targets", requestId: "r-3" },
+        targets: [
+          { jobId: "a", stepId: "work" },
+          { jobId: "b", stepId: "work" },
+        ],
+      })) as FetchLike
+    const client = new ApiClient({ token: () => null, fetch: fetchImpl })
+    try {
+      await client.recover("f-1", "go")
+      throw new Error("expected rejection")
+    } catch (err) {
+      expect(err).toBeInstanceOf(ApiError)
+      const apiErr = err as ApiError
+      expect(apiErr.code).toBe("ambiguous_target")
+      expect(apiErr.targets).toEqual([
+        { jobId: "a", stepId: "work" },
+        { jobId: "b", stepId: "work" },
+      ])
+    }
+  })
+
+  it("a plain conflict response leaves ApiError.targets null", async () => {
+    const fetchImpl = (async () =>
+      jsonResponse(409, { error: { code: "conflict", message: "not escalated", requestId: "r-4" } })) as FetchLike
+    const client = new ApiClient({ token: () => null, fetch: fetchImpl })
+    try {
+      await client.recover("f-1", "go")
+      throw new Error("expected rejection")
+    } catch (err) {
+      expect((err as ApiError).targets).toBeNull()
+    }
+  })
+})

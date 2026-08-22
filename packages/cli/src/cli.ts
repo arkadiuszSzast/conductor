@@ -119,10 +119,14 @@ commands:
   pause <feature-id>   pause the feature
   resume <feature-id>  resume a paused feature
   abandon <feature-id> abandon the feature
-  recover <feature-id> --notes <text|@file> [--expected-version <n>] [--idempotency-key <key>]
-                       re-arm an escalated feature's failed/blocked steps
-                       (--expected-version rejects a stale view; the key
-                       dedupes a retried delivery)
+  recover <feature-id> --notes <text|@file> [--job <jobId> --step <stepId>]
+                       [--expected-version <n>] [--idempotency-key <key>]
+                       re-arm an escalated feature's currently recoverable
+                       failed/blocked step (--job/--step select among
+                       several candidates — required together, and
+                       omitting both only works when exactly one
+                       candidate exists; --expected-version rejects a
+                       stale view; the key dedupes a retried delivery)
   logs <feature-id>    print the feature's transition timeline
 
 exit codes: 0 ok, 1 failure, 2 usage, 3 unauthorized, 4 not found,
@@ -145,6 +149,8 @@ const VALUE_FLAGS = new Set([
   "expected-version",
   "idempotency-key",
   "init-config",
+  "job",
+  "step",
 ])
 
 interface Parsed {
@@ -597,7 +603,17 @@ function printFeature(
       escalation: string | null
       jobs?: Readonly<Record<string, { steps?: Readonly<Record<string, { status?: string; prompt?: string }>> }>>
     }
-    activeRun: { id: string; jobId: string; stepId: string; attempt: number; pendingQuestion?: string | null } | null
+    activeRun: {
+      id: string
+      jobId: string
+      stepId: string
+      attempt: number
+      pendingQuestion?: string | null
+      /** Additive (harden-interactive-answer-delivery task 3.1): set
+       *  while a human answer was accepted but not yet confirmed
+       *  delivered — see `withAnswerDelivery` in `packages/server/src/api.ts`. */
+      answerDelivery?: { status: "pending" | "claimed"; acceptedAt: number }
+    } | null
   },
 ): void {
   const { feature, activeRun } = payload
@@ -610,7 +626,11 @@ function printFeature(
   if (feature.escalation !== null) deps.stdout(`escalation ${feature.escalation}`)
   if (activeRun) deps.stdout(`run      ${activeRun.id} (${activeRun.stepId}, attempt ${activeRun.attempt})`)
   if (activeRun?.pendingQuestion != null && activeRun.pendingQuestion.trim() !== "") {
-    deps.stdout(`question ${activeRun.jobId}/${activeRun.stepId} (answer with: conductor answer ${activeRun.id} --notes <text>):`)
+    if (activeRun.answerDelivery !== undefined) {
+      deps.stdout(`question ${activeRun.jobId}/${activeRun.stepId} (answer accepted, delivery in progress):`)
+    } else {
+      deps.stdout(`question ${activeRun.jobId}/${activeRun.stepId} (answer with: conductor answer ${activeRun.id} --notes <text>):`)
+    }
     for (const line of activeRun.pendingQuestion.split("\n")) deps.stdout(`  ${line}`)
   }
   for (const [jobId, job] of Object.entries(feature.jobs ?? {})) {
@@ -764,6 +784,7 @@ async function commandAnswer(parsed: Parsed, deps: CliDeps, client: ApiClient, j
 }
 
 async function commandRecover(parsed: Parsed, deps: CliDeps, client: ApiClient, json: boolean): Promise<number> {
+  requireFlags(parsed, ["notes", "job", "step", "expected-version", "idempotency-key"])
   const featureId = requireId(parsed, "recover requires a feature id")
   const notes = resolveNotes(stringFlag(parsed, "notes"), deps)
   if (notes === undefined || notes.trim() === "") {
@@ -774,17 +795,39 @@ async function commandRecover(parsed: Parsed, deps: CliDeps, client: ApiClient, 
     throw new UsageError("--expected-version must be an integer (the feature's updatedAt from `conductor show`)")
   }
   const idempotencyKey = stringFlag(parsed, "idempotency-key")
-  const payload = await client.recover(featureId, notes, {
-    ...(versionText !== undefined ? { expectedVersion: Number(versionText) } : {}),
-    ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
-  })
-  if (json) {
-    deps.stdout(JSON.stringify(payload))
-    return EXIT.ok
+  const jobId = stringFlag(parsed, "job")
+  const stepId = stringFlag(parsed, "step")
+  if ((jobId === undefined) !== (stepId === undefined)) {
+    throw new UsageError("--job and --step must be given together")
   }
-  deps.stdout(payload.result ?? "Recovered")
-  printFeature(deps, payload)
-  return EXIT.ok
+  const target = jobId !== undefined && stepId !== undefined ? { jobId, stepId } : undefined
+  try {
+    const payload = await client.recover(featureId, notes, {
+      ...(versionText !== undefined ? { expectedVersion: Number(versionText) } : {}),
+      ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
+      ...(target !== undefined ? { target } : {}),
+    })
+    if (json) {
+      deps.stdout(JSON.stringify(payload))
+      return EXIT.ok
+    }
+    deps.stdout(payload.result ?? "Recovered")
+    printFeature(deps, payload)
+    return EXIT.ok
+  } catch (err) {
+    if (err instanceof ApiError && err.code === "ambiguous_target") {
+      const targets = (err.body as { targets?: readonly { jobId: string; stepId: string }[] } | undefined)?.targets ?? []
+      if (json) {
+        deps.stderr(JSON.stringify({ error: { code: err.code, message: err.message }, targets }))
+      } else {
+        deps.stderr(`error[${err.code}]: ${err.message}`)
+        deps.stderr("recoverable targets:")
+        for (const t of targets) deps.stderr(`  --job ${t.jobId} --step ${t.stepId}`)
+      }
+      return EXIT.conflict
+    }
+    throw err
+  }
 }
 
 async function commandLifecycle(parsed: Parsed, deps: CliDeps, client: ApiClient, json: boolean): Promise<number> {

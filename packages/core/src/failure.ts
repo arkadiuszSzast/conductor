@@ -53,8 +53,35 @@ export interface FailureEnvelope {
   readonly retryHintMs?: number
 }
 
+/**
+ * Coarse credential patterns a thrown exception's message, a runner's
+ * error output, or a process's stderr tail can plausibly embed —
+ * NEVER inspected for failure classification (that stays symptom-only,
+ * see the module docstring), only stripped before a diagnostic becomes
+ * durable state, a log line, or an API-visible `reason`. Deliberately
+ * broad-but-cheap regexes (secret-safety over precision): a false-
+ * positive redaction loses nothing a human diagnostic needs, a
+ * false-negative leaks a credential.
+ */
+const SECRET_PATTERNS: ReadonlyArray<{ readonly pattern: RegExp; readonly replacement: string }> = [
+  { pattern: /\bBearer\s+\S+/gi, replacement: "Bearer [REDACTED]" },
+  { pattern: /\b(api[_-]?key)\s*[:=]\s*"?[^\s"',;]+"?/gi, replacement: "$1=[REDACTED]" },
+  { pattern: /\b(password|passwd|pwd)\s*[:=]\s*"?[^\s"',;]+"?/gi, replacement: "$1=[REDACTED]" },
+]
+
+function redactSecrets(text: string): string {
+  let redacted = text
+  for (const { pattern, replacement } of SECRET_PATTERNS) redacted = redacted.replace(pattern, replacement)
+  return redacted
+}
+
+/** The one place raw exception/output text becomes a durable diagnostic:
+ *  redacts common credential shapes (Bearer tokens, api_key, password),
+ *  THEN truncates to the shared bound — order matters, a secret must
+ *  never survive merely because it sat past the truncation point. */
 export function boundDiagnostic(text: string): string {
-  return text.length > MAX_DIAGNOSTIC_LENGTH ? text.slice(0, MAX_DIAGNOSTIC_LENGTH) : text
+  const redacted = redactSecrets(text)
+  return redacted.length > MAX_DIAGNOSTIC_LENGTH ? redacted.slice(0, MAX_DIAGNOSTIC_LENGTH) : redacted
 }
 
 /** An adapter that omits or invents a class defaults to `internal` — never
