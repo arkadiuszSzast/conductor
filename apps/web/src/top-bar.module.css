@@ -1,20 +1,29 @@
 .bar {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 0 16px;
-  height: 42px;
+  gap: var(--space-4);
+  padding: var(--safe-top) calc(var(--space-4) + var(--safe-right)) 0 calc(var(--space-4) + var(--safe-left));
+  min-height: calc(var(--topbar-h) + var(--safe-top));
+  flex: 0 0 auto;
   border-bottom: 1px solid var(--border);
-  background: var(--bg);
+  background: color-mix(in oklch, var(--bg) 92%, transparent);
+  backdrop-filter: blur(8px);
   position: sticky;
   top: 0;
-  z-index: 20;
+  z-index: var(--z-topbar);
 }
 .brand {
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  font-size: 12px;
-  color: var(--text-dim);
+  font-family: var(--font-display);
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  font-size: var(--text-sm);
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.brandMark {
+  color: var(--cyan);
 }
 .spacer {
   flex: 1;
@@ -22,29 +31,41 @@
 .right {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--space-2);
   position: relative;
 }
 .chip {
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--amber);
   border: 1px solid color-mix(in oklch, var(--amber) 40%, var(--border));
   border-radius: 999px;
-  padding: 2px 8px;
+  padding: 2px var(--space-2);
+}
+.startWorkBtn {
+  white-space: nowrap;
+  font-size: var(--text-sm);
+  padding: 4px var(--space-2);
+}
+@media (max-width: 420px) {
+  .startWorkLabel {
+    display: none;
+  }
 }
 .healthBtn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   background: none;
-  border: none;
+  border: 1px solid transparent;
   color: var(--text-dim);
   cursor: pointer;
-  font-size: 12px;
-  padding: 4px 6px;
+  font-size: var(--text-sm);
+  padding: 4px 8px;
+  min-height: 30px;
 }
 .healthBtn:hover {
   background: var(--bg-hover);
+  border-color: var(--border);
 }
 .dot {
   width: 8px;
@@ -52,11 +73,12 @@
   border-radius: 50%;
   display: inline-block;
 }
-.dot-ok {
-  background: var(--green);
+.dotOk {
+  background: var(--mint);
+  box-shadow: 0 0 6px color-mix(in oklch, var(--mint) 60%, transparent);
 }
-.dot-bad {
-  background: var(--red);
+.dotBad {
+  background: var(--coral);
 }
 .dim {
   color: var(--text-faint);
@@ -68,19 +90,24 @@
   margin-top: 6px;
   width: 360px;
   max-width: calc(100vw - 32px);
-  background: var(--bg-raised);
+  background: var(--bg-panel);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
-  padding: 12px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-  z-index: 30;
-  font-size: 12px;
+  padding: var(--space-3);
+  box-shadow: var(--shadow-overlay);
+  z-index: var(--z-overlay);
+  font-size: var(--text-sm);
+  animation: popIn var(--duration-fast) var(--ease-out);
+}
+@keyframes popIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 .popover h4 {
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: var(--tracking-label);
   margin: 10px 0 4px;
 }
 .popover h4:first-child {
@@ -102,5 +129,17 @@
   color: var(--text-dim);
 }
 .diag {
-  color: var(--red);
+  color: var(--coral);
+}
+
+@media (pointer: coarse) {
+  .healthBtn {
+    min-height: 40px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .popover {
+    animation: none;
+  }
 }

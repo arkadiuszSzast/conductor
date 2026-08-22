@@ -5,7 +5,7 @@
  * active loop.
  */
 import { describe, expect, it } from "bun:test"
-import { loopEdgeOf, mergeGraph, projectBasename, stepGlyph } from "../src/graph/merge.ts"
+import { loopEdgeOf, mergeGraph, projectBasename, stepGlyph, workflowCompatible } from "../src/graph/merge.ts"
 import type { FeatureDetail, JobRuntimeProjection, WorkflowProjection } from "../src/api/types.ts"
 
 function workflow(): WorkflowProjection {
@@ -17,6 +17,7 @@ function workflow(): WorkflowProjection {
       implement: { needs: ["design"], steps: [{ id: "code", kind: "agent" }, { id: "review", kind: "agent" }] },
       gate: { needs: ["implement"], steps: [{ id: "approve", kind: "human" }] },
     },
+    inputs: {},
     diagnostics: [],
   }
 }
@@ -195,6 +196,22 @@ describe("loop-edge predicate", () => {
       },
     })
     expect(loopEdgeOf(d, jobIds)).toBeNull()
+  })
+})
+
+describe("workflowCompatible", () => {
+  it("matches when the feature's workflow name equals the current projection's name", () => {
+    expect(workflowCompatible("default", "default")).toBe(true)
+    expect(workflowCompatible("release", "release")).toBe(true)
+  })
+
+  it("a null feature workflow is treated as the implicit default name", () => {
+    expect(workflowCompatible(null, "default")).toBe(true)
+    expect(workflowCompatible(null, "release")).toBe(false)
+  })
+
+  it("rejects a feature whose workflow name no longer matches the registered projection", () => {
+    expect(workflowCompatible("release-old", "release-new")).toBe(false)
   })
 })
 

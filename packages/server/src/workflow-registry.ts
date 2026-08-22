@@ -48,7 +48,22 @@ export interface WorkflowSnapshot {
 
 export interface WorkflowDiagnostic {
   readonly sourcePath: string
+  /** Full diagnostic — for an action-resolution failure this can embed
+   *  the action manifest's `sourcePath` and/or the daemon's configured
+   *  action registry search paths, both absolute daemon-local
+   *  filesystem paths, in addition to `sourcePath` above (the project's
+   *  own `conductor.yaml`, already a known, deliberate exception the
+   *  daemon's own operator-facing health surface reports as a
+   *  structured field). Operator/log use only. */
   readonly message: string
+  /** The same diagnostic with every embedded filesystem path removed —
+   *  still names the failing job/step/action reference, the reason, and
+   *  (for a missing action version) the available versions. Every
+   *  diagnostic kind other than action-resolution never embedded a path
+   *  in `message` to begin with, so `safeMessage` equals `message` for
+   *  those. The one browser-facing consumer (`GET /v1/projects/workflow`)
+   *  must always read `safeMessage`, never `message`. */
+  readonly safeMessage: string
 }
 
 export type LoadResult =
@@ -117,7 +132,13 @@ export class WorkflowRegistry {
     try {
       canonicalDir = canonicalizeProjectDir(projectDir)
     } catch (error) {
-      const diagnostics = [{ sourcePath: projectDir, message: canonicalizationErrorMessage(error, projectDir) }]
+      // `canonicalizationErrorMessage` embeds `projectDir` — but that is
+      // the SAME path the caller supplied via `?dir=` on this very
+      // request, not daemon-configured deployment layout (unlike an
+      // action registry's search paths, which the client has no way of
+      // already knowing). `safeMessage` equals `message` here.
+      const message = canonicalizationErrorMessage(error, projectDir)
+      const diagnostics = [{ sourcePath: projectDir, message, safeMessage: message }]
       this.recordFailure(this.entryKey(projectDir), diagnostics)
       return { ok: false, diagnostics }
     }
@@ -208,30 +229,41 @@ function canonicalizationErrorMessage(error: unknown, projectDir: string): strin
 function loadWorkflow(canonicalDir: string, actionRegistry: LoadedActionRegistry | undefined): LoadResult {
   const sourcePath = join(canonicalDir, WORKFLOW_RELATIVE_PATH)
 
+  // Every diagnostic in this function names `sourcePath` — the project's
+  // OWN `conductor.yaml`, i.e. exactly the path the caller already
+  // supplied via `?dir=`/registration, not daemon-configured deployment
+  // layout — so `safeMessage` equals `message` for all of them EXCEPT
+  // the action-reservation diagnostics below, which embed a resolved
+  // action's `sourcePath` (a bundled/local action manifest file the
+  // daemon operator configured, never supplied by the caller) and the
+  // daemon's configured action registry search paths; those two must
+  // use `diagnostic.safeMessage`, never `diagnostic.message`.
   let raw: string
   try {
     const info = statSync(sourcePath)
     if (!info.isFile()) {
-      return { ok: false, diagnostics: [{ sourcePath, message: "conductor.yaml exists but is not a file" }] }
+      const message = "conductor.yaml exists but is not a file"
+      return { ok: false, diagnostics: [{ sourcePath, message, safeMessage: message }] }
     }
     if (info.size > MAX_SOURCE_BYTES) {
-      return { ok: false, diagnostics: [{ sourcePath, message: `conductor.yaml exceeds ${MAX_SOURCE_BYTES} bytes` }] }
+      const message = `conductor.yaml exceeds ${MAX_SOURCE_BYTES} bytes`
+      return { ok: false, diagnostics: [{ sourcePath, message, safeMessage: message }] }
     }
     raw = readFileSync(sourcePath, "utf8")
   } catch (error) {
     const code = (error as { code?: string } | null)?.code
     const message = code === "ENOENT" ? "conductor.yaml not found" : `cannot read conductor.yaml: ${errorMessage(error)}`
-    return { ok: false, diagnostics: [{ sourcePath, message }] }
+    return { ok: false, diagnostics: [{ sourcePath, message, safeMessage: message }] }
   }
 
   const parsed = parseWorkflow(raw)
   if (!parsed.ok) {
     return {
       ok: false,
-      diagnostics: parsed.errors.map(error => ({
-        sourcePath,
-        message: `${error.message} (line ${error.line}, col ${error.col})`,
-      })),
+      diagnostics: parsed.errors.map(error => {
+        const message = `${error.message} (line ${error.line}, col ${error.col})`
+        return { sourcePath, message, safeMessage: message }
+      }),
     }
   }
 
@@ -239,7 +271,7 @@ function loadWorkflow(canonicalDir: string, actionRegistry: LoadedActionRegistry
   if (validation.errors.length > 0) {
     return {
       ok: false,
-      diagnostics: validation.errors.map(message => ({ sourcePath, message })),
+      diagnostics: validation.errors.map(message => ({ sourcePath, message, safeMessage: message })),
     }
   }
 
@@ -250,10 +282,8 @@ function loadWorkflow(canonicalDir: string, actionRegistry: LoadedActionRegistry
   let actionBindings: ResolvedActionBindings = {}
   if (hasActionSteps) {
     if (!actionRegistry) {
-      return {
-        ok: false,
-        diagnostics: [{ sourcePath, message: "action steps require a configured action registry" }],
-      }
+      const message = "action steps require a configured action registry"
+      return { ok: false, diagnostics: [{ sourcePath, message, safeMessage: message }] }
     }
     const reservation = checkWorkflowReservation(parsed.workflow, actionRegistry)
     if (!reservation.ok) {
@@ -262,6 +292,9 @@ function loadWorkflow(canonicalDir: string, actionRegistry: LoadedActionRegistry
         diagnostics: reservation.diagnostics.map(diagnostic => ({
           sourcePath,
           message: `job "${diagnostic.jobId}" step "${diagnostic.stepId}" (${diagnostic.uses}): ${diagnostic.message}`,
+          // `diagnostic.safeMessage` — never the action-source or
+          // registry-search-path detail carried in `diagnostic.message`.
+          safeMessage: `job "${diagnostic.jobId}" step "${diagnostic.stepId}" (${diagnostic.uses}): ${diagnostic.safeMessage}`,
         })),
       }
     }

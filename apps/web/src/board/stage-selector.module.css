@@ -1,0 +1,40 @@
+.wrap {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: var(--space-1) 0 var(--space-2);
+  /* Intentional horizontal scroll region — the spec explicitly permits
+     this for the stage selector while forbidding document overflow. */
+  scrollbar-width: thin;
+}
+.stage {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: var(--text-sm);
+  color: var(--text-dim);
+  min-height: 40px;
+}
+.stage.selected {
+  border-color: var(--cyan);
+  color: var(--text);
+  background: color-mix(in oklch, var(--cyan) 12%, var(--bg-panel));
+}
+.stage.attention {
+  border-color: color-mix(in oklch, var(--amber) 50%, var(--border));
+}
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amber);
+}
+.count {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+}

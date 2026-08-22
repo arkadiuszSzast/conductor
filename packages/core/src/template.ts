@@ -98,22 +98,27 @@ export function buildEvalContext(
   }
 }
 
+/** `record` keys come from resolved workflow inputs, so a name like
+ *  `__proto__` must survive as a genuine own property — built with
+ *  `Object.fromEntries` rather than `result[key] = value`, which would
+ *  reassign `Object.prototype`'s `__proto__` accessor instead for that
+ *  one name and silently drop it. */
 function onlyValues(record: Readonly<Record<string, unknown>>): Readonly<Record<string, Value>> {
-  const result: Record<string, Value> = {}
+  const entries: Array<[string, Value]> = []
   for (const [key, value] of Object.entries(record)) {
     if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-      result[key] = value
+      entries.push([key, value])
     }
   }
-  return result
+  return Object.fromEntries(entries)
 }
 
 function onlyStrings(record: Readonly<Record<string, unknown>>): Readonly<Record<string, string>> {
-  const result: Record<string, string> = {}
+  const entries: Array<[string, string]> = []
   for (const [key, value] of Object.entries(record)) {
-    if (typeof value === "string") result[key] = value
+    if (typeof value === "string") entries.push([key, value])
   }
-  return result
+  return Object.fromEntries(entries)
 }
 
 /**

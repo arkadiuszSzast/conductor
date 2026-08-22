@@ -311,7 +311,13 @@ describe("feature records (API projection reads)", () => {
     const done = store.createFeature({ title: "B", slug: "b", projectDir: "/p", workflow: "wf" })
     store.applyTransition(done.id, { kind: "feature.start" }, { decisions: [], patch: { status: "done" } })
     const waiting = store.createFeature({ title: "C", slug: "c", projectDir: "/p", workflow: "wf" })
-    store.applyTransition(waiting.id, { kind: "feature.start" }, { decisions: [], patch: { status: "waiting_human" } })
+    store.applyTransition(waiting.id, { kind: "feature.start" }, {
+      decisions: [{ kind: "wait_human", jobId: "main", stepId: "approve" }],
+      patch: {
+        status: "waiting_human",
+        jobs: { main: { status: "running", currentStep: "approve", steps: { approve: { status: "waiting_human" } } } },
+      },
+    })
 
     const filtered = store.listFeatureRecords({ statuses: ["done", "waiting_human"] })
     expect(filtered.map(record => record.state.id).sort()).toEqual([done.id, waiting.id].sort())
@@ -555,6 +561,80 @@ describe("interactive steps: run questions", () => {
     const kinds = store.getTransitions(feature.id).map(t => (t.event as { kind: string }).kind)
     expect(kinds).toContain("run.ask")
     expect(kinds).toContain("run.answer")
+  })
+
+  it("keeps the feature waiting until every concurrent question is answered", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const first = store.insertRun({ featureId: feature.id, jobId: "left", stepId: "explore", stepType: "agent", attempt: 1 })
+    const second = store.insertRun({ featureId: feature.id, jobId: "right", stepId: "review", stepType: "agent", attempt: 1 })
+
+    store.setRunQuestion(first, "First?")
+    store.setRunQuestion(second, "Second?")
+    expect(store.clearRunQuestion(first)).toBe(true)
+    expect(store.getFeature(feature.id)?.status).toBe("waiting_human")
+
+    expect(store.clearRunQuestion(second)).toBe(true)
+    expect(store.getFeature(feature.id)?.status).toBe("running")
+  })
+
+  it("keeps the feature waiting when a gate remains after its question is answered", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    store.applyTransition(feature.id, { kind: "feature.start" }, {
+      decisions: [{ kind: "wait_human", jobId: "gate", stepId: "approve" }],
+      patch: {
+        status: "waiting_human",
+        jobs: { gate: { status: "running", currentStep: "approve", steps: { approve: { status: "waiting_human" } } } },
+      },
+    })
+    const runId = store.insertRun({ featureId: feature.id, jobId: "agent", stepId: "explore", stepType: "agent", attempt: 1 })
+    store.setRunQuestion(runId, "Question?")
+
+    expect(store.clearRunQuestion(runId)).toBe(true)
+    expect(store.getFeature(feature.id)?.status).toBe("waiting_human")
+  })
+
+  it("preserves aggregate attention when a sibling transition writes running", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    store.applyTransition(feature.id, { kind: "feature.start" }, {
+      decisions: [
+        { kind: "wait_human", jobId: "gate", stepId: "approve" },
+        { kind: "execute_step", jobId: "worker", stepId: "build" },
+      ],
+      patch: {
+        status: "waiting_human",
+        jobs: {
+          gate: { status: "running", currentStep: "approve", steps: { approve: { status: "waiting_human" } } },
+          worker: { status: "running", currentStep: "build", steps: { build: { status: "running" } } },
+        },
+      },
+    })
+
+    store.applyTransition(feature.id, { kind: "step.failed", jobId: "worker", stepId: "build", reason: "retry" }, {
+      decisions: [{ kind: "execute_step", jobId: "worker", stepId: "build" }],
+      patch: { status: "running", jobs: { worker: { status: "running", currentStep: "build", steps: { build: { status: "running" } } } } },
+    })
+
+    expect(store.getFeature(feature.id)?.status).toBe("waiting_human")
+  })
+
+  it("returns to running after the final gate is resolved", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    store.applyTransition(feature.id, { kind: "feature.start" }, {
+      decisions: [{ kind: "wait_human", jobId: "gate", stepId: "approve" }],
+      patch: {
+        status: "waiting_human",
+        jobs: { gate: { status: "running", currentStep: "approve", steps: { approve: { status: "waiting_human" } } } },
+      },
+    })
+
+    store.applyTransition(feature.id, { kind: "step.completed", jobId: "gate", stepId: "approve", outcome: "approved" }, {
+      decisions: [{ kind: "execute_step", jobId: "gate", stepId: "deliver" }],
+      patch: {
+        jobs: { gate: { currentStep: "deliver", steps: { approve: { status: "succeeded" }, deliver: { status: "running" } } } },
+      },
+    })
+
+    expect(store.getFeature(feature.id)?.status).toBe("running")
   })
 
   it("rejects asking on a concluded run and clearing without a question", () => {

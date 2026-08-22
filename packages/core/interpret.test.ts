@@ -253,6 +253,7 @@ describe("step.completed outcomes", () => {
       evt({ kind: "step.completed", stepId: "review", outcome: "approved" }),
     )
     expect(t.decisions).toEqual([{ kind: "wait_human", jobId: "main", stepId: "approve-merge" }])
+    expect(t.patch.status).toBe("waiting_human")
   })
 
   it("escalates on an unmapped outcome", () => {
@@ -464,6 +465,21 @@ describe("DAG workflows", () => {
   it("starts all jobs with no needs at feature.start", () => {
     const t = interpret(dagWorkflow, dagState(), { kind: "feature.start" })
     expect(t.decisions).toContainEqual({ kind: "execute_step", jobId: "build", stepId: "compile" })
+  })
+
+  it("marks the feature waiting when a root job starts at a human step", () => {
+    const rootHuman = mkWorkflow(
+      {
+        approval: defineJob([humanStep("approve")]),
+        work: defineJob([commandStep("build", ["make"])]),
+      },
+      roles,
+      "root-human",
+    )
+
+    const t = interpret(rootHuman, state(), { kind: "feature.start" })
+    expect(t.decisions).toContainEqual({ kind: "wait_human", jobId: "approval", stepId: "approve" })
+    expect(t.patch.status).toBe("waiting_human")
   })
 
   it("starts dependent jobs when their dependency succeeds", () => {

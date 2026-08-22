@@ -208,6 +208,52 @@ describe("resolveAction", () => {
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.error).toContain('no entry named "git/push"')
   })
+
+  it("safeError for a missing action omits every searched path while keeping the reference, name and registry contents", () => {
+    const registry = buildActionRegistry([
+      entry(manifest({ name: "git/worktree", version: "1.0.0" }), "/opt/conductor/actions/bundled/git-worktree/action.yaml"),
+    ])
+    const result = resolveAction("git/push@v1", registry)
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.safeError).toContain('no entry named "git/push"')
+    expect(result.safeError).toContain("registry provides: git/worktree")
+    expect(result.safeError).not.toContain("/opt/conductor/actions")
+    expect(result.safeError).not.toContain("searched paths")
+    // The rich `error` still names the path — only `safeError` strips it.
+    expect(result.error).toContain("/opt/conductor/actions")
+  })
+
+  it("safeError for an empty registry omits the empty-registry path phrasing but keeps the reason", () => {
+    const result = resolveAction("git/push@v1", {})
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.safeError).toContain('action "git/push@v1" is not in the registry')
+    expect(result.safeError).not.toContain("searched paths")
+  })
+
+  it("safeError for a missing version omits every searched path while keeping the available versions", () => {
+    const registry = buildActionRegistry([
+      entry(manifest({ version: "1.10.0" }), "/opt/conductor/actions/bundled/git-push/action.yaml"),
+      ...Object.values(pushV1Registry("/opt/conductor/actions/bundled/git-push/action.yaml")).flat(),
+    ])
+    const result = resolveAction("git/push@v2", registry)
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.safeError).toContain('"git/push" has no v2')
+    expect(result.safeError).toContain("available: v1 (1.0.0, 1.0.1, 1.2.0, 1.10.0)")
+    expect(result.safeError).not.toContain("/opt/conductor/actions")
+    expect(result.safeError).not.toContain("searched paths")
+    expect(result.error).toContain("/opt/conductor/actions")
+  })
+
+  it("safeError for a malformed reference equals error — parsing never produced a path", () => {
+    const result = resolveAction("git/push", pushRegistry())
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.safeError).toBe(result.error)
+    expect(result.safeError).toContain('invalid action reference "git/push"')
+  })
 })
 
 // ---------------------------------------------------------------------------

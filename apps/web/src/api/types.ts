@@ -110,13 +110,49 @@ export interface RunSummary {
   readonly timeFinished: number | null
 }
 
+export type InputType = "string" | "number" | "boolean"
+
+/** An input is either required or has a default — never both, never
+ *  neither (mirrors `@conductor/core`'s `InputDef`, kept local per this
+ *  file's header note). */
+export type InputDef =
+  | { readonly type: InputType; readonly presence: "required" }
+  | { readonly type: InputType; readonly presence: "optional"; readonly default: string | number | boolean }
+
 export interface WorkflowProjection {
   readonly name: string
   readonly stale: boolean
   readonly jobs: Readonly<
     Record<string, { readonly needs: readonly string[]; readonly steps: readonly { readonly id: string; readonly kind: StepKind }[] }>
   >
+  /** Safe, name-keyed input definitions for the served snapshot — the
+   *  ONE exception to "structure only": defaults and required/optional
+   *  presence are user-facing start-form values, not authoring secrets.
+   *  Prompts, expressions, role/model bindings and retry policy never
+   *  appear here. */
+  readonly inputs: Readonly<Record<string, InputDef>>
   readonly diagnostics: readonly string[]
+}
+
+/** `POST /v1/features` body — `title` and `project` are required; every
+ *  other field, including `inputs`, is optional (omitting `inputs` is
+ *  equivalent to `{}`). */
+export interface StartFeatureRequest {
+  readonly title: string
+  readonly project: string
+  readonly description?: string
+  readonly workflow?: string
+  readonly pr?: number
+  readonly inputs?: Readonly<Record<string, string | number | boolean>>
+}
+
+/** `diagnostics[].kind` on a 422 `invalid_input` response — `name` is
+ *  absent only for `invalid_payload` (the payload itself, not one named
+ *  input, is wrong). */
+export interface WorkflowInputDiagnostic {
+  readonly name?: string
+  readonly kind: "invalid_payload" | "unknown_input" | "missing_required" | "wrong_type"
+  readonly message: string
 }
 
 export interface FindingView {
@@ -175,8 +211,29 @@ export interface DaemonHealth {
     readonly lastError: string | null
     readonly cycles: number
   }
-  readonly projects: readonly { readonly projectDir: string; readonly state: string; readonly diagnostics: readonly unknown[] }[]
+  readonly projects: readonly DaemonProjectHealth[]
   readonly runner: "available" | "unavailable"
+}
+
+export type ProjectWorkflowState = "unregistered" | "valid" | "stale" | "invalid"
+
+export interface HealthDiagnostic {
+  readonly sourcePath: string
+  /** May embed daemon-local absolute filesystem paths for action-
+   *  resolution failures — never render this directly; use
+   *  `safeMessage`, which is the same diagnostic with any such paths
+   *  stripped. */
+  readonly message: string
+  /** Path-free rendering of `message`, safe to show in the browser.
+   *  Optional only for wire compatibility with a daemon that predates
+   *  this field — callers must fall back to `message` in that case. */
+  readonly safeMessage?: string
+}
+
+export interface DaemonProjectHealth {
+  readonly projectDir: string
+  readonly state: ProjectWorkflowState
+  readonly diagnostics: readonly HealthDiagnostic[]
 }
 
 /** Invalidation frame carried by the SSE stream. */
@@ -187,4 +244,11 @@ export interface ChangeEvent {
 
 export interface CommandResponse extends FeatureDetailResponse {
   readonly result: string
+}
+
+/** `POST /v1/runs/:id/answer` — NOT a `CommandResponse`: the server
+ *  returns the answered run alone, never a feature detail payload. */
+export interface AnswerRunResponse {
+  readonly result: string
+  readonly run: RunSummary | null
 }

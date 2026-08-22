@@ -1,0 +1,95 @@
+.wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.wrap.fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay);
+  background: var(--bg-canvas);
+  padding-top: var(--safe-top);
+  padding-left: var(--safe-left);
+  padding-right: var(--safe-right);
+  padding-bottom: var(--safe-bottom);
+}
+.viewport {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  overflow: hidden;
+  cursor: grab;
+  /* Inline (non-fullscreen): allow the browser's native vertical touch
+   * scroll to pass through so a compact inline graph on mobile never
+   * hijacks page scrolling — desktop mouse drag-to-pan is unaffected by
+   * touch-action (it only governs default touch gesture handling), so
+   * pointer-captured drag panning still works here on pointer devices. */
+  touch-action: pan-y;
+  background:
+    linear-gradient(to right, color-mix(in oklch, var(--cyan) 4%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in oklch, var(--cyan) 4%, transparent) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+.viewport:active {
+  cursor: grabbing;
+}
+/* Fullscreen mode is the dedicated touch-exploration surface: capture
+ * every touch gesture as 2D pan so the graph, not the (invisible, full
+ * viewport) page, owns the drag. */
+.wrap.fullscreen .viewport {
+  touch-action: none;
+}
+.stage {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+.toolbar {
+  position: absolute;
+  right: var(--space-3);
+  bottom: var(--space-3);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: color-mix(in oklch, var(--bg-panel) 92%, transparent);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 4px;
+  box-shadow: var(--shadow-panel);
+  backdrop-filter: blur(6px);
+}
+.toolbar button {
+  min-height: 30px;
+  min-width: 30px;
+  padding: 4px 8px;
+  font-size: var(--text-sm);
+}
+
+.wrap.fullscreen .toolbar {
+  right: calc(var(--space-3) + var(--safe-right));
+  bottom: calc(var(--space-3) + var(--safe-bottom));
+}
+
+@media (pointer: coarse) {
+  .toolbar button {
+    min-height: 40px;
+    min-width: 40px;
+  }
+}
+.zoomReadout {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  width: 3.4em;
+  text-align: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stage {
+    transition: none !important;
+  }
+}

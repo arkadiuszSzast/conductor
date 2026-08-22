@@ -1,0 +1,10 @@
+.body {
+  color: var(--text-dim);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.error {
+  color: var(--coral);
+  font-size: var(--text-sm);
+  margin-top: var(--space-2);
+}

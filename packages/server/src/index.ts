@@ -123,6 +123,8 @@ export type {
   FeatureState,
   FeatureStatus,
   Feedback,
+  InputDef,
+  InputType,
   JobPatch,
   JobRuntime,
   JobStatus,
@@ -132,6 +134,7 @@ export type {
   StepRuntime,
   StepStatus,
   Transition,
+  WorkflowInputDiagnostic,
 } from "@conductor/core"
 
 // Re-export retry-policy's shared taxonomy/policy/decision types

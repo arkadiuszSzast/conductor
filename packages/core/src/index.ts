@@ -33,6 +33,8 @@ export { DEFAULT_OUTCOME } from "./types.ts"
 export { parseWorkflow, parseYamlObject, stringifyYamlObject } from "./parse.ts"
 export type { ParseError, ParseWorkflowResult, ParseYamlObjectResult, YamlObjectParseError } from "./parse.ts"
 export { validateWorkflow } from "./validate.ts"
+export { resolveWorkflowInputs } from "./workflow-input.ts"
+export type { ResolveWorkflowInputsResult, WorkflowInputDiagnostic } from "./workflow-input.ts"
 export {
   ACTION_CAPABILITIES,
   ACTION_INPUT_TYPES,

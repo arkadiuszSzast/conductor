@@ -38,6 +38,7 @@ import {
   normalizeResourceWaitPolicy,
   normalizeRetryPolicy,
   renderTemplate,
+  resolveWorkflowInputs,
   systemRandom,
 } from "@conductor/core"
 import type {
@@ -55,6 +56,7 @@ import type {
   PipelineEvent,
   StepDef,
   WorkflowDef,
+  WorkflowInputDiagnostic,
 } from "@conductor/core"
 import type { RunSummary, Store } from "./store.ts"
 import type { WorkflowResolver, WorkflowSnapshot } from "./workflow-registry.ts"
@@ -88,6 +90,12 @@ export interface EngineOptions {
 export type StartFeatureResult =
   | { readonly ok: true; readonly feature: FeatureState }
   | { readonly ok: false; readonly code: "project_not_configured" | "unknown_workflow"; readonly message: string }
+  | {
+      readonly ok: false
+      readonly code: "invalid_input"
+      readonly message: string
+      readonly diagnostics: readonly WorkflowInputDiagnostic[]
+    }
 
 export interface StartFeatureInput {
   readonly title: string
@@ -95,6 +103,14 @@ export interface StartFeatureInput {
   readonly workflow?: string
   readonly pr?: number
   readonly sessionId?: string
+  /** Values for the selected workflow's declared `inputs`. OMITTED
+   *  (`undefined`) is equivalent to `{}` — a workflow with no required
+   *  inputs starts fine either way; `resolveWorkflowInputs` still applies
+   *  its defaults. An explicit `null` (or any other non-object JSON
+   *  value) is NOT coalesced to `{}` here — it reaches
+   *  `resolveWorkflowInputs` as-is and is rejected as `invalid_payload`,
+   *  the same as any other malformed payload a caller sends on purpose. */
+  readonly inputs?: unknown
 }
 
 export class Engine {
@@ -147,16 +163,37 @@ export class Engine {
         message: `unknown workflow "${input.workflow}" (available: ${snapshot.workflow.name})`,
       }
     }
+    // Resolve declared workflow inputs BEFORE any durable state exists —
+    // a rejected/mistyped/unknown input must leave no feature, run,
+    // session, command or action behind. Only an OMITTED `inputs` field
+    // (undefined) becomes `{}`; an explicit `null` is passed through
+    // unchanged so `resolveWorkflowInputs` rejects it as `invalid_payload`
+    // exactly like any other non-object payload a caller sends on purpose.
+    const resolved = resolveWorkflowInputs(snapshot.workflow.inputs, input.inputs === undefined ? {} : input.inputs)
+    if (!resolved.ok) {
+      return {
+        ok: false,
+        code: "invalid_input",
+        message: resolved.diagnostics.map(d => d.message).join("; "),
+        diagnostics: resolved.diagnostics,
+      }
+    }
     const feature = this.deps.store.createFeature({
       title: input.title,
       slug: slugify(input.title),
       projectDir,
       workflow: snapshot.workflow.name,
+      input: resolved.inputs,
       ...(input.description !== undefined ? { description: input.description } : {}),
       ...(input.pr !== undefined ? { pr: input.pr } : {}),
       ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
     })
-    await this.dispatch(feature.id, { kind: "feature.start" })
+    // Interpret feature.start against the SAME snapshot already validated
+    // and persisted above — never re-resolve via `this.deps.workflows()`
+    // here. A `conductor.yaml` reload racing this call must not let the
+    // first dispatch interpret a different workflow than the one whose
+    // inputs were just resolved and whose name was just persisted.
+    await this.dispatchWithSnapshot(feature.id, snapshot, { kind: "feature.start" })
     const after = this.deps.store.getFeature(feature.id) ?? feature
     return { ok: true, feature: after }
   }
@@ -174,6 +211,21 @@ export class Engine {
     const snapshot = this.deps.workflows(state.projectDir)
     if (!snapshot) {
       log.log(`feature=${state.slug}: no valid workflow for ${state.projectDir} — skipping`)
+      return
+    }
+    await this.dispatchWithSnapshot(featureId, snapshot, event)
+  }
+
+  /** `dispatch`'s core, parameterized on an already-resolved snapshot —
+   *  the one seam `startFeature` reuses so the snapshot its inputs were
+   *  resolved against is EXACTLY the snapshot `feature.start` interprets,
+   *  even if a concurrent registry reload swaps `this.deps.workflows()`'s
+   *  answer in between. Every other caller resolves fresh via `dispatch`. */
+  private async dispatchWithSnapshot(featureId: string, snapshot: WorkflowSnapshot, event: PipelineEvent): Promise<void> {
+    const { store, log } = this.deps
+    const state = store.getFeature(featureId)
+    if (!state) {
+      log.log(`dispatch: unknown feature ${featureId}`)
       return
     }
     const transition = interpret(snapshot.workflow, state, event)

@@ -11,7 +11,7 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit && bun run --cwd apps/web typecheck",
-    "test": "bun test",
+    "test": "bun test && bun run --cwd apps/web test:mounted",
     "lint": "tsc --noEmit --noUnusedLocals && bun run --cwd apps/web lint",
     "build": "bun run typecheck && bun run --cwd apps/web build:vite",
     "build:binary": "bun scripts/build-binary.ts"

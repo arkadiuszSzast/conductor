@@ -27,6 +27,7 @@ export function AuthGate(): React.ReactNode {
         <div className={styles.row}>
           <input
             type="password"
+            aria-label="Bearer token"
             placeholder="bearer token"
             value={token}
             disabled={checking}
@@ -40,7 +41,7 @@ export function AuthGate(): React.ReactNode {
             {checking ? "…" : "Connect"}
           </button>
         </div>
-        <div className={styles.error}>{error ?? ""}</div>
+        <div className={styles.error} role="alert" aria-live="assertive">{error ?? ""}</div>
         {session.token !== null ? (
           <button
             className={styles.reconnect}

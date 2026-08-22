@@ -10,6 +10,7 @@
  */
 
 import type {
+  AnswerRunResponse,
   ChangeEvent,
   CommandResponse,
   DaemonHealth,
@@ -18,25 +19,34 @@ import type {
   FindingView,
   RunLogPage,
   RunSummary,
+  StartFeatureRequest,
   TransitionEntry,
+  WorkflowInputDiagnostic,
   WorkflowProjection,
 } from "./types.ts"
 
 export interface ApiErrorBody {
   readonly error: { readonly code: string; readonly message: string; readonly requestId: string }
+  /** Present only on `POST /v1/features`'s 422 `invalid_input` response —
+   *  one entry per rejected workflow input (or the payload itself). */
+  readonly diagnostics?: readonly WorkflowInputDiagnostic[]
 }
 
 export class ApiError extends Error {
   readonly status: number
   readonly code: string
   readonly requestId: string | null
+  /** Per-input validation diagnostics — only set for a `422 invalid_input`
+   *  response from `POST /v1/features`. */
+  readonly diagnostics: readonly WorkflowInputDiagnostic[] | null
 
-  constructor(status: number, code: string, message: string, requestId: string | null) {
+  constructor(status: number, code: string, message: string, requestId: string | null, diagnostics: readonly WorkflowInputDiagnostic[] | null = null) {
     super(message)
     this.name = "ApiError"
     this.status = status
     this.code = code
     this.requestId = requestId
+    this.diagnostics = diagnostics
   }
 }
 
@@ -80,7 +90,14 @@ export class ApiClient {
     }
     if (token !== null) headers["authorization"] = `Bearer ${token}`
     const response = await this.fetchImpl(path, { ...init, headers })
-    if (!response.ok) throw await toApiError(response)
+    if (!response.ok) {
+      const err = await toApiError(response)
+      // Centralized here so every caller — read or mutation, store-driven
+      // or a direct one-off call like `startFeature` — returns to the
+      // auth gate on a 401 without each caller repeating the check.
+      if (err.status === 401) this.onUnauthorized?.()
+      throw err
+    }
     return (await response.json()) as T
   }
 
@@ -109,8 +126,16 @@ export class ApiClient {
     return body.timeline
   }
 
+  /** `docs/http-api.md`: this route's `diagnostics` are plain message
+   *  strings (unlike `GET /v1/health`'s `{sourcePath, message}` per-
+   *  project diagnostics) — deliberately, since this route is structure-
+   *  only and must never leak an on-daemon filesystem path. Normalized
+   *  defensively so an unexpected `{message}`-shaped entry (a server
+   *  regression, or a future wire change) still renders a readable
+   *  diagnostic instead of `"[object Object]"` or a thrown render error. */
   async workflow(projectDir: string): Promise<WorkflowProjection> {
-    return this.request<WorkflowProjection>(`/v1/projects/workflow?dir=${encodeURIComponent(projectDir)}`)
+    const body = await this.request<WorkflowProjection>(`/v1/projects/workflow?dir=${encodeURIComponent(projectDir)}`)
+    return { ...body, diagnostics: normalizeDiagnostics(body.diagnostics) }
   }
 
   /** The workflow endpoint's 404/409 are NOT errors in the UI sense —
@@ -131,6 +156,17 @@ export class ApiClient {
       }
       throw err
     }
+  }
+
+  /** Non-optimistic — there is no feature id until the daemon responds.
+   *  Rejects with the typed `ApiError`; a 422 `invalid_input` carries
+   *  per-input `diagnostics`. */
+  async startFeature(request: StartFeatureRequest): Promise<FeatureDetailResponse> {
+    return this.request<FeatureDetailResponse>("/v1/features", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request),
+    })
   }
 
   async fullRun(runId: string): Promise<RunSummary> {
@@ -154,8 +190,11 @@ export class ApiClient {
     })
   }
 
-  async answerRun(runId: string, notes: string): Promise<CommandResponse> {
-    return this.request<CommandResponse>(`/v1/runs/${encodeURIComponent(runId)}/answer`, {
+  /** `{result, run}` — the answered run alone, never a feature detail
+   *  payload. Callers must refetch feature detail/runs themselves;
+   *  never pass this to `DataSource.command`/`applyDetail`. */
+  async answerRun(runId: string, notes: string): Promise<AnswerRunResponse> {
+    return this.request<AnswerRunResponse>(`/v1/runs/${encodeURIComponent(runId)}/answer`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ notes }),
@@ -211,6 +250,21 @@ export class ApiClient {
   }
 }
 
+/** Accepts the documented `string[]` shape as-is; tolerates a stray
+ *  `{message}`/`{sourcePath, message}` object (or anything else) by
+ *  projecting it to a string rather than propagating a non-string into
+ *  UI that assumes `readonly string[]`. */
+function normalizeDiagnostics(raw: unknown): readonly string[] {
+  if (!Array.isArray(raw)) return []
+  return raw.map(entry => {
+    if (typeof entry === "string") return entry
+    if (entry !== null && typeof entry === "object" && typeof (entry as { message?: unknown }).message === "string") {
+      return (entry as { message: string }).message
+    }
+    return String(entry)
+  })
+}
+
 async function toApiError(response: Response): Promise<ApiError> {
   let body: ApiErrorBody | undefined
   try {
@@ -221,7 +275,7 @@ async function toApiError(response: Response): Promise<ApiError> {
   const code = body?.error.code ?? "internal"
   const message = body?.error.message ?? `request failed with status ${response.status}`
   const requestId = body?.error.requestId ?? response.headers.get("x-request-id")
-  return new ApiError(response.status, code, message, requestId)
+  return new ApiError(response.status, code, message, requestId, body?.diagnostics ?? null)
 }
 
 /** The frames a fetch-based SSE reader surfaces. */

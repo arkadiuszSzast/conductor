@@ -117,6 +117,16 @@ describe("top-level shape", () => {
       steps: [{ id: "s", type: "human", outcomes: {}, retry: { strategy: "none" } }],
     })
   })
+
+  it("parses an input literally named `__proto__` as a genuine own property, not a prototype reassignment", () => {
+    const workflow = parsed(
+      "name: x\ninputs:\n  __proto__: { type: string, required: true }\n  normal: { type: string, required: true }\n" +
+        "jobs:\n  main:\n    steps:\n      - id: s\n        human: {}\n",
+    )
+    expect(Object.prototype.hasOwnProperty.call(workflow.inputs, "__proto__")).toBe(true)
+    expect(workflow.inputs["__proto__"]).toEqual({ type: "string", presence: "required" })
+    expect(Object.keys(workflow.inputs).sort()).toEqual(["__proto__", "normal"])
+  })
 })
 
 describe("triggers", () => {

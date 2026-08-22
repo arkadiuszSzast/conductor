@@ -149,6 +149,21 @@ export function loopEdgeOf(
   return null
 }
 
+/**
+ * `GET /v1/projects/workflow?dir=` serves exactly one structural
+ * projection per project — the currently registered workflow, not one
+ * per historical workflow name a feature may carry. A feature started
+ * under a workflow that has since been renamed/replaced would otherwise
+ * have its runtime (`FeatureDetail.jobs`) merged against a projection
+ * whose job/step ids may not even exist in its history — silently wrong,
+ * not merely stale. Compares against `feature.workflow ?? "default"`,
+ * matching every other place in this codebase that treats a null
+ * `workflow` as the implicit "default" name.
+ */
+export function workflowCompatible(featureWorkflow: string | null, currentWorkflowName: string): boolean {
+  return (featureWorkflow ?? "default") === currentWorkflowName
+}
+
 /** Short, content-safe project name for card labels. */
 export function projectBasename(projectDir: string): string {
   const trimmed = projectDir.replace(/\/+$/, "")

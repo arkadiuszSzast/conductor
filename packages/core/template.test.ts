@@ -139,6 +139,18 @@ describe("buildEvalContext", () => {
     const described = buildEvalContext(workflowDef, featureState({ "arch-a": jobRuntime({ status: "running" }) }, { description: "Do the thing" }), "arch-a")
     expect(renderTemplate("Task: {{ feature.description }}", described).text).toBe("Task: Do the thing")
   })
+
+  it("exposes an input literally named `__proto__` as a genuine own property in the eval context", () => {
+    // `Object.fromEntries`, not an object literal (which would set the
+    // object's [[Prototype]] for this key instead of an own property) —
+    // the same construction `resolveWorkflowInputs` and a JSON.parse of
+    // an HTTP body produce for a persisted `FeatureState.input` map.
+    const input = Object.fromEntries([["__proto__", "auth-value"], ["normal", "world"]]) as Record<string, unknown>
+    const state = featureState({ "arch-a": jobRuntime({ status: "running" }) }, { input })
+    const ctx = buildEvalContext(workflowDef, state, "arch-a")
+    expect(Object.prototype.hasOwnProperty.call(ctx.inputs, "__proto__")).toBe(true)
+    expect(renderTemplate('{{ inputs["__proto__"] }}|{{ inputs.normal }}', ctx).text).toBe("auth-value|world")
+  })
 })
 
 describe("resolveJobOutputs", () => {

@@ -123,6 +123,10 @@ export interface StartFeatureInput {
   readonly pr?: number
   /** Adopt an existing runner session as the feature's parent session (the seed's "one feature, one session"). */
   readonly sessionId?: string
+  /** Values for the selected workflow's declared inputs — resolved and
+   *  validated server-side. No `conductor start` flag surfaces this yet;
+   *  the wire contract exists so other clients (or a future flag) can. */
+  readonly inputs?: Readonly<Record<string, string | number | boolean>>
 }
 
 export interface ReportInput {

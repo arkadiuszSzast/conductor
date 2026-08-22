@@ -27,7 +27,7 @@
 import { randomUUID, timingSafeEqual } from "node:crypto"
 import { statSync } from "node:fs"
 import { extname, resolve, sep } from "node:path"
-import type { FeatureState, FeatureStatus, StepRuntime } from "@conductor/core"
+import type { FeatureState, FeatureStatus, InputDef, StepRuntime, WorkflowInputDiagnostic } from "@conductor/core"
 import type { RunLogEntryInput, Store, StoreChange } from "./store.ts"
 import type { DaemonHealth, DaemonLogger } from "./daemon.ts"
 import type { LoadResult, WorkflowResolver, WorkflowStatus } from "./workflow-registry.ts"
@@ -69,10 +69,16 @@ export interface ApiConfig {
 export interface EngineControl {
   startFeature(
     projectDir: string,
-    input: { title: string; description?: string; workflow?: string; pr?: number; sessionId?: string },
+    input: { title: string; description?: string; workflow?: string; pr?: number; sessionId?: string; inputs?: unknown },
   ): Promise<
     | { readonly ok: true; readonly feature: FeatureState }
     | { readonly ok: false; readonly code: "project_not_configured" | "unknown_workflow"; readonly message: string }
+    | {
+        readonly ok: false
+        readonly code: "invalid_input"
+        readonly message: string
+        readonly diagnostics: readonly WorkflowInputDiagnostic[]
+      }
   >
   report(input: { runId: string; outcome?: "succeeded" | "failed"; verdict?: string; notes?: string; ask?: string }): Promise<string>
   answer(runId: string, notes: string): Promise<
@@ -121,6 +127,7 @@ export type ApiErrorCode =
   | "invalid_request"
   | "project_not_configured"
   | "unknown_workflow"
+  | "invalid_input"
   | "conflict"
   | "stale_version"
   | "run_already_concluded"
@@ -139,6 +146,7 @@ const ERROR_STATUS: Record<ApiErrorCode, number> = {
   invalid_request: 400,
   project_not_configured: 422,
   unknown_workflow: 422,
+  invalid_input: 422,
   conflict: 409,
   stale_version: 409,
   run_already_concluded: 409,
@@ -651,12 +659,18 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       return error(requestId, "not_found", `no workflow registered for "${dir}"`)
     }
     if (status.state === "invalid") {
-      const detail = status.diagnostics.map(diagnostic => diagnostic.message).join("; ")
+      // `safeMessage`, never `message` — same boundary rule as the
+      // stale-diagnostics projection below: this route is browser-facing
+      // and must never embed an action manifest's `sourcePath` or the
+      // daemon's configured action registry search paths.
+      const detail = status.diagnostics.map(diagnostic => diagnostic.safeMessage).join("; ")
       return error(requestId, "conflict", `workflow for "${dir}" is invalid: ${detail}`)
     }
-    // Structure only — job edges plus step ids and kinds. Prompts,
-    // expressions, `with:` payloads and retry policies never leave the
-    // daemon through this route.
+    // Structure only — job edges, step ids/kinds and safe input
+    // definitions. Prompts, expressions, role/model bindings, `with:`
+    // payloads and retry policies never leave the daemon through this
+    // route. Input defaults ARE exposed: they are user-facing start
+    // values, not execution secrets.
     const workflow = status.snapshot.workflow
     const jobs: Record<string, { needs: readonly string[]; steps: Array<{ id: string; kind: string; interactive?: boolean }> }> = {}
     for (const [jobId, job] of Object.entries(workflow.jobs)) {
@@ -669,13 +683,30 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         })),
       }
     }
+    // `Object.fromEntries`, not `inputs[name] = def` — an input literally
+    // named `__proto__` is a legal JSON key and must survive as a genuine
+    // own property rather than reassigning `Object.prototype`'s accessor.
+    const inputs: Record<string, InputDef> = Object.fromEntries(Object.entries(workflow.inputs))
+    // Diagnostics project to `safeMessage`, never `message` —
+    // `WorkflowDiagnostic.sourcePath` is an absolute on-daemon
+    // filesystem path (this route's stale-only diagnostics come from a
+    // reload failure) and, for an action-resolution failure, `message`
+    // can additionally embed a resolved action manifest's `sourcePath`
+    // and the daemon's configured action registry search paths —
+    // `safeMessage` is the principled, structure-derived projection that
+    // strips exactly those two path sources while keeping every other
+    // diagnostic (parse errors, structural validation, missing file)
+    // byte-identical, since those never carried a path beyond
+    // `sourcePath` itself. This route is structure-only by design; the
+    // browser never needs, and must never see, the daemon's local layout.
     return json(
       200,
       {
         name: workflow.name,
         stale: status.state === "stale",
         jobs,
-        diagnostics: status.state === "stale" ? status.diagnostics : [],
+        inputs,
+        diagnostics: status.state === "stale" ? status.diagnostics.map(diagnostic => diagnostic.safeMessage) : [],
       },
       requestId,
     )
@@ -753,7 +784,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
   async function createFeature(request: Request, requestId: string): Promise<Response> {
     const parsed = await readJsonBody(request)
     if (!parsed.ok) return error(requestId, "invalid_json", "request body must be a JSON object")
-    const { title, project, description, workflow, pr, sessionId } = parsed.body
+    const { title, project, description, workflow, pr, sessionId, inputs } = parsed.body
     if (typeof title !== "string" || title.trim() === "") {
       return error(requestId, "invalid_request", "\"title\" (non-empty string) is required")
     }
@@ -781,8 +812,18 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       ...(workflow !== undefined ? { workflow } : {}),
       ...(pr !== undefined ? { pr } : {}),
       ...(sessionId !== undefined ? { sessionId } : {}),
+      ...(inputs !== undefined ? { inputs } : {}),
     })
-    if (!result.ok) return error(requestId, result.code, result.message)
+    if (!result.ok) {
+      if (result.code === "invalid_input") {
+        return json(
+          422,
+          { error: { code: result.code, message: result.message, requestId }, diagnostics: result.diagnostics },
+          requestId,
+        )
+      }
+      return error(requestId, result.code, result.message)
+    }
     return json(201, featurePayload(result.feature.id), requestId)
   }
 
