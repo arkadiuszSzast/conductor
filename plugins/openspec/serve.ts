@@ -111,20 +111,41 @@ async function listArchived(deps: OpenSpecServeDeps): Promise<readonly string[]>
   }
 }
 
+/** The `openspec` CLI may be absent on the host (it is the project's
+ *  tool, not the plugin's dependency) — enumerate change directories
+ *  directly so the panel degrades to file-derived data, not an empty
+ *  list. */
+async function listChangesFromFs(deps: OpenSpecServeDeps): Promise<readonly RawListedChange[]> {
+  try {
+    const entries = await deps.readDir(join(deps.projectDir, "openspec", "changes"))
+    const names = entries.filter(name => name !== "archive" && isSafeChangeName(name))
+    const changes: RawListedChange[] = []
+    for (const name of names.sort()) {
+      if (await deps.isDirectory(join(deps.projectDir, "openspec", "changes", name))) {
+        changes.push({ name })
+      }
+    }
+    return changes
+  } catch {
+    return []
+  }
+}
+
 async function handleChanges(deps: OpenSpecServeDeps): Promise<Response> {
   const hasOpenSpec = await deps.isDirectory(join(deps.projectDir, "openspec"))
   if (!hasOpenSpec) return jsonResponse(200, { openspec: false })
 
   const result = await deps.exec(["openspec", "list", "--json"], { cwd: deps.projectDir })
-  let rawChanges: readonly RawListedChange[] = []
+  let rawChanges: readonly RawListedChange[] | null = null
   if (result.code === 0) {
     try {
       const parsed = JSON.parse(result.stdout) as { changes?: readonly RawListedChange[] }
       rawChanges = parsed.changes ?? []
     } catch {
-      rawChanges = []
+      rawChanges = null
     }
   }
+  if (rawChanges === null) rawChanges = await listChangesFromFs(deps)
 
   const active = (await Promise.all(rawChanges.map(raw => toActiveChange(raw, deps))))
     .filter((change): change is ActiveChange => change !== null)

@@ -133,6 +133,28 @@ describe("GET /changes", () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  it("lists changes from the filesystem when the openspec CLI is not installed (exit 127)", async () => {
+    const dir = tempDir()
+    try {
+      mkdirSync(join(dir, "openspec", "changes", "sample-change"), { recursive: true })
+      writeFileSync(join(dir, "openspec", "changes", "sample-change", "tasks.md"), "- [x] one\n- [ ] two\n")
+      mkdirSync(join(dir, "openspec", "changes", "archive", "old-change"), { recursive: true })
+
+      const exec = async (): Promise<ExecResult> => ({ code: 127, stdout: "", stderr: "openspec: command not found" })
+      const response = await handleRequest(new Request("http://x/changes"), realFsDeps(dir, { exec }))
+      const body = (await response.json()) as {
+        openspec: boolean
+        active: Array<{ name: string; taskProgress: { done: number; total: number } | null }>
+        archived: string[]
+      }
+      expect(body.openspec).toBe(true)
+      expect(body.active).toEqual([{ name: "sample-change", taskProgress: { done: 1, total: 2 } }])
+      expect(body.archived).toEqual(["old-change"])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe("POST /start-work", () => {
