@@ -175,6 +175,21 @@ describe("Plugin e2e: the bundled OpenSpec plugin is discovered and run with no 
     expect(ui.headers.get("content-type")).toContain("text/html")
   })
 
+  it("reaps the whole process group: a grandchild spawned by the backend dies with it", async () => {
+    const marker = `conductor-e2e-grandchild-${process.pid}-${Date.now()}`
+    const script = `bash -c 'exec -a ${marker} sleep 300' & echo started >&2; wait`
+    const handle = realPluginProcessSpawner.spawn(["bash", "-c", script], { cwd: tmpdir(), env: {} })
+
+    await pollUntil(() => handle.recentStderr().includes("started"))
+    handle.signal("SIGTERM")
+    const exit = await handle.exited
+    expect(exit.signal).toBe("SIGTERM")
+
+    // The negative-PID kill must have reached the grandchild too — the
+    // uniquely named sleep must not survive the group signal.
+    await pollUntil(() => Bun.spawnSync(["pgrep", "-f", marker]).stdout.toString().trim() === "")
+  })
+
   it("shuts down cleanly: the backend is reaped and further proxy calls answer 'unavailable'", async () => {
     const { base, project, supervisor } = await startStackWithBundledPlugin()
 

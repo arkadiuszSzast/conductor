@@ -70,7 +70,7 @@ capabilities: [process, filesystem, network]  # optional, informational only
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `plugin` | string | yes | kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`); must equal the plugin's directory name or the manifest is rejected |
+| `plugin` | string | yes | kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`); must equal the plugin's directory name or the manifest is rejected. `session` is reserved (`/v1/plugins/session` is the cookie-exchange route) and rejected at scan time |
 | `version` | integer | yes | must be `>= 1`; a version greater than the daemon's supported version (currently `1`) is skipped with a diagnostic |
 | `panel.title` | string | yes | non-empty; shown as the rail tab label |
 | `panel.icon` | string | no | opaque icon token; the web UI falls back to the title's first letter when absent |

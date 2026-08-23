@@ -20,6 +20,10 @@ import type { PluginManifest, PluginManifestPanel } from "@conductor/core"
 
 const MAX_MANIFEST_BYTES = 1_048_576
 
+/** Ids whose proxy mount would collide with a fixed daemon route under
+ *  `/v1/plugins/` (`POST /v1/plugins/session` is the cookie exchange). */
+const RESERVED_PLUGIN_IDS: ReadonlySet<string> = new Set(["session"])
+
 export type PluginScope = "global" | "project"
 
 export interface PluginDiagnostic {
@@ -296,6 +300,14 @@ async function readPluginDirectory(
     diagnostics.push({
       path: manifestPath,
       message: `manifest declares plugin id "${parsed.manifest.id}" but its directory is named "${id}" — the id must match the directory name`,
+    })
+    return undefined
+  }
+
+  if (RESERVED_PLUGIN_IDS.has(id)) {
+    diagnostics.push({
+      path: manifestPath,
+      message: `plugin id "${id}" is reserved — "/v1/plugins/${id}" collides with a daemon route; pick another id`,
     })
     return undefined
   }

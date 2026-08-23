@@ -168,6 +168,17 @@ describe("PluginRegistry.scan: hygiene and diagnostics", () => {
     expect(diagnostics[0]!.path).toBe(join(dir, "plugin.yaml"))
   })
 
+  it("rejects the reserved plugin id 'session'", async () => {
+    const globalDir = await temporaryDir()
+    await writePlugin(globalDir, "session", manifest("session"))
+    const registry = await scan({ globalDir })
+
+    expect(registry.list()).toEqual([])
+    const diagnostics = registry.loadDiagnostics()
+    expect(diagnostics).toHaveLength(1)
+    expect(diagnostics[0]!.message).toContain('plugin id "session" is reserved')
+  })
+
   it("skips a manifest with an unsupported schema version", async () => {
     const globalDir = await temporaryDir()
     await writePlugin(globalDir, "future", manifest("future", { version: 999 }))

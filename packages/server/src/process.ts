@@ -161,6 +161,20 @@ export const realPluginProcessSpawner: PluginProcessSpawner = {
     })
     return {
       signal(name = "SIGTERM") {
+        // `detached: true` made the child a process-group leader, so the
+        // negative-PID form reaps grandchildren too (a backend that shells
+        // out must not leave orphans past daemon shutdown — design risk
+        // "zombie plugin processes"). Fall back to the single-PID kill
+        // where groups are unsupported (Windows) or the group is gone.
+        try {
+          const pid = child?.pid
+          if (pid !== undefined && process.platform !== "win32") {
+            process.kill(-pid, name)
+            return
+          }
+        } catch {
+          // Group already gone — fall through to the direct kill.
+        }
         try {
           child?.kill(name)
         } catch {
