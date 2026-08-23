@@ -13,6 +13,7 @@ import { Toasts } from "./ui/toasts.tsx"
 import { pushToast } from "./ui/toast-store.ts"
 import { StartWorkContext } from "./start-work/start-work-context.ts"
 import { StartWorkSheet } from "./start-work/start-work-sheet.tsx"
+import { PluginRail } from "./plugins/plugin-rail.tsx"
 
 async function probeHealth(token: string | null): Promise<number> {
   const headers: Record<string, string> = {}
@@ -63,17 +64,22 @@ export function App(): React.ReactNode {
 }
 
 function Shell(): React.ReactNode {
-  const { session, store } = useApp()
+  const { session, store, client } = useApp()
   const status = useAuthStatus(session)
   const [startWorkOpen, setStartWorkOpen] = useState(false)
 
   useEffect(() => {
     if (status === "authenticated") {
       if (!store.isStreamConnected()) void store.start()
+      // Fire-and-forget: sets the plugin-session cookie iframe
+      // navigations and panel fetches ride under bearer auth (design D5).
+      // A failure here just means panels 401 until the store's own
+      // retry-on-401 re-exchanges — never blocks the board from loading.
+      void client.exchangePluginSession().catch(() => {})
     } else if (status === "needs-token") {
       store.stop()
     }
-  }, [status, store])
+  }, [status, store, client])
 
   if (status !== "authenticated") return <AuthGate />
 
@@ -85,8 +91,11 @@ function Shell(): React.ReactNode {
         </a>
         <TopBar />
         <main id="main" tabIndex={-1}>
-          <Route path="/" component={Board} />
-          <Route path="/feature/:id" component={FeatureView} />
+          <div className="main-content">
+            <Route path="/" component={Board} />
+            <Route path="/feature/:id" component={FeatureView} />
+          </div>
+          <PluginRail />
         </main>
         <Toasts />
         {startWorkOpen ? <StartWorkSheet onClose={() => setStartWorkOpen(false)} /> : null}

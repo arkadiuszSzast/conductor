@@ -22,6 +22,8 @@ import type {
   FeatureDetailResponse,
   FeatureListItem,
   FindingView,
+  PluginListingResponse,
+  PluginsChangeEvent,
   RunSummary,
   StartFeatureRequest,
   TransitionEntry,
@@ -50,6 +52,8 @@ export type WorkflowState =
   | { readonly ok: false; readonly state: "unregistered" | "invalid"; readonly message: string }
 
 export type WorkflowResourceState = ResourceState<WorkflowState>
+
+export type PluginsState = ResourceState<PluginListingResponse>
 
 /** Coalescing window for SSE invalidations (brief rule 2). */
 const COALESCE_WINDOW_MS = 150
@@ -105,6 +109,9 @@ export class DataSource {
   private timelines = new Map<string, TimelineState>()
   private workflows = new Map<string, WorkflowResourceState>()
   private health: HealthState = { status: "loading", data: null, error: null, version: 0 }
+  /** Keyed by the active scope's project dir, or "" for the no-scope
+   *  (global-only) listing — mirrors `workflows`. */
+  private plugins = new Map<string, PluginsState>()
 
   private readonly listeners = new Map<string, Set<() => void>>()
   private readonly runLogListeners = new Map<string, Set<() => void>>()
@@ -114,7 +121,7 @@ export class DataSource {
   private readonly echo = new Map<string, EchoState>()
   private readonly commandChains = new Map<string, Promise<void>>()
 
-  private readonly pending = new Map<string, ChangeEvent>()
+  private readonly pending = new Map<string, ChangeEvent | PluginsChangeEvent>()
   private coalesceTimer: unknown | null = null
 
   private streamConnected = false
@@ -167,6 +174,10 @@ export class DataSource {
 
   getHealth(): HealthState {
     return this.health
+  }
+
+  getPlugins(project: string): PluginsState {
+    return this.plugins.get(project) ?? EMPTY_RESOURCE
   }
 
   subscribe(key: string, listener: () => void): () => void {
@@ -228,6 +239,16 @@ export class DataSource {
     return this.ensure("health", () => this.client.health(), true)
   }
 
+  ensurePluginsLoaded(project: string): void {
+    this.ensure(`plugins:${project}`, () => this.client.plugins(project === "" ? undefined : project))
+  }
+
+  /** Force-refetch the plugin listing for a scope — used on a `plugins`
+   *  SSE invalidation and on board scope change. */
+  refetchPlugins(project: string): Promise<void> {
+    return this.ensure(`plugins:${project}`, () => this.client.plugins(project === "" ? undefined : project), true)
+  }
+
   /** Force-refetch the feature detail (e.g. after a 409 race). */
   refetchFeatureDetail(featureId: string): Promise<void> {
     return this.ensure(`detail:${featureId}`, () => this.client.featureDetail(featureId), true)
@@ -273,6 +294,12 @@ export class DataSource {
           // branch only needs to stop the retry loop and record the error.
           this.inflight.delete(key)
           this.setResource(key, { status: "error", data: this.dataOf(key), error })
+          // The plugin listing itself is bearer-authorized; a 401 here
+          // means the bearer token is still valid (or `onUnauthorized`
+          // would already be resetting the app) but the plugin-session
+          // cookie panels rely on may have lapsed (daemon restart) —
+          // best-effort re-exchange so the NEXT panel load works.
+          if (key.startsWith("plugins:")) void this.client.exchangePluginSession().catch(() => {})
           return
         }
         // Transient failures on the initial (non-forced) load get a small
@@ -318,6 +345,7 @@ export class DataSource {
     if (key.startsWith("findings:")) return this.findings.get(key.slice(9))?.data ?? null
     if (key.startsWith("timeline:")) return this.timelines.get(key.slice(9))?.data ?? null
     if (key.startsWith("workflow:")) return this.workflows.get(key.slice(9))?.data ?? null
+    if (key.startsWith("plugins:")) return this.plugins.get(key.slice(8))?.data ?? null
     return null
   }
 
@@ -329,6 +357,7 @@ export class DataSource {
     const isFindings = key.startsWith("findings:")
     const isTimeline = key.startsWith("timeline:")
     const isWorkflow = key.startsWith("workflow:")
+    const isPlugins = key.startsWith("plugins:")
 
     const version = this.versionOf(key) + 1
     const next = { ...state, version }
@@ -347,6 +376,8 @@ export class DataSource {
       this.timelines.set(key.slice("timeline:".length), next as TimelineState)
     } else if (isWorkflow) {
       this.workflows.set(key.slice("workflow:".length), next as WorkflowResourceState)
+    } else if (isPlugins) {
+      this.plugins.set(key.slice("plugins:".length), next as PluginsState)
     }
     this.emit(key)
   }
@@ -359,6 +390,7 @@ export class DataSource {
     if (key.startsWith("findings:")) return this.findings.get(key.slice(9))?.status ?? "loading"
     if (key.startsWith("timeline:")) return this.timelines.get(key.slice(9))?.status ?? "loading"
     if (key.startsWith("workflow:")) return this.workflows.get(key.slice(9))?.status ?? "loading"
+    if (key.startsWith("plugins:")) return this.plugins.get(key.slice(8))?.status ?? "loading"
     return "loading"
   }
 
@@ -370,6 +402,7 @@ export class DataSource {
     if (key.startsWith("findings:")) return this.findings.get(key.slice(9))?.version ?? 0
     if (key.startsWith("timeline:")) return this.timelines.get(key.slice(9))?.version ?? 0
     if (key.startsWith("workflow:")) return this.workflows.get(key.slice(9))?.version ?? 0
+    if (key.startsWith("plugins:")) return this.plugins.get(key.slice(8))?.version ?? 0
     return 0
   }
 
@@ -629,8 +662,9 @@ export class DataSource {
     this.queue(frame.change)
   }
 
-  private queue(change: ChangeEvent): void {
-    this.pending.set(`${change.kind}:${change.featureId}`, change)
+  private queue(change: ChangeEvent | PluginsChangeEvent): void {
+    const key = change.kind === "plugins" ? "plugins" : `${change.kind}:${change.featureId}`
+    this.pending.set(key, change)
     if (this.coalesceTimer === null) {
       this.coalesceTimer = this.setTimeoutFn(() => {
         this.coalesceTimer = null
@@ -647,7 +681,13 @@ export class DataSource {
     // One refetch pass: collect targets as a set so a burst
     // (transition+run+feature for one feature) hits each endpoint once.
     const targets = new Set<string>()
-    for (const change of changes) this.collectTargets(change, targets)
+    for (const change of changes) {
+      if (change.kind === "plugins") {
+        targets.add("plugins")
+        continue
+      }
+      this.collectTargets(change, targets)
+    }
     for (const target of targets) this.executeTarget(target)
   }
 
@@ -732,6 +772,10 @@ export class DataSource {
       this.refetchFindings(target.slice(9))
     } else if (target.startsWith("run_log:")) {
       this.emitRunLog(target.slice(8))
+    } else if (target === "plugins") {
+      // No single "active scope" concept lives in the store (unlike
+      // `activeFeatureId`) — refetch every scope a rail has ever loaded.
+      for (const scope of this.plugins.keys()) this.refetchPlugins(scope)
     }
   }
 

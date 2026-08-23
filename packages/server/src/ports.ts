@@ -56,6 +56,52 @@ export interface ProcessRunner {
   shell(command: string, options: ProcessExecOptions): Promise<ProcessExecResult>
 }
 
+// ------------------------------------------------------- long-running process
+
+/** Allocates an ephemeral loopback TCP port for a plugin backend — bind
+ *  port 0, read back, release, so the daemon never configures a port. */
+export interface PortAllocator {
+  allocate(): Promise<number>
+}
+
+export interface PluginProcessSpawnOptions {
+  readonly cwd: string
+  /**
+   * The EXACT environment the child receives — no ambient merge happens
+   * here; the caller decides what crosses (e.g. the supervisor passes
+   * only its `CONDUCTOR_*` contract, and the real spawner adds a small
+   * PATH/HOME-style passthrough on top, never the daemon's whole env).
+   */
+  readonly env: Readonly<Record<string, string>>
+}
+
+export interface PluginProcessExit {
+  readonly code: number | null
+  readonly signal: string | null
+}
+
+/** A supervised long-running child process — distinct from `ProcessRunner`,
+ *  whose `exec`/`shell` run to completion. A plugin backend is a server
+ *  the supervisor starts, signals, and outlives across restarts. */
+export interface PluginProcessHandle {
+  /** Sends `name` (default `SIGTERM`) to the child. A no-op once exited. */
+  signal(name?: NodeJS.Signals): void
+  /** Resolves exactly once, when the child has exited. */
+  readonly exited: Promise<PluginProcessExit>
+  /** Bounded recent stderr output — a cheap crash diagnostic, not a log. */
+  recentStderr(): string
+}
+
+/**
+ * Spawns a long-running child process. `command` steps and plugin
+ * backends never call `spawn` directly — this is the only long-running-
+ * process boundary, mirroring `ProcessRunner` for run-to-completion
+ * commands.
+ */
+export interface PluginProcessSpawner {
+  spawn(command: readonly string[], options: PluginProcessSpawnOptions): PluginProcessHandle
+}
+
 // ------------------------------------------------------------ sessions
 
 /**

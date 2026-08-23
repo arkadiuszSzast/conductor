@@ -15,12 +15,18 @@ import { dirname, resolve } from "node:path"
 import { spawnSync } from "node:child_process"
 import {
   Daemon,
+  PluginRegistry,
+  PluginSupervisor,
   RunnerRegistry,
+  createPluginControl,
   createRunnerSessionClient,
+  realPluginProcessSpawner,
+  realPortAllocator,
   startApiServer,
   type ApiServer,
 } from "@conductor/server"
 import { runCli, type DaemonProcessHandle, type DaemonStartInput } from "./cli.ts"
+import { preparePluginSubsystem } from "./plugin-runtime.ts"
 import { uiDistStale, type UiDistFs } from "./ui-dist.ts"
 
 /**
@@ -106,6 +112,7 @@ function startDaemon(input: DaemonStartInput): DaemonProcessHandle {
   })
 
   let server: ApiServer | null = null
+  let pluginStop: (() => Promise<void>) | null = null
   let exitResolve!: (code: number) => void
   const exited = new Promise<number>(resolve => {
     exitResolve = resolve
@@ -122,6 +129,7 @@ function startDaemon(input: DaemonStartInput): DaemonProcessHandle {
     void (async () => {
       try {
         await server?.stop()
+        await pluginStop?.()
         await daemon.stop()
         exitResolve(0)
       } catch (error) {
@@ -139,6 +147,36 @@ function startDaemon(input: DaemonStartInput): DaemonProcessHandle {
 
   const started = (async () => {
     await daemon.start()
+
+    const plugins = await preparePluginSubsystem(input.plugins, {
+      scan: () =>
+        PluginRegistry.scan({
+          globalDir: input.pluginsDir,
+          extraPaths: input.plugins.paths,
+          projects: daemon.registry.list().map(entry => ({ id: entry.projectDir, root: entry.projectDir })),
+          disabled: input.plugins.disabled,
+        }),
+      createSupervisor: () =>
+        new PluginSupervisor(
+          {
+            spawner: realPluginProcessSpawner,
+            ports: realPortAllocator,
+            log: { log: (message: string) => input.log({ level: "info", message }) },
+          },
+          {
+            conductorUrl: `http://${apiConfig.bind.host}:${apiConfig.bind.port}`,
+            ...(apiConfig.auth.mode === "bearer" ? { conductorToken: apiConfig.auth.token } : {}),
+          },
+        ),
+      createControl: createPluginControl,
+      disabledControl: () => ({
+        listing: () => ({ enabled: false, plugins: [], diagnostics: [] }),
+        resolve: () => ({ ok: false as const }),
+        subscribe: () => () => {},
+      }),
+    })
+    pluginStop = plugins.stop
+
     server = startApiServer(apiConfig, {
       store: daemon.store,
       engine: daemon.engine,
@@ -147,8 +185,13 @@ function startDaemon(input: DaemonStartInput): DaemonProcessHandle {
       workflowStatus: dir => daemon.registry.getStatus(dir),
       registerProject: dir => daemon.registry.register(dir),
       runners,
+      plugins: plugins.control,
       logger,
     })
+
+    // Plugin backends are started once the daemon's own API is bound —
+    // their CONDUCTOR_URL env only becomes answerable at this point.
+    await plugins.start()
   })()
 
   return { started, exited }

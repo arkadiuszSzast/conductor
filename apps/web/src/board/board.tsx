@@ -19,6 +19,7 @@ import { JobFrontierCard } from "./job-frontier-card.tsx"
 import { StageSelector, type StageOption } from "./stage-selector.tsx"
 import { useIsNarrowViewport } from "../lib/viewport.ts"
 import { statusGlyph, type BoardCardModel } from "./card-model.ts"
+import { publishActiveScope } from "../plugins/active-scope.ts"
 import styles from "./board.module.css"
 
 export function Board(): React.ReactNode {
@@ -67,6 +68,11 @@ export function Board(): React.ReactNode {
   if (selectedScope !== scopeMemory) setScopeMemory(selectedScope)
 
   const scope = scopes.find(s => s.key === selectedScope) ?? null
+
+  useEffect(() => {
+    publishActiveScope({ project: scope?.projectDir ?? null, feature: null })
+  }, [scope])
+
   const workflowState = useWorkflow(store, scope?.projectDir ?? "")
   const workflowRes = workflowState.data
   const workflowMismatch = scope !== null && workflowRes !== null && workflowRes.ok && !scopeMatchesWorkflow(scope, workflowRes.workflow)

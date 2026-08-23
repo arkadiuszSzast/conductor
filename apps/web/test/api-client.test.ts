@@ -178,3 +178,29 @@ describe("ApiClient.recover", () => {
     }
   })
 })
+
+describe("ApiClient.exchangePluginSession", () => {
+  it("POSTs to /v1/plugins/session with the bearer header and same-origin credentials", async () => {
+    let capturedPath = ""
+    let capturedInit: RequestInit | undefined
+    const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      capturedPath = String(url)
+      capturedInit = init
+      return new Response(null, { status: 204 })
+    }) as FetchLike
+    const client = new ApiClient({ token: () => "tok", fetch: fetchImpl })
+    await client.exchangePluginSession()
+    expect(capturedPath).toBe("/v1/plugins/session")
+    expect(capturedInit?.method).toBe("POST")
+    expect((capturedInit?.headers as Record<string, string>)["authorization"]).toBe("Bearer tok")
+    expect(capturedInit?.credentials).toBe("same-origin")
+  })
+
+  it("fires onUnauthorized on a 401", async () => {
+    let unauthorized = 0
+    const fetchImpl = (async () => jsonResponse(401, { error: { code: "unauthorized", message: "no", requestId: "r" } })) as FetchLike
+    const client = new ApiClient({ token: () => null, onUnauthorized: () => unauthorized++, fetch: fetchImpl })
+    await expect(client.exchangePluginSession()).rejects.toBeInstanceOf(ApiError)
+    expect(unauthorized).toBe(1)
+  })
+})

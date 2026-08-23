@@ -64,6 +64,14 @@ export type {
 } from "./action.ts"
 export { parseActionManifest } from "./action-manifest.ts"
 export type { ParseActionManifestError, ParseActionManifestResult } from "./action-manifest.ts"
+export { SUPPORTED_PLUGIN_MANIFEST_VERSION, parsePluginManifest, validatePluginManifest } from "./plugin-manifest.ts"
+export type {
+  ParsePluginManifestError,
+  ParsePluginManifestResult,
+  PluginManifest,
+  PluginManifestBackend,
+  PluginManifestPanel,
+} from "./plugin-manifest.ts"
 export type * from "./types.ts"
 export type { RenderResult } from "./template.ts"
 export type { ValidationResult } from "./validate.ts"

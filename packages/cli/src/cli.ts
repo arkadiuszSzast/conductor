@@ -23,7 +23,14 @@
 import { ApiClient, ApiError, type FetchLike, type TransitionView } from "./client.ts"
 import { resolveConnection, UsageError } from "./config.ts"
 import type { ApiConfig, DaemonConfig, DaemonLogEntry } from "@conductor/server"
-import { DAEMON_CONFIG_TEMPLATE, addProjectToConfig, defaultDaemonConfig, loadDaemonConfig, platformPaths } from "./daemon-config.ts"
+import {
+  DAEMON_CONFIG_TEMPLATE,
+  addProjectToConfig,
+  defaultDaemonConfig,
+  loadDaemonConfig,
+  platformPaths,
+  type PluginsFileConfig,
+} from "./daemon-config.ts"
 
 /** Input for the `startDaemon` port — one assembled daemon + api config. */
 export interface DaemonStartInput {
@@ -37,6 +44,16 @@ export interface DaemonStartInput {
   readonly noUi: boolean
   /** Structured JSON log lines, `jsonLineLogger` shape. */
   readonly log: (entry: DaemonLogEntry) => void
+  /** Resolved `plugins` config section (defaults already applied). */
+  readonly plugins: PluginsFileConfig
+  /**
+   * `<config-dir>/plugins` — the global plugin search root, derived from
+   * `platformPaths()`. `null` when neither `XDG_CONFIG_HOME` nor `HOME`
+   * is set (an explicit `--config` daemon start needs neither): the
+   * global scope is then simply not scanned, matching
+   * `PluginRegistryConfig.globalDir`'s own `string | null`.
+   */
+  readonly pluginsDir: string | null
 }
 
 export interface DaemonProcessHandle {
@@ -558,7 +575,8 @@ async function commandDaemon(parsed: Parsed, deps: CliDeps): Promise<number> {
     deps.stderr("error: this build cannot start a daemon (no daemon runtime wired)")
     return EXIT.failure
   }
-  const handle = deps.startDaemon({ daemon, api, noUi: parsed.flags.has("no-ui"), log })
+  const pluginsDir = pluginsGlobalDir(deps.env)
+  const handle = deps.startDaemon({ daemon, api, noUi: parsed.flags.has("no-ui"), log, plugins: config.plugins, pluginsDir })
   try {
     await handle.started
   } catch (err) {
@@ -572,6 +590,22 @@ async function commandDaemon(parsed: Parsed, deps: CliDeps): Promise<number> {
 function parentPath(path: string): string {
   const index = path.lastIndexOf("/")
   return index <= 0 ? "" : path.slice(0, index)
+}
+
+/**
+ * The global plugin search root is always the platform config
+ * directory's `plugins` subdirectory (design D3), independent of an
+ * explicit `--config` path pointing elsewhere. `platformPaths` throws
+ * when neither XDG nor HOME is resolvable — a legitimate daemon startup
+ * shape when `--config` is explicit, so this degrades to no global
+ * plugin scope rather than failing the whole command.
+ */
+function pluginsGlobalDir(env: Readonly<Record<string, string | undefined>>): string | null {
+  try {
+    return platformPaths(env).pluginsDir
+  } catch {
+    return null
+  }
 }
 
 /**

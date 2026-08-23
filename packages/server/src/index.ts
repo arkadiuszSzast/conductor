@@ -70,11 +70,16 @@ export { ActionHost, CapabilityDeniedError, realSleep } from "./action-host.ts"
 export type { ActionHandler, ActionHostDeps, ActionHostExecuteResult } from "./action-host.ts"
 export { bundledHandlers } from "./actions/bundled.ts"
 
-export { realProcessRunner } from "./process.ts"
+export { realPluginProcessSpawner, realPortAllocator, realProcessRunner } from "./process.ts"
 export { systemClock } from "./ports.ts"
 export type {
   Clock,
   Logger,
+  PluginProcessExit,
+  PluginProcessHandle,
+  PluginProcessSpawnOptions,
+  PluginProcessSpawner,
+  PortAllocator,
   ProcessExecOptions,
   ProcessExecResult,
   ProcessRunner,
@@ -114,6 +119,32 @@ export type {
   RunnerDirectory,
   RunnerRegistration,
 } from "./runner-registry.ts"
+
+export { PluginRegistry } from "./plugin-registry.ts"
+export type {
+  DiscoveredPlugin,
+  PluginDiagnostic,
+  PluginListing,
+  PluginRegistryConfig,
+  PluginRegistryProject,
+  PluginScope,
+  PluginState,
+  PluginStateKey,
+  PluginStateLookup,
+} from "./plugin-registry.ts"
+
+export { PluginSupervisor } from "./plugin-supervisor.ts"
+export type { PluginSupervisorConfig, PluginSupervisorDeps } from "./plugin-supervisor.ts"
+
+export { createPluginControl, proxyPluginRequest } from "./plugin-proxy.ts"
+export type {
+  PluginControl,
+  PluginListingPayload,
+  PluginProxyResult,
+  PluginResolveResult,
+  PluginSupervisorView,
+  PluginTarget,
+} from "./plugin-proxy.ts"
 
 export { createRunnerSessionClient } from "./runner-transport.ts"
 export type { RunnerFetch, RunnerSessionClientDeps } from "./runner-transport.ts"

@@ -13,6 +13,7 @@ import type {
   FeatureDetailState,
   FindingsState,
   HealthState,
+  PluginsState,
   RunsState,
   TimelineState,
   WorkflowResourceState,
@@ -83,6 +84,17 @@ export function useHealth(store: DataSource): HealthState {
 
 export function useStreamConnected(store: DataSource): boolean {
   return useStore(store, "connection", s => s.isStreamConnected(), () => {})
+}
+
+/** `project` is the active board scope's project dir, or "" for the
+ *  global-only listing (no scope selected yet). */
+export function usePlugins(store: DataSource, project: string): PluginsState {
+  return useStore(
+    store,
+    `plugins:${project}`,
+    s => s.getPlugins(project),
+    s => s.ensurePluginsLoaded(project),
+  )
 }
 
 /** Subscribe to `run_log` invalidations for a feature (no snapshot). */

@@ -15,7 +15,7 @@ Authentication is explicit (`auth.mode: "none"` or `"bearer"`); only
 |---|---|
 | `GET /v1/livez`, `GET /v1/readyz` | Probes (unauthenticated). |
 | `GET /v1/health` | Full daemon health snapshot: heartbeat, per-project workflow state (`valid`/`stale`/`invalid`/`unregistered`) with diagnostics, runner availability. |
-| `GET /v1/events` | SSE invalidation stream: `{kind: feature\|transition\|run\|finding\|run_log, featureId}`; subscribers refetch over REST. `run_log` notifications are throttled at the source (at most one per run per second). |
+| `GET /v1/events` | SSE invalidation stream: `{kind: feature\|transition\|run\|finding\|run_log, featureId}` or `{kind: "plugins"}`; subscribers refetch over REST. `run_log` notifications are throttled at the source (at most one per run per second). |
 | `GET /v1/features` | Feature list. Filters: `?project=<dir>`, `?active=true`, `?status=a,b` (comma list of feature statuses; unknown value → 400). |
 | `POST /v1/features` | Start a feature (below). |
 | `GET /v1/features/:id` | Feature detail (see payloads below). |
@@ -29,6 +29,7 @@ Authentication is explicit (`auth.mode: "none"` or `"bearer"`); only
 | `POST /v1/runs/:id/answer` | Human answers a run's pending question; the notes flow into the live session. |
 | `GET /v1/projects/workflow?dir=<projectDir>` | Structure-only workflow projection (below). |
 | `GET/POST /v1/runners`, `DELETE /v1/runners/:id` | Runner endpoint registration (when a registry is configured). |
+| `GET /v1/plugins`, `POST /v1/plugins/session`, `ANY /v1/plugins/:id/*` | Plugin listing, session cookie exchange, and per-plugin reverse proxy (below; when a plugin control is configured). |
 
 ## Feature payloads
 
@@ -416,6 +417,91 @@ loaded validly is 409 with the load diagnostics (same messages, joined
 into the error's `message`). Workflow structure belongs to the project,
 not the feature — the graph view fetches here, not from the feature
 payload.
+
+## Plugins
+
+These routes are absent (404, `not_found`) when the daemon has no plugin
+control configured (`ApiDeps.plugins` unset) — same "absent optional
+dependency → 404" convention as `/v1/runners`. See [Plugins](plugins.md)
+for the manifest, backend, and bridge contracts these routes expose.
+
+### `GET /v1/plugins?project=<id>`
+
+Bearer-authenticated (or plugin-session cookie — see below). Returns
+
+```json
+{
+  "enabled": true,
+  "plugins": [
+    {
+      "id": "openspec",
+      "scope": "project",
+      "project": "proj-1",
+      "panel": { "title": "OpenSpec", "icon": "list-checks" },
+      "state": "running",
+      "diagnostics": []
+    }
+  ],
+  "diagnostics": []
+}
+```
+
+- `plugins[].project` is present only for `scope: "project"` entries.
+- `plugins[].state` is one of `running` | `stopped` | `disabled` | `error`.
+- `plugins[].diagnostics` are diagnostics scoped to that one plugin (e.g.
+  it shadows another plugin). The top-level `diagnostics` are load-level
+  (broken manifests, same-scope id conflicts) not tied to any one
+  registered plugin.
+- The optional `project` query parameter scopes the listing: global
+  plugins not shadowed for that project, plus that project's own plugins.
+  Omitting it returns every discovered plugin, unfiltered.
+- A `plugins` SSE frame (`{"kind": "plugins"}` on `GET /v1/events`) is
+  emitted whenever a plugin's state changes (spawn, crash, restart,
+  budget exhaustion, shutdown) — refetch this listing on it.
+
+### `POST /v1/plugins/session`
+
+Bearer-authenticated (harmless no-op under `auth.mode: none`). Mints a
+session cookie scoped to the plugin namespace and returns `204`:
+
+```
+Set-Cookie: conductor_plugin_session=<64-hex-char value>; Path=/v1/plugins; HttpOnly; SameSite=Strict; Max-Age=43200
+```
+
+The daemon accepts **either** the `Authorization` bearer header **or**
+this cookie for any `/v1/plugins/...` request — nowhere else on the API.
+Sessions are in-memory only (a daemon restart invalidates every issued
+cookie); the TTL is 12 hours. This exists because iframe navigations and
+panel-originated `fetch` calls cannot attach a bearer header — the SPA
+performs this exchange once after login.
+
+### `ANY /v1/plugins/:id/*`
+
+Reverse-proxies to the resolved plugin's backend (or serves its static
+`ui/` directory for a backend-less plugin), stripping the
+`/v1/plugins/:id` prefix so the backend sees the root-relative remainder
+— `GET /v1/plugins/openspec/changes` reaches the backend as `GET
+/changes`. Accepts the same optional `?project=` query parameter as the
+listing to disambiguate a project-scoped plugin from a global plugin
+sharing its id; without it, resolution prefers a global plugin, falling
+back to the first project plugin with that id.
+
+Header handling: the daemon's own `Authorization` header is never
+forwarded to the backend; hop-by-hop headers (`Connection`, `Keep-Alive`,
+`Transfer-Encoding`, `Upgrade`, `TE`, `Trailer`) and `Proxy-*` headers are
+stripped from both the request and the response. Request bodies are
+streamed through unmodified.
+
+Errors use the standard envelope:
+
+- unknown plugin id, or a plugin currently `disabled` → `404 not_found`
+  (a disabled plugin's backend is never reached),
+- a plugin whose backend isn't running (parked in `error`, no live port)
+  or whose connection fails outright → `503 unavailable`.
+
+A static-only plugin serves `/v1/plugins/:id/ui/*` through the same
+hardened static-file rules the daemon uses for the SPA (traversal
+rejected); any other path on a backend-less plugin is `404 not_found`.
 
 ## Static UI serving
 
