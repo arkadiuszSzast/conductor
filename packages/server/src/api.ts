@@ -24,14 +24,16 @@
  * then closes the listener.
  */
 
-import { randomUUID, timingSafeEqual } from "node:crypto"
-import { statSync } from "node:fs"
-import { extname, resolve, sep } from "node:path"
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
+import { resolve } from "node:path"
 import type { FeatureState, FeatureStatus, InputDef, StepRuntime, WorkflowInputDiagnostic } from "@conductor/core"
 import type { RunLogEntryInput, RunSummary, Store, StoreChange } from "./store.ts"
 import type { DaemonHealth, DaemonLogger } from "./daemon.ts"
 import type { LoadResult, WorkflowResolver, WorkflowStatus } from "./workflow-registry.ts"
 import type { RunnerRegistry } from "./runner-registry.ts"
+import { proxyPluginRequest } from "./plugin-proxy.ts"
+import type { PluginControl } from "./plugin-proxy.ts"
+import { pickStaticFile, serveStaticFile } from "./static-files.ts"
 
 // ------------------------------------------------------------ configuration
 
@@ -134,6 +136,8 @@ export interface ApiDeps {
   readonly registerProject?: (projectDir: string) => LoadResult
   /** Runner endpoint registration (`/v1/runners`). Absent → those routes 404. */
   readonly runners?: RunnerRegistry
+  /** Plugin listing + proxy resolution (`/v1/plugins`). Absent → those routes 404. */
+  readonly plugins?: PluginControl
   readonly logger?: DaemonLogger
 }
 
@@ -152,6 +156,7 @@ export type ApiErrorCode =
   | "run_already_concluded"
   | "no_pending_question"
   | "session_lost"
+  | "unavailable"
   | "internal"
 
 interface ErrorBody {
@@ -171,6 +176,7 @@ const ERROR_STATUS: Record<ApiErrorCode, number> = {
   run_already_concluded: 409,
   no_pending_question: 409,
   session_lost: 409,
+  unavailable: 503,
   internal: 500,
 }
 
@@ -232,6 +238,16 @@ const STEP_OUTPUT_LIMIT = 500
 
 /** Max characters per POSTed log line — well under the store's 2 MB per-run cap. */
 const RUN_LOG_LINE_LIMIT = 64 * 1024
+
+/** Name/path of the plugin-namespace session cookie (design D5, plugin-
+ *  runtime spec "Cookie unlocks the iframe under bearer auth"): scoped by
+ *  `Path` to `/v1/plugins` so it is never sent on any other route. */
+const PLUGIN_SESSION_COOKIE = "conductor_plugin_session"
+const PLUGIN_SESSION_COOKIE_PATH = "/v1/plugins"
+/** Sessions are disposable, like everything else in the plugin runtime —
+ *  kept in memory only, never persisted, so a daemon restart invalidates
+ *  every issued cookie and the SPA simply re-exchanges. */
+const PLUGIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000
 
 interface StepDetailProjection {
   readonly status: StepRuntime["status"]
@@ -307,35 +323,22 @@ function parseStatusFilter(raw: string): FeatureStatus[] | null {
   return statuses
 }
 
-const STATIC_CONTENT_TYPES: Readonly<Record<string, string>> = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "text/javascript; charset=utf-8",
-  ".mjs": "text/javascript; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".json": "application/json",
-  ".svg": "image/svg+xml",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".gif": "image/gif",
-  ".webp": "image/webp",
-  ".ico": "image/x-icon",
-  ".woff": "font/woff",
-  ".woff2": "font/woff2",
-  ".ttf": "font/ttf",
-  ".map": "application/json",
-  ".txt": "text/plain; charset=utf-8",
-  ".webmanifest": "application/manifest+json",
-}
+/** Everything the SSE `change` event can carry: store-originated changes
+ *  (always feature-scoped) plus the plugin subsystem's own invalidation,
+ *  which has no feature to scope to — subscribers refetch the plugin
+ *  listing on it exactly as they refetch feature state on a `StoreChange`. */
+type SseChangeFrame = StoreChange | { readonly kind: "plugins" }
 
 export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
-  const { store, engine, health, resolveWorkflow, workflowStatus, registerProject, runners, logger } = deps
+  const { store, engine, health, resolveWorkflow, workflowStatus, registerProject, runners, plugins, logger } = deps
   const staticRoot = config.ui !== undefined ? resolve(config.ui.staticDir) : null
   const sseClients = new Set<SseClient>()
   const inFlight = new Set<Promise<void>>()
   let closed = false
+  /** value → expiry (ms epoch). In-memory only — see `PLUGIN_SESSION_TTL_MS` doc. */
+  const pluginSessions = new Map<string, number>()
 
-  const unsubscribe = store.onChange((change: StoreChange) => {
+  const broadcast = (change: SseChangeFrame): void => {
     const frame = encoder.encode(`event: change\ndata: ${JSON.stringify(change)}\n\n`)
     for (const client of [...sseClients]) {
       try {
@@ -344,7 +347,10 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         sseClients.delete(client)
       }
     }
-  })
+  }
+
+  const unsubscribe = store.onChange(broadcast)
+  const unsubscribePlugins = plugins?.subscribe(() => broadcast({ kind: "plugins" }))
 
   const error = (requestId: string, code: ApiErrorCode, message: string): Response =>
     json(ERROR_STATUS[code], { error: { code, message, requestId } } satisfies ErrorBody, requestId)
@@ -355,13 +361,52 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       headers: { "content-type": "application/json", "x-request-id": requestId },
     })
 
-  const authorized = (request: Request): boolean => {
+  const bearerAuthorized = (request: Request): boolean => {
     if (config.auth.mode === "none") return true
     const header = request.headers.get("authorization")
     if (header === null || !header.startsWith("Bearer ")) return false
     const presented = Buffer.from(header.slice("Bearer ".length))
     const expected = Buffer.from(config.auth.token)
     return presented.length === expected.length && timingSafeEqual(presented, expected)
+  }
+
+  function pruneExpiredPluginSessions(): void {
+    const now = Date.now()
+    for (const [value, expiresAt] of pluginSessions) {
+      if (expiresAt <= now) pluginSessions.delete(value)
+    }
+  }
+
+  function pluginSessionCookieAuthorized(request: Request): boolean {
+    const header = request.headers.get("cookie")
+    if (header === null) return false
+    for (const part of header.split(";")) {
+      const eq = part.indexOf("=")
+      if (eq === -1) continue
+      if (part.slice(0, eq).trim() !== PLUGIN_SESSION_COOKIE) continue
+      const value = part.slice(eq + 1).trim()
+      const expiresAt = pluginSessions.get(value)
+      if (expiresAt !== undefined && expiresAt > Date.now()) return true
+    }
+    return false
+  }
+
+  /** `/v1/plugins…` requests accept EITHER the bearer header or a valid
+   *  plugin-session cookie (plugin-runtime spec: "Cookie unlocks the
+   *  iframe under bearer auth") — nothing else on the API does.
+   *
+   *  `POST /v1/plugins/session` (the exchange itself) is the one
+   *  exception: it must NOT accept the cookie it mints, or a client
+   *  holding a live cookie could exchange it for a fresh one forever,
+   *  defeating `PLUGIN_SESSION_TTL_MS`. It always requires the bearer
+   *  header (or `auth.mode: "none"`, where nothing on the API requires
+   *  one). Matched by exact path, not prefix, so this carve-out can
+   *  never accidentally swallow a real plugin route. */
+  const authorized = (request: Request, path: string): boolean => {
+    if (config.auth.mode === "none") return true
+    if (bearerAuthorized(request)) return true
+    if (path === PLUGIN_SESSION_COOKIE_PATH + "/session") return false
+    return (path === "/v1/plugins" || path.startsWith("/v1/plugins/")) && pluginSessionCookieAuthorized(request)
   }
 
   async function readJsonBody(request: Request): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false }> {
@@ -535,7 +580,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       if (served !== null) return served
     }
 
-    if (!authorized(request)) return error(requestId, "unauthorized", "missing or invalid bearer token")
+    if (!authorized(request, path)) return error(requestId, "unauthorized", "missing or invalid bearer token")
 
     if (method === "GET" && path === "/v1/health") {
       return json(200, health(), requestId)
@@ -682,6 +727,28 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       return error(requestId, "not_found", `no route for ${method} ${path}`)
     }
 
+    if (path === "/v1/plugins" && plugins !== undefined && method === "GET") {
+      const project = url.searchParams.get("project") ?? undefined
+      return json(200, plugins.listing(project), requestId)
+    }
+
+    if (path === "/v1/plugins/session" && plugins !== undefined && method === "POST") {
+      return pluginSessionExchange(requestId)
+    }
+
+    const pluginMatch = path.match(/^\/v1\/plugins\/([^/]+)(\/.*)?$/)
+    if (pluginMatch && plugins !== undefined) {
+      const pluginId = decodeURIComponent(pluginMatch[1]!)
+      const restPath = pluginMatch[2] ?? ""
+      const project = url.searchParams.get("project") ?? undefined
+      const resolved = plugins.resolve(pluginId, project)
+      if (!resolved.ok) return error(requestId, "not_found", `unknown plugin "${pluginId}"`)
+      const result = await proxyPluginRequest(resolved.target, restPath, request, requestId)
+      if (result.kind === "not_found") return error(requestId, "not_found", `no route for ${method} ${path}`)
+      if (result.kind === "unavailable") return error(requestId, "unavailable", result.message)
+      return result.response
+    }
+
     return error(requestId, "not_found", `no route for ${method} ${path}`)
   }
 
@@ -752,22 +819,8 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
   }
 
   function serveStatic(root: string, path: string, requestId: string): Response | null {
-    const decoded = safeDecode(path)
-    if (decoded === null) return null
-    const candidate = resolve(root, `.${decoded}`)
-    if (candidate !== root && !candidate.startsWith(root + sep)) return null
-    const file = pickStaticFile(candidate)
-    if (file !== null) {
-      const contentType = STATIC_CONTENT_TYPES[extname(file).toLowerCase()] ?? "application/octet-stream"
-      return new Response(Bun.file(file), {
-        status: 200,
-        headers: { "content-type": contentType, "x-request-id": requestId },
-      })
-    }
-    // Bun-compiled binaries: /$bunfs/ paths are invisible to statSync
-    // but Bun.file() can read them.
-    const embedded = serveEmbeddedFile(candidate, requestId)
-    if (embedded !== null) return embedded
+    const served = serveStaticFile(root, path, requestId)
+    if (served !== null) return served
     const fallback = pickStaticFile(resolve(root, "index.html"))
     if (fallback !== null) {
       return new Response(Bun.file(fallback), {
@@ -776,6 +829,23 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       })
     }
     return null
+  }
+
+  /**
+   * `POST /v1/plugins/session` mints an opaque cookie value scoped to
+   * `/v1/plugins` (design D5). Reached only once already bearer-
+   * authorized (or under `auth.mode: "none"`, where it is harmless — the
+   * cookie is set but never needed). No `Secure` attribute: the daemon
+   * has no TLS config to detect an https origin from (`ApiConfig` binds
+   * plain HTTP), and the deployment this protects is loopback/LAN, not a
+   * public origin — the honest v1 posture, not an oversight.
+   */
+  function pluginSessionExchange(requestId: string): Response {
+    pruneExpiredPluginSessions()
+    const value = randomBytes(32).toString("hex")
+    pluginSessions.set(value, Date.now() + PLUGIN_SESSION_TTL_MS)
+    const cookie = `${PLUGIN_SESSION_COOKIE}=${value}; Path=${PLUGIN_SESSION_COOKIE_PATH}; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(PLUGIN_SESSION_TTL_MS / 1000)}`
+    return new Response(null, { status: 204, headers: { "set-cookie": cookie, "x-request-id": requestId } })
   }
 
   async function registerRunner(request: Request, requestId: string): Promise<Response> {
@@ -1164,6 +1234,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     if (closed) return
     closed = true
     unsubscribe()
+    unsubscribePlugins?.()
     for (const client of [...sseClients]) {
       try {
         client.controller.close()
@@ -1187,40 +1258,6 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     get sseClientCount() {
       return sseClients.size
     },
-  }
-}
-
-function safeDecode(path: string): string | null {
-  try {
-    const decoded = decodeURIComponent(path)
-    if (decoded.includes("\0")) return null
-    return decoded
-  } catch {
-    return null
-  }
-}
-
-function pickStaticFile(path: string): string | null {
-  try {
-    return statSync(path).isFile() ? path : null
-  } catch {
-    return null
-  }
-}
-
-function serveEmbeddedFile(path: string, requestId: string): Response | null {
-  if (!path.includes("/$bunfs/")) return null
-  try {
-    const f = Bun.file(path)
-    return new Response(f, {
-      status: 200,
-      headers: {
-        "content-type": STATIC_CONTENT_TYPES[extname(path).toLowerCase()] ?? "application/octet-stream",
-        "x-request-id": requestId,
-      },
-    })
-  } catch {
-    return null
   }
 }
 

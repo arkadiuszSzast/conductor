@@ -99,6 +99,37 @@ auth:
 heartbeatIntervalMs: 5000
 # actions:
 #   bundledPath: /path/to/conductor/packages/server/actions   # needed for the compiled binary
+# plugins:
+#   enabled: true
+#   disabled: [some-plugin-id]
+#   paths: [/path/to/extra/plugins]
+```
+
+### Plugins
+
+An optional `plugins` section — see [Plugins](plugins.md) for the manifest
+and runtime contract. Omitting the section entirely is equivalent to
+`{enabled: true, disabled: [], paths: []}`.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | boolean | `true` | `false` turns off the whole subsystem: no plugin directories are scanned, no plugin processes start, and the listing reports the subsystem disabled |
+| `disabled` | string[] | `[]` | kebab-case plugin ids to keep discovered-but-inert: listed with state `disabled`, backend never started, routes never mounted |
+| `paths` | string[] | `[]` | extra **absolute** search roots scanned as part of the global scope, alongside `<config-dir>/plugins`; a relative path is a validation error at startup |
+
+Global plugins are always discovered from the platform config directory's
+`plugins` subdirectory (`~/.config/conductor/plugins` by default,
+independent of an explicit `--config` path pointing elsewhere); `paths`
+only adds to that, it does not replace it. Project plugins are discovered
+per-project from `<project>/.conductor/plugins/`, no config needed.
+
+```yaml
+plugins:
+  enabled: true
+  disabled:
+    - some-plugin-id
+  paths:
+    - /path/to/extra/plugins
 ```
 
 `CONDUCTOR_BIND_HOST` / `CONDUCTOR_BIND_PORT` override the config's

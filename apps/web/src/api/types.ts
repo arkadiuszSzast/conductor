@@ -262,6 +262,42 @@ export interface ChangeEvent {
   readonly featureId: string
 }
 
+/** The plugin subsystem's own SSE invalidation — no feature to scope to;
+ *  subscribers refetch `GET /v1/plugins` on it. */
+export interface PluginsChangeEvent {
+  readonly kind: "plugins"
+}
+
+export type PluginScope = "global" | "project"
+export type PluginState = "running" | "stopped" | "disabled" | "error"
+
+export interface PluginPanelMeta {
+  readonly title: string
+  readonly icon?: string
+}
+
+export interface PluginDiagnostic {
+  readonly path: string
+  readonly message: string
+}
+
+export interface PluginListingItem {
+  readonly id: string
+  readonly scope: PluginScope
+  /** Present only for `scope: "project"`. */
+  readonly project?: string
+  readonly panel: PluginPanelMeta
+  readonly state: PluginState
+  readonly diagnostics: readonly PluginDiagnostic[]
+}
+
+export interface PluginListingResponse {
+  readonly enabled: boolean
+  readonly plugins: readonly PluginListingItem[]
+  /** Load-level diagnostics (broken manifests, conflicts) not tied to one plugin. */
+  readonly diagnostics: readonly PluginDiagnostic[]
+}
+
 export interface CommandResponse extends FeatureDetailResponse {
   readonly result: string
 }

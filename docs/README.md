@@ -14,6 +14,7 @@ interpreter.
 | [Workflow reference](workflow-reference.md) | Every YAML field, with types, defaults and examples — the `conductor.yaml` counterpart to GHA's workflow syntax reference. |
 | [Expressions](expressions.md) | The `{{ }}` template contexts: `inputs`, `steps`, `needs`, `feedback` — what resolves when, and what is validated. |
 | [HTTP API](http-api.md) | The daemon's REST + SSE control surface: routes, feature payload projections, workflow structure endpoint, static UI serving. |
+| [Plugins](plugins.md) | The plugin system: manifest format, directory layout and scopes, the backend and proxy contract, the panel/bridge protocol, the trust model, and an install walkthrough for the bundled OpenSpec plugin. |
 
 ## Status of this documentation
 
@@ -36,3 +37,5 @@ For design rationale and the decision log, see the OpenSpec changes:
   budgets, the pause scheduling barrier, and operator recovery.
 - `openspec/changes/harden-interactive-answer-delivery/` — the accepted/
   delivered split for answering a mid-step question.
+- `openspec/changes/plugin-system/` — the plugin manifest, registry,
+  supervisor/proxy, panel rail and bridge, and the bundled OpenSpec plugin.

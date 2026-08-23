@@ -14,6 +14,7 @@ import { formatAge, formatClock } from "../lib/time.ts"
 import { mapGateError } from "../gate/gate-logic.ts"
 import { pushToast } from "../ui/toast-store.ts"
 import { useIsNarrowViewport } from "../lib/viewport.ts"
+import { publishActiveScope } from "../plugins/active-scope.ts"
 import type { RunSummary } from "../api/types.ts"
 import styles from "./feature-view.module.css"
 
@@ -52,6 +53,11 @@ export function FeatureView(): React.ReactNode {
   useEffect(() => {
     store.setActiveFeature(featureId)
   }, [store, featureId])
+
+  useEffect(() => {
+    publishActiveScope({ project: projectDir === "" ? null : projectDir, feature: featureId === "" ? null : featureId })
+    return () => publishActiveScope({ project: null, feature: null })
+  }, [projectDir, featureId])
 
   // Consumes the `open=gate|recover` deep-link param once it has been
   // acted on: leaving it in the URL would reopen the sheet on every

@@ -944,6 +944,33 @@ auth:
     expect(input.api.auth).toEqual({ mode: "none" })
   })
 
+  it("passes the resolved plugins config and global plugins dir to the daemon start input", async () => {
+    const h = makeDaemonHarness()
+    h.files.set(
+      "/daemon.yaml",
+      VALID_CONFIG + "plugins:\n  enabled: false\n  disabled:\n    - openspec\n  paths:\n    - /opt/plugins\n",
+    )
+    const deps = { ...h.deps, env: { HOME: "/home/dev" } }
+    expect(await runCli(["daemon", "--config", "/daemon.yaml"], deps)).toBe(EXIT.ok)
+    const input = h.starts[0]!
+    expect(input.plugins).toEqual({ enabled: false, disabled: ["openspec"], paths: ["/opt/plugins"] })
+    expect(input.pluginsDir).toBe("/home/dev/.config/conductor/plugins")
+  })
+
+  it("defaults plugins to enabled with no extras when the section is omitted", async () => {
+    const h = makeDaemonHarness()
+    h.files.set("/daemon.yaml", VALID_CONFIG)
+    expect(await runCli(["daemon", "--config", "/daemon.yaml"], h.deps)).toBe(EXIT.ok)
+    expect(h.starts[0]!.plugins).toEqual({ enabled: true, disabled: [], paths: [] })
+  })
+
+  it("pluginsDir is null when neither XDG nor HOME is set, even with --config explicit", async () => {
+    const h = makeDaemonHarness()
+    h.files.set("/daemon.yaml", VALID_CONFIG)
+    expect(await runCli(["daemon", "--config", "/daemon.yaml"], h.deps)).toBe(EXIT.ok)
+    expect(h.starts[0]!.pluginsDir).toBeNull()
+  })
+
   it("logs an explicit warning for auth.mode none", async () => {
     const h = makeDaemonHarness()
     h.files.set("/daemon.yaml", VALID_CONFIG)
@@ -1012,6 +1039,7 @@ describe("CLI: daemon config parsing", () => {
       createDatabaseDirectory: false,
       engine: { runTtlMs: 1000, nudgeIdleCycles: 2, maxNudges: 3 },
       actions: { bundledPath: "/actions", localPaths: ["/more"] },
+      plugins: { enabled: false, disabled: ["openspec"], paths: ["/opt/conductor-plugins"] },
     })
     expect(config.daemon).toEqual({
       databasePath: "/db/state.db",
@@ -1025,6 +1053,16 @@ describe("CLI: daemon config parsing", () => {
       bind: { host: "127.0.0.1", port: 4400 },
       auth: { mode: "bearer", token: "t" },
     })
+    expect(config.plugins).toEqual({
+      enabled: false,
+      disabled: ["openspec"],
+      paths: ["/opt/conductor-plugins"],
+    })
+  })
+
+  it("omitted plugins section defaults to enabled with no extras", () => {
+    const config = assembleDaemonConfig(base)
+    expect(config.plugins).toEqual({ enabled: true, disabled: [], paths: [] })
   })
 
   it.each([
@@ -1045,6 +1083,12 @@ describe("CLI: daemon config parsing", () => {
     ["bad localPaths", { ...base, actions: { localPaths: [""] } }, "actions.localPaths"],
     ["fractional nudgeIdleCycles", { ...base, engine: { nudgeIdleCycles: 2.5 } }, "positive integer"],
     ["fractional maxNudges", { ...base, engine: { maxNudges: 1.5 } }, "positive integer"],
+    ["non-boolean plugins.enabled", { ...base, plugins: { enabled: "yes" } }, "plugins.enabled"],
+    ["relative plugins.paths entry", { ...base, plugins: { paths: ["relative/dir"] } }, "plugins.paths"],
+    ["non-string plugins.disabled entry", { ...base, plugins: { disabled: [42] } }, "plugins.disabled"],
+    ["non-kebab-case plugins.disabled entry", { ...base, plugins: { disabled: ["Not_Kebab"] } }, "plugins.disabled"],
+    ["unknown plugins field", { ...base, plugins: { extra: true } }, "plugins.extra"],
+    ["plugins not a mapping", { ...base, plugins: "nope" }, "plugins"],
   ])("rejects %s", (_name, raw, needle) => {
     expect(() => assembleDaemonConfig(raw)).toThrow(needle as string)
   })
@@ -1063,10 +1107,12 @@ describe("CLI: zero-config platform paths", () => {
     expect(platformPaths({ XDG_CONFIG_HOME: "/x/cfg", XDG_DATA_HOME: "/x/data" })).toEqual({
       configPath: "/x/cfg/conductor/daemon.yaml",
       dataDir: "/x/data/conductor",
+      pluginsDir: "/x/cfg/conductor/plugins",
     })
     expect(platformPaths({ HOME: "/home/u" })).toEqual({
       configPath: "/home/u/.config/conductor/daemon.yaml",
       dataDir: "/home/u/.local/share/conductor",
+      pluginsDir: "/home/u/.config/conductor/plugins",
     })
     expect(() => platformPaths({})).toThrow(UsageError)
   })

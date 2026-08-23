@@ -17,6 +17,8 @@ import type {
   FeatureDetailResponse,
   FeatureListItem,
   FindingView,
+  PluginListingResponse,
+  PluginsChangeEvent,
   RunLogPage,
   RunSummary,
   StartFeatureRequest,
@@ -196,6 +198,49 @@ export class ApiClient {
     return this.request<DaemonHealth>("/v1/health")
   }
 
+  /** `GET /v1/plugins?project=<id>` — absent `project` lists global scope
+   *  only, mirroring the daemon's own scope resolution. */
+  async plugins(project?: string): Promise<PluginListingResponse> {
+    const query = project !== undefined ? `?project=${encodeURIComponent(project)}` : ""
+    return this.request<PluginListingResponse>(`/v1/plugins${query}`)
+  }
+
+  /**
+   * Same-origin `GET` probe for a plugin panel's UI route, used in place
+   * of `<iframe onError>` (which never fires for an HTTP-level failure —
+   * see `panel.tsx`'s module doc) to decide whether the panel should
+   * render the iframe or the inline diagnostic. Swallows network errors
+   * as `false` rather than throwing: a down/unreachable backend is an
+   * expected outcome here, not a client bug to surface as an `ApiError`.
+   */
+  async probePluginUi(path: string): Promise<boolean> {
+    try {
+      const response = await this.fetchImpl(path, { method: "GET", credentials: "same-origin" })
+      return response.ok
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * `POST /v1/plugins/session` — exchanges the bearer token for the
+   * HttpOnly, `/v1/plugins`-scoped session cookie iframe navigations and
+   * panel fetches ride on (design D5). `credentials: "same-origin"` so
+   * the browser stores the `Set-Cookie` the daemon returns; the 204
+   * response has no JSON body, so this bypasses `request()`.
+   */
+  async exchangePluginSession(): Promise<void> {
+    const token = this.token()
+    const headers: Record<string, string> = {}
+    if (token !== null) headers["authorization"] = `Bearer ${token}`
+    const response = await this.fetchImpl("/v1/plugins/session", { method: "POST", headers, credentials: "same-origin" })
+    if (!response.ok) {
+      const err = await toApiError(response)
+      if (err.status === 401) this.onUnauthorized?.()
+      throw err
+    }
+  }
+
   async approve(featureId: string, notes?: string): Promise<CommandResponse> {
     return this.request<CommandResponse>(`/v1/features/${encodeURIComponent(featureId)}/approve`, {
       method: "POST",
@@ -298,7 +343,9 @@ async function toApiError(response: Response): Promise<ApiError> {
 }
 
 /** The frames a fetch-based SSE reader surfaces. */
-export type SseFrame = { readonly type: "hello"; readonly requestId: string } | { readonly type: "change"; readonly change: ChangeEvent }
+export type SseFrame =
+  | { readonly type: "hello"; readonly requestId: string }
+  | { readonly type: "change"; readonly change: ChangeEvent | PluginsChangeEvent }
 
 /** Human-readable failure kinds from the stream transport. */
 export type SseDropReason = "aborted" | "http-error" | "network-error" | "closed"
@@ -353,11 +400,11 @@ export async function readSseStream(input: SseReaderInput): Promise<void> {
       const data = dataLines.join("\n")
       if (eventName === "change") {
         try {
-          const change = JSON.parse(data) as ChangeEvent
-          if (
-            (change as { kind?: unknown }).kind !== undefined &&
-            typeof (change as { featureId?: unknown }).featureId === "string"
-          ) {
+          const change = JSON.parse(data) as ChangeEvent | PluginsChangeEvent
+          const kind = (change as { kind?: unknown }).kind
+          const isFeatureScoped = kind !== undefined && kind !== "plugins" && typeof (change as { featureId?: unknown }).featureId === "string"
+          const isPluginsScoped = kind === "plugins"
+          if (isFeatureScoped || isPluginsScoped) {
             onFrame({ type: "change", change })
           }
         } catch {

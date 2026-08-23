@@ -12,6 +12,7 @@
  * (the core-owned `yaml` dependency — the CLI adds none of its own).
  */
 
+import { isAbsolute } from "node:path"
 import { parseYamlObject, stringifyYamlObject } from "@conductor/core"
 import type { ApiAuth, ApiConfig, DaemonConfig } from "@conductor/server"
 import type { EngineOptions } from "@conductor/server"
@@ -20,9 +21,18 @@ import { UsageError } from "./errors.ts"
 /** `heartbeatIntervalMs` when the file omits it. */
 export const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000
 
+/** Resolved `plugins` section — always present with defaults applied
+ *  (omitted section → enabled, no extras), never partial. */
+export interface PluginsFileConfig {
+  readonly enabled: boolean
+  readonly disabled: readonly string[]
+  readonly paths: readonly string[]
+}
+
 export interface DaemonFileConfig {
   readonly daemon: DaemonConfig
   readonly api: ApiConfig
+  readonly plugins: PluginsFileConfig
 }
 
 const TOP_LEVEL_FIELDS = new Set([
@@ -34,12 +44,15 @@ const TOP_LEVEL_FIELDS = new Set([
   "heartbeatIntervalMs",
   "engine",
   "actions",
+  "plugins",
 ])
 
 const ENGINE_FIELDS = new Set(["runTtlMs", "nudgeIdleCycles", "maxNudges"])
 const ACTIONS_FIELDS = new Set(["bundledPath", "localPaths"])
 const BIND_FIELDS = new Set(["host", "port"])
 const AUTH_FIELDS = new Set(["mode", "token"])
+const PLUGINS_FIELDS = new Set(["enabled", "disabled", "paths"])
+const PLUGIN_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 
 interface YamlObject {
   readonly [key: string]: unknown
@@ -161,6 +174,40 @@ export function assembleDaemonConfig(raw: unknown): DaemonFileConfig {
     }
   }
 
+  const pluginsRaw = raw["plugins"]
+  let pluginsEnabled = true
+  let pluginsDisabled: string[] = []
+  let pluginsPaths: string[] = []
+  if (pluginsRaw !== undefined) {
+    if (!isObject(pluginsRaw)) throw new UsageError('"plugins" must be a mapping')
+    for (const key of Object.keys(pluginsRaw)) {
+      if (!PLUGINS_FIELDS.has(key)) throw new UsageError(`unknown daemon config field "plugins.${key}"`)
+    }
+    const enabled = pluginsRaw["enabled"]
+    if (enabled !== undefined) {
+      if (typeof enabled !== "boolean") throw new UsageError('"plugins.enabled" must be a boolean')
+      pluginsEnabled = enabled
+    }
+    const disabled = pluginsRaw["disabled"]
+    if (disabled !== undefined) {
+      if (!Array.isArray(disabled) || !disabled.every(id => isString(id) && PLUGIN_ID_PATTERN.test(id))) {
+        throw new UsageError('"plugins.disabled" must be an array of kebab-case plugin ids (e.g. "openspec")')
+      }
+      pluginsDisabled = disabled as string[]
+    }
+    const paths = pluginsRaw["paths"]
+    if (paths !== undefined) {
+      if (!Array.isArray(paths) || !paths.every(isNonEmptyString)) {
+        throw new UsageError('"plugins.paths" must be an array of absolute path strings')
+      }
+      const relative = paths.find(path => !isAbsolute(path))
+      if (relative !== undefined) {
+        throw new UsageError(`"plugins.paths" must be absolute paths — got relative path "${relative}"`)
+      }
+      pluginsPaths = paths as string[]
+    }
+  }
+
   return {
     daemon: {
       databasePath,
@@ -173,6 +220,11 @@ export function assembleDaemonConfig(raw: unknown): DaemonFileConfig {
     api: {
       bind: { host: host!, port },
       auth: apiAuth,
+    },
+    plugins: {
+      enabled: pluginsEnabled,
+      disabled: pluginsDisabled,
+      paths: pluginsPaths,
     },
   }
 }
@@ -228,6 +280,16 @@ heartbeatIntervalMs: 5000
 #   bundledPath: /path/to/conductor/packages/server/actions
 #   localPaths:
 #     - /path/to/team/actions
+
+# Optional plugin subsystem config. Global plugins are discovered under
+# the platform config directory's "plugins" subdirectory; "paths" adds
+# extra absolute search roots. Omitted entirely -> enabled, no extras.
+# plugins:
+#   enabled: true
+#   disabled:
+#     - some-plugin-id
+#   paths:
+#     - /path/to/extra/plugins
 `
 
 export interface PlatformPaths {
@@ -235,6 +297,10 @@ export interface PlatformPaths {
   readonly configPath: string
   /** Default data directory, e.g. `~/.local/share/conductor`. */
   readonly dataDir: string
+  /** Global plugin search root, e.g. `~/.config/conductor/plugins` — always
+   *  the platform config directory's `plugins` subdirectory, independent
+   *  of an explicit `--config` path pointing elsewhere. */
+  readonly pluginsDir: string
 }
 
 /**
@@ -248,6 +314,7 @@ export function platformPaths(env: Readonly<Record<string, string | undefined>>)
   return {
     configPath: `${configHome}/conductor/daemon.yaml`,
     dataDir: `${dataHome}/conductor`,
+    pluginsDir: `${configHome}/conductor/plugins`,
   }
 }
 

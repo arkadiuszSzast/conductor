@@ -54,6 +54,11 @@ describe("SSE reader", () => {
     ])
   })
 
+  it("parses the plugin subsystem's own invalidation, which carries no featureId", async () => {
+    const { frames } = await collect(['event: change\ndata: {"kind":"plugins"}\n\n'])
+    expect(frames).toEqual([{ type: "change", change: { kind: "plugins" } }])
+  })
+
   it("reassembles frames split across chunk boundaries", async () => {
     const { frames } = await collect([
       "event: cha",
