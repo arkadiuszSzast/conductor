@@ -288,6 +288,38 @@ async function handleChangeDetail(request: Request, deps: OpenSpecServeDeps): Pr
   })
 }
 
+/** Workflows commonly declare which OpenSpec change a feature delivers
+ *  as a required string input (the dogfood workflow calls it
+ *  `change_slug`). The plugin knows the change being started, so it
+ *  fills that input automatically instead of failing the creation.
+ *  Projection failures degrade to "no inputs" — daemon validation
+ *  still applies and its message is relayed as usual. */
+const CHANGE_INPUT_NAMES = ["change_slug", "change"] as const
+
+async function resolveChangeInput(
+  change: string,
+  deps: OpenSpecServeDeps,
+): Promise<Record<string, string> | null> {
+  try {
+    const response = await deps.fetchFn(
+      `${deps.conductorUrl}/v1/projects/workflow?dir=${encodeURIComponent(deps.projectDir)}`,
+      {
+        headers: deps.conductorToken !== undefined ? { authorization: `Bearer ${deps.conductorToken}` } : {},
+      },
+    )
+    if (!response.ok) return null
+    const payload: unknown = await response.json()
+    if (!isRecord(payload) || !isRecord(payload.inputs)) return null
+    for (const name of CHANGE_INPUT_NAMES) {
+      const input = payload.inputs[name]
+      if (isRecord(input) && input.type === "string") return { [name]: change }
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
 async function handleStartWork(request: Request, deps: OpenSpecServeDeps): Promise<Response> {
   let body: unknown
   try {
@@ -308,6 +340,7 @@ async function handleStartWork(request: Request, deps: OpenSpecServeDeps): Promi
 
   const title = titleFromChangeName(change)
   const description = extractWhySection(proposalText) ?? proposalText.trim()
+  const inputs = await resolveChangeInput(change, deps)
 
   let response: Response
   try {
@@ -317,7 +350,7 @@ async function handleStartWork(request: Request, deps: OpenSpecServeDeps): Promi
         "content-type": "application/json",
         ...(deps.conductorToken !== undefined ? { authorization: `Bearer ${deps.conductorToken}` } : {}),
       },
-      body: JSON.stringify({ title, project: deps.projectDir, description }),
+      body: JSON.stringify({ title, project: deps.projectDir, description, ...(inputs !== null ? { inputs } : {}) }),
     })
   } catch (error) {
     return jsonResponse(502, { error: `could not reach the daemon: ${errorMessage(error)}` })
