@@ -14,9 +14,13 @@ body,
   height: 100%;
 }
 
+/* Hard viewport height (not min-height): every screen is a fixed-height
+ * app frame whose panes scroll internally. With min-height, a tall pane
+ * (e.g. the step inspector) would grow the shell past the viewport and
+ * force document scrolling instead of scrolling the pane itself. */
 .app-shell {
-  min-height: 100vh;
-  min-height: 100dvh;
+  height: 100vh;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
   overflow: hidden;
