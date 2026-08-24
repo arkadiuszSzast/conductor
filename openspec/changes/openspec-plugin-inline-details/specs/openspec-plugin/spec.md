@@ -1,6 +1,11 @@
+## RENAMED Requirements
+
+- FROM: `### Requirement: Clicking a change opens a detail modal with progressive disclosure`
+- TO: `### Requirement: Clicking a change expands its details inline with progressive disclosure`
+
 ## MODIFIED Requirements
 
-### Requirement: Clicking a change opens a detail modal with progressive disclosure
+### Requirement: Clicking a change expands its details inline with progressive disclosure
 
 Clicking a change tile (anywhere except its start-work action) SHALL
 expand the change's details **in place directly beneath the tile**,
