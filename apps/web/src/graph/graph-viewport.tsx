@@ -1,10 +1,12 @@
 /**
- * Pannable/zoomable graph stage — owns camera state and pointer/wheel/
+ * Pannable/zoomable graph stage — owns camera state and pointer/
  * keyboard interaction; the pure math lives in `camera.ts`. Wraps its
- * children (the SVG workflow graph) in a CSS-transformed layer so drag,
- * wheel-pan, and the explicit zoom/fit/reset controls never touch the
- * document scrollbar. Camera state resets whenever `resetKey` changes
- * (e.g. navigating to a different feature/workflow).
+ * children (the SVG workflow graph) in a CSS-transformed layer so drag
+ * and the explicit zoom/fit/reset controls never touch the document
+ * scrollbar. The wheel deliberately does nothing here: drag is the one
+ * panning gesture, and stray scrolls must not move the camera. Camera
+ * state resets whenever `resetKey` changes (e.g. navigating to a
+ * different feature/workflow).
  */
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react"
@@ -86,13 +88,6 @@ export function GraphViewport({ contentWidth, contentHeight, resetKey, children,
     } catch {
       // already released — ignore
     }
-  }
-
-  const onWheel = (e: React.WheelEvent<HTMLDivElement>): void => {
-    // Trackpad/mouse wheel pans the canvas in both axes; zoom stays on the
-    // explicit controls so accidental scroll never surprises the operator.
-    e.preventDefault()
-    setCamera(prev => panBy(prev, -e.deltaX, -e.deltaY))
   }
 
   const zoomInBtn = (): void => setCamera(prev => zoomInAt(prev, viewportSize()))
@@ -191,7 +186,6 @@ export function GraphViewport({ contentWidth, contentHeight, resetKey, children,
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
-        onWheel={onWheel}
         onKeyDown={onKeyDown}
         onDoubleClick={onDoubleClick}
       >
