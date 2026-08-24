@@ -27,6 +27,6 @@
 
 ## 3. Verification
 
-- [ ] 3.1 [test] Full suite green (typecheck, lint, bun test, web
+- [x] 3.1 [test] Full suite green (typecheck, lint, bun test, web
   mounted); redeploy dogfood daemon and verify the modal on the todo
   project
