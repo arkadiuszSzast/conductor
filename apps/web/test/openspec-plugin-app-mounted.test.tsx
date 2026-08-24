@@ -209,4 +209,114 @@ describe_("bundled OpenSpec plugin app.js: change detail modal", () => {
 
     expect(document.querySelector(".modal-overlay")).toBeNull()
   })
+
+  it("closes the modal on backdrop click but not on clicks inside the panel", async () => {
+    await load()
+    ;(window as unknown as HappyDomWindow).happyDOM.setURL(
+      "http://conductor.test/v1/plugins/openspec/ui/?project=%2Fproj%2Ff",
+    )
+    document.body.innerHTML = '<div id="root"></div>'
+    globalThis.fetch = (async (url: string) => {
+      if (String(url).startsWith("../changes")) {
+        return new Response(
+          JSON.stringify({ openspec: true, active: [{ name: "sample-change", taskProgress: null }], archived: [] }),
+          { status: 200 },
+        )
+      }
+      return new Response(JSON.stringify({ name: "sample-change", archived: false, why: "Why text." }), {
+        status: 200,
+      })
+    }) as typeof fetch
+
+    await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
+    await flush()
+    ;(document.querySelector(".change") as HTMLElement).click()
+    await flush()
+
+    const panel = document.querySelector(".modal-panel") as HTMLElement
+    panel.click()
+    await flush()
+    expect(document.querySelector(".modal-overlay")).not.toBeNull()
+
+    const overlay = document.querySelector(".modal-overlay") as HTMLElement
+    overlay.click()
+    await flush()
+    expect(document.querySelector(".modal-overlay")).toBeNull()
+  })
+
+  it("starts work from the modal's own button — same flow, then navigate", async () => {
+    await load()
+    ;(window as unknown as HappyDomWindow).happyDOM.setURL(
+      "http://conductor.test/v1/plugins/openspec/ui/?project=%2Fproj%2Fg",
+    )
+    document.body.innerHTML = '<div id="root"></div>'
+    const posts: string[] = []
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      const path = String(url)
+      if (path.startsWith("../changes")) {
+        return new Response(
+          JSON.stringify({ openspec: true, active: [{ name: "sample-change", taskProgress: null }], archived: [] }),
+          { status: 200 },
+        )
+      }
+      if (path.startsWith("../change?")) {
+        return new Response(JSON.stringify({ name: "sample-change", archived: false, why: "Why text." }), {
+          status: 200,
+        })
+      }
+      if (path.startsWith("../start-work")) {
+        posts.push(String(init?.body ?? ""))
+        return new Response(JSON.stringify({ featureId: "feat-77" }), { status: 200 })
+      }
+      return new Response("{}", { status: 404 })
+    }) as typeof fetch
+
+    await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
+    await flush()
+    ;(document.querySelector(".change") as HTMLElement).click()
+    await flush()
+
+    const modalButton = document.querySelector(".modal-panel .start-work") as HTMLButtonElement
+    expect(modalButton).not.toBeNull()
+    modalButton.click()
+    await flush()
+    await flush()
+
+    // Same code path as the tile button: the daemon call carries the
+    // change name. (The subsequent `navigate` postMessage is untestable
+    // here — `postToHost` no-ops when window.parent === window, i.e.
+    // outside a real iframe — and is covered by the host-side bridge
+    // tests in plugin-rail-mounted.test.tsx.)
+    expect(posts).toEqual(['{"change":"sample-change"}'])
+  })
+
+  it("opens the modal from the keyboard (Enter on a focused tile)", async () => {
+    await load()
+    ;(window as unknown as HappyDomWindow).happyDOM.setURL(
+      "http://conductor.test/v1/plugins/openspec/ui/?project=%2Fproj%2Fh",
+    )
+    document.body.innerHTML = '<div id="root"></div>'
+    globalThis.fetch = (async (url: string) => {
+      if (String(url).startsWith("../changes")) {
+        return new Response(
+          JSON.stringify({ openspec: true, active: [{ name: "sample-change", taskProgress: null }], archived: [] }),
+          { status: 200 },
+        )
+      }
+      return new Response(JSON.stringify({ name: "sample-change", archived: false, why: "Why text." }), {
+        status: 200,
+      })
+    }) as typeof fetch
+
+    await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
+    await flush()
+
+    const tile = document.querySelector(".change") as HTMLElement
+    expect(tile.getAttribute("tabindex")).toBe("0")
+    expect(tile.getAttribute("role")).toBe("button")
+    tile.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }))
+    await flush()
+
+    expect(document.querySelector(".modal-overlay")).not.toBeNull()
+  })
 })

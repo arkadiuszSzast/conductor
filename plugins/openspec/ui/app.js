@@ -110,13 +110,20 @@
       })
     }
 
-    for (const changeEl of root.querySelectorAll(".change")) {
-      changeEl.addEventListener("click", () => openModal(changeEl.dataset.name))
+    const makeModalTrigger = element => {
+      element.setAttribute("tabindex", "0")
+      element.setAttribute("role", "button")
+      element.addEventListener("click", () => openModal(element.dataset.name))
+      element.addEventListener("keydown", event => {
+        if (event.key !== "Enter" && event.key !== " ") return
+        if (event.target !== element) return
+        event.preventDefault()
+        openModal(element.dataset.name)
+      })
     }
 
-    for (const item of root.querySelectorAll(".archived-item")) {
-      item.addEventListener("click", () => openModal(item.dataset.name))
-    }
+    for (const changeEl of root.querySelectorAll(".change")) makeModalTrigger(changeEl)
+    for (const item of root.querySelectorAll(".archived-item")) makeModalTrigger(item)
   }
 
   async function runStartWork(name, button, errorEl) {
