@@ -260,6 +260,146 @@ describe("POST /start-work", () => {
   })
 })
 
+describe("GET /change", () => {
+  it("returns full detail: proposal sections, specs grouped by capability, and tasks", async () => {
+    const dir = tempDir()
+    try {
+      const changeDir = join(dir, "openspec", "changes", "add-feature")
+      mkdirSync(changeDir, { recursive: true })
+      writeFileSync(
+        join(changeDir, "proposal.md"),
+        "## Why\n\nBecause it matters.\n\n## What Changes\n\n- do the thing\n- do another thing\n",
+      )
+      writeFileSync(join(changeDir, "tasks.md"), "- [x] first task\n- [ ] second task\n")
+      const specA = join(changeDir, "specs", "capability-a")
+      const specB = join(changeDir, "specs", "capability-b")
+      mkdirSync(specA, { recursive: true })
+      mkdirSync(specB, { recursive: true })
+      writeFileSync(
+        join(specA, "spec.md"),
+        "## ADDED Requirements\n\n### Requirement: Widgets can spin\n\nWidgets SHALL spin when clicked.\n\n### Requirement: Widgets can stop\n\nWidgets SHALL stop when clicked again.\n",
+      )
+      writeFileSync(
+        join(specB, "spec.md"),
+        "## ADDED Requirements\n\n### Requirement: Gadgets glow\n\nGadgets SHALL glow.\n",
+      )
+
+      const response = await handleRequest(new Request("http://x/change?name=add-feature"), realFsDeps(dir))
+      expect(response.status).toBe(200)
+      const body = (await response.json()) as {
+        name: string
+        archived: boolean
+        why?: string
+        whatChanges?: string
+        specs?: Array<{ capability: string; requirements: Array<{ heading: string; body: string }> }>
+        tasks?: Array<{ text: string; done: boolean }>
+      }
+      expect(body.name).toBe("add-feature")
+      expect(body.archived).toBe(false)
+      expect(body.why).toBe("Because it matters.")
+      expect(body.whatChanges).toBe("- do the thing\n- do another thing")
+      expect(body.specs).toEqual([
+        {
+          capability: "capability-a",
+          requirements: [
+            { heading: "Widgets can spin", body: "Widgets SHALL spin when clicked." },
+            { heading: "Widgets can stop", body: "Widgets SHALL stop when clicked again." },
+          ],
+        },
+        {
+          capability: "capability-b",
+          requirements: [{ heading: "Gadgets glow", body: "Gadgets SHALL glow." }],
+        },
+      ])
+      expect(body.tasks).toEqual([
+        { text: "first task", done: true },
+        { text: "second task", done: false },
+      ])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("returns sparse detail when only a proposal exists, omitting specs and tasks", async () => {
+    const dir = tempDir()
+    try {
+      const changeDir = join(dir, "openspec", "changes", "proposal-only")
+      mkdirSync(changeDir, { recursive: true })
+      writeFileSync(join(changeDir, "proposal.md"), "## Why\n\nJust a sketch.\n")
+
+      const response = await handleRequest(new Request("http://x/change?name=proposal-only"), realFsDeps(dir))
+      expect(response.status).toBe(200)
+      const body = (await response.json()) as Record<string, unknown>
+      expect(body.why).toBe("Just a sketch.")
+      expect("specs" in body).toBe(false)
+      expect("tasks" in body).toBe(false)
+      expect("whatChanges" in body).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("resolves an archived change under changes/archive/ and marks it archived", async () => {
+    const dir = tempDir()
+    try {
+      const changeDir = join(dir, "openspec", "changes", "archive", "old-change")
+      mkdirSync(changeDir, { recursive: true })
+      writeFileSync(join(changeDir, "proposal.md"), "## Why\n\nHistorical reasons.\n")
+
+      const response = await handleRequest(new Request("http://x/change?name=old-change"), realFsDeps(dir))
+      expect(response.status).toBe(200)
+      const body = (await response.json()) as { archived: boolean; why?: string }
+      expect(body.archived).toBe(true)
+      expect(body.why).toBe("Historical reasons.")
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("404s for an unknown change name", async () => {
+    const dir = tempDir()
+    try {
+      mkdirSync(join(dir, "openspec", "changes"), { recursive: true })
+      const response = await handleRequest(new Request("http://x/change?name=ghost"), realFsDeps(dir))
+      expect(response.status).toBe(404)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("rejects an unsafe change name with 400 without touching the filesystem", async () => {
+    let readFileCalled = false
+    let isDirectoryCalled = false
+    const deps = baseDeps({
+      readFile: async () => {
+        readFileCalled = true
+        throw new Error("should not be called")
+      },
+      isDirectory: async () => {
+        isDirectoryCalled = true
+        return false
+      },
+    })
+    const response = await handleRequest(new Request("http://x/change?name=../x"), deps)
+    expect(response.status).toBe(400)
+    expect(readFileCalled).toBe(false)
+    expect(isDirectoryCalled).toBe(false)
+  })
+
+  it("rejects a missing name parameter with 400 without touching the filesystem", async () => {
+    let isDirectoryCalled = false
+    const deps = baseDeps({
+      isDirectory: async () => {
+        isDirectoryCalled = true
+        return false
+      },
+    })
+    const response = await handleRequest(new Request("http://x/change"), deps)
+    expect(response.status).toBe(400)
+    expect(isDirectoryCalled).toBe(false)
+  })
+})
+
 describe("static UI serving", () => {
   it("serves a file from the ui directory", async () => {
     const dir = tempDir()

@@ -5,6 +5,7 @@
  * stripped:
  *
  *   GET  /changes     -> { openspec: false } | { openspec: true, active, archived }
+ *   GET  /change      -> per-change detail (proposal sections, delta specs, tasks) | { error }
  *   POST /start-work  -> { featureId } | { error }
  *   GET  /ui/...      -> static panel files
  *
@@ -161,14 +162,130 @@ function titleFromChangeName(name: string): string {
     .join(" ")
 }
 
-function extractWhySection(markdown: string): string | null {
+function extractSection(markdown: string, heading: string): string | null {
   const lines = markdown.split("\n")
-  const startIndex = lines.findIndex(line => /^##\s+why\s*$/i.test(line.trim()))
+  const headingPattern = new RegExp(`^##\\s+${heading}\\s*$`, "i")
+  const startIndex = lines.findIndex(line => headingPattern.test(line.trim()))
   if (startIndex === -1) return null
   const rest = lines.slice(startIndex + 1)
   const endIndex = rest.findIndex(line => /^##\s+/.test(line))
   const section = (endIndex === -1 ? rest : rest.slice(0, endIndex)).join("\n").trim()
   return section === "" ? null : section
+}
+
+function extractWhySection(markdown: string): string | null {
+  return extractSection(markdown, "why")
+}
+
+interface ChangeRequirement {
+  readonly heading: string
+  readonly body: string
+}
+
+interface ChangeSpec {
+  readonly capability: string
+  readonly requirements: readonly ChangeRequirement[]
+}
+
+interface ChangeTask {
+  readonly text: string
+  readonly done: boolean
+}
+
+interface ResolvedChangeDir {
+  readonly dir: string
+  readonly archived: boolean
+}
+
+async function resolveChangeDir(deps: OpenSpecServeDeps, name: string): Promise<ResolvedChangeDir | null> {
+  const activeDir = join(deps.projectDir, "openspec", "changes", name)
+  if (await deps.isDirectory(activeDir)) return { dir: activeDir, archived: false }
+  const archivedDir = join(deps.projectDir, "openspec", "changes", "archive", name)
+  if (await deps.isDirectory(archivedDir)) return { dir: archivedDir, archived: true }
+  return null
+}
+
+function parseRequirements(markdown: string): readonly ChangeRequirement[] {
+  const lines = markdown.split("\n")
+  const headingIndices: number[] = []
+  for (let i = 0; i < lines.length; i++) {
+    if (/^#{2,3}\s+/.test(lines[i] ?? "")) headingIndices.push(i)
+  }
+  const requirements: ChangeRequirement[] = []
+  for (let i = 0; i < lines.length; i++) {
+    const match = /^###\s*Requirement:\s*(.+)$/i.exec(lines[i] ?? "")
+    if (match === null) continue
+    const heading = (match[1] ?? "").trim()
+    const nextHeadingIndex = headingIndices.find(index => index > i)
+    const end = nextHeadingIndex ?? lines.length
+    const body = lines.slice(i + 1, end).join("\n").trim()
+    requirements.push({ heading, body })
+  }
+  return requirements
+}
+
+function parseTasks(markdown: string): readonly ChangeTask[] {
+  const tasks: ChangeTask[] = []
+  for (const line of markdown.split("\n")) {
+    const match = /^\s*-\s*\[([ xX])\]\s*(.*)$/.exec(line)
+    if (match === null) continue
+    tasks.push({ text: (match[2] ?? "").trim(), done: match[1] !== " " })
+  }
+  return tasks
+}
+
+async function readSpecs(deps: OpenSpecServeDeps, changeDir: string): Promise<readonly ChangeSpec[] | undefined> {
+  let capabilities: readonly string[]
+  try {
+    capabilities = await deps.readDir(join(changeDir, "specs"))
+  } catch {
+    return undefined
+  }
+  const specs: ChangeSpec[] = []
+  for (const capability of [...capabilities].sort()) {
+    const capabilityDir = join(changeDir, "specs", capability)
+    if (!(await deps.isDirectory(capabilityDir))) continue
+    let text: string
+    try {
+      text = await deps.readFile(join(capabilityDir, "spec.md"))
+    } catch {
+      continue
+    }
+    specs.push({ capability, requirements: parseRequirements(text) })
+  }
+  return specs
+}
+
+async function handleChangeDetail(request: Request, deps: OpenSpecServeDeps): Promise<Response> {
+  const url = new URL(request.url)
+  const name = url.searchParams.get("name") ?? ""
+  if (!isSafeChangeName(name)) return jsonResponse(400, { error: `invalid change name "${name}"` })
+
+  const resolved = await resolveChangeDir(deps, name)
+  if (resolved === null) return jsonResponse(404, { error: `no change found named "${name}"` })
+
+  let proposalText: string | null = null
+  try {
+    proposalText = await deps.readFile(join(resolved.dir, "proposal.md"))
+  } catch {
+    proposalText = null
+  }
+
+  let tasksText: string | null = null
+  try {
+    tasksText = await deps.readFile(join(resolved.dir, "tasks.md"))
+  } catch {
+    tasksText = null
+  }
+
+  return jsonResponse(200, {
+    name,
+    archived: resolved.archived,
+    why: proposalText !== null ? (extractSection(proposalText, "why") ?? undefined) : undefined,
+    whatChanges: proposalText !== null ? (extractSection(proposalText, "what changes") ?? undefined) : undefined,
+    specs: await readSpecs(deps, resolved.dir),
+    tasks: tasksText !== null ? parseTasks(tasksText) : undefined,
+  })
 }
 
 async function handleStartWork(request: Request, deps: OpenSpecServeDeps): Promise<Response> {
@@ -265,6 +382,7 @@ export async function handleRequest(request: Request, deps: OpenSpecServeDeps): 
   const path = url.pathname
 
   if (request.method === "GET" && path === "/changes") return handleChanges(deps)
+  if (request.method === "GET" && path === "/change") return handleChangeDetail(request, deps)
   if (request.method === "POST" && path === "/start-work") return handleStartWork(request, deps)
   if (request.method === "GET" && (path === "/ui" || path.startsWith("/ui/"))) return handleStatic(path, deps)
 
