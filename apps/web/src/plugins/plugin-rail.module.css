@@ -86,10 +86,22 @@
   box-shadow: var(--shadow-panel);
 }
 
+/* iOS Safari sizes an iframe to its content ("shrink-to-fit"),
+ * ignoring percentage heights — inside the sheet the panel rendered at
+ * full content height and got clipped with no way to scroll. A fixed-
+ * height positioning context with an absolutely-inset iframe gives the
+ * frame a hard viewport-derived size iOS cannot inflate; the plugin's
+ * own #root then scrolls internally as designed. */
 .sheetBody {
-  flex: 1;
-  min-height: 60vh;
-  display: flex;
+  position: relative;
+  height: min(70dvh, 640px);
+}
+
+.sheetBody iframe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
 }
 
 @media (pointer: coarse) {
