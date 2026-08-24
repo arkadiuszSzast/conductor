@@ -78,3 +78,135 @@ describe_("bundled OpenSpec plugin app.js: query-string preservation (M7)", () =
     expect(calls).toContain("../start-work?project=%2Fproj%2Fb")
   })
 })
+
+describe_("bundled OpenSpec plugin app.js: change detail modal", () => {
+  it("opens the modal on tile click, fetching detail with the project query string preserved, and shows Why text", async () => {
+    await load()
+    ;(window as unknown as HappyDomWindow).happyDOM.setURL(
+      "http://conductor.test/v1/plugins/openspec/ui/?project=%2Fproj%2Fc",
+    )
+    document.body.innerHTML = '<div id="root"></div>'
+    const calls: string[] = []
+    globalThis.fetch = (async (url: string) => {
+      calls.push(String(url))
+      if (String(url).startsWith("../changes")) {
+        return new Response(
+          JSON.stringify({
+            openspec: true,
+            active: [{ name: "sample-change", taskProgress: { done: 1, total: 2 } }],
+            archived: [],
+          }),
+          { status: 200 },
+        )
+      }
+      return new Response(
+        JSON.stringify({
+          name: "sample-change",
+          archived: false,
+          why: "Because it matters.",
+          whatChanges: "- do the thing",
+          specs: [
+            {
+              capability: "capability-a",
+              requirements: [{ heading: "Widgets can spin", body: "Widgets SHALL spin." }],
+            },
+          ],
+          tasks: [
+            { text: "first task", done: true },
+            { text: "second task", done: false },
+          ],
+        }),
+        { status: 200 },
+      )
+    }) as typeof fetch
+
+    await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
+    await flush()
+
+    const tile = document.querySelector(".change") as HTMLElement
+    expect(tile).not.toBeNull()
+    tile.click()
+    await flush()
+
+    expect(calls).toContain("../change?name=sample-change&project=%2Fproj%2Fc")
+
+    const modal = document.querySelector(".modal-overlay")
+    expect(modal).not.toBeNull()
+    const why = document.querySelector(".modal-why")
+    expect(why?.textContent).toContain("Because it matters.")
+
+    const requirementsDetails = Array.from(document.querySelectorAll(".modal-section")).find(
+      section => section.querySelector("summary")?.textContent === "Requirements",
+    ) as HTMLDetailsElement
+    expect(requirementsDetails).not.toBeUndefined()
+    expect(requirementsDetails.open).toBe(false)
+    requirementsDetails.open = true
+
+    expect(requirementsDetails.textContent).toContain("capability-a")
+    expect(requirementsDetails.textContent).toContain("Widgets can spin")
+  })
+
+  it("opens the modal for an archived change without a Start work button", async () => {
+    await load()
+    ;(window as unknown as HappyDomWindow).happyDOM.setURL(
+      "http://conductor.test/v1/plugins/openspec/ui/?project=%2Fproj%2Fd",
+    )
+    document.body.innerHTML = '<div id="root"></div>'
+    globalThis.fetch = (async (url: string) => {
+      if (String(url).startsWith("../changes")) {
+        return new Response(
+          JSON.stringify({ openspec: true, active: [], archived: ["old-change"] }),
+          { status: 200 },
+        )
+      }
+      return new Response(
+        JSON.stringify({ name: "old-change", archived: true, why: "Historical reasons." }),
+        { status: 200 },
+      )
+    }) as typeof fetch
+
+    await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
+    await flush()
+
+    const item = document.querySelector(".archived-item") as HTMLElement
+    expect(item).not.toBeNull()
+    item.click()
+    await flush()
+
+    const modal = document.querySelector(".modal-overlay")
+    expect(modal).not.toBeNull()
+    expect(document.querySelector(".modal-body .start-work")).toBeNull()
+  })
+
+  it("closes the modal on Escape", async () => {
+    await load()
+    ;(window as unknown as HappyDomWindow).happyDOM.setURL(
+      "http://conductor.test/v1/plugins/openspec/ui/?project=%2Fproj%2Fe",
+    )
+    document.body.innerHTML = '<div id="root"></div>'
+    globalThis.fetch = (async (url: string) => {
+      if (String(url).startsWith("../changes")) {
+        return new Response(
+          JSON.stringify({ openspec: true, active: [{ name: "sample-change", taskProgress: null }], archived: [] }),
+          { status: 200 },
+        )
+      }
+      return new Response(JSON.stringify({ name: "sample-change", archived: false, why: "Why text." }), {
+        status: 200,
+      })
+    }) as typeof fetch
+
+    await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
+    await flush()
+
+    const tile = document.querySelector(".change") as HTMLElement
+    tile.click()
+    await flush()
+    expect(document.querySelector(".modal-overlay")).not.toBeNull()
+
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }))
+    await flush()
+
+    expect(document.querySelector(".modal-overlay")).toBeNull()
+  })
+})
