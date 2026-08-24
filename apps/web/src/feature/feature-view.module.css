@@ -63,6 +63,20 @@
 .activity_blocked, .activity_waiting_retry { border-color: var(--status-waiting); }
 .activity_escalated { border-color: var(--status-escalated); }
 .activity_active strong { color: var(--status-running); }
+.escalationDetail {
+  flex-basis: 100%;
+  margin: var(--space-1) 0 0;
+  padding: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--status-escalated);
+  background: color-mix(in oklch, var(--status-escalated) 8%, transparent);
+  border-radius: var(--radius-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 12rem;
+  overflow-y: auto;
+}
 .grid {
   display: flex;
   gap: var(--space-3);

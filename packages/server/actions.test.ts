@@ -54,6 +54,7 @@ describe("git/worktree", () => {
     process_.handlers = [
       () => ok(), // check-ref-format
       () => ok(""), // worktree list --porcelain (empty)
+      () => fail(1, ""), // show-ref: branch does not exist yet
       () => ok(), // worktree add
     ]
     const result = await gitWorktree(ctx({ branch: "feat/x" }), deps(process_))
@@ -65,8 +66,37 @@ describe("git/worktree", () => {
     expect(process_.argv()).toEqual([
       ["git", "check-ref-format", "--branch", "feat/x"],
       ["git", "worktree", "list", "--porcelain"],
+      ["git", "show-ref", "--verify", "--quiet", "refs/heads/feat/x"],
       ["git", "worktree", "add", "/repo-worktrees/feat-x", "-b", "feat/x", "main"],
     ])
+  })
+
+  it("attaches to an existing branch (no -b) when the branch survives from an earlier feature", async () => {
+    const process_ = new FakeProcess()
+    process_.handlers = [
+      () => ok(), // check-ref-format
+      () => ok(""), // worktree list: no worktree for it
+      () => ok(), // show-ref: branch exists
+      () => ok(), // worktree add (attach)
+    ]
+    const result = await gitWorktree(ctx({ branch: "feat/x" }), deps(process_))
+
+    expect(result.status).toBe("succeeded")
+    if (result.status !== "succeeded") return
+    expect(result.outputs.created).toBe(true)
+    expect(process_.argv().at(-1)).toEqual(["git", "worktree", "add", "/repo-worktrees/feat-x", "feat/x"])
+  })
+
+  it("fails with a pointer when the branch is checked out in a different worktree path", async () => {
+    const process_ = new FakeProcess()
+    const porcelain = "worktree /elsewhere/feat-x\nHEAD abc123\nbranch refs/heads/feat/x\n"
+    process_.handlers = [() => ok(), () => ok(porcelain)]
+    const result = await gitWorktree(ctx({ branch: "feat/x" }), deps(process_))
+
+    expect(result.status).toBe("failed")
+    if (result.status !== "failed") return
+    expect(result.error).toContain("already checked out in another worktree at /elsewhere/feat-x")
+    expect(process_.argv()).toHaveLength(2)
   })
 
   it("is idempotent: an existing worktree for the same branch at the target path succeeds without mutation", async () => {
@@ -98,7 +128,7 @@ describe("git/worktree", () => {
 
   it("honours an explicit dir input, resolved relative to workdir", async () => {
     const process_ = new FakeProcess()
-    process_.handlers = [() => ok(), () => ok(""), () => ok()]
+    process_.handlers = [() => ok(), () => ok(""), () => fail(1, ""), () => ok()]
     const result = await gitWorktree(ctx({ branch: "feat/x", dir: "../custom-wt" }), deps(process_))
 
     expect(result.status).toBe("succeeded")
@@ -108,7 +138,7 @@ describe("git/worktree", () => {
 
   it("branches from the given base", async () => {
     const process_ = new FakeProcess()
-    process_.handlers = [() => ok(), () => ok(""), () => ok()]
+    process_.handlers = [() => ok(), () => ok(""), () => fail(1, ""), () => ok()]
     await gitWorktree(ctx({ branch: "feat/x", base: "develop" }), deps(process_))
     expect(process_.argv().at(-1)).toEqual(["git", "worktree", "add", "/repo-worktrees/feat-x", "-b", "feat/x", "develop"])
   })
