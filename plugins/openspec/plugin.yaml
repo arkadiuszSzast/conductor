@@ -2,7 +2,6 @@ plugin: openspec
 version: 1
 panel:
   title: OpenSpec
-  icon: list-checks
 backend:
   run: [bun, serve.ts]
 capabilities: [process, filesystem, network]

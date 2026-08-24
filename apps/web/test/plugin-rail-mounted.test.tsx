@@ -216,6 +216,64 @@ describe("PluginRail: visibility", () => {
 
     await m.unmount()
   })
+
+  it("falls back to the sole registered project when no board scope is published (quiet daemon)", async () => {
+    const seen: { project: string | null } = { project: null }
+    const services = await makeServices([
+      {
+        test: p => p.startsWith("/v1/plugins"),
+        handler: p => {
+          const url = new URL(p, "http://x")
+          seen.project = url.searchParams.get("project")
+          return seen.project === "/proj/only"
+            ? listing([{ id: "openspec", scope: "project", project: "/proj/only", panel: { title: "OpenSpec" }, state: "running", diagnostics: [] }])
+            : listing([])
+        },
+      },
+      {
+        test: p => p.startsWith("/v1/health"),
+        handler: () => ({ ...health(), projects: [{ projectDir: "/proj/only", state: "valid", diagnostics: [] }] }),
+      },
+    ])
+
+    // No published scope at all — the board never mounted a scope tab.
+    const m = await mountRail(services)
+    await flush()
+    expect(seen.project).toBe("/proj/only")
+    expect(m.container.querySelector('[role="tab"][title="OpenSpec"]')).not.toBeNull()
+
+    await m.unmount()
+  })
+
+  it("does NOT fall back when several projects are registered — ambiguity requires a real scope", async () => {
+    const seen: { project: string | null } = { project: "unset" }
+    const services = await makeServices([
+      {
+        test: p => p.startsWith("/v1/plugins"),
+        handler: p => {
+          const url = new URL(p, "http://x")
+          seen.project = url.searchParams.get("project")
+          return listing([])
+        },
+      },
+      {
+        test: p => p.startsWith("/v1/health"),
+        handler: () => ({
+          ...health(),
+          projects: [
+            { projectDir: "/proj/a", state: "valid", diagnostics: [] },
+            { projectDir: "/proj/b", state: "valid", diagnostics: [] },
+          ],
+        }),
+      },
+    ])
+
+    const m = await mountRail(services)
+    await flush()
+    expect(seen.project).toBeNull()
+
+    await m.unmount()
+  })
 })
 
 describe("PluginRail: persistence", () => {
