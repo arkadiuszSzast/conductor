@@ -14,5 +14,5 @@
 
 ## 2. Verification
 
-- [ ] 2.1 [test] Full suite green; redeploy dogfood plugin and verify
+- [x] 2.1 [test] Full suite green; redeploy dogfood plugin and verify
   on desktop and mobile

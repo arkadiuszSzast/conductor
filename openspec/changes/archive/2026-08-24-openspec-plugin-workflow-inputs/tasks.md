@@ -12,5 +12,5 @@
 
 ## 2. Verification
 
-- [ ] 2.1 [test] Full suite green; redeploy dogfood plugin and start
+- [x] 2.1 [test] Full suite green; redeploy dogfood plugin and start
   todo-filtering from the panel successfully

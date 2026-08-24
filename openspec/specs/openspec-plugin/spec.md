@@ -32,12 +32,18 @@ from the panel.
 
 ### Requirement: Work can be started from the panel
 
-The panel SHALL offer a start-work action for a change. Invoking it SHALL
-create a Conductor feature through the daemon's existing public
+The panel SHALL offer a start-work action for a change. Invoking it
+SHALL create a Conductor feature through the daemon's existing public
 feature-creation API (title derived from the change name and description
-derived from the proposal), then navigate the Control Room to the created
-feature via the host bridge. Failures SHALL surface the API error
-envelope's message in the panel.
+from the proposal), then navigate the Control Room to the created
+feature via the host bridge. Before creating, the plugin SHALL consult
+the project's workflow projection: when the workflow declares a string
+input named `change_slug` or `change`, the creation request SHALL carry
+`inputs` with that input set to the change's name; otherwise the request
+SHALL carry no `inputs` field. A projection that cannot be fetched SHALL
+NOT block the attempt — the creation proceeds without inputs and any
+daemon-side validation failure surfaces as an error. Failures SHALL
+surface the API error envelope's message in the panel.
 
 #### Scenario: Start work creates a feature and navigates
 
@@ -45,11 +51,24 @@ envelope's message in the panel.
 - **THEN** a feature is created via the public API with the change's
   context, and the Control Room navigates to the new feature
 
+#### Scenario: Workflow's change input is filled automatically
+
+- **WHEN** the project's workflow declares a required string input
+  `change_slug` and the user triggers start-work for `todo-filtering`
+- **THEN** the creation request carries
+  `inputs: { "change_slug": "todo-filtering" }` and succeeds without
+  the user typing anything
+
+#### Scenario: No matching input, no inputs field
+
+- **WHEN** the workflow declares no `change_slug`/`change` input
+- **THEN** the creation request carries no `inputs` field
+
 #### Scenario: API failure is shown inline
 
 - **WHEN** the feature-creation call fails
-- **THEN** the panel shows the error message from the response envelope and
-  no navigation occurs
+- **THEN** the panel shows the error message from the response envelope
+  and no navigation occurs
 
 ### Requirement: The plugin ships in-repo and uses only the public contract
 
@@ -99,38 +118,48 @@ plain directory name SHALL be rejected without touching the filesystem.
   archived)
 - **THEN** the backend answers 404
 
-### Requirement: Clicking a change opens a detail modal with progressive disclosure
+### Requirement: Clicking a change expands its details inline with progressive disclosure
 
 Clicking a change tile (anywhere except its start-work action) SHALL
-open a modal overlay showing the change name, its task progress, and
-the proposal's Why text visible immediately. What Changes,
-Requirements (grouped by capability), and Tasks SHALL be present as
-sections collapsed by default, expandable individually. The modal
-SHALL offer the same start-work action as the tile for active changes
-(hidden for archived ones) and SHALL close via close button, backdrop
-click, and Escape. Markdown in displayed texts SHALL be rendered with a
-minimal safe renderer (no raw HTML injection).
+expand the change's details **in place directly beneath the tile**,
+accordion-style, within the listing; clicking the expanded tile again
+SHALL collapse it. The expanded area SHALL show the change's task
+progress and the proposal's Why text immediately, with What Changes,
+Requirements (grouped by capability), and Tasks as sections collapsed
+by default and expandable individually. At most one change SHALL be
+expanded at a time — expanding another collapses the previous one. The
+tile's own start-work action SHALL remain the only one — the expanded
+area adds no duplicate button. Tiles SHALL be operable by
+keyboard (Enter/Space toggles the expansion). Details SHALL be fetched
+lazily on first expansion, with fetch failures shown inline in the
+expanded area. Markdown in displayed texts SHALL be rendered with a
+minimal safe renderer (no raw HTML injection). No modal overlay SHALL
+be used.
 
-#### Scenario: Open, read, expand
+#### Scenario: Expand, read, expand deeper
 
 - **WHEN** the user clicks an active change's tile
-- **THEN** a modal opens with the Why text visible, and expanding
-  Requirements reveals each capability's requirement headings and
-  bodies
+- **THEN** the details expand beneath the tile with the Why text
+  visible, and expanding Requirements reveals each capability's
+  requirement headings and bodies
 
-#### Scenario: Start work from the modal
+#### Scenario: Accordion keeps one open
 
-- **WHEN** the user triggers Start work inside the modal
-- **THEN** the same feature-creation flow runs as from the tile (and
-  the Control Room navigates to the created feature)
+- **WHEN** one change is expanded and the user clicks another change
+- **THEN** the first collapses and the second expands
 
-#### Scenario: Archived change opens without start-work
+#### Scenario: One start-work action per change
+
+- **WHEN** an active change is expanded
+- **THEN** the tile's start-work button remains the only start-work
+  control — the expanded area contains no duplicate
+
+#### Scenario: Archived change expands without start-work
 
 - **WHEN** the user clicks an archived change
-- **THEN** the modal opens with its details and no start-work action
+- **THEN** its details expand with no start-work action
 
-#### Scenario: Dismissal
+#### Scenario: Collapse
 
-- **WHEN** the user presses Escape or clicks the backdrop or close
-  button
-- **THEN** the modal closes and the listing remains as it was
+- **WHEN** the user clicks the expanded change's tile again
+- **THEN** the details collapse and the listing remains as it was
