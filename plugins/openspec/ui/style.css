@@ -135,88 +135,53 @@ button:disabled {
   color: var(--fg);
 }
 
-.modal-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.6);
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
-  padding: 24px 12px;
-  z-index: 1000;
+.change[aria-expanded="true"] {
+  border-color: var(--accent);
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
 }
 
-.modal-panel {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  width: 100%;
-  max-width: 480px;
-  max-height: calc(100vh - 48px);
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
+.change-detail {
+  border: 1px solid var(--accent);
+  border-top: none;
+  border-radius: 0 0 6px 6px;
+  padding: 10px 12px;
+  margin: -8px 0 8px;
 }
 
-.modal-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 12px 14px;
+.archived-list li.change-detail {
   border-bottom: 1px solid var(--border);
-  position: sticky;
-  top: 0;
-  background: var(--bg);
-}
-
-.modal-title {
-  font-size: 14px;
-  font-weight: 600;
-  margin: 0;
-  word-break: break-word;
-}
-
-.modal-close {
-  border: none;
-  background: transparent;
-  color: var(--muted);
-  font-size: 18px;
-  line-height: 1;
-  padding: 0 4px;
-  cursor: pointer;
-}
-
-.modal-close:hover {
+  padding: 8px 10px;
+  cursor: default;
   color: var(--fg);
 }
 
-.modal-body {
-  padding: 12px 14px;
+.change-detail .loading {
+  padding: 4px 0;
 }
 
-.modal-why {
+.detail-why {
   margin-bottom: 12px;
 }
 
-.modal-why p,
-.modal-section-body p {
+.detail-why p,
+.detail-section-body p {
   margin: 0 0 8px;
   line-height: 1.5;
 }
 
-.modal-why ul,
-.modal-section-body ul {
+.detail-why ul,
+.detail-section-body ul {
   margin: 0 0 8px;
   padding-left: 18px;
 }
 
-.modal-section {
+.detail-section {
   border-top: 1px solid var(--border);
   padding: 8px 0;
 }
 
-.modal-section summary {
+.detail-section summary {
   cursor: pointer;
   font-weight: 600;
   font-size: 12px;
@@ -225,11 +190,11 @@ button:disabled {
   color: var(--muted);
 }
 
-.modal-section-body {
+.detail-section-body {
   margin-top: 8px;
 }
 
-.modal-capability {
+.detail-capability {
   font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -237,28 +202,28 @@ button:disabled {
   margin: 12px 0 4px;
 }
 
-.modal-capability:first-child {
+.detail-capability:first-child {
   margin-top: 0;
 }
 
-.modal-requirement-heading {
+.detail-requirement-heading {
   margin: 0 0 2px;
 }
 
-.modal-tasks {
+.detail-tasks {
   list-style: none;
   padding: 0;
   margin: 0;
 }
 
-.modal-tasks li {
+.detail-tasks li {
   display: flex;
   align-items: center;
   gap: 6px;
   padding: 3px 0;
 }
 
-.modal-tasks .task-done span {
+.detail-tasks .task-done span {
   color: var(--muted);
   text-decoration: line-through;
 }
