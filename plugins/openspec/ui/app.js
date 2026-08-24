@@ -378,22 +378,8 @@
       sectionBody.appendChild(list)
       container.appendChild(details)
     }
-
-    if (!data.archived) {
-      const actions = document.createElement("div")
-      actions.className = "change-actions"
-      const button = document.createElement("button")
-      button.type = "button"
-      button.className = "start-work"
-      button.textContent = "Start work"
-      const errorEl = document.createElement("div")
-      errorEl.className = "error-message"
-      errorEl.hidden = true
-      button.addEventListener("click", () => runStartWork(data.name, button, errorEl))
-      actions.appendChild(button)
-      container.appendChild(actions)
-      container.appendChild(errorEl)
-    }
+    // No start-work button here: the tile's own button stays visible
+    // above the expanded area, so a second one would be redundant.
   }
 
   async function loadDetail(name, container) {

@@ -261,14 +261,13 @@ describe_("bundled OpenSpec plugin app.js: change detail inline expansion", () =
     expect(detail.querySelector(".start-work")).toBeNull()
   })
 
-  it("starts work from the expanded area — same flow, then navigate", async () => {
+  it("renders no duplicate start-work inside the expanded area — the tile's button stays the only one", async () => {
     await load()
     ;(window as unknown as HappyDomWindow).happyDOM.setURL(
       "http://conductor.test/v1/plugins/openspec/ui/?project=%2Fproj%2Fg",
     )
     document.body.innerHTML = '<div id="root"></div>'
-    const posts: string[] = []
-    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    globalThis.fetch = (async (url: string) => {
       const path = String(url)
       if (path.startsWith("../changes")) {
         return new Response(
@@ -281,10 +280,6 @@ describe_("bundled OpenSpec plugin app.js: change detail inline expansion", () =
           status: 200,
         })
       }
-      if (path.startsWith("../start-work")) {
-        posts.push(String(init?.body ?? ""))
-        return new Response(JSON.stringify({ featureId: "feat-77" }), { status: 200 })
-      }
       return new Response("{}", { status: 404 })
     }) as typeof fetch
 
@@ -293,18 +288,12 @@ describe_("bundled OpenSpec plugin app.js: change detail inline expansion", () =
     ;(document.querySelector(".change") as HTMLElement).click()
     await flush()
 
-    const detailButton = document.querySelector(".change-detail .start-work") as HTMLButtonElement
-    expect(detailButton).not.toBeNull()
-    detailButton.click()
-    await flush()
-    await flush()
-
-    // Same code path as the tile button: the daemon call carries the
-    // change name. (The subsequent `navigate` postMessage is untestable
-    // here — `postToHost` no-ops when window.parent === window, i.e.
-    // outside a real iframe — and is covered by the host-side bridge
-    // tests in plugin-rail-mounted.test.tsx.)
-    expect(posts).toEqual(['{"change":"sample-change"}'])
+    expect(document.querySelector(".change-detail")).not.toBeNull()
+    expect(document.querySelectorAll(".start-work").length).toBe(1)
+    expect(document.querySelector(".change-detail .start-work")).toBeNull()
+    // The tile's own button remains clickable while expanded (its
+    // start-work flow is covered by the query-string test above).
+    expect(document.querySelector(".change .start-work")).not.toBeNull()
   })
 
   it("toggles expansion from the keyboard (Enter on a focused tile)", async () => {
