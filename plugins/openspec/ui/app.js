@@ -70,9 +70,63 @@
       "</div>"
   }
 
+  // At most one change/archived entry is expanded at a time — the panel
+  // is narrow (mobile sheet, desktop side column), so an accordion keeps
+  // it readable. Both refs are reset whenever the listing is rebuilt
+  // (refresh), since the DOM nodes they'd otherwise point at are gone.
+  let expandedTile = null
+  let expandedContainer = null
+
+  function collapseExpanded() {
+    if (expandedTile === null) return
+    expandedTile.setAttribute("aria-expanded", "false")
+    expandedContainer.hidden = true
+    expandedTile = null
+    expandedContainer = null
+  }
+
+  function toggleExpansion(tileEl, container, name) {
+    if (expandedContainer === container) {
+      collapseExpanded()
+      return
+    }
+    collapseExpanded()
+    tileEl.setAttribute("aria-expanded", "true")
+    container.hidden = false
+    expandedTile = tileEl
+    expandedContainer = container
+    if (container.dataset.loaded !== "true") loadDetail(name, container)
+  }
+
+  function attachExpansion(tileEl) {
+    const name = tileEl.dataset.name
+    // A `<li>` tile (archived entries) gets a `<li>` detail sibling so
+    // the `<ul>` stays validly nested; regular tiles get a `<div>`.
+    const container = document.createElement(tileEl.tagName === "LI" ? "li" : "div")
+    container.className = "change-detail"
+    container.hidden = true
+    tileEl.insertAdjacentElement("afterend", container)
+
+    tileEl.setAttribute("tabindex", "0")
+    tileEl.setAttribute("role", "button")
+    tileEl.setAttribute("aria-expanded", "false")
+
+    const toggle = () => toggleExpansion(tileEl, container, name)
+    tileEl.addEventListener("click", toggle)
+    tileEl.addEventListener("keydown", event => {
+      if (event.key !== "Enter" && event.key !== " ") return
+      if (event.target !== tileEl) return
+      event.preventDefault()
+      toggle()
+    })
+  }
+
   function renderChanges(data) {
     const active = data.active || []
     const archived = data.archived || []
+
+    expandedTile = null
+    expandedContainer = null
 
     let html = '<div class="toolbar"><h1>OpenSpec</h1><button type="button" id="refresh">Refresh</button></div>'
 
@@ -110,20 +164,8 @@
       })
     }
 
-    const makeModalTrigger = element => {
-      element.setAttribute("tabindex", "0")
-      element.setAttribute("role", "button")
-      element.addEventListener("click", () => openModal(element.dataset.name))
-      element.addEventListener("keydown", event => {
-        if (event.key !== "Enter" && event.key !== " ") return
-        if (event.target !== element) return
-        event.preventDefault()
-        openModal(element.dataset.name)
-      })
-    }
-
-    for (const changeEl of root.querySelectorAll(".change")) makeModalTrigger(changeEl)
-    for (const item of root.querySelectorAll(".archived-item")) makeModalTrigger(item)
+    for (const changeEl of root.querySelectorAll(".change")) attachExpansion(changeEl)
+    for (const item of root.querySelectorAll(".archived-item")) attachExpansion(item)
   }
 
   async function runStartWork(name, button, errorEl) {
@@ -176,26 +218,12 @@
     }
   }
 
-  // --- Detail modal -------------------------------------------------
+  // --- Change detail expansion ---------------------------------------
   //
   // Everything below builds DOM via createElement/textContent only —
   // proposal and requirement text comes from files in the target
   // project's repo, not from this plugin, so it is rendered as data,
   // never as HTML.
-
-  let currentModal = null
-  let currentModalKeydownHandler = null
-
-  function closeModal() {
-    if (currentModalKeydownHandler !== null) {
-      document.removeEventListener("keydown", currentModalKeydownHandler)
-      currentModalKeydownHandler = null
-    }
-    if (currentModal !== null) {
-      currentModal.remove()
-      currentModal = null
-    }
-  }
 
   function renderInlineNodes(text) {
     const nodes = []
@@ -261,37 +289,37 @@
 
   function createCollapsibleSection(titleText) {
     const details = document.createElement("details")
-    details.className = "modal-section"
+    details.className = "detail-section"
     const summary = document.createElement("summary")
     summary.textContent = titleText
     details.appendChild(summary)
     const sectionBody = document.createElement("div")
-    sectionBody.className = "modal-section-body"
+    sectionBody.className = "detail-section-body"
     details.appendChild(sectionBody)
     return { details, sectionBody }
   }
 
-  function renderModalError(body, message) {
-    body.textContent = ""
+  function renderDetailError(container, message) {
+    container.textContent = ""
     const errorEl = document.createElement("p")
     errorEl.className = "error-message"
     errorEl.textContent = message
-    body.appendChild(errorEl)
+    container.appendChild(errorEl)
   }
 
-  function renderModalDetail(body, data) {
-    body.textContent = ""
+  function renderDetailBody(container, data) {
+    container.textContent = ""
 
     if (Array.isArray(data.tasks) && data.tasks.length > 0) {
       const done = data.tasks.filter(task => task.done).length
       const progressLine = document.createElement("div")
       progressLine.className = "progress-label"
       progressLine.textContent = done + " / " + data.tasks.length + " tasks"
-      body.appendChild(progressLine)
+      container.appendChild(progressLine)
     }
 
     const why = document.createElement("div")
-    why.className = "modal-why"
+    why.className = "detail-why"
     if (typeof data.why === "string" && data.why !== "") {
       renderMarkdownInto(why, data.why)
     } else {
@@ -300,24 +328,24 @@
       empty.textContent = "No description yet."
       why.appendChild(empty)
     }
-    body.appendChild(why)
+    container.appendChild(why)
 
     if (typeof data.whatChanges === "string" && data.whatChanges !== "") {
       const { details, sectionBody } = createCollapsibleSection("What Changes")
       renderMarkdownInto(sectionBody, data.whatChanges)
-      body.appendChild(details)
+      container.appendChild(details)
     }
 
     if (Array.isArray(data.specs) && data.specs.length > 0) {
       const { details, sectionBody } = createCollapsibleSection("Requirements")
       for (const spec of data.specs) {
         const capabilityHeading = document.createElement("h3")
-        capabilityHeading.className = "modal-capability"
+        capabilityHeading.className = "detail-capability"
         capabilityHeading.textContent = spec.capability
         sectionBody.appendChild(capabilityHeading)
         for (const requirement of spec.requirements || []) {
           const reqHeading = document.createElement("p")
-          reqHeading.className = "modal-requirement-heading"
+          reqHeading.className = "detail-requirement-heading"
           const strong = document.createElement("strong")
           strong.textContent = requirement.heading
           reqHeading.appendChild(strong)
@@ -327,13 +355,13 @@
           sectionBody.appendChild(reqBody)
         }
       }
-      body.appendChild(details)
+      container.appendChild(details)
     }
 
     if (Array.isArray(data.tasks) && data.tasks.length > 0) {
       const { details, sectionBody } = createCollapsibleSection("Tasks")
       const list = document.createElement("ul")
-      list.className = "modal-tasks"
+      list.className = "detail-tasks"
       for (const task of data.tasks) {
         const item = document.createElement("li")
         item.className = task.done ? "task-done" : "task-pending"
@@ -348,7 +376,7 @@
         list.appendChild(item)
       }
       sectionBody.appendChild(list)
-      body.appendChild(details)
+      container.appendChild(details)
     }
 
     if (!data.archived) {
@@ -363,73 +391,29 @@
       errorEl.hidden = true
       button.addEventListener("click", () => runStartWork(data.name, button, errorEl))
       actions.appendChild(button)
-      body.appendChild(actions)
-      body.appendChild(errorEl)
+      container.appendChild(actions)
+      container.appendChild(errorEl)
     }
   }
 
-  async function loadModalDetail(name, body) {
+  async function loadDetail(name, container) {
+    container.textContent = ""
+    const loading = document.createElement("p")
+    loading.className = "loading"
+    loading.textContent = "Loading…"
+    container.appendChild(loading)
     try {
       const response = await fetch(withQuery("../change?name=" + encodeURIComponent(name)))
       const payload = await response.json().catch(() => null)
       if (!response.ok || payload === null) {
-        renderModalError(body, (payload && payload.error) || "failed to load change")
+        renderDetailError(container, (payload && payload.error) || "failed to load change")
         return
       }
-      renderModalDetail(body, payload)
+      renderDetailBody(container, payload)
+      container.dataset.loaded = "true"
     } catch (error) {
-      renderModalError(body, String(error))
+      renderDetailError(container, String(error))
     }
-  }
-
-  function openModal(name) {
-    if (!name) return
-    closeModal()
-
-    const overlay = document.createElement("div")
-    overlay.className = "modal-overlay"
-    overlay.addEventListener("click", event => {
-      if (event.target === overlay) closeModal()
-    })
-
-    const panel = document.createElement("div")
-    panel.className = "modal-panel"
-    panel.setAttribute("role", "dialog")
-    panel.setAttribute("aria-modal", "true")
-    overlay.appendChild(panel)
-
-    const header = document.createElement("div")
-    header.className = "modal-header"
-    const title = document.createElement("h2")
-    title.className = "modal-title"
-    title.textContent = name
-    const closeButton = document.createElement("button")
-    closeButton.type = "button"
-    closeButton.className = "modal-close"
-    closeButton.setAttribute("aria-label", "Close")
-    closeButton.textContent = "×"
-    closeButton.addEventListener("click", closeModal)
-    header.appendChild(title)
-    header.appendChild(closeButton)
-    panel.appendChild(header)
-
-    const body = document.createElement("div")
-    body.className = "modal-body"
-    const loading = document.createElement("p")
-    loading.className = "loading"
-    loading.textContent = "Loading…"
-    body.appendChild(loading)
-    panel.appendChild(body)
-
-    document.body.appendChild(overlay)
-    currentModal = overlay
-
-    currentModalKeydownHandler = event => {
-      if (event.key === "Escape") closeModal()
-    }
-    document.addEventListener("keydown", currentModalKeydownHandler)
-
-    loadModalDetail(name, body)
   }
 
   postToHost("ready", { v: BRIDGE_VERSION })

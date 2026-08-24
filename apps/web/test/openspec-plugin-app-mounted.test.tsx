@@ -79,8 +79,8 @@ describe_("bundled OpenSpec plugin app.js: query-string preservation (M7)", () =
   })
 })
 
-describe_("bundled OpenSpec plugin app.js: change detail modal", () => {
-  it("opens the modal on tile click, fetching detail with the project query string preserved, and shows Why text", async () => {
+describe_("bundled OpenSpec plugin app.js: change detail inline expansion", () => {
+  it("expands the detail inline on tile click, fetching with the project query string preserved, and shows Why text", async () => {
     await load()
     ;(window as unknown as HappyDomWindow).happyDOM.setURL(
       "http://conductor.test/v1/plugins/openspec/ui/?project=%2Fproj%2Fc",
@@ -130,12 +130,13 @@ describe_("bundled OpenSpec plugin app.js: change detail modal", () => {
 
     expect(calls).toContain("../change?name=sample-change&project=%2Fproj%2Fc")
 
-    const modal = document.querySelector(".modal-overlay")
-    expect(modal).not.toBeNull()
-    const why = document.querySelector(".modal-why")
+    const detail = document.querySelector(".change-detail")
+    expect(detail).not.toBeNull()
+    expect((detail as HTMLElement).hidden).toBe(false)
+    const why = document.querySelector(".detail-why")
     expect(why?.textContent).toContain("Because it matters.")
 
-    const requirementsDetails = Array.from(document.querySelectorAll(".modal-section")).find(
+    const requirementsDetails = Array.from(document.querySelectorAll(".detail-section")).find(
       section => section.querySelector("summary")?.textContent === "Requirements",
     ) as HTMLDetailsElement
     expect(requirementsDetails).not.toBeUndefined()
@@ -146,10 +147,90 @@ describe_("bundled OpenSpec plugin app.js: change detail modal", () => {
     expect(requirementsDetails.textContent).toContain("Widgets can spin")
   })
 
-  it("opens the modal for an archived change without a Start work button", async () => {
+  it("collapses on a second click of the same tile", async () => {
     await load()
     ;(window as unknown as HappyDomWindow).happyDOM.setURL(
       "http://conductor.test/v1/plugins/openspec/ui/?project=%2Fproj%2Fd",
+    )
+    document.body.innerHTML = '<div id="root"></div>'
+    globalThis.fetch = (async (url: string) => {
+      if (String(url).startsWith("../changes")) {
+        return new Response(
+          JSON.stringify({ openspec: true, active: [{ name: "sample-change", taskProgress: null }], archived: [] }),
+          { status: 200 },
+        )
+      }
+      return new Response(JSON.stringify({ name: "sample-change", archived: false, why: "Why text." }), {
+        status: 200,
+      })
+    }) as typeof fetch
+
+    await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
+    await flush()
+
+    const tile = document.querySelector(".change") as HTMLElement
+    tile.click()
+    await flush()
+    expect((document.querySelector(".change-detail") as HTMLElement).hidden).toBe(false)
+    expect(tile.getAttribute("aria-expanded")).toBe("true")
+
+    tile.click()
+    await flush()
+    expect((document.querySelector(".change-detail") as HTMLElement).hidden).toBe(true)
+    expect(tile.getAttribute("aria-expanded")).toBe("false")
+  })
+
+  it("expanding another change collapses the first (accordion)", async () => {
+    await load()
+    ;(window as unknown as HappyDomWindow).happyDOM.setURL(
+      "http://conductor.test/v1/plugins/openspec/ui/?project=%2Fproj%2Fe",
+    )
+    document.body.innerHTML = '<div id="root"></div>'
+    globalThis.fetch = (async (url: string) => {
+      if (String(url).startsWith("../changes")) {
+        return new Response(
+          JSON.stringify({
+            openspec: true,
+            active: [
+              { name: "change-one", taskProgress: null },
+              { name: "change-two", taskProgress: null },
+            ],
+            archived: [],
+          }),
+          { status: 200 },
+        )
+      }
+      const name = new URL(url, "http://conductor.test").searchParams.get("name")
+      return new Response(JSON.stringify({ name, archived: false, why: "Why text." }), { status: 200 })
+    }) as typeof fetch
+
+    await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
+    await flush()
+
+    const tiles = Array.from(document.querySelectorAll(".change")) as HTMLElement[]
+    expect(tiles.length).toBe(2)
+    const first = tiles[0] as HTMLElement
+    const second = tiles[1] as HTMLElement
+
+    first.click()
+    await flush()
+    expect(first.getAttribute("aria-expanded")).toBe("true")
+    const firstDetail = first.nextElementSibling as HTMLElement
+    expect(firstDetail.hidden).toBe(false)
+
+    second.click()
+    await flush()
+    expect(first.getAttribute("aria-expanded")).toBe("false")
+    expect(firstDetail.hidden).toBe(true)
+    expect(second.getAttribute("aria-expanded")).toBe("true")
+    const secondDetail = second.nextElementSibling as HTMLElement
+    expect(secondDetail.hidden).toBe(false)
+  })
+
+  it("expands an archived change without a Start work button", async () => {
+    await load()
+    ;(window as unknown as HappyDomWindow).happyDOM.setURL(
+      "http://conductor.test/v1/plugins/openspec/ui/?project=%2Fproj%2Ff",
     )
     document.body.innerHTML = '<div id="root"></div>'
     globalThis.fetch = (async (url: string) => {
@@ -173,78 +254,14 @@ describe_("bundled OpenSpec plugin app.js: change detail modal", () => {
     item.click()
     await flush()
 
-    const modal = document.querySelector(".modal-overlay")
-    expect(modal).not.toBeNull()
-    expect(document.querySelector(".modal-body .start-work")).toBeNull()
+    const detail = item.nextElementSibling as HTMLElement
+    expect(detail).not.toBeNull()
+    expect(detail.classList.contains("change-detail")).toBe(true)
+    expect(detail.hidden).toBe(false)
+    expect(detail.querySelector(".start-work")).toBeNull()
   })
 
-  it("closes the modal on Escape", async () => {
-    await load()
-    ;(window as unknown as HappyDomWindow).happyDOM.setURL(
-      "http://conductor.test/v1/plugins/openspec/ui/?project=%2Fproj%2Fe",
-    )
-    document.body.innerHTML = '<div id="root"></div>'
-    globalThis.fetch = (async (url: string) => {
-      if (String(url).startsWith("../changes")) {
-        return new Response(
-          JSON.stringify({ openspec: true, active: [{ name: "sample-change", taskProgress: null }], archived: [] }),
-          { status: 200 },
-        )
-      }
-      return new Response(JSON.stringify({ name: "sample-change", archived: false, why: "Why text." }), {
-        status: 200,
-      })
-    }) as typeof fetch
-
-    await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
-    await flush()
-
-    const tile = document.querySelector(".change") as HTMLElement
-    tile.click()
-    await flush()
-    expect(document.querySelector(".modal-overlay")).not.toBeNull()
-
-    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }))
-    await flush()
-
-    expect(document.querySelector(".modal-overlay")).toBeNull()
-  })
-
-  it("closes the modal on backdrop click but not on clicks inside the panel", async () => {
-    await load()
-    ;(window as unknown as HappyDomWindow).happyDOM.setURL(
-      "http://conductor.test/v1/plugins/openspec/ui/?project=%2Fproj%2Ff",
-    )
-    document.body.innerHTML = '<div id="root"></div>'
-    globalThis.fetch = (async (url: string) => {
-      if (String(url).startsWith("../changes")) {
-        return new Response(
-          JSON.stringify({ openspec: true, active: [{ name: "sample-change", taskProgress: null }], archived: [] }),
-          { status: 200 },
-        )
-      }
-      return new Response(JSON.stringify({ name: "sample-change", archived: false, why: "Why text." }), {
-        status: 200,
-      })
-    }) as typeof fetch
-
-    await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
-    await flush()
-    ;(document.querySelector(".change") as HTMLElement).click()
-    await flush()
-
-    const panel = document.querySelector(".modal-panel") as HTMLElement
-    panel.click()
-    await flush()
-    expect(document.querySelector(".modal-overlay")).not.toBeNull()
-
-    const overlay = document.querySelector(".modal-overlay") as HTMLElement
-    overlay.click()
-    await flush()
-    expect(document.querySelector(".modal-overlay")).toBeNull()
-  })
-
-  it("starts work from the modal's own button — same flow, then navigate", async () => {
+  it("starts work from the expanded area — same flow, then navigate", async () => {
     await load()
     ;(window as unknown as HappyDomWindow).happyDOM.setURL(
       "http://conductor.test/v1/plugins/openspec/ui/?project=%2Fproj%2Fg",
@@ -276,9 +293,9 @@ describe_("bundled OpenSpec plugin app.js: change detail modal", () => {
     ;(document.querySelector(".change") as HTMLElement).click()
     await flush()
 
-    const modalButton = document.querySelector(".modal-panel .start-work") as HTMLButtonElement
-    expect(modalButton).not.toBeNull()
-    modalButton.click()
+    const detailButton = document.querySelector(".change-detail .start-work") as HTMLButtonElement
+    expect(detailButton).not.toBeNull()
+    detailButton.click()
     await flush()
     await flush()
 
@@ -290,7 +307,7 @@ describe_("bundled OpenSpec plugin app.js: change detail modal", () => {
     expect(posts).toEqual(['{"change":"sample-change"}'])
   })
 
-  it("opens the modal from the keyboard (Enter on a focused tile)", async () => {
+  it("toggles expansion from the keyboard (Enter on a focused tile)", async () => {
     await load()
     ;(window as unknown as HappyDomWindow).happyDOM.setURL(
       "http://conductor.test/v1/plugins/openspec/ui/?project=%2Fproj%2Fh",
@@ -314,9 +331,18 @@ describe_("bundled OpenSpec plugin app.js: change detail modal", () => {
     const tile = document.querySelector(".change") as HTMLElement
     expect(tile.getAttribute("tabindex")).toBe("0")
     expect(tile.getAttribute("role")).toBe("button")
+    expect(tile.getAttribute("aria-expanded")).toBe("false")
+
     tile.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }))
     await flush()
 
-    expect(document.querySelector(".modal-overlay")).not.toBeNull()
+    expect(tile.getAttribute("aria-expanded")).toBe("true")
+    expect((document.querySelector(".change-detail") as HTMLElement).hidden).toBe(false)
+
+    tile.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }))
+    await flush()
+
+    expect(tile.getAttribute("aria-expanded")).toBe("false")
+    expect((document.querySelector(".change-detail") as HTMLElement).hidden).toBe(true)
   })
 })
