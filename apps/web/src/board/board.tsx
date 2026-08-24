@@ -183,7 +183,12 @@ export function Board(): React.ReactNode {
     // re-run every time the operator changes it by hand.
   }, [stageOptions])
 
-  const loading = featuresState.status === "loading" || items === null
+  // Health readiness gates the empty state too: `scopes` now derives
+  // from registered projects, so if /v1/features resolves before
+  // /v1/health the board would flash "no active features" for a daemon
+  // that does have a registered (feature-less) project — the exact
+  // absent-scope flash this change eliminates.
+  const loading = featuresState.status === "loading" || items === null || (healthState.status === "loading" && healthState.data === null)
   const activeStageCol = board?.columns.find(c => c.jobId === mobileStage) ?? null
 
   return (

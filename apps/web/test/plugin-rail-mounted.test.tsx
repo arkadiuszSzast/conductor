@@ -329,6 +329,58 @@ describe("PluginRail: visibility", () => {
 
     await m.unmount()
   })
+
+  it("does not flash 'no active features' when /v1/features resolves before /v1/health (loading gates on health too)", async () => {
+    let releaseHealth: (() => void) | null = null
+    const healthGate = new Promise<void>(resolve => {
+      releaseHealth = resolve
+    })
+    // Health hangs until released, everything else answers immediately —
+    // deterministic features-before-health ordering.
+    const services = await makeServices([
+      { test: p => p.startsWith("/v1/plugins"), handler: () => listing([]) },
+      { test: p => p === "/v1/features", handler: () => ({ features: [] }) },
+      { test: p => p.startsWith("/v1/projects/workflow"), handler: () => ({ name: "delivery", stale: false, jobs: {}, inputs: {}, diagnostics: [] }) },
+    ])
+    const { ApiClient } = await import("../src/api/client.ts")
+    const { DataSource } = await import("../src/api/store.ts")
+    const delayedFetch = (async (url: RequestInfo | URL) => {
+      const path = String(url)
+      if (path.startsWith("/v1/health")) {
+        await healthGate
+        return new Response(
+          JSON.stringify({ ...health(), projects: [{ projectDir: "/proj/quiet", state: "valid", diagnostics: [] }] }),
+          { status: 200 },
+        )
+      }
+      if (path.startsWith("/v1/plugins")) return new Response(JSON.stringify(listing([])), { status: 200 })
+      if (path === "/v1/features") return new Response(JSON.stringify({ features: [] }), { status: 200 })
+      if (path.startsWith("/v1/projects/workflow")) {
+        return new Response(JSON.stringify({ name: "delivery", stale: false, jobs: {}, inputs: {}, diagnostics: [] }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ error: { code: "not_found", message: "no route", requestId: "r" } }), { status: 404 })
+    }) as FetchLike
+    const client = new ApiClient({ token: () => "tok", fetch: delayedFetch })
+    const store = new DataSource({ client, setTimeoutFn: fn => setTimeout(fn, 0), clearTimeoutFn: h => clearTimeout(h as ReturnType<typeof setTimeout>) })
+    const withDelayedHealth = { ...services, client, store }
+
+    const m = await mountBoardAndRail(withDelayedHealth)
+    await flush()
+    // Features resolved, health still pending: must show loading, not
+    // the "no active features" empty state.
+    expect(m.container.textContent).not.toContain("no active features")
+
+    const { act } = await load()
+    await act(async () => {
+      releaseHealth?.()
+      await flush()
+      await flush()
+    })
+    // Health arrived — the registered quiet project's scope exists now.
+    expect(m.container.textContent).not.toContain("no active features")
+
+    await m.unmount()
+  })
 })
 
 describe("PluginRail: persistence", () => {
