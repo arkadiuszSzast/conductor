@@ -258,6 +258,103 @@ describe("POST /start-work", () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  const startWorkWithWorkflow = async (
+    dir: string,
+    workflowResponse: () => Response | Promise<Response>,
+  ): Promise<{ body: Record<string, unknown> | null }> => {
+    const captured: { body: Record<string, unknown> | null } = { body: null }
+    const fetchFn = (async (url: string, init?: RequestInit) => {
+      if (String(url).includes("/v1/projects/workflow")) return workflowResponse()
+      captured.body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>
+      return new Response(JSON.stringify({ feature: { id: "feat-1" } }), { status: 201 })
+    }) as unknown as typeof fetch
+    const request = new Request("http://x/start-work", {
+      method: "POST",
+      body: JSON.stringify({ change: "retry-policy" }),
+    })
+    const response = await handleRequest(request, realFsDeps(dir, { fetchFn }))
+    expect(response.status).toBe(200)
+    return captured
+  }
+
+  it("fills the workflow's change_slug string input with the change name", async () => {
+    const dir = tempDir()
+    try {
+      writeChangeFixture(dir, "retry-policy", "")
+      const captured = await startWorkWithWorkflow(
+        dir,
+        () =>
+          new Response(
+            JSON.stringify({ name: "delivery", inputs: { change_slug: { type: "string", presence: "required" } } }),
+            { status: 200 },
+          ),
+      )
+      expect(captured.body?.inputs).toEqual({ change_slug: "retry-policy" })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("uses the `change` input name when the workflow declares that instead", async () => {
+    const dir = tempDir()
+    try {
+      writeChangeFixture(dir, "retry-policy", "")
+      const captured = await startWorkWithWorkflow(
+        dir,
+        () =>
+          new Response(JSON.stringify({ name: "delivery", inputs: { change: { type: "string" } } }), { status: 200 }),
+      )
+      expect(captured.body?.inputs).toEqual({ change: "retry-policy" })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("sends no inputs field when the workflow declares no change input", async () => {
+    const dir = tempDir()
+    try {
+      writeChangeFixture(dir, "retry-policy", "")
+      const captured = await startWorkWithWorkflow(
+        dir,
+        () =>
+          new Response(JSON.stringify({ name: "delivery", inputs: { other: { type: "string" } } }), { status: 200 }),
+      )
+      expect("inputs" in (captured.body ?? {})).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("does not fill a change_slug input that is not a string", async () => {
+    const dir = tempDir()
+    try {
+      writeChangeFixture(dir, "retry-policy", "")
+      const captured = await startWorkWithWorkflow(
+        dir,
+        () =>
+          new Response(JSON.stringify({ name: "delivery", inputs: { change_slug: { type: "number" } } }), {
+            status: 200,
+          }),
+      )
+      expect("inputs" in (captured.body ?? {})).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("proceeds without inputs when the workflow projection cannot be fetched", async () => {
+    const dir = tempDir()
+    try {
+      writeChangeFixture(dir, "retry-policy", "")
+      const captured = await startWorkWithWorkflow(dir, () => {
+        throw new Error("projection down")
+      })
+      expect("inputs" in (captured.body ?? {})).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe("GET /change", () => {
