@@ -72,7 +72,11 @@ export function JobFrontierCard({ card }: JobFrontierCardProps): React.ReactNode
           </span>
         </div>
         {card.frontierKind === "escalated-fallback" ? <div className={styles.failedTag}>✖ job failed</div> : null}
-        {card.escalation !== null ? <div className={styles.escalation}>{card.escalation}</div> : null}
+        {card.escalation !== null ? (
+          <div className={styles.escalation} title={card.escalation}>
+            {card.escalation}
+          </div>
+        ) : null}
         {card.findingsNew > 0 ? <div className={styles.findings}>⚑ {card.findingsNew} new</div> : null}
       </Link>
       {attention ? (

@@ -199,6 +199,7 @@ export function FeatureView(): React.ReactNode {
         ) : null}
         {activity.reason !== null ? <span>reason: {activity.reason}</span> : null}
         {activity.nextAt !== null ? <span>next check: {formatClock(activity.nextAt)}</span> : null}
+        {feature.escalation !== null ? <pre className={styles.escalationDetail}>{feature.escalation}</pre> : null}
       </div>
       <div className={styles.grid}>
         <div className={styles.graphCol}>
