@@ -10,9 +10,8 @@ future changes to the board, graph, or action surfaces have a map.
 from the feature list plus one workflow projection:
 
 - **Scopes** (`deriveWorkflowScopes`) group features by `projectDir` +
-  `workflow`, busiest-first. Only the *selected* scope's workflow structure
-  is fetched (`GET /v1/projects/workflow?dir=`), so opening the board never
-  N+1s across every project a daemon knows about.
+  `workflow`, busiest-first. See "Always-selected scope" below for how
+  registered projects (not just features) contribute scopes.
 - **Frontier** (`resolveFrontierJobIds`) picks the job(s) that represent a
   feature's current position: every `running` job, else every `ready` job,
   else — only for `escalated` features with nothing running/ready — every
@@ -203,6 +202,45 @@ above:
   `resolveInspectorStepId` instead of the incompatible projection. The
   existing same-name-but-`stale` warning (a workflow edited, not renamed)
   is unchanged and still renders once the compatibility check passes.
+
+## Always-selected scope
+
+Reference: `openspec/changes/always-selected-scope/{proposal,design}.md`.
+Scopes previously came from the feature list alone, so a quiet daemon (no
+non-terminal features) published a `null` active scope and nothing
+scope-dependent — the plugin rail, in particular — could reach a
+feature-less project.
+
+- **`deriveWorkflowScopes` takes the project registry as a second input**
+  (`RegisteredProject[]`, projectDir + workflow name from the workflow
+  projection, `null` when unregistered/invalid). Every registered project
+  now yields a zero-count base scope keyed the same way a feature's scope
+  would be (`"default"` sentinel for a null workflow name); feature-derived
+  entries merge their counts onto a matching base scope, or add their own
+  scope when a feature's workflow name differs from the project's current
+  one. The busiest-first/label sort is unchanged — base scopes with zero
+  features simply sort last within their tier.
+- **`board.tsx` sources the registry via `useHealth`, resolves workflow
+  names via the new `useWorkflowNames` hook** (subscribes to the store's
+  `workflow:<dir>` resource for every registered project, ensuring each is
+  loaded — small N, matches design.md D4), and feeds both into
+  `deriveWorkflowScopes`. The existing freeze/default selection cascade
+  (`pickStableDefaultScopeKey`) needed no changes: with a non-empty base
+  set it can no longer resolve to "no scope" while any project is
+  registered, and it already tolerates the frozen key momentarily not
+  matching (e.g. while a workflow name is still loading).
+  `publishActiveScope` therefore only ever publishes `null` when the
+  daemon has zero registered projects.
+- **The plugin rail's sole-project fallback is removed.**
+  `use-plugin-rail.ts` previously called `useHealth` itself and fell back
+  to the sole registered project when `useActiveScope()` returned `null` —
+  a rail-side patch for the same gap. Since the board now always publishes
+  a real scope while any project is registered, the rail follows
+  `useActiveScope()` alone again; the fallback tests moved to board-level
+  mounted tests (`plugin-rail-mounted.test.tsx`'s "quiet single-project
+  daemon" and "multi-project daemon with zero features" cases now mount
+  `Board` + `PluginRail` together instead of calling `publishActiveScope`
+  directly).
 
 ## What did not change
 

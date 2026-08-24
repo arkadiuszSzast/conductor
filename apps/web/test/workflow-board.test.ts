@@ -161,6 +161,64 @@ describe("deriveWorkflowScopes", () => {
     const scopes = deriveWorkflowScopes([item({ workflow: null })])
     expect(scopes[0]!.workflow).toBe("default")
   })
+
+  it("a quiet daemon (registered projects, no features) still yields a base scope per project", () => {
+    const scopes = deriveWorkflowScopes([], [{ projectDir: "/p1", workflowName: "delivery" }])
+    expect(scopes).toEqual([
+      { key: scopeKey("/p1", "delivery"), projectDir: "/p1", workflow: "delivery", projectLabel: "p1", featureCount: 0, activeCount: 0 },
+    ])
+  })
+
+  it("a feature-less registered project appears beside a busy one", () => {
+    const scopes = deriveWorkflowScopes(
+      [item({ id: "a", projectDir: "/busy", workflow: "delivery", status: "running" })],
+      [
+        { projectDir: "/busy", workflowName: "delivery" },
+        { projectDir: "/quiet", workflowName: "hotfix" },
+      ],
+    )
+    expect(scopes.map(s => s.key)).toEqual([scopeKey("/busy", "delivery"), scopeKey("/quiet", "hotfix")])
+    expect(scopes[0]!.featureCount).toBe(1)
+    expect(scopes[1]!.featureCount).toBe(0)
+  })
+
+  it("a registered project with an unregistered/invalid workflow surfaces as a 'default'-labelled scope", () => {
+    const scopes = deriveWorkflowScopes([], [{ projectDir: "/broken", workflowName: null }])
+    expect(scopes).toHaveLength(1)
+    expect(scopes[0]!.workflow).toBe("default")
+    expect(scopes[0]!.key).toBe(scopeKey("/broken", "default"))
+  })
+
+  it("no registered projects and no features yields no scopes", () => {
+    expect(deriveWorkflowScopes([], [])).toEqual([])
+    expect(deriveWorkflowScopes([])).toEqual([])
+  })
+
+  it("feature counts merge onto the registered project's base scope instead of duplicating it", () => {
+    const scopes = deriveWorkflowScopes(
+      [
+        item({ id: "a", projectDir: "/p1", workflow: "delivery", status: "running" }),
+        item({ id: "b", projectDir: "/p1", workflow: "delivery", status: "waiting_human" }),
+      ],
+      [{ projectDir: "/p1", workflowName: "delivery" }],
+    )
+    expect(scopes).toHaveLength(1)
+    expect(scopes[0]!.key).toBe(scopeKey("/p1", "delivery"))
+    expect(scopes[0]!.featureCount).toBe(2)
+    expect(scopes[0]!.activeCount).toBe(2)
+  })
+
+  it("a feature on a workflow other than the project's registered one still gets its own scope", () => {
+    const scopes = deriveWorkflowScopes(
+      [item({ id: "a", projectDir: "/p1", workflow: "legacy", status: "running" })],
+      [{ projectDir: "/p1", workflowName: "delivery" }],
+    )
+    expect(scopes.map(s => s.key).sort()).toEqual([scopeKey("/p1", "delivery"), scopeKey("/p1", "legacy")].sort())
+    const base = scopes.find(s => s.workflow === "delivery")!
+    const extra = scopes.find(s => s.workflow === "legacy")!
+    expect(base.featureCount).toBe(0)
+    expect(extra.featureCount).toBe(1)
+  })
 })
 
 describe("scopeMatchesWorkflow", () => {

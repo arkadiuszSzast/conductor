@@ -152,6 +152,53 @@ async function mountRail(
   }
 }
 
+/** Mounts `Board` beside `PluginRail` — used for the scenarios where the
+ *  rail's active project must come from the board's own registry-derived
+ *  scope publication rather than a directly-called `publishActiveScope`
+ *  (design.md D3: the fallback moved from the rail to the board). */
+async function mountBoardAndRail(
+  services: Awaited<ReturnType<typeof makeServices>>,
+): Promise<{ container: HTMLDivElement; unmount: () => Promise<void> }> {
+  const { React, act, createRoot } = await load()
+  const h = React.createElement
+  const { AppContext } = await import("../src/app-context.ts")
+  const { Board } = await import("../src/board/board.tsx")
+  const { PluginRail } = await import("../src/plugins/plugin-rail.tsx")
+  const { StartWorkContext } = await import("../src/start-work/start-work-context.ts")
+  const { Router } = await import("wouter")
+  const { memoryLocation } = await import("wouter/memory-location")
+
+  const container = document.createElement("div")
+  document.body.appendChild(container)
+  const root = createRoot(container)
+  const { hook } = memoryLocation({ path: "/", record: true })
+
+  await act(async () => {
+    root.render(
+      h(
+        AppContext.Provider,
+        { value: services },
+        h(
+          StartWorkContext.Provider,
+          { value: () => {} },
+          h(Router, { hook, children: h("div", null, h(Board), h(PluginRail)) }),
+        ),
+      ),
+    )
+    await flush()
+  })
+
+  return {
+    container,
+    unmount: async () => {
+      await act(async () => {
+        root.unmount()
+      })
+      container.remove()
+    },
+  }
+}
+
 describe("PluginRail: visibility", () => {
   it("renders no rail chrome when the listing is empty", async () => {
     const services = await makeServices([
@@ -217,7 +264,7 @@ describe("PluginRail: visibility", () => {
     await m.unmount()
   })
 
-  it("falls back to the sole registered project when no board scope is published (quiet daemon)", async () => {
+  it("shows a project plugin tab on a quiet single-project daemon — the board publishes the registry-derived scope with no features (supersedes the old rail-side sole-project fallback)", async () => {
     const seen: { project: string | null } = { project: null }
     const services = await makeServices([
       {
@@ -234,10 +281,12 @@ describe("PluginRail: visibility", () => {
         test: p => p.startsWith("/v1/health"),
         handler: () => ({ ...health(), projects: [{ projectDir: "/proj/only", state: "valid", diagnostics: [] }] }),
       },
+      { test: p => p === "/v1/features", handler: () => ({ features: [] }) },
+      { test: p => p.startsWith("/v1/projects/workflow"), handler: () => ({ name: "delivery", stale: false, jobs: {}, inputs: {}, diagnostics: [] }) },
     ])
 
-    // No published scope at all — the board never mounted a scope tab.
-    const m = await mountRail(services)
+    const m = await mountBoardAndRail(services)
+    await flush()
     await flush()
     expect(seen.project).toBe("/proj/only")
     expect(m.container.querySelector('[role="tab"][title="OpenSpec"]')).not.toBeNull()
@@ -245,7 +294,7 @@ describe("PluginRail: visibility", () => {
     await m.unmount()
   })
 
-  it("does NOT fall back when several projects are registered — ambiguity requires a real scope", async () => {
+  it("selects a scope on a multi-project daemon with zero features — the board picks the first project by label rather than publishing nothing", async () => {
     const seen: { project: string | null } = { project: "unset" }
     const services = await makeServices([
       {
@@ -266,11 +315,69 @@ describe("PluginRail: visibility", () => {
           ],
         }),
       },
+      { test: p => p === "/v1/features", handler: () => ({ features: [] }) },
+      { test: p => p.startsWith("/v1/projects/workflow"), handler: () => ({ name: "delivery", stale: false, jobs: {}, inputs: {}, diagnostics: [] }) },
     ])
 
-    const m = await mountRail(services)
+    const m = await mountBoardAndRail(services)
     await flush()
-    expect(seen.project).toBeNull()
+    await flush()
+    // Neither project has any features to sort by activeCount, so the
+    // busiest-first/label tiebreak picks "a" first — the board still
+    // always selects *something* rather than leaving the rail scopeless.
+    expect(seen.project).toBe("/proj/a")
+
+    await m.unmount()
+  })
+
+  it("does not flash 'no active features' when /v1/features resolves before /v1/health (loading gates on health too)", async () => {
+    let releaseHealth: (() => void) | null = null
+    const healthGate = new Promise<void>(resolve => {
+      releaseHealth = resolve
+    })
+    // Health hangs until released, everything else answers immediately —
+    // deterministic features-before-health ordering.
+    const services = await makeServices([
+      { test: p => p.startsWith("/v1/plugins"), handler: () => listing([]) },
+      { test: p => p === "/v1/features", handler: () => ({ features: [] }) },
+      { test: p => p.startsWith("/v1/projects/workflow"), handler: () => ({ name: "delivery", stale: false, jobs: {}, inputs: {}, diagnostics: [] }) },
+    ])
+    const { ApiClient } = await import("../src/api/client.ts")
+    const { DataSource } = await import("../src/api/store.ts")
+    const delayedFetch = (async (url: RequestInfo | URL) => {
+      const path = String(url)
+      if (path.startsWith("/v1/health")) {
+        await healthGate
+        return new Response(
+          JSON.stringify({ ...health(), projects: [{ projectDir: "/proj/quiet", state: "valid", diagnostics: [] }] }),
+          { status: 200 },
+        )
+      }
+      if (path.startsWith("/v1/plugins")) return new Response(JSON.stringify(listing([])), { status: 200 })
+      if (path === "/v1/features") return new Response(JSON.stringify({ features: [] }), { status: 200 })
+      if (path.startsWith("/v1/projects/workflow")) {
+        return new Response(JSON.stringify({ name: "delivery", stale: false, jobs: {}, inputs: {}, diagnostics: [] }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ error: { code: "not_found", message: "no route", requestId: "r" } }), { status: 404 })
+    }) as FetchLike
+    const client = new ApiClient({ token: () => "tok", fetch: delayedFetch })
+    const store = new DataSource({ client, setTimeoutFn: fn => setTimeout(fn, 0), clearTimeoutFn: h => clearTimeout(h as ReturnType<typeof setTimeout>) })
+    const withDelayedHealth = { ...services, client, store }
+
+    const m = await mountBoardAndRail(withDelayedHealth)
+    await flush()
+    // Features resolved, health still pending: must show loading, not
+    // the "no active features" empty state.
+    expect(m.container.textContent).not.toContain("no active features")
+
+    const { act } = await load()
+    await act(async () => {
+      releaseHealth?.()
+      await flush()
+      await flush()
+    })
+    // Health arrived — the registered quiet project's scope exists now.
+    expect(m.container.textContent).not.toContain("no active features")
 
     await m.unmount()
   })

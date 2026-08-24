@@ -7,7 +7,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react"
 import { useApp } from "../app-context.ts"
-import { useHealth, usePlugins } from "../api/hooks.ts"
+import { usePlugins } from "../api/hooks.ts"
 import { useActiveScope } from "./active-scope.ts"
 import { visiblePlugins } from "./visibility.ts"
 import { localStorageRailStorage, type RailStorage } from "./rail-storage.ts"
@@ -26,20 +26,11 @@ export interface PluginRailState {
 
 export function usePluginRail(storage: RailStorage = localStorageRailStorage()): PluginRailState {
   const { store } = useApp()
-  const { project: scopedProject, feature: activeFeature } = useActiveScope()
-  // The board only publishes a scope when at least one non-terminal
-  // feature exists (scope tabs derive from the feature list, not the
-  // project registry) — so on a quiet daemon the active scope stays null
-  // and a project plugin would be invisible with no way to reach it.
-  // Fall back to the sole registered project from health: with exactly
-  // one project there is no ambiguity about what the operator is looking
-  // at. Multi-project daemons still require a real scope selection.
-  const healthState = useHealth(store)
-  const soleProject = useMemo(() => {
-    const projects = healthState.data?.projects ?? []
-    return projects.length === 1 ? (projects[0]?.projectDir ?? null) : null
-  }, [healthState.data])
-  const activeProject = scopedProject ?? soleProject
+  // The board always publishes a scope while at least one project is
+  // registered (registry-derived scopes, not feature-derived — see
+  // `workflow-board.ts`'s `deriveWorkflowScopes`), so the rail follows it
+  // directly with no fallback of its own.
+  const { project: activeProject, feature: activeFeature } = useActiveScope()
   const pluginsState = usePlugins(store, activeProject ?? "")
   // A scope switch starts a fresh `loading` resource for the new key
   // (`store.ts`'s `EMPTY_RESOURCE`) even when a global plugin's tab

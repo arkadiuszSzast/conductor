@@ -4,7 +4,7 @@
  * the snapshot reference is stable until the resource actually changes.
  */
 
-import { useCallback, useEffect, useSyncExternalStore } from "react"
+import { useCallback, useEffect, useMemo, useReducer, useSyncExternalStore } from "react"
 import type { ApiClient } from "./client.ts"
 import type { AnswerRunResponse, CommandResponse, FeatureDetailResponse, StartFeatureRequest } from "./types.ts"
 import type {
@@ -80,6 +80,43 @@ export function useWorkflow(store: DataSource, projectDir: string): WorkflowReso
 
 export function useHealth(store: DataSource): HealthState {
   return useStore(store, "health", s => s.getHealth(), s => s.ensureHealthLoaded())
+}
+
+/**
+ * Per-project workflow *name* lookup for scope derivation (design.md D4):
+ * ensures each project's workflow resource is loaded and subscribes to
+ * every one, returning `projectDir -> name` (`null` while loading or when
+ * the workflow is unregistered/invalid — callers fall back to the
+ * `"default"` sentinel, same convention as a feature's null `workflow`).
+ * Not built on `useStore`, which is keyed to a single resource: the
+ * project set is dynamic (driven by health), so this subscribes to one
+ * key per project directly and re-renders on any of their changes.
+ */
+export function useWorkflowNames(store: DataSource, projectDirs: readonly string[]): Readonly<Record<string, string | null>> {
+  const [version, bump] = useReducer((c: number) => c + 1, 0)
+  const dirsKey = projectDirs.join("\u0000")
+
+  useEffect(() => {
+    const dirs = dirsKey === "" ? [] : dirsKey.split("\u0000")
+    const unsubs = dirs.map(dir => store.subscribe(`workflow:${dir}`, bump))
+    for (const dir of dirs) store.ensureWorkflowLoaded(dir)
+    return () => {
+      for (const unsub of unsubs) unsub()
+    }
+  }, [store, dirsKey])
+
+  return useMemo(() => {
+    const dirs = dirsKey === "" ? [] : dirsKey.split("\u0000")
+    const map: Record<string, string | null> = {}
+    for (const dir of dirs) {
+      const state = store.getWorkflow(dir).data
+      map[dir] = state !== null && state.ok ? state.workflow.name : null
+    }
+    return map
+    // `version` is read only to force recompute on any subscribed
+    // workflow change (the actual data comes from `store.getWorkflow`,
+    // not from `version` itself).
+  }, [store, dirsKey, version])
 }
 
 export function useStreamConnected(store: DataSource): boolean {
