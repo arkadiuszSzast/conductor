@@ -15,8 +15,8 @@ progress and the proposal's Why text immediately, with What Changes,
 Requirements (grouped by capability), and Tasks as sections collapsed
 by default and expandable individually. At most one change SHALL be
 expanded at a time — expanding another collapses the previous one. The
-expanded area SHALL offer the same start-work action as the tile for
-active changes (absent for archived ones). Tiles SHALL be operable by
+tile's own start-work action SHALL remain the only one — the expanded
+area adds no duplicate button. Tiles SHALL be operable by
 keyboard (Enter/Space toggles the expansion). Details SHALL be fetched
 lazily on first expansion, with fetch failures shown inline in the
 expanded area. Markdown in displayed texts SHALL be rendered with a
@@ -35,11 +35,11 @@ be used.
 - **WHEN** one change is expanded and the user clicks another change
 - **THEN** the first collapses and the second expands
 
-#### Scenario: Start work from the expanded area
+#### Scenario: One start-work action per change
 
-- **WHEN** the user triggers Start work inside the expanded details
-- **THEN** the same feature-creation flow runs as from the tile (and
-  the Control Room navigates to the created feature)
+- **WHEN** an active change is expanded
+- **THEN** the tile's start-work button remains the only start-work
+  control — the expanded area contains no duplicate
 
 #### Scenario: Archived change expands without start-work
 

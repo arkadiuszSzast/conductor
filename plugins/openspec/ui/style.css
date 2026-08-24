@@ -13,12 +13,28 @@
   box-sizing: border-box;
 }
 
+/* The panel lives in an iframe. iOS Safari does not scroll an iframe's
+ * document — the frame expands to its content and the overflow is
+ * clipped and unreachable. Scrolling therefore happens on #root (a div
+ * with its own overflow), never on the document itself. */
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+}
+
 body {
   margin: 0;
-  padding: 12px;
   background: var(--bg);
   color: var(--fg);
   font-size: 13px;
+}
+
+#root {
+  height: 100%;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 12px;
 }
 
 .loading,
