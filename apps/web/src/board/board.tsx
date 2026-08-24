@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import { useSearchParams } from "wouter"
 import { useApp } from "../app-context.ts"
-import { useFeatures, useWorkflow } from "../api/hooks.ts"
+import { useFeatures, useHealth, useWorkflow, useWorkflowNames } from "../api/hooks.ts"
 import { useStartWork } from "../start-work/start-work-context.ts"
 import {
   deriveOverview,
@@ -9,6 +9,7 @@ import {
   deriveWorkflowScopes,
   pickStableDefaultScopeKey,
   scopeMatchesWorkflow,
+  type RegisteredProject,
   type WorkflowBoardModel,
 } from "./workflow-board.ts"
 import { describeBoardMovements, diffBoardMovements } from "./board-activity.ts"
@@ -40,8 +41,22 @@ export function Board(): React.ReactNode {
     store.setActiveFeature(null)
   }, [store])
 
+  const healthState = useHealth(store)
+  const registeredProjectDirs = useMemo(
+    () => (healthState.data?.projects ?? []).map(p => p.projectDir),
+    [healthState.data],
+  )
+  const workflowNames = useWorkflowNames(store, registeredProjectDirs)
+  const registeredProjects: readonly RegisteredProject[] = useMemo(
+    () => registeredProjectDirs.map(projectDir => ({ projectDir, workflowName: workflowNames[projectDir] ?? null })),
+    [registeredProjectDirs, workflowNames],
+  )
+
   const items = featuresState.data
-  const scopes = useMemo(() => (items === null ? [] : deriveWorkflowScopes(items)), [items])
+  const scopes = useMemo(
+    () => (items === null ? [] : deriveWorkflowScopes(items, registeredProjects)),
+    [items, registeredProjects],
+  )
   const overview = useMemo(() => (items === null ? null : deriveOverview(items, now)), [items, now])
 
   const requestedScope = params.get("scope")

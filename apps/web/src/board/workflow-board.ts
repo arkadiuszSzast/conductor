@@ -69,9 +69,34 @@ export function pickStableDefaultScopeKey(
   return scopes[0]?.key ?? null
 }
 
-/** Group non-terminal features into project+workflow scopes, busiest first. */
-export function deriveWorkflowScopes(items: readonly FeatureListItem[]): readonly WorkflowScopeSummary[] {
+/** One project the daemon currently has registered — `workflowName` is
+ *  `null` when the project's workflow is unregistered/invalid (mirrors
+ *  `item.workflow`'s "no name yet" case), which yields the same
+ *  `"default"` sentinel `scopeKey` uses for a feature with no workflow. */
+export interface RegisteredProject {
+  readonly projectDir: string
+  readonly workflowName: string | null
+}
+
+/**
+ * Group features into project+workflow scopes, busiest first — plus a
+ * zero-count base scope for every registered project (D1: "scopes =
+ * registry ⋈ workflow, features decorate"), so a scope exists even for a
+ * project with no features yet. Feature-derived entries merge onto a
+ * matching base scope's counts; a feature whose workflow name differs
+ * from its project's currently registered one still gets its own scope
+ * (unchanged from the feature-only behaviour this supersedes).
+ */
+export function deriveWorkflowScopes(
+  items: readonly FeatureListItem[],
+  registeredProjects: readonly RegisteredProject[] = [],
+): readonly WorkflowScopeSummary[] {
   const map = new Map<string, { projectDir: string; workflow: string; featureCount: number; activeCount: number }>()
+  for (const project of registeredProjects) {
+    const workflow = project.workflowName ?? "default"
+    const key = scopeKey(project.projectDir, workflow)
+    if (!map.has(key)) map.set(key, { projectDir: project.projectDir, workflow, featureCount: 0, activeCount: 0 })
+  }
   for (const item of items) {
     if (item.status === "done" || item.status === "abandoned") continue
     const workflow = item.workflow ?? "default"

@@ -152,6 +152,53 @@ async function mountRail(
   }
 }
 
+/** Mounts `Board` beside `PluginRail` — used for the scenarios where the
+ *  rail's active project must come from the board's own registry-derived
+ *  scope publication rather than a directly-called `publishActiveScope`
+ *  (design.md D3: the fallback moved from the rail to the board). */
+async function mountBoardAndRail(
+  services: Awaited<ReturnType<typeof makeServices>>,
+): Promise<{ container: HTMLDivElement; unmount: () => Promise<void> }> {
+  const { React, act, createRoot } = await load()
+  const h = React.createElement
+  const { AppContext } = await import("../src/app-context.ts")
+  const { Board } = await import("../src/board/board.tsx")
+  const { PluginRail } = await import("../src/plugins/plugin-rail.tsx")
+  const { StartWorkContext } = await import("../src/start-work/start-work-context.ts")
+  const { Router } = await import("wouter")
+  const { memoryLocation } = await import("wouter/memory-location")
+
+  const container = document.createElement("div")
+  document.body.appendChild(container)
+  const root = createRoot(container)
+  const { hook } = memoryLocation({ path: "/", record: true })
+
+  await act(async () => {
+    root.render(
+      h(
+        AppContext.Provider,
+        { value: services },
+        h(
+          StartWorkContext.Provider,
+          { value: () => {} },
+          h(Router, { hook, children: h("div", null, h(Board), h(PluginRail)) }),
+        ),
+      ),
+    )
+    await flush()
+  })
+
+  return {
+    container,
+    unmount: async () => {
+      await act(async () => {
+        root.unmount()
+      })
+      container.remove()
+    },
+  }
+}
+
 describe("PluginRail: visibility", () => {
   it("renders no rail chrome when the listing is empty", async () => {
     const services = await makeServices([
@@ -217,7 +264,7 @@ describe("PluginRail: visibility", () => {
     await m.unmount()
   })
 
-  it("falls back to the sole registered project when no board scope is published (quiet daemon)", async () => {
+  it("shows a project plugin tab on a quiet single-project daemon — the board publishes the registry-derived scope with no features (supersedes the old rail-side sole-project fallback)", async () => {
     const seen: { project: string | null } = { project: null }
     const services = await makeServices([
       {
@@ -234,10 +281,12 @@ describe("PluginRail: visibility", () => {
         test: p => p.startsWith("/v1/health"),
         handler: () => ({ ...health(), projects: [{ projectDir: "/proj/only", state: "valid", diagnostics: [] }] }),
       },
+      { test: p => p === "/v1/features", handler: () => ({ features: [] }) },
+      { test: p => p.startsWith("/v1/projects/workflow"), handler: () => ({ name: "delivery", stale: false, jobs: {}, inputs: {}, diagnostics: [] }) },
     ])
 
-    // No published scope at all — the board never mounted a scope tab.
-    const m = await mountRail(services)
+    const m = await mountBoardAndRail(services)
+    await flush()
     await flush()
     expect(seen.project).toBe("/proj/only")
     expect(m.container.querySelector('[role="tab"][title="OpenSpec"]')).not.toBeNull()
@@ -245,7 +294,7 @@ describe("PluginRail: visibility", () => {
     await m.unmount()
   })
 
-  it("does NOT fall back when several projects are registered — ambiguity requires a real scope", async () => {
+  it("selects a scope on a multi-project daemon with zero features — the board picks the first project by label rather than publishing nothing", async () => {
     const seen: { project: string | null } = { project: "unset" }
     const services = await makeServices([
       {
@@ -266,11 +315,17 @@ describe("PluginRail: visibility", () => {
           ],
         }),
       },
+      { test: p => p === "/v1/features", handler: () => ({ features: [] }) },
+      { test: p => p.startsWith("/v1/projects/workflow"), handler: () => ({ name: "delivery", stale: false, jobs: {}, inputs: {}, diagnostics: [] }) },
     ])
 
-    const m = await mountRail(services)
+    const m = await mountBoardAndRail(services)
     await flush()
-    expect(seen.project).toBeNull()
+    await flush()
+    // Neither project has any features to sort by activeCount, so the
+    // busiest-first/label tiebreak picks "a" first — the board still
+    // always selects *something* rather than leaving the rail scopeless.
+    expect(seen.project).toBe("/proj/a")
 
     await m.unmount()
   })
