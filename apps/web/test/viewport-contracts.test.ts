@@ -14,7 +14,11 @@ describe("viewport containment contracts", () => {
       source("src/top-bar.module.css"),
     ])
     expect(html).toContain("viewport-fit=cover")
-    expect(globalCss).toContain("min-height: 100dvh")
+    // Hard height, not min-height: the shell is a fixed app frame whose
+    // panes scroll internally — min-height would let a tall inspector
+    // column grow the document and shift scrolling to the page itself.
+    expect(globalCss).toContain("height: 100dvh")
+    expect(globalCss).not.toContain("min-height: 100dvh")
     expect(globalCss).toContain("overflow: hidden")
     expect(topBarCss).toContain("var(--safe-top)")
     expect(topBarCss).toContain("var(--safe-left)")
