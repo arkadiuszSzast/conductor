@@ -6,13 +6,14 @@
  * before resubmitting (design.md "Use application-owned action sheets").
  *
  * When the feature exposes more than one `recoverableTargets` candidate,
- * a required target select renders so the operator picks one explicitly
- * (retry-budget spec: "Parallel failures require a selected target").
- * Exactly one candidate keeps the prior no-select behavior. An
- * `ambiguous_target` response (a race that added a second candidate
- * after this sheet loaded) surfaces the server's target list the same
- * way, so the operator can retry with an explicit selection even before
- * a refetch lands.
+ * a pre-checked checkbox list renders so the operator recovers all of
+ * them in one atomic request or narrows the selection explicitly
+ * (retry-budget spec: "Parallel failures recover together or by
+ * explicit selection"). Exactly one candidate keeps the prior no-select
+ * behavior. An `ambiguous_target` response (a race that added a second
+ * candidate after this sheet loaded) surfaces the server's target list
+ * the same way, so the operator can retry with an explicit selection
+ * even before a refetch lands.
  */
 
 import { useEffect, useState } from "react"
@@ -46,7 +47,7 @@ export function RecoverySheet({ featureId, onClose }: RecoverySheetProps): React
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [stale, setStale] = useState(false)
-  const [selectedTarget, setSelectedTarget] = useState<string>("")
+  const [checkedTargets, setCheckedTargets] = useState<ReadonlySet<string> | null>(null)
   const [ambiguousTargets, setAmbiguousTargets] = useState<readonly { readonly jobId: string; readonly stepId: string }[] | null>(null)
   // Fixed for the lifetime of this sheet instance: a retry after a
   // conflict must reuse the same key so the server can dedupe it as the
@@ -55,26 +56,43 @@ export function RecoverySheet({ featureId, onClose }: RecoverySheetProps): React
 
   const feature = detailState.data?.feature
   const candidates = ambiguousTargets ?? feature?.recoverableTargets ?? []
-  const needsSelect = candidates.length > 1
-  const singleCandidateKey = candidates.length === 1 ? targetKey(candidates[0]!) : null
-  const trimmed = notes.trim()
-  const invalid = trimmed === "" || feature === undefined || (needsSelect && selectedTarget === "")
-
-  // Once exactly one candidate is known, pre-select it so `invalid`
-  // reflects the notes field alone — matching the prior single-candidate
-  // no-select behavior.
+  const showList = candidates.length > 1
+  // Pre-check everything once the candidate set is known: recovering the
+  // whole frontier is the common case after a shared-cause outage, and a
+  // narrower selection is one click away.
+  const candidatesKey = candidates.map(targetKey).join("|")
   useEffect(() => {
-    if (singleCandidateKey !== null) setSelectedTarget(singleCandidateKey)
-  }, [singleCandidateKey])
+    if (candidates.length > 0) setCheckedTargets(new Set(candidates.map(targetKey)))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [candidatesKey])
+
+  const checked = checkedTargets ?? new Set<string>()
+  const selectedCandidates = candidates.filter(candidate => checked.has(targetKey(candidate)))
+  const trimmed = notes.trim()
+  const invalid = trimmed === "" || feature === undefined || (showList && selectedCandidates.length === 0)
+
+  const toggleTarget = (key: string): void => {
+    const next = new Set(checked)
+    if (next.has(key)) next.delete(key)
+    else next.add(key)
+    setCheckedTargets(next)
+  }
 
   const submit = async (): Promise<void> => {
     if (invalid || pending || feature === undefined) return
     setError(null)
     setPending(true)
     try {
-      const target = selectedTarget !== "" ? candidates.find(candidate => targetKey(candidate) === selectedTarget) : undefined
+      // Exact selection under the version check: send `targets` (not
+      // `all`) so the server re-arms precisely what this view showed,
+      // even if the candidate set widened concurrently.
+      const selection = candidates.length === 1
+        ? { target: candidates[0]! }
+        : selectedCandidates.length === candidates.length || selectedCandidates.length > 1
+          ? { targets: selectedCandidates }
+          : { target: selectedCandidates[0]! }
       const response = await runCommand(featureId, client =>
-        client.recover(featureId, notes, { expectedVersion: feature.updatedAt, idempotencyKey, target }),
+        client.recover(featureId, notes, { expectedVersion: feature.updatedAt, idempotencyKey, ...selection }),
       )
       pushToast(`✓ ${response.result}`)
       onClose()
@@ -109,7 +127,11 @@ export function RecoverySheet({ featureId, onClose }: RecoverySheetProps): React
             cancel
           </button>
           <button className="primary" onClick={() => void submit()} disabled={pending || invalid}>
-            {pending ? "recovering…" : "recover"}
+            {pending
+              ? "recovering…"
+              : showList && selectedCandidates.length > 1
+                ? `recover ${selectedCandidates.length} steps`
+                : "recover"}
           </button>
         </>
       }
@@ -124,22 +146,48 @@ export function RecoverySheet({ featureId, onClose }: RecoverySheetProps): React
           still applies.
         </div>
       ) : null}
-      {needsSelect ? (
-        <label className={styles.field}>
+      {showList ? (
+        <div className={styles.field}>
           <span className={styles.label}>
-            target <span className={styles.required}>(required)</span>
+            targets <span className={styles.required}>(at least one)</span>
           </span>
-          <select value={selectedTarget} onChange={e => setSelectedTarget(e.target.value)} disabled={pending}>
-            <option value="" disabled>
-              select a failed/blocked step…
-            </option>
-            {candidates.map(candidate => (
-              <option key={targetKey(candidate)} value={targetKey(candidate)}>
-                {candidate.jobId}/{candidate.stepId}
-              </option>
-            ))}
-          </select>
-        </label>
+          <div className={styles.targetList} role="group" aria-label="recoverable targets">
+            {candidates.map(candidate => {
+              const key = targetKey(candidate)
+              return (
+                <label key={key} className={styles.targetRow}>
+                  <input
+                    type="checkbox"
+                    checked={checked.has(key)}
+                    onChange={() => toggleTarget(key)}
+                    disabled={pending}
+                  />
+                  <span>
+                    {candidate.jobId}/{candidate.stepId}
+                  </span>
+                </label>
+              )
+            })}
+          </div>
+          <div className={styles.targetActions}>
+            <button
+              type="button"
+              className={styles.linkButton}
+              onClick={() => setCheckedTargets(new Set(candidates.map(targetKey)))}
+              disabled={pending || selectedCandidates.length === candidates.length}
+            >
+              recover all
+            </button>
+            <button
+              type="button"
+              className={styles.linkButton}
+              onClick={() => setCheckedTargets(new Set())}
+              disabled={pending || selectedCandidates.length === 0}
+            >
+              clear
+            </button>
+          </div>
+        </div>
       ) : null}
       <label className={styles.field}>
         <span className={styles.label}>

@@ -130,4 +130,12 @@ export interface SessionClient {
    * readable timeline of what each step/agent did.
    */
   note(input: { sessionID: string; text: string }): Promise<void>
+  /**
+   * Stop a session's current processing — the engine calls this when it
+   * reaps a run so the runtime does not keep an orphan session burning
+   * tokens against a concluded run. Aborting a session that is already
+   * finished or missing is a no-op success; a thrown error is treated
+   * as best-effort failure by callers (logged, never blocks the reap).
+   */
+  abort(sessionID: string): Promise<void>
 }

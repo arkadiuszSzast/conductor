@@ -299,6 +299,8 @@ export class ApiClient {
       readonly expectedVersion?: number
       readonly idempotencyKey?: string
       readonly target?: { readonly jobId: string; readonly stepId: string }
+      readonly targets?: readonly { readonly jobId: string; readonly stepId: string }[]
+      readonly all?: boolean
     },
   ): Promise<CommandResponse> {
     return this.request<CommandResponse>(`/v1/features/${encodeURIComponent(featureId)}/recover`, {
@@ -309,6 +311,8 @@ export class ApiClient {
         ...(options?.expectedVersion !== undefined ? { expectedVersion: options.expectedVersion } : {}),
         ...(options?.idempotencyKey !== undefined ? { idempotencyKey: options.idempotencyKey } : {}),
         ...(options?.target !== undefined ? { target: options.target } : {}),
+        ...(options?.targets !== undefined ? { targets: options.targets } : {}),
+        ...(options?.all === true ? { all: true } : {}),
       }),
     })
   }

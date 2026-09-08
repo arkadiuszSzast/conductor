@@ -1071,6 +1071,13 @@ export class Engine {
     }
 
     try {
+      // Same as the nudge path: deliver the human answer as the STEP's
+      // agent so the resumed turn keeps the step's system prompt instead
+      // of falling back to the runner's default build agent.
+      const answerState = store.getFeature(run.featureId)
+      const answerSnapshot = answerState ? this.deps.workflows(answerState.projectDir) : undefined
+      const answerStep = answerSnapshot ? findStep(answerSnapshot.workflow, run.jobId, run.stepId) : undefined
+      const answerRole = answerStep?.type === "agent" ? answerSnapshot!.workflow.roles[answerStep.role] : undefined
       await this.deps.sessions.prompt({
         sessionID: sessionId!,
         text:
@@ -1078,6 +1085,9 @@ export class Engine {
           `Treat the answers as binding decisions. Continue step "${run.stepId}" and report ` +
           `run_id="${run.id}" with the appropriate outcome when done (or ask again if a further decision is needed).\n\n` +
           `[conductor delivery ${claimed.deliveryToken}]`,
+        ...(answerRole
+          ? { agent: answerRole.agent, ...(answerRole.model !== undefined ? { model: answerRole.model } : {}) }
+          : {}),
       })
     } catch (err) {
       const failureClass = classifyThrownBoundary(err)
@@ -1257,8 +1267,15 @@ export class Engine {
     for (const [jobId, jobRuntime] of Object.entries(state.jobs)) {
       if (jobRuntime.status !== "failed") continue
       for (const [stepId, stepRuntime] of Object.entries(jobRuntime.steps)) {
-        if (stepRuntime.status !== "failed") continue
-        add(jobId, stepId, 0)
+        if (stepRuntime.status === "failed") {
+          add(jobId, stepId, 0)
+          continue
+        }
+        // Rerun-budget exhaustion: the routing step itself SUCCEEDED (its
+        // run completed fine) but the job failed because its loop outcome
+        // burned maxRounds. Re-arming the step — recoverStepTargets resets
+        // the rerun counter alongside attempts — starts a fresh loop.
+        if (stepRuntime.status === "succeeded" && (jobRuntime.reruns[stepId] ?? 0) > 0) add(jobId, stepId, 0)
       }
     }
 
@@ -1327,19 +1344,27 @@ export class Engine {
   /**
    * Explicit operator recovery for an escalated feature: derives the
    * currently recoverable job/step target(s) from the durable frontier
-   * (`recoveryCandidates`), requires a non-empty note, and re-arms
-   * exactly ONE step — never the whole workflow. A still-absent runner
-   * re-enters a fresh resource wait (the upsert's uniqueness keeps it to
-   * one open row per target); an available runner dispatches one new
-   * run.
+   * (`recoveryCandidates`), requires a non-empty note, and re-arms the
+   * SELECTED steps — never the whole workflow implicitly. A still-absent
+   * runner re-enters a fresh resource wait (the upsert's uniqueness
+   * keeps it to one open row per target); an available runner dispatches
+   * one new run per recovered step.
    *
-   * `target` selects among several currently recoverable candidates
-   * (retry-budget spec: "Parallel failures require a selected target").
-   * Omitted with exactly one candidate recovers it (backwards
-   * compatible); omitted with several is rejected `ambiguous` listing
-   * them; a `target` absent from the candidate set is rejected
-   * `staleTarget` with NO fallback to another candidate (retry-budget
-   * spec: "Selected recovery target became stale").
+   * Selection takes exactly ONE form: `target` (one candidate,
+   * back-compat), `targets` (an explicit non-empty subset), or
+   * `all: true` (every current candidate — resolved server-side under
+   * the same version check, so a stale view can never silently widen
+   * the set). More than one form is rejected as invalid. Every
+   * explicitly named target must be in the current candidate set; any
+   * miss rejects the WHOLE request (`staleTarget`, no partial re-arm,
+   * no fallback — retry-budget spec: "Selected recovery target became
+   * stale"). Omitted selection with exactly one candidate recovers it
+   * (backwards compatible); omitted with several is rejected
+   * `ambiguous` listing them and offering the recover-all form
+   * (retry-budget spec: "Parallel failures recover together or by
+   * explicit selection"). All selected targets are re-armed in ONE
+   * `recoverStepTargets` transaction — one idempotency key, one
+   * version check, no observable partial re-arm.
    *
    * Optimistic concurrency (retry-policy 4.1): `expectedVersion` is the
    * feature's `updatedAt` the operator's view was rendered from — a
@@ -1359,6 +1384,8 @@ export class Engine {
       readonly expectedVersion?: number
       readonly idempotencyKey?: string
       readonly target?: { readonly jobId: string; readonly stepId: string }
+      readonly targets?: readonly { readonly jobId: string; readonly stepId: string }[]
+      readonly all?: boolean
     },
   ): Promise<{
     ok: boolean
@@ -1367,9 +1394,18 @@ export class Engine {
     readonly duplicate?: boolean
     readonly ambiguous?: boolean
     readonly staleTarget?: boolean
+    readonly allowAll?: boolean
     readonly targets?: readonly { readonly jobId: string; readonly stepId: string }[]
+    readonly recovered?: readonly { readonly jobId: string; readonly stepId: string }[]
   }> {
     const { store, log } = this.deps
+    const selectionForms = [input.target !== undefined, input.targets !== undefined, input.all === true].filter(Boolean).length
+    if (selectionForms > 1) {
+      return { ok: false, message: 'pass exactly one of "target", "targets", or "all" — they cannot be combined' }
+    }
+    if (input.targets !== undefined && input.targets.length === 0) {
+      return { ok: false, message: '"targets" must be a non-empty list — omit it to recover a single candidate' }
+    }
     const record = store.getFeatureRecord(featureId)
     if (!record) return { ok: false, message: `unknown feature "${featureId}"` }
     const state = record.state
@@ -1397,26 +1433,41 @@ export class Engine {
       return { ok: false, message: "no recoverable failed or blocked step found — nothing to recover" }
     }
 
-    let target = candidates[0]!
-    if (input.target !== undefined) {
-      const match = candidates.find(candidate => candidate.jobId === input.target!.jobId && candidate.stepId === input.target!.stepId)
-      if (!match) {
+    let selected: typeof candidates
+    if (input.all === true) {
+      selected = candidates
+    } else if (input.targets !== undefined || input.target !== undefined) {
+      const requested = input.targets ?? [input.target!]
+      const matches: typeof candidates = []
+      const misses: string[] = []
+      for (const req of requested) {
+        const match = candidates.find(candidate => candidate.jobId === req.jobId && candidate.stepId === req.stepId)
+        if (match) {
+          if (!matches.includes(match)) matches.push(match)
+        } else {
+          misses.push(`"${req.jobId}/${req.stepId}"`)
+        }
+      }
+      if (misses.length > 0) {
         return {
           ok: false,
           staleTarget: true,
-          message: `target "${input.target.jobId}/${input.target.stepId}" is not currently recoverable (already resolved, active, or unknown) — refresh and select a current target`,
+          message: `target(s) ${misses.join(", ")} are not currently recoverable (already resolved, active, or unknown) — nothing re-armed; refresh and select current targets`,
         }
       }
-      target = match
+      selected = matches
     } else if (candidates.length > 1) {
       const targets = candidates.map(candidate => ({ jobId: candidate.jobId, stepId: candidate.stepId }))
       const list = targets.map(t => `"${t.jobId}/${t.stepId}"`).join(", ")
       return {
         ok: false,
         ambiguous: true,
+        allowAll: true,
         targets,
-        message: `multiple recoverable targets: ${list} — pass "target" ({jobId, stepId}) to select one`,
+        message: `multiple recoverable targets: ${list} — pass "target"/"targets" to select, or "all" to recover every one`,
       }
+    } else {
+      selected = [candidates[0]!]
     }
 
     // Repair the DAG state FIRST, atomically and authoritatively: recovered
@@ -1432,7 +1483,7 @@ export class Engine {
     // this transaction actually won.
     const txResult = store.recoverStepTargets(
       featureId,
-      [{ jobId: target.jobId, stepId: target.stepId }],
+      selected.map(target => ({ jobId: target.jobId, stepId: target.stepId })),
       { expectedVersion: input.expectedVersion, idempotencyKey: input.idempotencyKey },
     )
     switch (txResult) {
@@ -1448,14 +1499,19 @@ export class Engine {
         break
     }
 
-    this.resetRetryEpisodeForRecover(featureId, target.jobId, target.stepId, target.step)
+    for (const target of selected) {
+      this.resetRetryEpisodeForRecover(featureId, target.jobId, target.stepId, target.step)
+    }
 
-    const { jobId, stepId, step } = target
-    log.log(`feature=${state.slug} recover: re-arming ${step.type} step "${jobId}/${stepId}"`)
-    if (step.type === "agent") await this.executeAgent(featureId, snapshot, jobId, step)
-    else if (step.type === "command") await this.executeCommand(featureId, snapshot, jobId, step)
-    else await this.executeAction(featureId, snapshot, jobId, step)
-    return { ok: true, message: `Recovered. Step "${jobId}/${stepId}" re-armed.` }
+    for (const { jobId, stepId, step } of selected) {
+      log.log(`feature=${state.slug} recover: re-arming ${step.type} step "${jobId}/${stepId}"`)
+      if (step.type === "agent") await this.executeAgent(featureId, snapshot, jobId, step)
+      else if (step.type === "command") await this.executeCommand(featureId, snapshot, jobId, step)
+      else await this.executeAction(featureId, snapshot, jobId, step)
+    }
+    const recovered = selected.map(target => ({ jobId: target.jobId, stepId: target.stepId }))
+    const list = recovered.map(t => `"${t.jobId}/${t.stepId}"`).join(", ")
+    return { ok: true, recovered, message: `Recovered. Step${recovered.length > 1 ? "s" : ""} ${list} re-armed.` }
   }
 
   // ------------------------------------------------------------ lifecycle
@@ -1721,7 +1777,7 @@ export class Engine {
         // that, re-observe once its next-observation time has passed
         // (guarding against double-invocation if an observation for this
         // run is already in flight — e.g. this pass raced dispatch).
-        if (clock.now() - active.timeStarted > this.runTtlMs) {
+        if (clock.now() - Math.max(active.timeLastActivity, active.timeStarted) > this.runTtlMs) {
           await this.reconcileTtl(feature, snapshot, active)
         } else if (!this.actionRuns.has(active.id) && clock.now() >= active.nextObservation) {
           await this.reconcileActionRun(feature, snapshot, jobId, step, active)
@@ -1816,6 +1872,12 @@ export class Engine {
           if (active.nudges < this.maxNudges) {
             const nudgeNo = this.deps.store.incrementNudges(active.id)
             log.log(`reconcile ${feature.slug}: run ${active.id} idle without report — nudge ${nudgeNo}/${this.maxNudges}`)
+            // Resume as the STEP's agent, not the runner default: a nudge
+            // dispatched without the role lands as the default build agent,
+            // dropping the step's system prompt (reporting discipline,
+            // tool rules) for the resumed turn.
+            const nudgeStep = findStep(snapshot.workflow, active.jobId, active.stepId)
+            const nudgeRole = nudgeStep?.type === "agent" ? snapshot.workflow.roles[nudgeStep.role] : undefined
             try {
               await this.deps.sessions.prompt({
                 sessionID: active.sessionId,
@@ -1823,6 +1885,9 @@ export class Engine {
                   `[conductor] Your previous turn appears to have been interrupted (session idle, no report received). ` +
                   `The work state is in your context. Finish step "${active.stepId}" and report ` +
                   `run_id="${active.id}" with the appropriate outcome.`,
+                ...(nudgeRole
+                  ? { agent: nudgeRole.agent, ...(nudgeRole.model !== undefined ? { model: nudgeRole.model } : {}) }
+                  : {}),
               })
             } catch (err) {
               // Secret-safe diagnostics: a log line, but still built from
@@ -1840,25 +1905,47 @@ export class Engine {
     await this.reconcileTtl(feature, snapshot, active)
   }
 
+  /**
+   * TTL measures SILENCE, not age: the clock anchors on the run's last
+   * observed activity (log appends, question flow, nudges — dispatch as
+   * the floor), so a run that demonstrably makes progress is never
+   * reaped by wall-clock while a run gone dark is. An agent step's own
+   * `ttlMs` overrides the engine default for its runs.
+   */
   private async reconcileTtl(
     feature: FeatureState,
-    _snapshot: WorkflowSnapshot,
-    active: { id: string; jobId: string; stepId: string; timeStarted: number },
+    snapshot: WorkflowSnapshot,
+    active: { id: string; jobId: string; stepId: string; sessionId?: string | null; timeStarted: number; timeLastActivity?: number },
   ): Promise<void> {
-    const age = this.deps.clock.now() - active.timeStarted
-    if (age > this.runTtlMs) {
+    const step = findStep(snapshot.workflow, active.jobId, active.stepId)
+    const ttlMs = (step?.type === "agent" ? step.ttlMs : undefined) ?? this.runTtlMs
+    const lastActivity = Math.max(active.timeLastActivity ?? active.timeStarted, active.timeStarted)
+    const silence = this.deps.clock.now() - lastActivity
+    if (silence > ttlMs) {
       this.deps.log.log(`reconcile ${feature.slug}: run ${active.id} (step ${active.stepId}) exceeded TTL — reaping`)
       this.idleCycles.delete(active.id)
-      await this.reap(feature, active, `run reaped after ${Math.round(age / 60000)} min without a report`)
+      await this.reap(feature, active, `run reaped after ${Math.round(silence / 60000)} min without activity`)
     }
   }
 
   private async reap(
     feature: FeatureState,
-    active: { id: string; jobId: string; stepId: string },
+    active: { id: string; jobId: string; stepId: string; sessionId?: string | null },
     reason: string,
     failureClass: FailureClass = "timeout",
   ): Promise<void> {
+    // Abort BEFORE concluding: if the daemon dies in between, reconcile
+    // re-reaps the still-active run; conclude-first would leave the
+    // session an orphan burning tokens against a closed run — exactly
+    // the failure this exists to prevent. Best-effort by contract: a
+    // runner that cannot abort must never block the conclusion.
+    if (active.sessionId) {
+      try {
+        await this.deps.sessions.abort(active.sessionId)
+      } catch (err) {
+        this.deps.log.log(`session abort failed for run ${active.id}: ${boundDiagnostic(errorMessage(err))}`)
+      }
+    }
     await this.concludeAndDispatch(
       feature.id,
       active.id,
@@ -2010,7 +2097,7 @@ function classifyProcessExit(code: number): FailureClass {
 
 function classifyThrownBoundary(error: unknown): FailureClass {
   const message = errorMessage(error)
-  if (/ECONNREFUSED|ECONNRESET|EPIPE|ETIMEDOUT|EAI_AGAIN|fetch failed|socket|network/i.test(message)) return "transient_transport"
+  if (/ECONNREFUSED|ECONNRESET|EPIPE|ETIMEDOUT|EAI_AGAIN|fetch failed|socket|network|unable to connect|connectionrefused|connection closed|connection error/i.test(message)) return "transient_transport"
   if (/429|rate limit|overloaded|capacity/i.test(message)) return "capacity"
   if (/502|503|504|bad gateway|service unavailable|gateway timeout/i.test(message)) return "transient_upstream"
   if (/timeout|timed out/i.test(message)) return "timeout"

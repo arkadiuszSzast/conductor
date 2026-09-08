@@ -20,6 +20,7 @@
  *   GET  /v1/sessions/:id/exists       → 200 {exists}
  *   POST /v1/sessions/:id/prompt       {text, agent?, model?} → 200 | 404
  *   POST /v1/sessions/:id/note         {text} → 200 | 404
+ *   POST /v1/sessions/:id/abort        → 200 | 404
  * Auth is explicit even on localhost: bearer when the operator set
  * `CONDUCTOR_RUNNER_TOKEN`, or the written-down `CONDUCTOR_RUNNER_AUTH=none`.
  */
@@ -303,7 +304,7 @@ export class OpencodeRunnerHub {
       return json(201, { id: created.id })
     }
 
-    const sessionMatch = path.match(/^\/v1\/sessions\/([^/]+)\/(status|exists|prompt|note)$/)
+    const sessionMatch = path.match(/^\/v1\/sessions\/([^/]+)\/(status|exists|prompt|note|abort)$/)
     if (sessionMatch) {
       const sessionID = decodeURIComponent(sessionMatch[1]!)
       const action = sessionMatch[2]!
@@ -336,6 +337,14 @@ export class OpencodeRunnerHub {
         if (typeof body.text !== "string") return json(400, { error: "\"text\" is required" })
         if (!(await sessions.sessionExists(sessionID))) return json(404, { error: `unknown session "${sessionID}"` })
         await sessions.note({ sessionID, text: body.text })
+        return json(200, { ok: true })
+      }
+      if (action === "abort" && method === "POST") {
+        // 404 for an unknown session keeps the daemon's multi-endpoint
+        // routing working ("not my session" → try the next runner); the
+        // daemon treats it as a no-op success when every runner disavows.
+        if (!(await sessions.sessionExists(sessionID))) return json(404, { error: `unknown session "${sessionID}"` })
+        await sessions.abort(sessionID)
         return json(200, { ok: true })
       }
     }

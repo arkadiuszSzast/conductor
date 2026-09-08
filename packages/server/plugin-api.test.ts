@@ -27,6 +27,10 @@ class FakeSessions implements SessionClient {
     return { id: "ses-1" }
   }
   async prompt(): Promise<void> {}
+  aborted: string[] = []
+  async abort(sessionID: string): Promise<void> {
+    this.aborted.push(sessionID)
+  }
   async sessionExists(): Promise<boolean> {
     return true
   }

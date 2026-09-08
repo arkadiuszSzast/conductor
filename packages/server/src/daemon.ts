@@ -212,6 +212,10 @@ function unavailableSessionClient(): SessionClient {
     async note() {
       throw unavailable()
     },
+    async abort() {
+      // Nothing to stop when no runner is attached — a no-op success,
+      // matching the port contract (abort must never block a reap).
+    },
   }
 }
 

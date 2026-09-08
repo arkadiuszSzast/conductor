@@ -303,7 +303,7 @@ describe("github/pr-merge", () => {
       () => ok(),
       () => fail(1, "cannot delete branch used by worktree"),
     ]
-    const result = await githubPrMerge(ctx({ pr: 9 }), deps(process_))
+    const result = await githubPrMerge(ctx({ pr: 9, resolve_threads: false }), deps(process_))
 
     expect(result).toEqual({ status: "succeeded", outputs: { merged_sha: "deadbeef" } })
     expect(process_.argv()).toEqual([
@@ -315,10 +315,59 @@ describe("github/pr-merge", () => {
     ])
   })
 
+  it("resolves unresolved review threads before merging (merge policies require thread resolution)", async () => {
+    const process_ = new FakeProcess()
+    process_.handlers = [
+      () => ok("owner/repo\n"),
+      () =>
+        ok(
+          JSON.stringify({
+            data: {
+              repository: {
+                pullRequest: {
+                  reviewThreads: {
+                    nodes: [
+                      { id: "PRRT_open", isResolved: false },
+                      { id: "PRRT_done", isResolved: true },
+                    ],
+                  },
+                },
+              },
+            },
+          }),
+        ),
+      () => ok(JSON.stringify({ data: { resolveReviewThread: { thread: { isResolved: true } } } })),
+      () => ok(),
+      () => ok(JSON.stringify({ state: "MERGED", mergeCommit: { oid: "beefcafe" } })),
+    ]
+    const result = await githubPrMerge(ctx({ pr: 9, delete_branch: false }), deps(process_))
+
+    expect(result).toEqual({ status: "succeeded", outputs: { merged_sha: "beefcafe" } })
+    const argv = process_.argv()
+    expect(argv[0]).toEqual(["gh", "repo", "view", "--json", "owner,name", "--jq", '.owner.login + "/" + .name'])
+    expect(argv[1]?.[2]).toBe("graphql")
+    expect(argv[1]?.[4]).toContain('pullRequest(number: 9)')
+    // Only the UNRESOLVED thread gets a resolve mutation.
+    expect(argv[2]?.[4]).toContain('resolveReviewThread(input: {threadId: "PRRT_open"})')
+    expect(argv[3]).toEqual(["gh", "pr", "merge", "9", "--squash"])
+  })
+
+  it("a failed thread listing never blocks the merge itself", async () => {
+    const process_ = new FakeProcess()
+    process_.handlers = [
+      () => ok("owner/repo\n"),
+      () => fail(1, "graphql unavailable"),
+      () => ok(),
+      () => ok(JSON.stringify({ state: "MERGED", mergeCommit: { oid: "feedface" } })),
+    ]
+    const result = await githubPrMerge(ctx({ pr: 9, delete_branch: false }), deps(process_))
+    expect(result).toEqual({ status: "succeeded", outputs: { merged_sha: "feedface" } })
+  })
+
   it("honours method and delete_branch inputs", async () => {
     const process_ = new FakeProcess()
     process_.handlers = [() => ok(), () => ok(JSON.stringify({ state: "MERGED", mergeCommit: { oid: "sha" } }))]
-    const result = await githubPrMerge(ctx({ pr: 9, method: "rebase", delete_branch: false }), deps(process_))
+    const result = await githubPrMerge(ctx({ pr: 9, method: "rebase", delete_branch: false, resolve_threads: false }), deps(process_))
     expect(result.status).toBe("succeeded")
     expect(process_.argv()).toEqual([
       ["gh", "pr", "merge", "9", "--rebase"],
@@ -332,14 +381,14 @@ describe("github/pr-merge", () => {
       () => fail(1, "! Pull request #9 was already merged"),
       () => ok(JSON.stringify({ state: "MERGED", mergeCommit: { oid: "cafe" } })),
     ]
-    const result = await githubPrMerge(ctx({ pr: 9, delete_branch: false }), deps(process_))
+    const result = await githubPrMerge(ctx({ pr: 9, delete_branch: false, resolve_threads: false }), deps(process_))
     expect(result).toEqual({ status: "succeeded", outputs: { merged_sha: "cafe" } })
   })
 
   it("fails when gh pr merge exits non-zero", async () => {
     const process_ = new FakeProcess()
     process_.handlers = [() => fail(1, "not mergeable")]
-    const result = await githubPrMerge(ctx({ pr: 9 }), deps(process_))
+    const result = await githubPrMerge(ctx({ pr: 9, resolve_threads: false }), deps(process_))
     expect(result.status).toBe("failed")
     if (result.status !== "failed") return
     expect(result.error).toContain("not mergeable")

@@ -33,6 +33,7 @@ export interface RawOpencodeSessionApi {
         parts: Array<{ type: string; text: string }>
       }
     }): Promise<unknown>
+    abort(input: { path: { id: string }; query?: { directory?: string } }): Promise<unknown>
   }
 }
 
@@ -88,6 +89,13 @@ export function createOpencodeSessions(rawClient: RawOpencodeSessionApi): Sessio
           parts: [{ type: "text", text: args.text }],
         },
       })
+    },
+    async abort(sessionID) {
+      // Best-effort by the port contract: a session that is already
+      // finished or gone aborts as a no-op success — only a live
+      // transport failure propagates (and the engine logs, never blocks).
+      if (!(await this.sessionExists(sessionID))) return
+      await rawClient.session.abort({ path: { id: sessionID } })
     },
     async status(sessionID) {
       // /session/status only lists sessions with live activity state —

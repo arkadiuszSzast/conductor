@@ -75,3 +75,42 @@ export async function loadAllLogPages(
   }
   return current
 }
+
+// ------------------------------------------------------------ log display
+
+/** A rendered log row: a narrative line, or a collapsed run of tool lines. */
+export type DisplayLogLine =
+  | { readonly kind: "line"; readonly line: RunLogLine }
+  | {
+      /** Consecutive `source: "tool"` lines collapsed into one dimmed
+       *  status row — OpenChamber-style: the latest invocation is the
+       *  visible text, earlier ones in the run are summarised by count. */
+      readonly kind: "tools"
+      readonly latest: RunLogLine
+      readonly count: number
+      /** Collapsed history, newest last (excludes `latest`). */
+      readonly earlier: readonly RunLogLine[]
+    }
+
+/**
+ * Collapse consecutive tool lines into single status rows. While the run
+ * is still streaming, the trailing tool group reads as "what is it doing
+ * right now" — one dim line that keeps replacing itself — instead of a
+ * wall of ⚙ rows drowning the narrative.
+ */
+export function collapseToolLines(lines: readonly RunLogLine[]): readonly DisplayLogLine[] {
+  const out: DisplayLogLine[] = []
+  for (const line of lines) {
+    if (line.source !== "tool") {
+      out.push({ kind: "line", line })
+      continue
+    }
+    const last = out[out.length - 1]
+    if (last?.kind === "tools") {
+      out[out.length - 1] = { kind: "tools", latest: line, count: last.count + 1, earlier: [...last.earlier, last.latest] }
+    } else {
+      out.push({ kind: "tools", latest: line, count: 1, earlier: [] })
+    }
+  }
+  return out
+}

@@ -55,6 +55,7 @@ class FakeOpencodeServer {
   /** Message timelines per session for the status fallback probe. */
   timelines = new Map<string, Array<{ info?: { role?: string; time?: { completed?: number } } }>>()
   statusEndpointBroken = false
+  aborted: string[] = []
   private counter = 0
 
   constructor(readonly defaultDirectory: string) {}
@@ -101,6 +102,12 @@ class FakeOpencodeServer {
             ...(input.body.model !== undefined ? { model: input.body.model } : {}),
             ...(input.body.noReply !== undefined ? { noReply: input.body.noReply } : {}),
           })
+          return {}
+        },
+        abort: async input => {
+          const session = this.sessions.get(input.path.id)
+          if (!session) throw new Error("not found")
+          this.aborted.push(input.path.id)
           return {}
         },
       },
@@ -361,6 +368,17 @@ describe("session transport preserves the seed's opencode wire shape", () => {
     const { id } = await sessions.createSession({ title: "t", directory: "/p" })
     server.statusEndpointBroken = true
     expect(await sessions.status(id)).toBe("busy")
+  })
+
+  it("abort stops a live session and is a no-op success for a missing one", async () => {
+    const server = new FakeOpencodeServer("/fallback")
+    const sessions = createOpencodeSessions(server.api())
+    const { id } = await sessions.createSession({ title: "t", directory: "/p" })
+    await sessions.abort(id)
+    expect(server.aborted).toEqual([id])
+    // Missing session: no throw, no abort call against the SDK.
+    await sessions.abort("ses-gone")
+    expect(server.aborted).toEqual([id])
   })
 
   it("an unlisted session with an in-flight assistant turn is busy, not idle", async () => {
@@ -679,6 +697,20 @@ jobs:
     expect((await h.client.getRun(runId)).run.status).toBe("succeeded")
     expect((await h.client.getFeature(featureId)).feature.status).toBe("done")
   })
+
+  it("a reap aborts the opencode session end to end — daemon transport → runner hub → opencode", async () => {
+    const project = writeProject()
+    const h = await makeHarness({ projects: [project] })
+    const opencode = new FakeOpencodeServer(project)
+    const { runId, sessionId } = await startedRun(h, project, opencode)
+
+    // Idle through the nudge budget (nudgeIdleCycles=1, maxNudges=1):
+    // the second beat reaps — and the reap must reach opencode's abort.
+    await h.daemon.beat() // nudge
+    await h.daemon.beat() // reap + abort
+    expect((await h.client.getRun(runId)).run.status).toBe("reaped")
+    expect(opencode.aborted).toContain(sessionId)
+  })
 })
 
 describe("agent log capture via runner push", () => {
@@ -734,13 +766,67 @@ describe("agent log capture via runner push", () => {
     expect(client.pushes).toEqual([])
   })
 
-  it("ignores non-text and non-part events", async () => {
+  it("ignores non-part events and tool parts without input", async () => {
     const client = new FakeLogClient()
     const logs = pusher({ client })
     logs.push({ type: "session.idle", properties: {} })
-    logs.push({ type: "message.part.updated", properties: { sessionID: "ses-mapped", part: { id: "p1", type: "tool", text: "x" } } })
+    // A tool part with no input yet (pending, input unknown) is not a line.
+    logs.push({ type: "message.part.updated", properties: { sessionID: "ses-mapped", part: { id: "p1", type: "tool", tool: "bash" } } })
     await logs.flush()
     expect(client.pushes).toEqual([])
+  })
+
+  it("emits one compact tool line per invocation, deduped across state re-sends", async () => {
+    const client = new FakeLogClient()
+    const logs = pusher({ client })
+    const tool = (id: string, status: string) => ({
+      type: "message.part.updated",
+      properties: {
+        sessionID: "ses-mapped",
+        part: { id, type: "tool", tool: "bash", state: { status, input: { command: "git  diff   main...HEAD" } } },
+      },
+    })
+    logs.push(tool("t1", "running"))
+    logs.push(tool("t1", "completed")) // re-sent on state transition: deduped
+    logs.push({
+      type: "message.part.updated",
+      properties: {
+        sessionID: "ses-mapped",
+        part: { id: "t2", type: "tool", tool: "grep", state: { status: "running", input: { pattern: "findBundle" } } },
+      },
+    })
+    await logs.flush()
+    expect(client.pushes).toEqual([
+      {
+        runId: "run-1",
+        lines: [
+          { text: "running command — git diff main...HEAD", source: "tool" },
+          { text: "searching content — findBundle", source: "tool" },
+        ],
+      },
+    ])
+  })
+
+  it("preserves narrative/tool ordering and truncates oversized tool detail", async () => {
+    const client = new FakeLogClient()
+    const logs = pusher({ client })
+    logs.push(partEvent("ses-mapped", { id: "p1", text: "Reviewing the aggregate. " }))
+    logs.push({
+      type: "message.part.updated",
+      properties: {
+        sessionID: "ses-mapped",
+        part: { id: "t1", type: "tool", tool: "read", state: { status: "running", input: { filePath: `/x/${"a".repeat(300)}.kt` } } },
+      },
+    })
+    logs.push(partEvent("ses-mapped", { id: "p1", text: "Reviewing the aggregate. Looks sound." }))
+    await logs.flush()
+    const lines = client.pushes[0]!.lines
+    expect(lines).toHaveLength(3)
+    expect(lines[0]).toEqual({ text: "Reviewing the aggregate. ", source: "agent" })
+    expect(lines[1]!.source).toBe("tool")
+    expect(lines[1]!.text.length).toBeLessThanOrEqual("reading file — ".length + 161)
+    expect(lines[1]!.text.endsWith("…")).toBe(true)
+    expect(lines[2]).toEqual({ text: "Looks sound.", source: "agent" })
   })
 
   it("is best-effort: a failed push is logged and the buffer dropped, the run stays tracked", async () => {

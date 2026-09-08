@@ -25,6 +25,10 @@ class FakeSessions implements SessionClient {
   async prompt(input: { sessionID: string; text: string }): Promise<void> {
     this.prompts.push(input)
   }
+  aborted: string[] = []
+  async abort(sessionID: string): Promise<void> {
+    this.aborted.push(sessionID)
+  }
   async sessionExists(): Promise<boolean> {
     return true
   }
@@ -1351,15 +1355,16 @@ describe("API: run logs", () => {
     const run = daemon.store.getActiveRun(feature.id)!
 
     const response = await request("POST", `/v1/runs/${run.id}/logs`, {
-      lines: [{ text: "checkpoint one" }, { text: "checkpoint two", source: "agent" }],
+      lines: [{ text: "checkpoint one" }, { text: "checkpoint two", source: "agent" }, { text: "running command — git diff", source: "tool" }],
     })
     expect(response.status).toBe(201)
-    expect(((await response.json()) as { appended: number }).appended).toBe(2)
+    expect(((await response.json()) as { appended: number }).appended).toBe(3)
 
     const page = (await (await request("GET", `/v1/runs/${run.id}/logs`)).json()) as LogPage
     expect(page.lines.map(line => [line.source, line.text])).toEqual([
       ["step", "checkpoint one"],
       ["agent", "checkpoint two"],
+      ["tool", "running command — git diff"],
     ])
   })
 

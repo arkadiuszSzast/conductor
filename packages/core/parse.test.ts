@@ -205,6 +205,26 @@ describe("steps", () => {
     expect(messages(errors)).toContain("timeoutMs must be ≥ 1")
   })
 
+  it("accepts ttlMs on agent steps, absent means engine default", () => {
+    const on = parsed(wrap("      - id: s\n        agent: { role: r, prompt: p, ttlMs: 10800000 }\n")).jobs.main!.steps[0]!
+    expect(on).toMatchObject({ type: "agent", ttlMs: 10800000 })
+    const off = parsed(wrap("      - id: s\n        agent: { role: r, prompt: p }\n")).jobs.main!.steps[0]!
+    expect((off as { ttlMs?: number }).ttlMs).toBeUndefined()
+  })
+
+  it("rejects a non-positive or non-integer ttlMs, naming the step", () => {
+    const zero = failed(wrap("      - id: s\n        agent: { role: r, prompt: p, ttlMs: 0 }\n"))
+    expect(messages(zero)).toContain("ttlMs must be ≥ 1")
+    expect(messages(zero)).toContain('step "s"')
+    const text = failed(wrap("      - id: s\n        agent: { role: r, prompt: p, ttlMs: 1h }\n"))
+    expect(messages(text)).toContain("ttlMs must be a number")
+  })
+
+  it("rejects ttlMs on non-agent step bodies", () => {
+    const errors = failed(wrap("      - id: s\n        command:\n          run: [ls]\n          ttlMs: 1000\n"))
+    expect(messages(errors)).toContain('unknown field "ttlMs"')
+  })
+
   it("keeps action uses as an unresolved string and normalises with", () => {
     const workflow = parsed(wrap("      - id: s\n        action:\n          uses: git/push@v1\n"))
     expect(workflow.jobs.main!.steps[0]).toMatchObject({ type: "action", uses: "git/push@v1", with: {} })

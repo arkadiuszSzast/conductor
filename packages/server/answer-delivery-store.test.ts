@@ -414,7 +414,18 @@ describe("migration compatibility: a pre-existing asking run stays readable", ()
         `INSERT INTO run (id, feature_id, job_id, step_id, step_type, attempt, time_started) VALUES (?, ?, ?, ?, 'agent', 1, ?)`,
         [runId, feature.id, "main", "explore", Date.now()],
       )
-      legacyStore.setRunQuestion(runId, "Pre-migration question?")
+      // Raw update for the same reason: the CURRENT `setRunQuestion`
+      // touches `time_last_activity` (added by 0018, after this
+      // schema's checkpoint) — mirror only what a pre-upgrade daemon
+      // would have written.
+      legacyConnection.db.run(
+        "UPDATE run SET pending_question = ?, asked_at = ? WHERE id = ?",
+        ["Pre-migration question?", Date.now(), runId],
+      )
+      legacyConnection.db.run(
+        "UPDATE feature SET status = 'waiting_human', state = json_set(state, '$.status', 'waiting_human') WHERE id = ?",
+        [feature.id],
+      )
       legacyConnection.close()
 
       const upgraded = openMigratedDatabase({ path: dbPath })

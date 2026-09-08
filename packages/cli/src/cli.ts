@@ -136,20 +136,26 @@ commands:
   pause <feature-id>   pause the feature
   resume <feature-id>  resume a paused feature
   abandon <feature-id> abandon the feature
-  recover <feature-id> --notes <text|@file> [--job <jobId> --step <stepId>]
-                       [--expected-version <n>] [--idempotency-key <key>]
+  recover <feature-id> --notes <text|@file> [--job <jobId> --step <stepId>]...
+                       [--all] [--expected-version <n>] [--idempotency-key <key>]
                        re-arm an escalated feature's currently recoverable
-                       failed/blocked step (--job/--step select among
-                       several candidates — required together, and
-                       omitting both only works when exactly one
-                       candidate exists; --expected-version rejects a
-                       stale view; the key dedupes a retried delivery)
+                       failed/blocked step(s): repeat --job/--step pairs
+                       to select several (pairs match positionally), or
+                       --all for every candidate; omitting both only
+                       works when exactly one candidate exists. All
+                       selected steps re-arm in one atomic operation
+                       (--expected-version rejects a stale view; the
+                       key dedupes a retried delivery)
   logs <feature-id>    print the feature's transition timeline
 
 exit codes: 0 ok, 1 failure, 2 usage, 3 unauthorized, 4 not found,
             5 conflict, 6 duplicate report, 7 daemon unreachable`
 
-const BOOLEAN_FLAGS = new Set(["json", "active", "force", "help", "no-register", "no-ui"])
+const BOOLEAN_FLAGS = new Set(["json", "active", "force", "help", "no-register", "no-ui", "all"])
+
+/** Flags that may repeat (collected in order); `stringFlag` still sees the
+ *  last occurrence, so single-use callers behave unchanged. */
+const REPEATABLE_FLAGS = new Set(["job", "step"])
 
 const VALUE_FLAGS = new Set([
   "url",
@@ -174,11 +180,13 @@ interface Parsed {
   readonly command: string | null
   readonly positionals: readonly string[]
   readonly flags: ReadonlyMap<string, string | true>
+  readonly repeated: ReadonlyMap<string, readonly string[]>
 }
 
 function parseArgs(argv: readonly string[]): Parsed {
   const positionals: string[] = []
   const flags = new Map<string, string | true>()
+  const repeated = new Map<string, string[]>()
   let command: string | null = null
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i]!
@@ -194,12 +202,17 @@ function parseArgs(argv: readonly string[]): Parsed {
       const value = eq === -1 ? argv[++i] : token.slice(eq + 1)
       if (value === undefined) throw new UsageError(`flag --${name} requires a value`)
       flags.set(name, value)
+      if (REPEATABLE_FLAGS.has(name)) {
+        const list = repeated.get(name) ?? []
+        list.push(value)
+        repeated.set(name, list)
+      }
       continue
     }
     if (command === null) command = token
     else positionals.push(token)
   }
-  return { command, positionals, flags }
+  return { command, positionals, flags, repeated }
 }
 
 function stringFlag(parsed: Parsed, name: string): string | undefined {
@@ -818,7 +831,7 @@ async function commandAnswer(parsed: Parsed, deps: CliDeps, client: ApiClient, j
 }
 
 async function commandRecover(parsed: Parsed, deps: CliDeps, client: ApiClient, json: boolean): Promise<number> {
-  requireFlags(parsed, ["notes", "job", "step", "expected-version", "idempotency-key"])
+  requireFlags(parsed, ["notes", "job", "step", "all", "expected-version", "idempotency-key"])
   const featureId = requireId(parsed, "recover requires a feature id")
   const notes = resolveNotes(stringFlag(parsed, "notes"), deps)
   if (notes === undefined || notes.trim() === "") {
@@ -829,17 +842,25 @@ async function commandRecover(parsed: Parsed, deps: CliDeps, client: ApiClient, 
     throw new UsageError("--expected-version must be an integer (the feature's updatedAt from `conductor show`)")
   }
   const idempotencyKey = stringFlag(parsed, "idempotency-key")
-  const jobId = stringFlag(parsed, "job")
-  const stepId = stringFlag(parsed, "step")
-  if ((jobId === undefined) !== (stepId === undefined)) {
-    throw new UsageError("--job and --step must be given together")
+  const all = parsed.flags.get("all") === true
+  const jobIds = parsed.repeated.get("job") ?? []
+  const stepIds = parsed.repeated.get("step") ?? []
+  if (all && jobIds.length > 0) {
+    throw new UsageError("--all cannot be combined with --job/--step")
   }
-  const target = jobId !== undefined && stepId !== undefined ? { jobId, stepId } : undefined
+  if (jobIds.length !== stepIds.length) {
+    throw new UsageError("--job and --step must be given together, one --step per --job (pairs match positionally)")
+  }
+  const pairs = jobIds.map((jobId, i) => ({ jobId, stepId: stepIds[i]! }))
+  const target = pairs.length === 1 ? pairs[0]! : undefined
+  const targets = pairs.length > 1 ? pairs : undefined
   try {
     const payload = await client.recover(featureId, notes, {
       ...(versionText !== undefined ? { expectedVersion: Number(versionText) } : {}),
       ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
       ...(target !== undefined ? { target } : {}),
+      ...(targets !== undefined ? { targets } : {}),
+      ...(all ? { all } : {}),
     })
     if (json) {
       deps.stdout(JSON.stringify(payload))
@@ -857,6 +878,7 @@ async function commandRecover(parsed: Parsed, deps: CliDeps, client: ApiClient, 
         deps.stderr(`error[${err.code}]: ${err.message}`)
         deps.stderr("recoverable targets:")
         for (const t of targets) deps.stderr(`  --job ${t.jobId} --step ${t.stepId}`)
+        deps.stderr("or recover every target at once: --all")
       }
       return EXIT.conflict
     }

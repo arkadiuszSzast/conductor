@@ -99,6 +99,8 @@ export interface EngineControl {
       readonly expectedVersion?: number
       readonly idempotencyKey?: string
       readonly target?: { readonly jobId: string; readonly stepId: string }
+      readonly targets?: readonly { readonly jobId: string; readonly stepId: string }[]
+      readonly all?: boolean
     },
   ): Promise<{
     ok: boolean
@@ -107,7 +109,9 @@ export interface EngineControl {
     readonly duplicate?: boolean
     readonly ambiguous?: boolean
     readonly staleTarget?: boolean
+    readonly allowAll?: boolean
     readonly targets?: readonly { readonly jobId: string; readonly stepId: string }[]
+    readonly recovered?: readonly { readonly jobId: string; readonly stepId: string }[]
   }>
   /** Every currently recoverable job/step target for an escalated
    *  feature, in default-choice order; null when not escalated/no
@@ -1020,28 +1024,60 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         if (idempotencyKey !== undefined && (typeof idempotencyKey !== "string" || idempotencyKey.trim() === "")) {
           return error(requestId, "invalid_request", "\"idempotencyKey\" must be a non-empty string")
         }
-        const rawTarget = parsed.body["target"]
-        let target: { jobId: string; stepId: string } | undefined
-        if (rawTarget !== undefined) {
-          const candidate = rawTarget as Record<string, unknown>
+        const parseTarget = (raw: unknown, label: string): { jobId: string; stepId: string } | string => {
+          const candidate = raw as Record<string, unknown>
           const jobId = typeof candidate === "object" && candidate !== null ? candidate["jobId"] : undefined
           const stepId = typeof candidate === "object" && candidate !== null ? candidate["stepId"] : undefined
           if (typeof jobId !== "string" || jobId.trim() === "" || typeof stepId !== "string" || stepId.trim() === "") {
-            return error(requestId, "invalid_request", "\"target\" must be an object with non-empty string \"jobId\" and \"stepId\"")
+            return `${label} must be an object with non-empty string "jobId" and "stepId"`
           }
-          target = { jobId, stepId }
+          return { jobId, stepId }
+        }
+        const rawTarget = parsed.body["target"]
+        let target: { jobId: string; stepId: string } | undefined
+        if (rawTarget !== undefined) {
+          const parsedTarget = parseTarget(rawTarget, "\"target\"")
+          if (typeof parsedTarget === "string") return error(requestId, "invalid_request", parsedTarget)
+          target = parsedTarget
+        }
+        const rawTargets = parsed.body["targets"]
+        let targets: { jobId: string; stepId: string }[] | undefined
+        if (rawTargets !== undefined) {
+          if (!Array.isArray(rawTargets) || rawTargets.length === 0) {
+            return error(requestId, "invalid_request", "\"targets\" must be a non-empty array of {jobId, stepId} objects")
+          }
+          targets = []
+          for (const entry of rawTargets) {
+            const parsedEntry = parseTarget(entry, "every \"targets\" entry")
+            if (typeof parsedEntry === "string") return error(requestId, "invalid_request", parsedEntry)
+            targets.push(parsedEntry)
+          }
+        }
+        const rawAll = parsed.body["all"]
+        if (rawAll !== undefined && typeof rawAll !== "boolean") {
+          return error(requestId, "invalid_request", "\"all\" must be a boolean")
+        }
+        const all = rawAll === true
+        if ([target !== undefined, targets !== undefined, all].filter(Boolean).length > 1) {
+          return error(requestId, "invalid_request", "pass exactly one of \"target\", \"targets\", or \"all\" — they cannot be combined")
         }
         const result = await engine.recover(featureId, {
           notes,
           ...(expectedVersion !== undefined ? { expectedVersion } : {}),
           ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
           ...(target !== undefined ? { target } : {}),
+          ...(targets !== undefined ? { targets } : {}),
+          ...(all ? { all } : {}),
         })
         if (!result.ok) {
           if (result.ambiguous === true) {
             return json(
               409,
-              { error: { code: "ambiguous_target", message: result.message, requestId }, targets: result.targets ?? [] },
+              {
+                error: { code: "ambiguous_target", message: result.message, requestId },
+                targets: result.targets ?? [],
+                ...(result.allowAll === true ? { allowAll: true } : {}),
+              },
               requestId,
             )
           }
@@ -1050,7 +1086,15 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
           }
           return error(requestId, result.stale === true ? "stale_version" : "conflict", result.message)
         }
-        return json(200, { result: result.message, ...(featurePayload(featureId) as Record<string, unknown>) }, requestId)
+        return json(
+          200,
+          {
+            result: result.message,
+            ...(result.recovered !== undefined ? { recovered: result.recovered } : {}),
+            ...(featurePayload(featureId) as Record<string, unknown>),
+          },
+          requestId,
+        )
       }
       default:
         return error(requestId, "not_found", `no route for POST /v1/features/:id/${action}`)
@@ -1109,8 +1153,8 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         return error(requestId, "invalid_request", `each line's "text" must be at most ${RUN_LOG_LINE_LIMIT} characters`)
       }
       const source = record.source ?? "step"
-      if (source !== "step" && source !== "agent") {
-        return error(requestId, "invalid_request", "\"source\" must be \"step\" or \"agent\"")
+      if (source !== "step" && source !== "agent" && source !== "tool") {
+        return error(requestId, "invalid_request", "\"source\" must be \"step\", \"agent\" or \"tool\"")
       }
       entries.push({ source, text: record.text })
     }

@@ -27,6 +27,7 @@ class FakeSessions implements SessionClient {
     return { id: `ses-${++this.counter}` }
   }
   async prompt(): Promise<void> {}
+  async abort(): Promise<void> {}
   async sessionExists(): Promise<boolean> {
     return true
   }

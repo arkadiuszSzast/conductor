@@ -133,31 +133,45 @@ means "at least one rerun has ever happened".
 ```
 
 - `notes` is required (non-empty).
-- `target` is optional and selects among the feature's currently
-  recoverable job/step candidates (`recoverableTargets` on the detail
-  payload, or GET the feature first). Candidates come from the CURRENT
-  durable failed/blocked frontier — open resource waits and failed jobs'
-  failed steps — never from run history alone; history only orders and
-  explains candidates.
+- Target selection takes **exactly one** of three forms (combining them
+  is `422 invalid_request`):
+  - `target` — one `{jobId, stepId}` (backwards compatible);
+  - `targets` — a non-empty array of `{jobId, stepId}` to recover
+    several failed steps in one atomic operation;
+  - `all: true` — every currently recoverable candidate, resolved
+    server-side under the same version check.
+- Candidates come from the CURRENT durable failed/blocked frontier
+  (`recoverableTargets` on the detail payload, or GET the feature
+  first) — open resource waits and failed jobs' failed steps — never
+  from run history alone; history only orders and explains candidates.
   - Zero candidates: `409 conflict`, "no recoverable failed or blocked
     step found".
-  - Exactly one candidate and no `target`: recovers it (backwards
+  - Exactly one candidate and no selection: recovers it (backwards
     compatible).
-  - More than one candidate and no `target`: `409` with
-    `code: "ambiguous_target"` and a top-level `targets: [{jobId,
-    stepId}]` array to choose from.
-  - A `target` not among the current candidates: `409` with
-    `code: "stale_target"` — rejected with no fallback to another
-    candidate.
+  - More than one candidate and no selection: `409` with
+    `code: "ambiguous_target"`, a top-level `targets: [{jobId,
+    stepId}]` array to choose from, and `allowAll: true` advertising
+    the recover-all form.
+  - Any named target (in `target` or `targets`) not among the current
+    candidates: `409` with `code: "stale_target"` — the WHOLE request
+    is rejected, nothing re-armed, no fallback to another candidate.
+- All selected targets are re-armed in **one transaction**: one version
+  check, one idempotency key, one `human.recovered` transition row
+  carrying every `execute_step` decision — a partial re-arm is never
+  observable. The `200` response carries `recovered: [{jobId, stepId}]`
+  listing what was re-armed.
 - `expectedVersion` (the feature's `updatedAt` your view was rendered
-  from) rejects with `409 stale_version` if the feature moved since.
+  from) rejects with `409 stale_version` if the feature moved since —
+  this also bounds `all`: a stale view can never silently widen the
+  recovered set.
 - `idempotencyKey` dedupes a retried delivery of the same logical
   recover: a repeat with the same key returns `200` with the fresh
   feature payload and no new work armed.
-- On success, the recovered step's retry budget resets — a fresh finite
-  episode, chained to its prior one for audit history — so a subsequent
-  failure of the recovered step gets its own attempt/elapsed allowance
-  instead of inheriting the exhausted one's count.
+- On success, every recovered step's retry budget resets — a fresh
+  finite episode per step, chained to its prior one for audit history —
+  so a subsequent failure of a recovered step gets its own
+  attempt/elapsed allowance instead of inheriting the exhausted one's
+  count.
 
 ## Starting a feature
 

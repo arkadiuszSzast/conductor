@@ -304,6 +304,7 @@ Performs LLM work.
 | `role` | yes | Must exist in `roles`. |
 | `prompt` | yes | Template; see [Expressions](expressions.md). |
 | `interactive` | no | Boolean, default `false`. Grants the step the right to pause mid-run and ask the human a question. |
+| `ttlMs` | no | Positive integer (ms). Silence budget for this step's runs, overriding the engine-wide `engine.runTtlMs` (default 1 h). The TTL measures time since the run's **last observed activity** (log appends, question flow, nudges) — not age since dispatch — so a long-running step that streams logs stays alive; use `ttlMs` when even the gaps between a step's activity legitimately exceed the engine default (e.g. a 90-minute quality gate inside an implement step). |
 
 **Outputs:** the agent's report is published as `outputs.report`.
 
@@ -490,6 +491,10 @@ Semantics:
 - The round counter is per routing step, lives on the routing job, and
   **survives the closure reset** — that is what makes `maxRounds` hold
   across rounds.
+- **On exhaustion** the feature escalates and the routing job's
+  `currentStep` is cleared with its status set to `failed`, so the
+  reconciler does not re-dispatch the routing step after escalation.
+  `recover` on that job re-arms the step with its round counter reset.
 - Every rerun transition carries a **feedback snapshot** of the pre-reset
   round; see [Expressions § feedback](expressions.md#feedback--the-previous-round).
 
