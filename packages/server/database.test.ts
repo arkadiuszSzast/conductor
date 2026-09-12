@@ -75,6 +75,34 @@ describe("database lifecycle and migrations", () => {
     connection.close()
   })
 
+  it("0019_run_recover_notes adds nullable recover_notes + recovery_dispatch.notes and leaves legacy rows untouched", () => {
+    const connection = openDatabase({ path: temporaryPath() })
+    const upTo = migrations.findIndex(m => m.id === "0018_run_time_last_activity")
+    expect(upTo).toBeGreaterThan(0)
+    runMigrations(connection.db, migrations.slice(0, upTo))
+    connection.db.run(
+      `INSERT INTO feature (id, slug, project_dir, title, status, state, time_created, time_updated)
+       VALUES ('f1', 'f', '/p', 'F', 'escalated', '{}', 1, 1)`,
+    )
+    connection.db.run(
+      `INSERT INTO run (id, feature_id, job_id, step_id, step_type, time_started) VALUES ('r1', 'f1', 'main', 'implement', 'agent', 4321)`,
+    )
+    connection.db.run(
+      `INSERT INTO recovery_dispatch (id, feature_id, job_id, step_id, status, time_created, time_updated)
+       VALUES ('d1', 'f1', 'main', 'implement', 'unhandled', 1, 1)`,
+    )
+
+    runMigrations(connection.db, migrations)
+
+    expect(columnNames(connection.db, "run")).toContain("recover_notes")
+    expect(columnNames(connection.db, "recovery_dispatch")).toContain("notes")
+    const runRow = connection.db.query("SELECT recover_notes FROM run WHERE id = 'r1'").get() as { recover_notes: string | null }
+    expect(runRow.recover_notes).toBeNull()
+    const dispatchRow = connection.db.query("SELECT notes FROM recovery_dispatch WHERE id = 'd1'").get() as { notes: string | null }
+    expect(dispatchRow.notes).toBeNull()
+    connection.close()
+  })
+
   it("enforces one active run per job+step at the DB layer (idx_run_one_active_target)", () => {
     const connection = openMigratedDatabase({ path: temporaryPath() })
     connection.db.run(

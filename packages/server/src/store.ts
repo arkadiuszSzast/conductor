@@ -132,6 +132,7 @@ interface RunRow {
   time_started: number
   time_last_activity: number | null
   time_finished: number | null
+  recover_notes: string | null
 }
 
 /** Resolved action identity recorded on an action run — pins `uses`, the
@@ -180,6 +181,7 @@ export interface RunSummary {
    *  predating the column. */
   readonly timeLastActivity: number
   readonly timeFinished: number | null
+  readonly recoverNotes: string | null
 }
 
 function toRunSummary(row: RunRow): RunSummary {
@@ -205,6 +207,7 @@ function toRunSummary(row: RunRow): RunSummary {
     timeStarted: row.time_started,
     timeLastActivity: row.time_last_activity ?? row.time_started,
     timeFinished: row.time_finished,
+    recoverNotes: row.recover_notes,
   }
 }
 
@@ -562,6 +565,7 @@ interface RecoveryDispatchRow {
   status: RecoveryDispatchStatus
   time_created: number
   time_updated: number
+  notes: string | null
 }
 
 /**
@@ -580,6 +584,7 @@ export interface RecoveryDispatchRecord {
   readonly status: RecoveryDispatchStatus
   readonly createdAt: number
   readonly updatedAt: number
+  readonly notes: string | null
 }
 
 function toRecoveryDispatchRecord(row: RecoveryDispatchRow): RecoveryDispatchRecord {
@@ -591,6 +596,7 @@ function toRecoveryDispatchRecord(row: RecoveryDispatchRow): RecoveryDispatchRec
     status: row.status,
     createdAt: row.time_created,
     updatedAt: row.time_updated,
+    notes: row.notes,
   }
 }
 
@@ -795,7 +801,7 @@ export class Store {
   recoverStepTargets(
     featureId: string,
     targets: readonly { jobId: string; stepId: string }[],
-    options: { readonly expectedVersion?: number; readonly idempotencyKey?: string } = {},
+    options: { readonly expectedVersion?: number; readonly idempotencyKey?: string; readonly notes?: string | null } = {},
   ): "recovered" | "duplicate" | "stale_version" | "not_escalated" | "not_found" {
     const now = Date.now()
     let featureIdForEmit: string | null = null
@@ -838,7 +844,11 @@ export class Store {
         "INSERT INTO transition_log (feature_id, event, decisions, time_created) VALUES (?, ?, ?, ?)",
         [
           featureId,
-          JSON.stringify({ kind: "human.recovered", ...(options.idempotencyKey !== undefined ? { idempotencyKey: options.idempotencyKey } : {}) }),
+          JSON.stringify({
+            kind: "human.recovered",
+            ...(options.idempotencyKey !== undefined ? { idempotencyKey: options.idempotencyKey } : {}),
+            ...(options.notes !== undefined && options.notes !== null ? { notes: options.notes } : {}),
+          }),
           JSON.stringify(targets.map(target => ({ kind: "execute_step", jobId: target.jobId, stepId: target.stepId }))),
           now,
         ],
@@ -850,9 +860,13 @@ export class Store {
       // feature with no anchor at all.
       for (const target of appliedTargets) {
         this.db.run(
-          `INSERT INTO recovery_dispatch (id, feature_id, job_id, step_id, status, time_created, time_updated)
-           VALUES (?, ?, ?, ?, 'unhandled', ?, ?)`,
-          [randomUUID(), featureId, target.jobId, target.stepId, now, now],
+          "UPDATE recovery_dispatch SET notes_consumed = 1 WHERE feature_id = ? AND job_id = ? AND step_id = ?",
+          [featureId, target.jobId, target.stepId],
+        )
+        this.db.run(
+          `INSERT INTO recovery_dispatch (id, feature_id, job_id, step_id, status, time_created, time_updated, notes)
+           VALUES (?, ?, ?, ?, 'unhandled', ?, ?, ?)`,
+          [randomUUID(), featureId, target.jobId, target.stepId, now, now, options.notes ?? null],
         )
       }
       featureIdForEmit = featureId
@@ -895,6 +909,15 @@ export class Store {
       "UPDATE recovery_dispatch SET status = 'handled', time_updated = ? WHERE id = ? AND status = 'unhandled'",
       [Date.now(), id],
     ).changes > 0
+  }
+
+  getRecoverNotesForTarget(featureId: string, jobId: string, stepId: string): string | null {
+    const row = this.db.query(
+      `SELECT notes FROM recovery_dispatch
+       WHERE feature_id = ? AND job_id = ? AND step_id = ? AND notes_consumed = 0
+       ORDER BY time_created DESC, rowid DESC LIMIT 1`,
+    ).get(featureId, jobId, stepId) as { notes: string | null } | null
+    return row?.notes ?? null
   }
 
   private applyTransitionTx(featureId: string, event: PipelineEvent, transition: Transition): void {
@@ -1354,6 +1377,7 @@ export class Store {
     attempt: number
     sessionId?: string
     metadata?: RunActionMetadata
+    recoverNotes?: string | null
   }): string {
     const id = randomUUID()
     this.db.transaction(() => {
@@ -1365,9 +1389,13 @@ export class Store {
       // durable, never a value that could race a concurrent pause/resume.
       const feature = this.db.query("SELECT paused_ms FROM feature WHERE id = ?").get(input.featureId) as { paused_ms: number } | null
       const now = this.clock.now()
+      const recovery = this.db.query(
+        `SELECT id, notes FROM recovery_dispatch WHERE feature_id = ? AND job_id = ? AND step_id = ?
+         AND notes_consumed = 0 ORDER BY time_created DESC, rowid DESC LIMIT 1`,
+      ).get(input.featureId, input.jobId, input.stepId) as { id: string; notes: string | null } | null
       this.db.run(
-        `INSERT INTO run (id, feature_id, job_id, step_id, step_type, attempt, session_id, metadata, paused_ms_at_dispatch, time_started, time_last_activity)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO run (id, feature_id, job_id, step_id, step_type, attempt, session_id, metadata, paused_ms_at_dispatch, time_started, time_last_activity, recover_notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id,
           input.featureId,
@@ -1380,8 +1408,10 @@ export class Store {
           feature?.paused_ms ?? 0,
           now,
           now,
+          recovery?.notes ?? input.recoverNotes ?? null,
         ],
       )
+      if (recovery) this.db.run("UPDATE recovery_dispatch SET notes_consumed = 1 WHERE id = ?", [recovery.id])
     })()
     this.emit({ kind: "run", featureId: input.featureId })
     return id

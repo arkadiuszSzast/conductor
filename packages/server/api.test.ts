@@ -1130,6 +1130,92 @@ describe("API: recover", () => {
     )
     expect(afterBody.feature.recoverableTargets).toHaveLength(2)
   })
+
+  it("recover notes reach the recovered step's agent session: the run row carries them and the prompt header prepends a [conductor] recovery block", async () => {
+    const { request, project, daemon, sessions } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    expect((await request("POST", `/v1/runs/${run.id}/report`, { outcome: "failed", notes: "broke" })).status).toBe(200)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("escalated")
+
+    sessions.prompts.length = 0
+    const response = await request("POST", `/v1/features/${feature.id}/recover`, {
+      notes: "runner is back, retry with the same prompt",
+    })
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { result: string; recovered: Array<{ jobId: string; stepId: string }> }
+    expect(body.recovered).toEqual([{ jobId: "main", stepId: "implement" }])
+
+    const recoveredRun = daemon.store.getActiveRunForStep(feature.id, "main", "implement")
+    expect(recoveredRun).not.toBeNull()
+    expect(recoveredRun?.recoverNotes).toBe("runner is back, retry with the same prompt")
+
+    expect(sessions.prompts.length).toBe(1)
+    const prompt = sessions.prompts[0]!.text
+    expect(prompt).toContain("[conductor] Job \"main\" step \"implement\"")
+    expect(prompt).toContain("[conductor] This step was recovered by an operator. Operator notes:")
+    expect(prompt).toContain("runner is back, retry with the same prompt")
+  })
+
+  it("a non-recovery dispatch's prompt header has no recovery block", async () => {
+    const { request, project, sessions } = await makeApi()
+    const feature = await startFeature(request, project)
+    expect(feature.status).toBe("running")
+    expect(sessions.prompts.length).toBe(1)
+    const prompt = sessions.prompts[0]!.text
+    expect(prompt).toContain("[conductor] Job \"main\" step \"implement\"")
+    expect(prompt).not.toContain("[conductor] This step was recovered by an operator.")
+  })
+
+  it("recover still rejects an empty notes value with invalid_request (no silent regression)", async () => {
+    const { request, project, daemon } = await makeApi()
+    const feature = await startFeature(request, project)
+    const run = daemon.store.getActiveRun(feature.id)!
+    expect((await request("POST", `/v1/runs/${run.id}/report`, { outcome: "failed", notes: "broke" })).status).toBe(200)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("escalated")
+
+    const empty = await request("POST", `/v1/features/${feature.id}/recover`, { notes: "" })
+    expect(empty.status).toBe(400)
+    expect(((await empty.json()) as { error: { code: string } }).error.code).toBe("invalid_request")
+    const whitespace = await request("POST", `/v1/features/${feature.id}/recover`, { notes: "   " })
+    expect(whitespace.status).toBe(400)
+    expect(((await whitespace.json()) as { error: { code: string } }).error.code).toBe("invalid_request")
+  })
+
+  it("multi-target recover with all: true stamps notes on every recovered run and every prompt header", async () => {
+    const { request, project, daemon, sessions } = await makeApi({ workflow: fanInWorkflow })
+    const feature = await startFeature(request, project)
+    const runA = daemon.store.getActiveRunForStep(feature.id, "a", "work")!
+    const runB = daemon.store.getActiveRunForStep(feature.id, "b", "work")!
+    expect((await request("POST", `/v1/runs/${runA.id}/report`, { outcome: "failed", notes: "a broke" })).status).toBe(200)
+    expect((await request("POST", `/v1/runs/${runB.id}/report`, { outcome: "failed", notes: "b broke" })).status).toBe(200)
+    expect(daemon.store.getFeature(feature.id)?.status).toBe("escalated")
+
+    sessions.prompts.length = 0
+    const response = await request("POST", `/v1/features/${feature.id}/recover`, {
+      notes: "provider outage is over",
+      all: true,
+    })
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { recovered: Array<{ jobId: string; stepId: string }> }
+    expect(body.recovered).toEqual(
+      expect.arrayContaining([
+        { jobId: "a", stepId: "work" },
+        { jobId: "b", stepId: "work" },
+      ]),
+    )
+
+    const runARecovered = daemon.store.getActiveRunForStep(feature.id, "a", "work")
+    const runBRecovered = daemon.store.getActiveRunForStep(feature.id, "b", "work")
+    expect(runARecovered?.recoverNotes).toBe("provider outage is over")
+    expect(runBRecovered?.recoverNotes).toBe("provider outage is over")
+
+    expect(sessions.prompts.length).toBe(2)
+    for (const prompt of sessions.prompts) {
+      expect(prompt.text).toContain("[conductor] This step was recovered by an operator. Operator notes:")
+      expect(prompt.text).toContain("provider outage is over")
+    }
+  })
 })
 
 describe("API: run reports", () => {

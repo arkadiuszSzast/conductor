@@ -816,6 +816,23 @@ describe("Engine: runner resource waits", () => {
 })
 
 describe("Engine: durable recovery-dispatch replay", () => {
+  it("retains notes through a handled resource wait and consumes them only for the recovered run", async () => {
+    let available = true
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => available })
+    const feature = await startedFeature(engine)
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    available = false
+    await engine.recover(feature.id, { notes: "Keep {{ feature.title }} literal" })
+    await engine.reconcile()
+    expect(store.getUnhandledRecoveryDispatches(feature.id)).toHaveLength(0)
+    available = true
+    clock.advance(60_000)
+    await engine.reconcile()
+    const run = store.getActiveRun(feature.id)!
+    expect(run.recoverNotes).toBe("Keep {{ feature.title }} literal")
+    expect(sessions.prompts.at(-1)?.text).toContain("Keep {{ feature.title }} literal")
+    expect(store.getRecoverNotesForTarget(feature.id, "main", "implement")).toBeNull()
+  })
   it("crash boundary: a recoverStepTargets commit with no dispatch yet is durably replayed by reconcile — one run, feature stays running (not invariant-escalated); a second reconcile is a no-op", async () => {
     const engine = makeEngine(retryWorkflow)
     const feature = await startedFeature(engine)
@@ -903,6 +920,60 @@ describe("Engine: durable recovery-dispatch replay", () => {
     // No double dispatch: same run, still exactly one active run for the step.
     expect(store.getActiveRunForStep(feature.id, "main", "implement")?.id).toBe(rearmed!.id)
     expect(store.listRuns(feature.id).filter(r => r.stepId === "implement" && r.status === "running")).toHaveLength(1)
+  })
+
+  it("recover notes are stamped on the run row AND the agent prompt header for the recovered step (normal path)", async () => {
+    const engine = makeEngine(retryWorkflow)
+    const feature = await startedFeature(engine)
+    let run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, outcome: "failed", notes: "attempt 1" })
+    run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, outcome: "failed", notes: "attempt 2" })
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+
+    sessions.prompts.length = 0
+    const result = await engine.recover(feature.id, { notes: "runner is back, retry with the same prompt" })
+    expect(result.ok).toBe(true)
+
+    const rearmed = store.getActiveRunForStep(feature.id, "main", "implement")
+    expect(rearmed?.recoverNotes).toBe("runner is back, retry with the same prompt")
+
+    expect(sessions.prompts.length).toBe(1)
+    const prompt = sessions.prompts[0]!.text
+    expect(prompt).toContain("[conductor] Job \"main\" step \"implement\"")
+    expect(prompt).toContain("[conductor] This step was recovered by an operator. Operator notes:")
+    expect(prompt).toContain("runner is back, retry with the same prompt")
+  })
+
+  it("recover notes survive a daemon restart between commit and dispatch: the recovery_dispatch outbox row carries the notes that the replay prompt path reads back", async () => {
+    const engine = makeEngine(retryWorkflow)
+    const feature = await startedFeature(engine)
+    let run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, outcome: "failed", notes: "attempt 1" })
+    run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, outcome: "failed", notes: "attempt 2" })
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+
+    const txResult = store.recoverStepTargets(
+      feature.id,
+      [{ jobId: "main", stepId: "implement" }],
+      { notes: "runner is back, retry with the same prompt" },
+    )
+    expect(txResult).toBe("recovered")
+    const unhandled = store.getUnhandledRecoveryDispatches(feature.id)
+    expect(unhandled).toHaveLength(1)
+    expect(unhandled[0]!.notes).toBe("runner is back, retry with the same prompt")
+    expect(store.getRecoverNotesForTarget(feature.id, "main", "implement")).toBe("runner is back, retry with the same prompt")
+
+    sessions.prompts.length = 0
+    await engine.reconcile()
+
+    const rearmed = store.getActiveRunForStep(feature.id, "main", "implement")
+    expect(rearmed?.recoverNotes).toBe("runner is back, retry with the same prompt")
+    expect(sessions.prompts.length).toBe(1)
+    const prompt = sessions.prompts[0]!.text
+    expect(prompt).toContain("[conductor] This step was recovered by an operator. Operator notes:")
+    expect(prompt).toContain("runner is back, retry with the same prompt")
   })
 })
 

@@ -417,11 +417,20 @@ export class Engine {
     const rendered = renderTemplate(step.prompt, context)
     for (const error of rendered.errors) log.log(`job=${jobId} step=${step.id}: ${error}`)
 
+    const recoverNotes = store.getRecoverNotesForTarget(featureId, jobId, step.id)
+
     // Claim the run synchronously, BEFORE any await: this closes the
     // reconcile race a live daemon can hit — a concurrent reconcile pass
     // would otherwise see no run for this step while session setup below
     // is still in flight and re-dispatch it.
-    const runId = store.insertRun({ featureId, jobId, stepId: step.id, stepType: "agent", attempt })
+    const runId = store.insertRun({
+      featureId,
+      jobId,
+      stepId: step.id,
+      stepType: "agent",
+      attempt,
+      recoverNotes,
+    })
 
     try {
       let parentId = state.sessionId
@@ -464,7 +473,10 @@ export class Engine {
 
       const header =
         `[conductor] Job "${jobId}" step "${step.id}" (attempt ${attempt}) — run ${runId}.\n` +
-        `When this step is complete you MUST report run_id="${runId}" and its outcome.\n\n`
+        `When this step is complete you MUST report run_id="${runId}" and its outcome.\n\n` +
+        (recoverNotes !== null
+          ? `[conductor] This step was recovered by an operator. Operator notes:\n${recoverNotes}\n\n`
+          : "")
 
       await sessions.prompt({
         sessionID: sessionId,
@@ -501,7 +513,15 @@ export class Engine {
     const context = buildEvalContext(snapshot.workflow, state, jobId, feedback)
     const cwd = step.cwd !== undefined ? renderTemplate(step.cwd, context).text : (state.worktree ?? state.projectDir)
 
-    const runId = store.insertRun({ featureId, jobId, stepId: step.id, stepType: "command", attempt })
+    const recoverNotes = store.getRecoverNotesForTarget(featureId, jobId, step.id)
+    const runId = store.insertRun({
+      featureId,
+      jobId,
+      stepId: step.id,
+      stepType: "command",
+      attempt,
+      recoverNotes,
+    })
 
     const outputDir = await mkdtemp(join(tmpdir(), "conductor-output-"))
     const outputPath = join(outputDir, "outputs")
@@ -572,9 +592,11 @@ export class Engine {
       return
     }
 
+    const recoverNotes = store.getRecoverNotesForTarget(featureId, jobId, step.id)
     const runId = store.insertRun({
       featureId, jobId, stepId: step.id, stepType: "action", attempt,
       metadata: { uses: step.uses, version: binding.manifest.version, digest: binding.digest },
+      recoverNotes,
     })
 
     const coerced = this.renderActionInputs(snapshot, state, jobId, step, binding.manifest)
@@ -1484,7 +1506,11 @@ export class Engine {
     const txResult = store.recoverStepTargets(
       featureId,
       selected.map(target => ({ jobId: target.jobId, stepId: target.stepId })),
-      { expectedVersion: input.expectedVersion, idempotencyKey: input.idempotencyKey },
+      {
+        expectedVersion: input.expectedVersion,
+        idempotencyKey: input.idempotencyKey,
+        notes: input.notes ?? null,
+      },
     )
     switch (txResult) {
       case "not_found":
