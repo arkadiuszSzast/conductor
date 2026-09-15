@@ -609,7 +609,7 @@ type StepBase = Pick<StepDef, "id" | "if" | "outcomes" | "onFail" | "retry">
 function readAgentBody(node: Node | null, base: StepBase, where: string, reader: Reader): StepDef | undefined {
   const map = readMap(node, `${where}: agent`, reader)
   if (map === undefined) return undefined
-  const fields = readFields(map, `${where}: agent`, ["role", "prompt", "interactive", "ttlMs"], reader)
+  const fields = readFields(map, `${where}: agent`, ["role", "prompt", "interactive", "ttlMs", "reviewHead", "fixFrom", "qualityFrom", "fixPrompt"], reader)
   const roleNode = requireField(fields, "role", map, `${where}: agent`, reader)
   const promptNode = requireField(fields, "prompt", map, `${where}: agent`, reader)
   const role = roleNode === undefined ? undefined : readString(roleNode, `${where}: agent: role`, reader)
@@ -628,8 +628,19 @@ function readAgentBody(node: Node | null, base: StepBase, where: string, reader:
       return undefined
     }
   }
+  const structured: Partial<Record<"reviewHead" | "fixFrom" | "qualityFrom" | "fixPrompt", string>> = {}
+  for (const key of ["reviewHead", "fixFrom", "qualityFrom", "fixPrompt"] as const) {
+    if (!fields.has(key)) continue
+    const value = readString(fields.get(key)!.value, `${where}: agent: ${key}`, reader)
+    if (value === undefined || value.trim() === "") {
+      reader.error(fields.get(key)!.value, `${where}: agent: ${key} must be non-empty`)
+      return undefined
+    }
+    structured[key] = value
+  }
   if (role === undefined || prompt === undefined) return undefined
   return {
+    ...structured,
     ...base,
     type: "agent",
     role,

@@ -22,7 +22,7 @@ import { ApiClient } from "@conductor/cli"
 import { resolveRunnerConfig } from "./config.ts"
 import { OpencodeRunnerHub } from "./hub.ts"
 import { createOpencodeSessions, type RawOpencodeSessionApi } from "./sessions.ts"
-import { createConductorTools } from "./tools.ts"
+import { createConductorTools, type ConductorTools } from "./tools.ts"
 import { createAgentLogPusher } from "./agent-logs.ts"
 
 const HUB_KEY = Symbol.for("conductor.runner-opencode.hub")
@@ -35,6 +35,46 @@ function getOrCreateHub(log: (message: string) => void): OpencodeRunnerHub {
   const hub = new OpencodeRunnerHub(config, { log })
   globalScope[HUB_KEY] = hub
   return hub
+}
+
+export function createReportTool(tools: Pick<ConductorTools, "report">) {
+  return tool({
+    description:
+      "Report the outcome of a conductor pipeline step you were asked to execute. " +
+      "MANDATORY at the end of every conductor-driven task: pass the run_id from the task header " +
+      "plus either outcome (succeeded/failed) or verdict (for review steps). " +
+      "Structured gates also require review with the configured reviewed head and all gate findings. " +
+      "Use changes_requested when any blocking finding is new or reopened, otherwise approved. " +
+      "The daemon rejects stale heads, inconsistent verdicts and invalid lifecycle changes.",
+    args: {
+      run_id: tool.schema.string().describe("The run id from the [conductor] task header"),
+      outcome: tool.schema.enum(["succeeded", "failed"]).optional().describe("Step outcome (non-review steps)"),
+      verdict: tool.schema.string().optional().describe("Review verdict, e.g. approved / changes_requested"),
+      notes: tool.schema.string().optional().describe("Findings, failure reason, or summary for the next step"),
+      review: tool.schema.object({
+        head: tool.schema.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/),
+        findings: tool.schema.array(tool.schema.object({
+          id: tool.schema.string().regex(/^F[1-9][0-9]*$/).optional(),
+          path: tool.schema.string().min(1),
+          line: tool.schema.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+          severity: tool.schema.enum(["blocker", "major", "minor", "nit"]),
+          blocking: tool.schema.boolean(),
+          body: tool.schema.string().min(1),
+          acceptanceTests: tool.schema.array(tool.schema.string().min(1)),
+          status: tool.schema.enum(["new", "fixed", "dismissed", "reopened"]),
+          resolution: tool.schema.string().min(1).optional(),
+        }).strict()),
+      }).strict().optional().describe(
+        "Structured gate report, not prose. Use repository-relative paths and positive lines; blocking findings " +
+        "require acceptanceTests. Reuse all previous F IDs, explicitly carrying forward, fixing or dismissing. " +
+        "Non-new dispositions require an existing ID and resolution; reopening requires a reason. " +
+        "Omit for ordinary reports and failures.",
+      ),
+    },
+    async execute(args) {
+      return tools.report(args)
+    },
+  })
 }
 
 export const ConductorRunnerPlugin: Plugin = async input => {
@@ -90,21 +130,7 @@ export const ConductorRunnerPlugin: Plugin = async input => {
         },
       }),
 
-      conductor_report: tool({
-        description:
-          "Report the outcome of a conductor pipeline step you were asked to execute. " +
-          "MANDATORY at the end of every conductor-driven task: pass the run_id from the task header " +
-          "plus either outcome (succeeded/failed) or verdict (for review steps).",
-        args: {
-          run_id: tool.schema.string().describe("The run id from the [conductor] task header"),
-          outcome: tool.schema.enum(["succeeded", "failed"]).optional().describe("Step outcome (non-review steps)"),
-          verdict: tool.schema.string().optional().describe("Review verdict, e.g. approved / changes_requested"),
-          notes: tool.schema.string().optional().describe("Findings, failure reason, or summary for the next step"),
-        },
-        async execute(args) {
-          return tools.report(args)
-        },
-      }),
+      conductor_report: createReportTool(tools),
 
       conductor_ask: tool({
         description:

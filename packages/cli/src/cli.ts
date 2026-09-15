@@ -129,7 +129,7 @@ commands:
                        approve the waiting human gate
   request-changes <feature-id> --notes <text|@file>
                        reject the waiting human gate with notes
-  report <run-id> (--outcome succeeded|failed | --verdict <verdict>) [--notes <text|@file>]
+  report <run-id> (--outcome succeeded|failed | --verdict <verdict>) [--notes <text|@file>] [--review <json|@file>]
                        report an agent run's result to the daemon
   answer <run-id> --notes <text|@file>
                        answer a run's pending question (interactive step)
@@ -169,6 +169,7 @@ const VALUE_FLAGS = new Set([
   "notes",
   "outcome",
   "verdict",
+  "review",
   "expected-version",
   "idempotency-key",
   "init-config",
@@ -787,7 +788,7 @@ async function commandRequestChanges(parsed: Parsed, deps: CliDeps, client: ApiC
 }
 
 async function commandReport(parsed: Parsed, deps: CliDeps, client: ApiClient, json: boolean): Promise<number> {
-  requireFlags(parsed, ["outcome", "verdict", "notes"])
+  requireFlags(parsed, ["outcome", "verdict", "notes", "review"])
   const runId = requireId(parsed, "report requires a run id")
   const outcome = stringFlag(parsed, "outcome")
   const verdict = stringFlag(parsed, "verdict")
@@ -801,7 +802,13 @@ async function commandReport(parsed: Parsed, deps: CliDeps, client: ApiClient, j
     throw new UsageError('--outcome must be "succeeded" or "failed"')
   }
   const notes = resolveNotes(stringFlag(parsed, "notes"), deps)
+  const rawReview = resolveNotes(stringFlag(parsed, "review"), deps)
+  let review: unknown
+  if (rawReview !== undefined) {
+    try { review = JSON.parse(rawReview) } catch { throw new UsageError("--review requires JSON or @file containing JSON") }
+  }
   const payload = await client.report(runId, {
+    ...(rawReview !== undefined ? { review } : {}),
     ...(outcome !== undefined ? { outcome: outcome as "succeeded" | "failed" } : {}),
     ...(verdict !== undefined ? { verdict } : {}),
     ...(notes !== undefined ? { notes } : {}),

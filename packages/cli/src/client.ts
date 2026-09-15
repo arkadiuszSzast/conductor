@@ -111,6 +111,11 @@ export interface RunLogPage {
 }
 
 export interface FindingView {
+  readonly blocking: boolean | null
+  readonly acceptanceTests: readonly string[]
+  readonly sourceJobId: string | null
+  readonly sourceRunId: string | null
+  readonly reviewedHead: string | null
   readonly id: string
   readonly stepId: string
   readonly path: string
@@ -145,6 +150,7 @@ export interface StartFeatureInput {
 }
 
 export interface ReportInput {
+  readonly review?: unknown
   readonly outcome?: "succeeded" | "failed"
   readonly verdict?: string
   readonly notes?: string

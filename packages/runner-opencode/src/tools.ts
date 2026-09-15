@@ -24,6 +24,7 @@
 
 import { ApiClient, ApiError } from "@conductor/cli"
 import type { FeatureView } from "@conductor/cli"
+import type { ReviewReport } from "@conductor/server"
 
 export interface ConductorToolContext {
   readonly sessionID: string
@@ -38,6 +39,7 @@ export interface StartArgs {
 
 export interface ReportArgs {
   readonly run_id: string
+  readonly review?: ReviewReport
   readonly outcome?: "succeeded" | "failed"
   readonly verdict?: string
   readonly notes?: string
@@ -117,6 +119,7 @@ export function createConductorTools(client: ApiClient, projectDir: string): Con
     async report(args) {
       try {
         const result = await client.report(args.run_id, {
+          ...(args.review !== undefined ? { review: args.review } : {}),
           ...(args.outcome !== undefined ? { outcome: args.outcome } : {}),
           ...(args.verdict !== undefined ? { verdict: args.verdict } : {}),
           ...(args.notes !== undefined ? { notes: args.notes } : {}),

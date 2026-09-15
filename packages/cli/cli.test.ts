@@ -439,6 +439,34 @@ jobs:
 })
 
 describe("CLI: report", () => {
+  it("reports structured JSON files through HTTP and rejects malformed/contradictory payloads", async () => {
+    const head = "a".repeat(40)
+    const h = await makeHarness({ workflow: `name: structured
+roles:
+  reviewer: { agent: review }
+jobs:
+  main:
+    steps:
+      - id: review
+        agent:
+          role: reviewer
+          prompt: review
+          reviewHead: '${head}'
+        outcomes:
+          approved: next
+          changes_requested: next
+` })
+    const { runId, featureId } = await startFeature(h)
+    h.files.set("/tmp/review.json", "not json")
+    expect(await h.run("report", runId, "--verdict", "approved", "--review", "@/tmp/review.json")).toBe(EXIT.usage)
+    const review = { head, findings: [{ path: "a.ts", line: 1, severity: "minor", blocking: true, body: "real bug regardless of label", acceptanceTests: ["a.test.ts"], status: "new" }] }
+    h.files.set("/tmp/review.json", JSON.stringify(review))
+    expect(await h.run("report", runId, "--verdict", "approved", "--review", "@/tmp/review.json")).not.toBe(EXIT.ok)
+    expect(h.daemon.store.getRunById(runId)!.status).toBe("running")
+    h.files.set("/tmp/review.json", JSON.stringify(review))
+    expect(await h.run("report", runId, "--verdict", "changes_requested", "--review", "@/tmp/review.json")).toBe(EXIT.ok)
+    expect(h.daemon.store.listFindings(featureId)[0]).toMatchObject({ blocking: true, id: "F1" })
+  })
   it("report --outcome succeeded advances the pipeline to the gate", async () => {
     const h = await makeHarness()
     const { featureId, runId } = await startFeature(h)

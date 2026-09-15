@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto"
+import type { AcceptedReview } from "./review.ts"
 import type { Database } from "./database.ts"
 import { applyPatch, initialFeatureState } from "./state.ts"
 import type { CreateFeatureInput } from "./state.ts"
@@ -267,6 +268,11 @@ const RUN_LOG_CAP_BYTES = 2 * 1024 * 1024
 const RUN_LOG_EMIT_WINDOW_MS = 1_000
 
 export interface FindingView {
+  readonly blocking: boolean | null
+  readonly acceptanceTests: readonly string[]
+  readonly sourceJobId: string | null
+  readonly sourceRunId: string | null
+  readonly reviewedHead: string | null
   readonly id: string
   readonly stepId: string
   readonly path: string
@@ -860,7 +866,7 @@ export class Store {
       // feature with no anchor at all.
       for (const target of appliedTargets) {
         this.db.run(
-          "UPDATE recovery_dispatch SET notes_consumed = 1 WHERE feature_id = ? AND job_id = ? AND step_id = ?",
+          "UPDATE recovery_dispatch SET notes_consumed = 1, episode_closed = 1, status = 'handled' WHERE feature_id = ? AND job_id = ? AND step_id = ?",
           [featureId, target.jobId, target.stepId],
         )
         this.db.run(
@@ -914,7 +920,7 @@ export class Store {
   getRecoverNotesForTarget(featureId: string, jobId: string, stepId: string): string | null {
     const row = this.db.query(
       `SELECT notes FROM recovery_dispatch
-       WHERE feature_id = ? AND job_id = ? AND step_id = ? AND notes_consumed = 0
+       WHERE feature_id = ? AND job_id = ? AND step_id = ? AND episode_closed = 0
        ORDER BY time_created DESC, rowid DESC LIMIT 1`,
     ).get(featureId, jobId, stepId) as { notes: string | null } | null
     return row?.notes ?? null
@@ -926,6 +932,23 @@ export class Store {
     const current = toFeatureState(row)
     const patched = applyPatch(current, transition.patch)
     const next = this.withAggregateHumanAttention(featureId, patched)
+    const episodes = this.db.query(
+      "SELECT id, job_id, step_id FROM recovery_dispatch WHERE feature_id = ? AND episode_closed = 0",
+    ).all(featureId) as Array<{ id: string; job_id: string; step_id: string }>
+    for (const episode of episodes) {
+      const runtime = next.jobs[episode.job_id]
+      const targetConcluded = (event.kind === "step.completed" || event.kind === "step.budget_exhausted")
+        && event.jobId === episode.job_id && event.stepId === episode.step_id
+        && current.jobs[episode.job_id]?.currentStep === episode.step_id
+      const failureRouted = event.kind === "step.failed" && event.jobId === episode.job_id
+        && event.stepId === episode.step_id && transition.patch.jobs?.[episode.job_id] !== undefined
+        && transition.patch.status !== "running"
+      const reset = transition.feedback !== undefined && transition.patch.jobs?.[episode.job_id] !== undefined
+      if (targetConcluded || failureRouted || reset || runtime?.currentStep !== episode.step_id
+        || runtime.status !== "running" || next.status === "done" || next.status === "abandoned" || next.status === "escalated") {
+        this.db.run("UPDATE recovery_dispatch SET episode_closed = 1 WHERE id = ?", [episode.id])
+      }
+    }
     const now = Date.now()
     const escalation = transition.patch.status === "escalated"
       ? escalationReason(transition.decisions)
@@ -1377,7 +1400,6 @@ export class Store {
     attempt: number
     sessionId?: string
     metadata?: RunActionMetadata
-    recoverNotes?: string | null
   }): string {
     const id = randomUUID()
     this.db.transaction(() => {
@@ -1389,10 +1411,7 @@ export class Store {
       // durable, never a value that could race a concurrent pause/resume.
       const feature = this.db.query("SELECT paused_ms FROM feature WHERE id = ?").get(input.featureId) as { paused_ms: number } | null
       const now = this.clock.now()
-      const recovery = this.db.query(
-        `SELECT id, notes FROM recovery_dispatch WHERE feature_id = ? AND job_id = ? AND step_id = ?
-         AND notes_consumed = 0 ORDER BY time_created DESC, rowid DESC LIMIT 1`,
-      ).get(input.featureId, input.jobId, input.stepId) as { id: string; notes: string | null } | null
+      const recoverNotes = this.getRecoverNotesForTarget(input.featureId, input.jobId, input.stepId)
       this.db.run(
         `INSERT INTO run (id, feature_id, job_id, step_id, step_type, attempt, session_id, metadata, paused_ms_at_dispatch, time_started, time_last_activity, recover_notes)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1408,10 +1427,13 @@ export class Store {
           feature?.paused_ms ?? 0,
           now,
           now,
-          recovery?.notes ?? input.recoverNotes ?? null,
+          recoverNotes,
         ],
       )
-      if (recovery) this.db.run("UPDATE recovery_dispatch SET notes_consumed = 1 WHERE id = ?", [recovery.id])
+      this.db.run(
+        "UPDATE recovery_dispatch SET notes_consumed = 1 WHERE feature_id = ? AND job_id = ? AND step_id = ? AND episode_closed = 0",
+        [input.featureId, input.jobId, input.stepId],
+      )
     })()
     this.emit({ kind: "run", featureId: input.featureId })
     return id
@@ -1509,6 +1531,7 @@ export class Store {
     event: PipelineEvent,
     transition: Transition,
     options?: {
+      readonly review?: AcceptedReview
       readonly persistDecisions?: readonly Decision[]
       readonly retrySchedule?: {
         readonly jobId: string
@@ -1550,6 +1573,23 @@ export class Store {
       if (result.changes === 0) return false
       const run = this.db.query("SELECT feature_id FROM run WHERE id = ?").get(runId) as { feature_id: string } | null
       if (!run) return false
+      if (options?.review) {
+        const review = options.review
+        for (const finding of review.findings) {
+          this.db.run(
+            `INSERT INTO finding (id, feature_id, seq, step_id, path, line, severity, tags, body, status, resolution,
+              blocking, acceptance_tests, source_job_id, source_run_id, reviewed_head, time_created, time_updated)
+             VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET path=excluded.path, line=excluded.line, severity=excluded.severity,
+               body=excluded.body, status=excluded.status, resolution=excluded.resolution, blocking=excluded.blocking,
+               acceptance_tests=excluded.acceptance_tests, source_run_id=excluded.source_run_id,
+               reviewed_head=excluded.reviewed_head, synced=0, time_updated=excluded.time_updated`,
+            [`${run.feature_id}:${finding.id}`, run.feature_id, Number(finding.id.slice(1)), review.stepId,
+              finding.path, finding.line, finding.severity, finding.body, finding.status, finding.resolution ?? null,
+              finding.blocking ? 1 : 0, JSON.stringify(finding.acceptanceTests), review.jobId, runId, review.head, Date.now(), Date.now()],
+          )
+        }
+      }
       this.applyTransitionTx(run.feature_id, event, transition)
       if (options?.followUp) this.applyTransitionTx(run.feature_id, options.followUp.event, options.followUp.transition)
       if (options?.retrySchedule) {
@@ -1565,7 +1605,10 @@ export class Store {
       featureId = run.feature_id
       return true
     })()
-    if (claimed && featureId !== null) this.emit({ kind: "transition", featureId })
+    if (claimed && featureId !== null) {
+      this.emit({ kind: "transition", featureId })
+      if (options?.review) this.emit({ kind: "finding", featureId })
+    }
     return { claimed, episode }
   }
 
@@ -1830,18 +1873,24 @@ export class Store {
 
   // ------------------------------------------------------------- resource waits
 
-  /**
-   * Upsert a resource wait for one job+step target: the first
-   * observation creates it; a later observation while still `waiting`
-   * updates `latest_observed_at`/`observation_count`/`next_observation_at`/
-   * `diagnostic` in place (durable-retries spec: "persist … first/latest
-   * observation, next observation time and finite deadline" — one row
-   * per target, not one row per observation). A concurrent claim wins
-   * over a concurrent observation update by construction: the `DO
-   * UPDATE … WHERE status = 'waiting'` clause makes the update a no-op
-   * once another caller has claimed it, and the caller gets back the
-   * (now claimed) row unchanged rather than corrupting a claim in flight.
-   */
+  concludeRunForResourceWait(runId: string, input: Parameters<Store["upsertResourceWait"]>[0]): boolean {
+    return this.db.transaction(() => {
+      const changed = this.db.run(
+        `UPDATE run SET status = 'failed', reason = ?, failure_class = 'transient_transport',
+         failure_source = 'runner', time_finished = ?, action_handled = 1
+         WHERE id = ? AND status = 'running'`,
+        [input.diagnostic ?? null, input.observedAt, runId],
+      ).changes
+      if (changed === 0) return false
+      this.db.run(
+        `UPDATE resource_wait SET status = 'waiting' WHERE feature_id = ? AND job_id = ? AND step_id = ? AND status = 'claimed'`,
+        [input.featureId, input.jobId, input.stepId],
+      )
+      this.upsertResourceWait(input)
+      return true
+    })()
+  }
+
   upsertResourceWait(input: {
     featureId: string
     jobId: string
@@ -1890,6 +1939,15 @@ export class Store {
       `SELECT * FROM resource_wait WHERE feature_id = ? AND job_id = ? AND step_id = ? AND status IN ('waiting','claimed')`,
     ).get(featureId, jobId, stepId) as ResourceWaitRow | null
     return row ? toResourceWaitRecord(row) : null
+  }
+
+  releaseResourceWaitWithoutRun(waitId: string): void {
+    this.db.run(
+      `UPDATE resource_wait SET status = 'waiting' WHERE id = ? AND status = 'claimed'
+       AND NOT EXISTS (SELECT 1 FROM run WHERE run.feature_id = resource_wait.feature_id
+         AND run.job_id = resource_wait.job_id AND run.step_id = resource_wait.step_id AND run.status = 'running')`,
+      [waitId],
+    )
   }
 
   getResourceWait(waitId: string): ResourceWaitRecord | null {
@@ -2058,8 +2116,18 @@ export class Store {
       resolution: string | null
       thread_id: string | null
       synced: number
+      blocking: number | null
+      acceptance_tests: string
+      source_job_id: string | null
+      source_run_id: string | null
+      reviewed_head: string | null
     }>
     return rows.map(row => ({
+      blocking: row.blocking === null ? null : row.blocking === 1,
+      acceptanceTests: JSON.parse(row.acceptance_tests) as string[],
+      sourceJobId: row.source_job_id,
+      sourceRunId: row.source_run_id,
+      reviewedHead: row.reviewed_head,
       id: row.id.split(":").pop() ?? row.id,
       stepId: row.step_id,
       path: row.path,

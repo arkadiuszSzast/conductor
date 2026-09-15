@@ -31,6 +31,28 @@ Authentication is explicit (`auth.mode: "none"` or `"bearer"`); only
 | `GET/POST /v1/runners`, `DELETE /v1/runners/:id` | Runner endpoint registration (when a registry is configured). |
 | `GET /v1/plugins`, `POST /v1/plugins/session`, `ANY /v1/plugins/:id/*` | Plugin listing, session cookie exchange, and per-plugin reverse proxy (below; when a plugin control is configured). |
 
+## Runner registration and callback health
+
+`POST /v1/runners` accepts `{name, endpoint, token?, projects}`. Endpoint
+refresh preserves its id and unions projects. Registrations expire 60 seconds
+after the last announce; the opencode hub already announces every 15 seconds.
+`GET /v1/runners` projects `{id, name, endpoint, projects, registeredAt,
+expiresAt}` for unexpired registrations, never callback tokens. Daemon health
+reports runner availability from this lease-fresh set, not a successful probe.
+Different live endpoints on the same host are never superseded by hostname/PID.
+
+Runner callbacks must implement `GET /v1/health` using the same authentication
+as session routes, returning `200 {"ok": true}` when ready. The daemon probes
+before each write with a 10-second timeout and no redirects. Only definitive
+pre-connect failure permits skipping an endpoint. Rejected/inconclusive probes
+send no write and enter bounded runner resource waiting; ambiguous POST
+reset/timeout propagates through ordinary failure handling without transport
+replay. HTTP write errors are not registration eviction signals.
+
+Deploy the updated runner callback before the daemon, or update both together.
+An old callback without health support safely blocks writes until upgraded.
+No database migration or configuration change is required.
+
 ## Feature payloads
 
 Both list items and the detail carry the feature state plus projection
@@ -181,8 +203,14 @@ means "at least one rerun has ever happened".
   durable across a daemon restart between the recover commit and the
   actual dispatch (the `recovery_dispatch` outbox row is the source of
   truth), so the agent sees the operator's intent on every future
-  recovery, not just the one that motivated the change. A normal
-  first-attempt dispatch's prompt has no recovery block. See
+  recovery, including every automatic retry in that target's recovery
+  episode. Scheduled retries and runner resource waits retain the same
+  literal notes, even across restart. Completion, terminal routing and
+  rerun/reset end inheritance; later jobs or loops receive no old notes.
+  A subsequent recover replaces the selected target's guidance. Historical
+  run snapshots remain unchanged. Migration 0020 does not reactivate
+  already-consumed pre-upgrade notes; those need a separately authorized
+  new recovery. A normal first-attempt prompt has no recovery block. See
   `openspec/changes/recover-notes-to-agent` for the design.
 
 ## Starting a feature
@@ -307,6 +335,63 @@ Bearer-authenticated. Body: `{lines: [{text, source?}]}`.
 - A successful append emits a `run_log` SSE invalidation event (throttled
   to at most one per run per second), so an open inspector can refetch the
   tail.
+
+### Structured review reports
+
+An agent configured with `reviewHead` must send a successful review as:
+
+```json
+{
+  "verdict": "changes_requested",
+  "notes": "One accepted blocker",
+  "review": {
+    "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "findings": [{
+      "path": "src/example.ts",
+      "line": 12,
+      "severity": "major",
+      "blocking": true,
+      "body": "Describe the reachable bug and required correction.",
+      "acceptanceTests": ["tests/example.test.ts: invalid input is rejected"],
+      "status": "new"
+    }]
+  }
+}
+```
+
+CLI: `conductor report <run-id> --verdict changes_requested --review @review.json`.
+The file contains the `review` object, not the entire request.
+The opencode runner's `conductor_report` tool accepts the same optional `review`
+object alongside `run_id`, `verdict` and optional `notes` (not a JSON-encoded string).
+The tool forwards it unchanged; the daemon checks configured-head freshness,
+verdict consistency, gate ownership and lifecycle before atomic completion.
+The tool does not infer a verdict or override a contradictory one. Ordinary reports
+omit `review`. This requires the updated runner plugin as well as the daemon;
+already-loaded older tool schemas cannot submit the object until a separately
+approved runtime upgrade/reload.
+Unknown review/finding
+fields are rejected. Head must be a full lowercase 40/64-character Git SHA matching
+the configured template. Locations are relative paths and positive line numbers;
+severity is blocker/major/minor/nit; blocking is an explicit boolean independent of
+severity. Blocking findings require nonempty acceptance-test descriptions/locations.
+These descriptions are not automatically executed as shell commands.
+
+New entries omit `id` and use status `new`. The daemon allocates feature-local F IDs.
+Every previous finding owned by this job/step must be included by ID, including
+fixed/dismissed findings. Status fixed/dismissed/reopened requires a nonempty
+`resolution`; reactivating a fixed/dismissed ID requires `reopened`. Another gate's
+IDs cannot be updated. No semantic deduplication or automatic prose parsing occurs.
+
+Active blockers (new/reopened and blocking=true) require `changes_requested`;
+otherwise the verdict must be `approved`. Invalid reports return 400 and leave the
+run active without mutation. Failed reports may omit review; review cannot accompany
+failure or ask. Unconfigured steps reject structured payloads but retain plain notes.
+
+Completion atomically updates existing findings, routing and immutable
+`outputs.work_order` JSON containing the accepted review plus source run/job/step.
+The findings endpoint adds `blocking` (null for old unclassified rows),
+`acceptanceTests`, `sourceJobId`, `sourceRunId`, and `reviewedHead`.
+Duplicate completion remains 409 without finding mutations.
 
 ### `POST /v1/runs/:id/report` — the `ask` shape
 

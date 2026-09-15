@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test"
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { loadActionRegistry } from "./src/action-registry.ts"
@@ -8,7 +8,7 @@ import {
   checkWorkflowReservation,
 } from "./src/workflow-reservation.ts"
 import type { LoadedActionRegistry } from "./src/action-registry.ts"
-import { resolveAction } from "@conductor/core"
+import { parseWorkflow, resolveAction, validateWorkflow } from "@conductor/core"
 import type { ActionStep, WorkflowDef } from "@conductor/core"
 
 const temporaryDirectories: string[] = []
@@ -263,6 +263,24 @@ describe("checkWorkflowReservation", () => {
 })
 
 describe("loadActionRegistry: the bundled actions directory", () => {
+  it("validates documented push/check and command diagnostic wiring against current manifests", async () => {
+    const source = await readFile(join(import.meta.dirname, "../../docs/workflow-reference.md"), "utf8")
+    const section = source.split("## Bundled commit evidence actions")[1]!.split("## Routes")[0]!
+    const registry = await load(import.meta.dirname, "actions")
+    const blocks = [...section.matchAll(/```yaml\n([\s\S]*?)```/g)]
+    expect(blocks).toHaveLength(2)
+    for (const block of blocks) {
+      const parsed = parseWorkflow(`name: evidence\nroles:\n  implementer: { agent: build }\njobs:\n  main:\n    steps:\n${block[1]!.split("\n").map(line => `      ${line}`).join("\n")}`)
+      expect(parsed.ok).toBe(true)
+      if (!parsed.ok) throw new Error(JSON.stringify(parsed))
+      expect(validateWorkflow(parsed.workflow).errors).toEqual([])
+      expect(checkWorkflowReservation(parsed.workflow, registry).ok).toBe(true)
+    }
+    const missing = checkWorkflowReservation(workflow(actionStep("checks", "github/await-checks@v1", { pr: 5 })), registry)
+    expect(missing.ok).toBe(false)
+    if (!missing.ok) expect(missing.diagnostics.length).toBeGreaterThan(0)
+  })
+
   it("finds and validates all six bundled actions", async () => {
     const result = await loadActionRegistry({ baseDir: import.meta.dirname, bundledPath: "actions" })
     expect(result.ok).toBe(true)

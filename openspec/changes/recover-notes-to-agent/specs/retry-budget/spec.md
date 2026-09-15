@@ -19,7 +19,35 @@ engine SHALL treat a null notes value as "no recovery context" (a
 normal first-attempt dispatch has no outbox row, so the engine MUST
 NOT prepend a recovery block in that case). The propagation SHALL
 apply automatically to every future `recover` call — no per-call
-flag, no template change, no new expression root.
+flag, no template change, no new expression root. Notes SHALL persist for
+all automatic retries in the same target recovery episode, independently
+of dispatch-intent handling or first-run consumption. Completion, terminal
+routing, rerun/reset and replacement recovery SHALL end the old episode;
+no unrelated target or later workflow visit SHALL inherit its notes.
+
+#### Scenario: Automatic retry retains literal guidance across restart and resource waits
+
+- **GIVEN** a recovered target has dispatched with operator notes and fails within its fresh retry budget
+- **WHEN** an immediate or scheduled automatic retry dispatches, including after a database reopen or runner resource wait
+- **THEN** its run snapshot and actual agent prompt contain the same complete literal notes, without requiring another recover call.
+
+#### Scenario: Runner disappears after recovery run insertion
+
+- **GIVEN** the recovered run is inserted but session prompting finds no live runner
+- **WHEN** the resource wait subsequently dispatches another run
+- **THEN** that run and prompt retain the episode notes.
+
+#### Scenario: Successful recovery is followed by a later rerun
+
+- **GIVEN** the recovered target succeeds and a later review routes back to that target
+- **WHEN** the later workflow visit dispatches
+- **THEN** neither the later run nor its prompt carries the old recovery guidance, while the original run retains its audit snapshot.
+
+#### Scenario: A new recovery replaces guidance without crossing targets
+
+- **GIVEN** an episode exhausts and another recovery is accepted for the selected target
+- **WHEN** the new recovered run and its automatic retries dispatch
+- **THEN** only the new notes appear, and other jobs or features with matching step IDs receive none of that guidance.
 
 #### Scenario: Operator recovers a single failed step and the agent session receives the notes
 

@@ -270,6 +270,10 @@ export class OpencodeRunnerHub {
     const path = url.pathname.replace(/\/+$/, "")
     const method = request.method.toUpperCase()
 
+    if (path === "/v1/health" && method === "GET") {
+      return json(this.projects.size > 0 ? 200 : 503, { ok: this.projects.size > 0 })
+    }
+
     if (path === "/v1/sessions" && method === "POST") {
       const body = (await request.json()) as { title?: unknown; directory?: unknown; parentID?: unknown; runId?: unknown }
       if (typeof body.title !== "string" || typeof body.directory !== "string") {

@@ -24,6 +24,7 @@
 
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
+import { prepareReview, renderFixPack, validateReview, type AcceptedReview, type ReviewReport } from "./review.ts"
 import { join } from "node:path"
 import {
   DEFAULT_OUTCOME,
@@ -63,6 +64,7 @@ import type {
 } from "@conductor/core"
 import type { RunSummary, Store } from "./store.ts"
 import { applyPatch } from "./state.ts"
+import { NoLiveRunnerError } from "./runner-transport.ts"
 import type { WorkflowResolver, WorkflowSnapshot } from "./workflow-registry.ts"
 import type { Clock, Logger, ProcessRunner, SessionClient } from "./ports.ts"
 import type { ActionExecutor } from "./action-host.ts"
@@ -302,6 +304,11 @@ export class Engine {
   private async actDecision(featureId: string, snapshot: WorkflowSnapshot, decision: Decision): Promise<void> {
     switch (decision.kind) {
       case "execute_step": {
+        const state = this.deps.store.getFeature(featureId)
+        const runtime = state?.jobs[decision.jobId]
+        if (!state || !["running", "waiting_human"].includes(state.status)
+          || runtime?.status !== "running" || runtime.currentStep !== decision.stepId
+          || runtime.steps[decision.stepId]?.status !== "running") return
         const step = findStep(snapshot.workflow, decision.jobId, decision.stepId)
         if (!step) {
           this.deps.log.log(`feature=${featureId}: step "${decision.stepId}" not in job "${decision.jobId}" — escalating`)
@@ -414,10 +421,36 @@ export class Engine {
     const attempt = (state.jobs[jobId]?.attempts[step.id] ?? 0) + 1
     const feedback = store.getFeedback(featureId) ?? undefined
     const context = buildEvalContext(snapshot.workflow, state, jobId, feedback)
-    const rendered = renderTemplate(step.prompt, context)
+    let prompt = step.prompt
+    let fixEvidence = ""
+    try {
+      const from = (ref: string | undefined, key: string) => {
+        if (!ref) return undefined
+        const [sourceJob, sourceStep] = ref.split("/")
+        return feedback?.jobs[sourceJob!]?.[sourceStep!]?.[key]
+      }
+      const rawOrder = from(step.fixFrom, "work_order")
+      const diagnostic = from(step.qualityFrom, "diagnostic")
+      if (step.fixPrompt !== undefined && (rawOrder !== undefined || diagnostic !== undefined)) {
+        prompt = step.fixPrompt
+        if (rawOrder !== undefined) {
+          const order = JSON.parse(rawOrder) as AcceptedReview
+          const source = store.getRunById(order.runId)
+          if (!source || source.featureId !== featureId || `${source.jobId}/${source.stepId}` !== step.fixFrom || source.status !== "succeeded" || source.outputs.work_order !== rawOrder) throw new Error("fix work order is not an accepted report from the configured gate")
+          fixEvidence += `\n\n${renderFixPack(order)}`
+        }
+        if (diagnostic !== undefined) fixEvidence += `\n\nQuality diagnostic (${step.qualityFrom}):\n${diagnostic}`
+      }
+    } catch (error) {
+      await this.dispatch(featureId, { kind: "step.failed", jobId, stepId: step.id, reason: `Invalid fix evidence: ${errorMessage(error)}` })
+      return
+    }
+    if (step.reviewHead !== undefined) {
+      const prior = store.listFindings(featureId).filter(finding => finding.sourceJobId === jobId && finding.stepId === step.id)
+      fixEvidence += `\n\nStructured review required. Submit review JSON with head and findings using conductor report --review @file (or HTTP). Reuse every previous ID, explicitly fixing/dismissing or carrying it forward; reopening requires a reason. Explicit active blockers require changes_requested, otherwise approved.\nPrevious gate findings:\n${JSON.stringify(prior)}`
+    }
+    const rendered = renderTemplate(prompt, context)
     for (const error of rendered.errors) log.log(`job=${jobId} step=${step.id}: ${error}`)
-
-    const recoverNotes = store.getRecoverNotesForTarget(featureId, jobId, step.id)
 
     // Claim the run synchronously, BEFORE any await: this closes the
     // reconcile race a live daemon can hit — a concurrent reconcile pass
@@ -429,7 +462,6 @@ export class Engine {
       stepId: step.id,
       stepType: "agent",
       attempt,
-      recoverNotes,
     })
 
     try {
@@ -471,6 +503,7 @@ export class Engine {
       }
       if (createdParent) store.setFeatureFields(featureId, { sessionId: parentId })
 
+      const recoverNotes = store.getRunById(runId)?.recoverNotes ?? null
       const header =
         `[conductor] Job "${jobId}" step "${step.id}" (attempt ${attempt}) — run ${runId}.\n` +
         `When this step is complete you MUST report run_id="${runId}" and its outcome.\n\n` +
@@ -480,7 +513,7 @@ export class Engine {
 
       await sessions.prompt({
         sessionID: sessionId,
-        text: header + rendered.text,
+        text: header + rendered.text + fixEvidence,
         agent: role.agent,
         ...(role.model !== undefined ? { model: role.model } : {}),
       })
@@ -496,6 +529,21 @@ export class Engine {
       // the FailureEnvelope's own `diagnostic`, which `makeFailureEnvelope`
       // already bounds separately).
       const reason = boundDiagnostic(`failed to prompt session: ${errorMessage(err)}`)
+      if (err instanceof NoLiveRunnerError) {
+        const now = this.deps.clock.now()
+        const policy = this.resourceWaitPolicy()
+        const wait = store.getOpenResourceWait(featureId, jobId, step.id)
+        const observed = decideResourceWaitRoute("runner_unavailable", policy, {
+          firstObservedAtMs: wait?.firstObservedAt ?? now,
+          observationCount: wait?.observationCount ?? 0,
+        }, now, systemRandom)
+        store.concludeRunForResourceWait(runId, {
+          featureId, jobId, stepId: step.id, reason: "runner_unavailable", observedAt: now,
+          nextObservationAt: observed.kind === "wait_resource" ? observed.nextObservationAtMs : now,
+          deadlineAt: wait?.deadlineAt ?? now + policy.maxWaitMs, diagnostic: reason,
+        })
+        return
+      }
       await this.concludeAndDispatch(
         featureId, runId, "failed",
         { reason, failure: makeFailureEnvelope({ class: classifyThrownBoundary(err), diagnostic: reason, source: "runner" }) },
@@ -513,14 +561,12 @@ export class Engine {
     const context = buildEvalContext(snapshot.workflow, state, jobId, feedback)
     const cwd = step.cwd !== undefined ? renderTemplate(step.cwd, context).text : (state.worktree ?? state.projectDir)
 
-    const recoverNotes = store.getRecoverNotesForTarget(featureId, jobId, step.id)
     const runId = store.insertRun({
       featureId,
       jobId,
       stepId: step.id,
       stepType: "command",
       attempt,
-      recoverNotes,
     })
 
     const outputDir = await mkdtemp(join(tmpdir(), "conductor-output-"))
@@ -592,11 +638,9 @@ export class Engine {
       return
     }
 
-    const recoverNotes = store.getRecoverNotesForTarget(featureId, jobId, step.id)
     const runId = store.insertRun({
       featureId, jobId, stepId: step.id, stepType: "action", attempt,
       metadata: { uses: step.uses, version: binding.manifest.version, digest: binding.digest },
-      recoverNotes,
     })
 
     const coerced = this.renderActionInputs(snapshot, state, jobId, step, binding.manifest)
@@ -752,13 +796,33 @@ export class Engine {
     status: "succeeded" | "failed" | "reaped",
     detail: { outputs?: Readonly<Record<string, string>>; reason?: string; failure?: FailureEnvelope } | undefined,
     event: PipelineEvent,
+    review?: AcceptedReview,
   ): Promise<boolean> {
     const { store, log } = this.deps
     const state = store.getFeature(featureId)
     if (!state) return false
     const snapshot = this.deps.workflows(state.projectDir)
     if (!snapshot) return false
-    const transition = interpret(snapshot.workflow, state, event)
+    let transition = interpret(snapshot.workflow, state, event)
+    if (event.kind === "step.failed" && detail?.failure?.source === "command" && transition.feedback) {
+      const feedback = transition.feedback
+      transition = {
+        ...transition,
+        feedback: {
+          ...feedback,
+          jobs: {
+            ...feedback.jobs,
+            [event.jobId]: {
+              ...feedback.jobs[event.jobId],
+              [event.stepId]: {
+                ...feedback.jobs[event.jobId]?.[event.stepId],
+                diagnostic: boundDiagnostic(detail.reason ?? event.reason),
+              },
+            },
+          },
+        },
+      }
+    }
 
     const plan =
       detail?.failure !== undefined && event.kind === "step.failed"
@@ -768,6 +832,7 @@ export class Engine {
 
     const result = store.concludeRun(runId, status, detail, event, transition, {
       persistDecisions: decisions,
+      ...(review ? { review } : {}),
       ...(plan?.retrySchedule ? { retrySchedule: plan.retrySchedule } : {}),
       ...(plan?.followUp ? { followUp: plan.followUp } : {}),
     })
@@ -925,11 +990,31 @@ export class Engine {
    * Called by the API's report endpoint from inside agent sessions. The
    * ONLY path by which an agent step concludes — idle never does.
    */
-  async report(input: { runId: string; outcome?: "succeeded" | "failed"; verdict?: string; notes?: string; ask?: string }): Promise<string> {
+  async report(input: { runId: string; outcome?: "succeeded" | "failed"; verdict?: string; notes?: string; ask?: string; review?: unknown }): Promise<string> {
     const { store } = this.deps
     const run = store.getRunById(input.runId)
     if (!run) return `Unknown run_id "${input.runId}".`
     if (run.status !== "running") return alreadyConcludedText(input.runId, run.status)
+
+    const feature = store.getFeature(run.featureId)
+    const definition = feature ? this.deps.workflows(feature.projectDir)?.workflow : undefined
+    const configured = definition ? findStep(definition, run.jobId, run.stepId) : undefined
+    let review: AcceptedReview | undefined
+    if (input.review !== undefined || (configured?.type === "agent" && configured.reviewHead !== undefined && input.outcome !== "failed" && input.ask === undefined)) {
+      try {
+        if (configured?.type !== "agent" || configured.reviewHead === undefined || !feature || !definition) throw new Error("step is not configured for structured review")
+        if (input.outcome === "failed" || input.ask !== undefined) throw new Error("review cannot be combined with failure or ask")
+        const error = validateReview(input.review)
+        if (error) throw new Error(error)
+        const report = input.review as ReviewReport
+        const head = renderTemplate(configured.reviewHead, buildEvalContext(definition, feature, run.jobId))
+        if (head.errors.length || head.text !== report.head) throw new Error("review head does not match configured reviewed head")
+        review = prepareReview(report, store.listFindings(run.featureId), { runId: run.id, jobId: run.jobId, stepId: run.stepId }, input.verdict)
+      } catch (error) {
+        return `Invalid review: ${errorMessage(error)}`
+      }
+    }
+    const outputs = { report: input.notes ?? "", ...(review ? { work_order: JSON.stringify(review) } : {}) }
 
     if (input.ask !== undefined) {
       // Asking is a privilege the workflow grants per step: only an
@@ -965,7 +1050,7 @@ export class Engine {
             jobId: run.jobId,
             stepId: run.stepId,
             outcome: input.verdict ?? DEFAULT_OUTCOME,
-            outputs: { report: input.notes ?? "" },
+            outputs,
           }
     if (event.kind === "step.completed") {
       // A step that declares outcomes routes on the verdict — concluding
@@ -986,9 +1071,9 @@ export class Engine {
       }
     }
     const status: "succeeded" | "failed" = input.outcome === "failed" ? "failed" : "succeeded"
-    const detail = status === "failed" ? { reason: input.notes ?? "reported failed" } : { outputs: { report: input.notes ?? "" } }
+    const detail = status === "failed" ? { reason: input.notes ?? "reported failed" } : { outputs }
 
-    const claimed = await this.concludeAndDispatch(run.featureId, input.runId, status, detail, event)
+    const claimed = await this.concludeAndDispatch(run.featureId, input.runId, status, detail, event, review)
     if (!claimed) {
       const after = store.getRunById(input.runId)
       return alreadyConcludedText(input.runId, after?.status ?? run.status)
@@ -1583,6 +1668,11 @@ export class Engine {
 
     if (input.status === "paused") return
 
+    for (const wait of store.listResourceWaits(input.id)) {
+      if (wait.status !== "claimed") continue
+      if (input.jobs[wait.jobId]?.currentStep !== wait.stepId) store.closeResourceWait(wait.id, "target_advanced")
+      else store.releaseResourceWaitWithoutRun(wait.id)
+    }
     const waits = store.listResourceWaits(input.id).filter(wait => wait.status === "waiting")
     for (const wait of waits) {
       if (wait.deadlineAt <= clock.now()) {
@@ -1600,9 +1690,9 @@ export class Engine {
       if (this.deps.runnerAvailable?.() === true) {
         const claimed = store.claimResourceWait(wait.id, clock.now())
         if (!claimed) continue
-        store.closeResourceWait(wait.id, "resource_available")
         const step = findStep(snapshot.workflow, wait.jobId, wait.stepId)
         if (!step || step.type !== "agent") {
+          store.closeResourceWait(wait.id, "invalid_target")
           await this.dispatch(input.id, {
             kind: "step.failed",
             jobId: wait.jobId,
@@ -1612,6 +1702,7 @@ export class Engine {
           continue
         }
         await this.executeAgent(input.id, snapshot, wait.jobId, step)
+        if (store.getResourceWait(wait.id)?.status === "claimed") store.closeResourceWait(wait.id, "resource_available")
         continue
       }
       if (wait.nextObservationAt !== null && wait.nextObservationAt > clock.now()) continue
