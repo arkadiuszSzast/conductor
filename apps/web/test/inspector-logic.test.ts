@@ -2,7 +2,7 @@
  * Log-tail cursor logic — `after=nextSeq` pagination with dedupe.
  */
 import { describe, expect, it } from "bun:test"
-import { applyLogPage, EMPTY_LOG_CURSOR, loadAllLogPages, pageAdvances, resolveInspectorStepId } from "../src/feature/inspector-logic.ts"
+import { applyLogPage, collapseToolLines, EMPTY_LOG_CURSOR, loadAllLogPages, pageAdvances, resolveInspectorStepId } from "../src/feature/inspector-logic.ts"
 import type { FeatureDetail, RunLogLine, RunLogPage, WorkflowProjection } from "../src/api/types.ts"
 
 function line(seq: number, text = `line ${seq}`): RunLogLine {
@@ -138,5 +138,49 @@ describe("inspector step selection", () => {
       jobs: { deliver: { currentStep: null } },
     } as unknown as FeatureDetail
     expect(resolveInspectorStepId(workflow, completed, "deliver", null)).toBeNull()
+  })
+})
+
+describe("collapseToolLines", () => {
+  const line = (seq: number, source: string, text: string): RunLogLine =>
+    ({ seq, time: seq * 1000, source, text }) as RunLogLine
+
+  it("passes narrative lines through untouched", () => {
+    const result = collapseToolLines([line(1, "agent", "a"), line(2, "process", "b")])
+    expect(result).toEqual([
+      { kind: "line", line: line(1, "agent", "a") },
+      { kind: "line", line: line(2, "process", "b") },
+    ])
+  })
+
+  it("collapses consecutive tool lines into one status with the latest visible", () => {
+    const result = collapseToolLines([
+      line(1, "agent", "start"),
+      line(2, "tool", "running command — git diff"),
+      line(3, "tool", "searching content — findBundle"),
+      line(4, "tool", "reading file — Koin.kt"),
+      line(5, "agent", "found it"),
+    ])
+    expect(result).toHaveLength(3)
+    expect(result[0]).toEqual({ kind: "line", line: line(1, "agent", "start") })
+    expect(result[1]).toMatchObject({
+      kind: "tools",
+      count: 3,
+      latest: line(4, "tool", "reading file — Koin.kt"),
+    })
+    expect((result[1] as { earlier: readonly RunLogLine[] }).earlier.map(l => l.seq)).toEqual([2, 3])
+    expect(result[2]).toEqual({ kind: "line", line: line(5, "agent", "found it") })
+  })
+
+  it("a narrative line splits tool groups; a trailing group keeps replacing itself", () => {
+    const result = collapseToolLines([
+      line(1, "tool", "t1"),
+      line(2, "agent", "text"),
+      line(3, "tool", "t2"),
+      line(4, "tool", "t3"),
+    ])
+    expect(result).toHaveLength(3)
+    expect(result[0]).toMatchObject({ kind: "tools", count: 1 })
+    expect(result[2]).toMatchObject({ kind: "tools", count: 2, latest: line(4, "tool", "t3") })
   })
 })

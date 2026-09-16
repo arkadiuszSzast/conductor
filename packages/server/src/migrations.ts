@@ -617,6 +617,19 @@ export const migrations: readonly Migration[] = [
       addColumn(db, "retry_episode", "feature_paused_ms_at_start", "INTEGER NOT NULL DEFAULT 0")
     },
   },
+  {
+    id: "0018_run_time_last_activity",
+    up(db) {
+      // resilient-agent-runs: the reaper's TTL measures silence (time
+      // since the run last showed life — log appends, question flow,
+      // nudges), not age since dispatch. Durable so a daemon restart
+      // neither grants stale runs a fresh window nor inherits dispatch
+      // time when later activity was recorded. Backfill from
+      // time_started: the best known lower bound for legacy rows.
+      addColumn(db, "run", "time_last_activity", "INTEGER")
+      db.run("UPDATE run SET time_last_activity = time_started WHERE time_last_activity IS NULL")
+    },
+  },
 ]
 
 function validateMigrations(ordered: readonly Migration[]): void {

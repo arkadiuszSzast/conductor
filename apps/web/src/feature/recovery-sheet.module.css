@@ -35,3 +35,38 @@
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-sm);
 }
+.targetList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+  max-height: 12rem;
+  overflow-y: auto;
+}
+.targetRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  font-family: var(--font-mono);
+  cursor: pointer;
+}
+.targetActions {
+  display: flex;
+  gap: var(--space-3);
+}
+.linkButton {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text-dim);
+  font-size: var(--text-xs);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.linkButton:disabled {
+  opacity: 0.4;
+  cursor: default;
+}

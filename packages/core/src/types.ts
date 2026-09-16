@@ -111,6 +111,9 @@ export interface AgentStep extends StepBase {
    *  question (the ask/answer protocol). Absent means autonomous: the
    *  engine refuses asks and the agent must decide and report. */
   readonly interactive?: boolean
+  /** Silence budget for THIS step's runs, in milliseconds — overrides
+   *  the engine-wide TTL. Absent means the engine default governs. */
+  readonly ttlMs?: number
 }
 
 export interface ActionStep extends StepBase {

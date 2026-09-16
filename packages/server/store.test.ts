@@ -134,6 +134,52 @@ describe("runs", () => {
     expect(store.listActiveRuns(feature.id).map(r => r.id).sort()).toEqual([a, b].sort())
   })
 
+  it("initialises timeLastActivity to the dispatch time on insert", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 1 })
+    const run = store.getRunById(runId)!
+    expect(run.timeLastActivity).toBe(run.timeStarted)
+  })
+
+  it("touchRunActivity advances the activity clock only while running", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 1 })
+    const started = store.getRunById(runId)!.timeStarted
+    store.touchRunActivity(runId, started + 5000)
+    expect(store.getRunById(runId)!.timeLastActivity).toBe(started + 5000)
+    store.finishRun(runId, "reaped", { reason: "TTL" })
+    store.touchRunActivity(runId, started + 99000)
+    expect(store.getRunById(runId)!.timeLastActivity).toBe(started + 5000)
+  })
+
+  it("appendRunLog counts as activity; a concluded run's clock is frozen", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 1 })
+    const started = store.getRunById(runId)!.timeStarted
+    store.touchRunActivity(runId, started - 60000)
+    store.appendRunLog(runId, [{ source: "agent", text: "progress" }])
+    expect(store.getRunById(runId)!.timeLastActivity).toBeGreaterThanOrEqual(started)
+    store.finishRun(runId, "succeeded")
+    const frozen = store.getRunById(runId)!.timeLastActivity
+    store.appendRunLog(runId, [{ source: "agent", text: "late" }])
+    expect(store.getRunById(runId)!.timeLastActivity).toBe(frozen)
+  })
+
+  it("nudges and question flow count as activity", () => {
+    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+    const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 1 })
+    const started = store.getRunById(runId)!.timeStarted
+    store.touchRunActivity(runId, started - 60000)
+    store.incrementNudges(runId)
+    expect(store.getRunById(runId)!.timeLastActivity).toBeGreaterThanOrEqual(started)
+    store.touchRunActivity(runId, started - 60000)
+    expect(store.setRunQuestion(runId, "which db?")).toBe(true)
+    expect(store.getRunById(runId)!.timeLastActivity).toBeGreaterThanOrEqual(started)
+    store.touchRunActivity(runId, started - 60000)
+    expect(store.clearRunQuestion(runId)).toBe(true)
+    expect(store.getRunById(runId)!.timeLastActivity).toBeGreaterThanOrEqual(started)
+  })
+
   it("insertRun leaves pendingState/nextObservation null", () => {
     const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
     const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "poll", stepType: "action", attempt: 1 })

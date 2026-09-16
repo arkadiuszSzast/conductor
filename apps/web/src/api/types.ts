@@ -195,7 +195,7 @@ export interface TransitionEntry {
   readonly time: number
 }
 
-export type RunLogSource = "process" | "action" | "agent" | "step"
+export type RunLogSource = "process" | "action" | "agent" | "tool" | "step"
 
 export interface RunLogLine {
   readonly seq: number

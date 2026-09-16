@@ -56,6 +56,25 @@ describe("database lifecycle and migrations", () => {
     connection.close()
   })
 
+  it("adds run.time_last_activity and backfills legacy rows from time_started", () => {
+    const connection = openDatabase({ path: temporaryPath() })
+    const upTo = migrations.findIndex(m => m.id === "0018_run_time_last_activity")
+    expect(upTo).toBeGreaterThan(0)
+    runMigrations(connection.db, migrations.slice(0, upTo))
+    connection.db.run(
+      `INSERT INTO feature (id, slug, project_dir, title, status, state, time_created, time_updated)
+       VALUES ('f1', 'f', '/p', 'F', 'running', '{}', 1, 1)`,
+    )
+    connection.db.run(
+      `INSERT INTO run (id, feature_id, job_id, step_id, step_type, time_started) VALUES ('r1', 'f1', 'main', 'implement', 'agent', 4321)`,
+    )
+    runMigrations(connection.db, migrations)
+    expect(columnNames(connection.db, "run")).toContain("time_last_activity")
+    const row = connection.db.query("SELECT time_last_activity FROM run WHERE id = 'r1'").get() as { time_last_activity: number }
+    expect(row.time_last_activity).toBe(4321)
+    connection.close()
+  })
+
   it("enforces one active run per job+step at the DB layer (idx_run_one_active_target)", () => {
     const connection = openMigratedDatabase({ path: temporaryPath() })
     connection.db.run(

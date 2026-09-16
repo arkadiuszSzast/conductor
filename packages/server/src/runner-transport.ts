@@ -14,6 +14,7 @@
  *   GET  <endpoint>/v1/sessions/:id/exists     → 200 {exists: boolean}
  *   POST <endpoint>/v1/sessions/:id/prompt     {text, agent?, model?} → 200 | 404 unknown session
  *   POST <endpoint>/v1/sessions/:id/note       {text} → 200 | 404 unknown session
+ *   POST <endpoint>/v1/sessions/:id/abort      → 200 | 404 unknown session (no-op success)
  *
  * Safe directions, matching the daemon's stand-in client exactly:
  * with no registered runner (or an unreachable one), `status` claims
@@ -143,6 +144,20 @@ export function createRunnerSessionClient(deps: RunnerSessionClientDeps): Sessio
         return
       }
       throw new Error(`no registered runner knows session ${input.sessionID}`)
+    },
+
+    async abort(sessionID) {
+      const runners = deps.runners.list()
+      // No runner, nothing to abort — the orphan cannot be running.
+      if (runners.length === 0) return
+      for (const runner of runners) {
+        // 404 = "not my session" (or already gone) — both fine: abort of
+        // a missing session is a no-op success by the port contract.
+        const response = await call(runner, "POST", `/v1/sessions/${encodeURIComponent(sessionID)}/abort`)
+        if (response.status === 404) continue
+        if (!response.ok) throw new Error(`runner ${runner.endpoint} failed to abort (status ${response.status})`)
+        return
+      }
     },
 
     async sessionExists(sessionID) {

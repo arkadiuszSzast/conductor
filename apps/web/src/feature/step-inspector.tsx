@@ -8,7 +8,8 @@
 
 import { useApp } from "../app-context.ts"
 import { useFindings, useTimeline } from "../api/hooks.ts"
-import type { WorkflowProjection } from "../api/types.ts"
+import type { RunLogLine, WorkflowProjection } from "../api/types.ts"
+import { collapseToolLines, type DisplayLogLine } from "./inspector-logic.ts"
 import { useRunLog, useStepRun } from "./use-step-run.ts"
 import { FindingsPanel } from "./findings-panel.tsx"
 import { TimelinePanel } from "./timeline-panel.tsx"
@@ -180,18 +181,57 @@ function OutputsTab(props: {
   )
 }
 
-function LogsTab({ cursor, runId }: { readonly cursor: { readonly lines: readonly { readonly seq: number; readonly time: number; readonly source: string; readonly text: string }[] }; readonly runId: string | null }): React.ReactNode {
+function LogsTab({ cursor, runId }: { readonly cursor: { readonly lines: readonly RunLogLine[] }; readonly runId: string | null }): React.ReactNode {
   if (runId === null) return <div className={styles.empty}>no run for this step yet</div>
   if (cursor.lines.length === 0) return <div className={styles.empty}>no log lines yet</div>
+  const display = collapseToolLines(cursor.lines)
   return (
     <div className={styles.panel}>
-      {cursor.lines.map(line => (
-        <div key={line.seq} className={styles.line}>
-          <span className={styles.src}>{line.source}</span>
-          <span className={styles.time}>{formatClock(line.time)}</span>
-          <span className={styles.text}>{line.text}</span>
-        </div>
-      ))}
+      {display.map(entry =>
+        entry.kind === "line" ? (
+          <div key={entry.line.seq} className={styles.line}>
+            <span className={styles.src}>{entry.line.source}</span>
+            <span className={styles.time}>{formatClock(entry.line.time)}</span>
+            <span className={styles.text}>{entry.line.text}</span>
+          </div>
+        ) : (
+          <ToolStatusRow key={`tools-${entry.latest.seq}`} group={entry} />
+        ),
+      )}
     </div>
+  )
+}
+
+/**
+ * A collapsed run of tool invocations: one dimmed status row showing the
+ * latest tool line (OpenChamber-style "what is it doing"), with a count
+ * badge that expands the earlier invocations on demand.
+ */
+function ToolStatusRow({ group }: { readonly group: Extract<DisplayLogLine, { kind: "tools" }> }): React.ReactNode {
+  const [expanded, setExpanded] = useState(false)
+  return (
+    <>
+      {expanded
+        ? group.earlier.map(line => (
+            <div key={line.seq} className={`${styles.line} ${styles.toolLine}`}>
+              <span className={styles.src}>⚙</span>
+              <span className={styles.time}>{formatClock(line.time)}</span>
+              <span className={styles.text}>{line.text}</span>
+            </div>
+          ))
+        : null}
+      <div className={`${styles.line} ${styles.toolLine}`}>
+        <span className={styles.src}>⚙</span>
+        <span className={styles.time}>{formatClock(group.latest.time)}</span>
+        <span className={styles.text}>
+          {group.latest.text}
+          {group.count > 1 ? (
+            <button className={styles.toolCount} onClick={() => setExpanded(value => !value)}>
+              {expanded ? "collapse" : `+${group.count - 1} more`}
+            </button>
+          ) : null}
+        </span>
+      </div>
+    </>
   )
 }

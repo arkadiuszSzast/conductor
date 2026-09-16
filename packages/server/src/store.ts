@@ -130,6 +130,7 @@ interface RunRow {
   failure_retry_hint_ms: number | null
   paused_ms_at_dispatch: number
   time_started: number
+  time_last_activity: number | null
   time_finished: number | null
 }
 
@@ -173,6 +174,11 @@ export interface RunSummary {
    *  feature's pause total was at that past instant. */
   readonly pausedMsAtDispatch: number
   readonly timeStarted: number
+  /** When this run last showed life — dispatch, accepted log appends,
+   *  question flow, nudges. The reaper's TTL measures silence from here,
+   *  never age from `timeStarted`. Falls back to `timeStarted` for rows
+   *  predating the column. */
+  readonly timeLastActivity: number
   readonly timeFinished: number | null
 }
 
@@ -197,6 +203,7 @@ function toRunSummary(row: RunRow): RunSummary {
     failure: toFailureEnvelope(row.failure_class, row.failure_source, row.reason, row.failure_retry_hint_ms),
     pausedMsAtDispatch: row.paused_ms_at_dispatch,
     timeStarted: row.time_started,
+    timeLastActivity: row.time_last_activity ?? row.time_started,
     timeFinished: row.time_finished,
   }
 }
@@ -229,7 +236,7 @@ export interface FindingCounts {
   readonly reopened: number
 }
 
-export type RunLogSource = "process" | "action" | "agent" | "step"
+export type RunLogSource = "process" | "action" | "agent" | "tool" | "step"
 
 export interface RunLogEntryInput {
   readonly source: RunLogSource
@@ -806,11 +813,13 @@ export class Store {
         const runtime = jobs[target.jobId]
         if (!runtime) continue
         const { [target.stepId]: _dropped, ...remainingAttempts } = runtime.attempts
+        const { [target.stepId]: _droppedReruns, ...remainingReruns } = runtime.reruns
         jobs[target.jobId] = {
           ...runtime,
           status: "running",
           currentStep: target.stepId,
           attempts: remainingAttempts,
+          reruns: remainingReruns,
           steps: { ...runtime.steps, [target.stepId]: { status: "running", outputs: {} } },
         }
         appliedTargets.push(target)
@@ -1038,8 +1047,8 @@ export class Store {
       featureId = run.feature_id
       const now = Date.now()
       this.db.run(
-        "UPDATE run SET pending_question = ?, asked_at = ? WHERE id = ?",
-        [question, now, runId],
+        "UPDATE run SET pending_question = ?, asked_at = ?, time_last_activity = ? WHERE id = ?",
+        [question, now, now, runId],
       )
       const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(run.feature_id) as FeatureRow | null
       if (!row) return false
@@ -1067,7 +1076,7 @@ export class Store {
       if (!run || run.status !== "running" || run.pending_question === null) return false
       featureId = run.feature_id
       const now = Date.now()
-      this.db.run("UPDATE run SET pending_question = NULL, asked_at = NULL WHERE id = ?", [runId])
+      this.db.run("UPDATE run SET pending_question = NULL, asked_at = NULL, time_last_activity = ? WHERE id = ?", [now, runId])
       const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(run.feature_id) as FeatureRow | null
       if (!row) return false
       const next = this.withAggregateHumanAttention(run.feature_id, toFeatureState(row))
@@ -1280,7 +1289,7 @@ export class Store {
         )
         return { kind: "stale_superseded" }
       }
-      this.db.run("UPDATE run SET pending_question = NULL, asked_at = NULL WHERE id = ?", [run.id])
+      this.db.run("UPDATE run SET pending_question = NULL, asked_at = NULL, time_last_activity = ? WHERE id = ?", [now, run.id])
       this.db.run(
         "UPDATE answer_delivery SET status = 'delivered', version = version + 1, time_updated = ? WHERE id = ?",
         [now, deliveryId],
@@ -1355,9 +1364,10 @@ export class Store {
       // is exactly what was true the instant this run's row became
       // durable, never a value that could race a concurrent pause/resume.
       const feature = this.db.query("SELECT paused_ms FROM feature WHERE id = ?").get(input.featureId) as { paused_ms: number } | null
+      const now = this.clock.now()
       this.db.run(
-        `INSERT INTO run (id, feature_id, job_id, step_id, step_type, attempt, session_id, metadata, paused_ms_at_dispatch, time_started)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO run (id, feature_id, job_id, step_id, step_type, attempt, session_id, metadata, paused_ms_at_dispatch, time_started, time_last_activity)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id,
           input.featureId,
@@ -1368,7 +1378,8 @@ export class Store {
           input.sessionId ?? null,
           input.metadata ? JSON.stringify(input.metadata) : null,
           feature?.paused_ms ?? 0,
-          Date.now(),
+          now,
+          now,
         ],
       )
     })()
@@ -1408,8 +1419,8 @@ export class Store {
    */
   recordPendingObservation(runId: string, state: Readonly<Record<string, unknown>> | null, nextObservation: number): boolean {
     return this.db.run(
-      "UPDATE run SET pending_state = ?, next_observation = ? WHERE id = ? AND status = 'running'",
-      [state ? JSON.stringify(state) : null, nextObservation, runId],
+      "UPDATE run SET pending_state = ?, next_observation = ?, time_last_activity = ? WHERE id = ? AND status = 'running'",
+      [state ? JSON.stringify(state) : null, nextObservation, this.clock.now(), runId],
     ).changes > 0
   }
 
@@ -1581,9 +1592,20 @@ export class Store {
   }
 
   incrementNudges(runId: string): number {
-    this.db.run("UPDATE run SET nudges = nudges + 1 WHERE id = ?", [runId])
+    this.db.run("UPDATE run SET nudges = nudges + 1, time_last_activity = ? WHERE id = ?", [this.clock.now(), runId])
     const row = this.db.query("SELECT nudges FROM run WHERE id = ?").get(runId) as { nudges: number } | null
     return row?.nudges ?? 0
+  }
+
+  /**
+   * Marks a run as alive NOW — the reaper's activity clock. Called from
+   * every write path that proves the run's session is doing something
+   * (log ingestion, question flow, nudge sends). O(1) by PK; guarded to
+   * running runs so late signals cannot resurrect a concluded row's
+   * timestamp.
+   */
+  touchRunActivity(runId: string, time: number = this.clock.now()): void {
+    this.db.run("UPDATE run SET time_last_activity = ? WHERE id = ? AND status = 'running'", [time, runId])
   }
 
   /**
@@ -1920,7 +1942,7 @@ export class Store {
     options?: { requireRunning?: boolean },
   ): { firstSeq: number; lastSeq: number } | null {
     if (entries.length === 0) return null
-    const now = Date.now()
+    const now = this.clock.now()
     let firstSeq = 0
     const appended = this.db.transaction(() => {
       if (options?.requireRunning) {
@@ -1936,6 +1958,7 @@ export class Store {
         )
       }
       this.enforceRunLogCap(runId)
+      this.db.run("UPDATE run SET time_last_activity = ? WHERE id = ? AND status = 'running'", [now, runId])
       return true
     })()
     if (!appended) return null

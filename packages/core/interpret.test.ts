@@ -242,6 +242,11 @@ describe("step.completed outcomes", () => {
       evt({ kind: "step.completed", stepId: "review", outcome: "changes_requested" }),
     )
     expect(t.decisions[0]?.kind).toBe("escalate")
+    // The routing job must not be left "running" on the exhausted step:
+    // the reconciler would re-dispatch it forever (escalation doom loop).
+    expect(t.patch.status).toBe("escalated")
+    expect(t.patch.jobs?.main?.currentStep).toBeNull()
+    expect(t.patch.jobs?.main?.status).toBe("failed")
   })
 
   it("approved outcome proceeds past the loop to the human gate", () => {

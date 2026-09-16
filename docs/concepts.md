@@ -331,6 +331,11 @@ An adapter that reports no class, or an unrecognised one, always normalises
 to `internal` — Conductor never trusts an unknown value as "safe to retry
 patiently" or "safe to ignore".
 
+The engine's own boundary classification recognises runner-connection
+failure shapes ("Unable to connect", connection refused/closed) as
+`transient_transport`: a temporarily dead or restarting runner follows
+the patient transient budget instead of burning attempts as `internal`.
+
 Each of the classes above carries **two independent budgets**, and the
 first one exhausted stops the retry, whichever it is:
 
@@ -399,9 +404,11 @@ but they mean different things and are not interchangeable:
   explaining why, chains a brand-new finite retry episode onto the
   target's prior history (so the exhausted episode's attempts/diagnostics
   remain visible, never erased), and — when more than one job/step is
-  currently recoverable — requires the operator to name which one
-  (`--job`/`--step`, or the `target` body field) rather than silently
-  picking one. See [Recovering an escalated feature](http-api.md#recovering-an-escalated-feature)
+  currently recoverable — requires the operator to select explicitly:
+  one or more `--job`/`--step` pairs (the `target`/`targets` body
+  fields) or `--all` (`all: true`) to re-arm every candidate at once.
+  All selected steps re-arm in one atomic operation. See
+  [Recovering an escalated feature](http-api.md#recovering-an-escalated-feature)
   for the full contract (optimistic concurrency, idempotency, ambiguous/stale
   target rejection).
 

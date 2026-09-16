@@ -225,6 +225,8 @@ export class ApiClient {
       readonly expectedVersion?: number
       readonly idempotencyKey?: string
       readonly target?: { readonly jobId: string; readonly stepId: string }
+      readonly targets?: readonly { readonly jobId: string; readonly stepId: string }[]
+      readonly all?: boolean
     },
   ): Promise<CommandResult> {
     return this.request("POST", `/v1/features/${encodeURIComponent(featureId)}/recover`, {
@@ -232,6 +234,8 @@ export class ApiClient {
       ...(options?.expectedVersion !== undefined ? { expectedVersion: options.expectedVersion } : {}),
       ...(options?.idempotencyKey !== undefined ? { idempotencyKey: options.idempotencyKey } : {}),
       ...(options?.target !== undefined ? { target: options.target } : {}),
+      ...(options?.targets !== undefined ? { targets: options.targets } : {}),
+      ...(options?.all === true ? { all: true } : {}),
     })
   }
 
@@ -256,7 +260,7 @@ export class ApiClient {
     return this.request("GET", `/v1/runs/${encodeURIComponent(runId)}/logs${suffix}`)
   }
 
-  appendRunLogs(runId: string, lines: readonly { text: string; source?: "step" | "agent" }[]): Promise<{ appended: number }> {
+  appendRunLogs(runId: string, lines: readonly { text: string; source?: "step" | "agent" | "tool" }[]): Promise<{ appended: number }> {
     return this.request("POST", `/v1/runs/${encodeURIComponent(runId)}/logs`, { lines })
   }
 

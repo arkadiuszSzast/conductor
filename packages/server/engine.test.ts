@@ -48,11 +48,27 @@ class FakeSessions implements SessionClient {
     if (input.parentID !== undefined) this.parents.set(id, input.parentID)
     return { id }
   }
+  promptError: Error | null = null
   async prompt(input: { sessionID: string; text: string; agent?: string; model?: string }): Promise<void> {
+    if (this.promptError) {
+      const error = this.promptError
+      this.promptError = null
+      throw error
+    }
     this.prompts.push(input)
   }
   async note(input: { sessionID: string; text: string }): Promise<void> {
     this.notes.push(input)
+  }
+  aborted: string[] = []
+  abortError: Error | null = null
+  async abort(sessionID: string): Promise<void> {
+    if (this.abortError) {
+      const error = this.abortError
+      this.abortError = null
+      throw error
+    }
+    this.aborted.push(sessionID)
   }
   async sessionExists(sessionID: string): Promise<boolean> {
     return this.liveSessions.has(sessionID)
@@ -264,10 +280,10 @@ let actions: FakeActionHost
 beforeEach(() => {
   directory = mkdtempSync(join(tmpdir(), "conductor-engine-"))
   connection = openMigratedDatabase({ path: join(directory, "state.db") })
-  store = new Store(connection.db)
+  clock = new FakeClock()
+  store = new Store(connection.db, clock)
   sessions = new FakeSessions()
   process_ = new FakeProcess()
-  clock = new FakeClock()
   actions = new FakeActionHost()
 })
 
@@ -550,7 +566,7 @@ describe("Engine: runner resource waits", () => {
     })
     await engine.settleActions()
 
-    expect(result).toEqual({ ok: true, message: 'Recovered. Step "deliver/pr_create" re-armed.' })
+    expect(result).toEqual({ ok: true, message: 'Recovered. Step "deliver/pr_create" re-armed.', recovered: [{ jobId: "deliver", stepId: "pr_create" }] })
     expect(actionCalls).toEqual(["pr_create", "await_checks"])
     expect(implementCalls).toBe(0)
     expect(store.getActiveRunForStep(feature.id, "deliver", "pr_create")).toBeNull()
@@ -619,7 +635,7 @@ describe("Engine: runner resource waits", () => {
     expect(store.getFeature(feature.id)?.status).toBe("escalated")
 
     const recovered = await engine.recover(feature.id, { notes: "retry a", target: { jobId: "a", stepId: "work" } })
-    expect(recovered).toEqual({ ok: true, message: 'Recovered. Step "a/work" re-armed.' })
+    expect(recovered).toEqual({ ok: true, message: 'Recovered. Step "a/work" re-armed.', recovered: [{ jobId: "a", stepId: "work" }] })
     expect(store.getActiveRunForStep(feature.id, "a", "work")).not.toBeNull()
     // Job b's failure is untouched and still independently a candidate —
     // its runtime status stayed "failed" and there is no active run for it.
@@ -648,6 +664,109 @@ describe("Engine: runner resource waits", () => {
     // The genuinely current target still recovers normally.
     const recovered = await engine.recover(feature.id, { notes: "retry b", target: { jobId: "b", stepId: "work" } })
     expect(recovered.ok).toBe(true)
+  })
+
+  it("multi-target recover re-arms every selected step in one transaction: one version bump, one transition row, all dispatched", async () => {
+    const engine = makeEngine(fanInWorkflow)
+    const feature = await startedFeature(engine)
+    const runA = store.getActiveRunForStep(feature.id, "a", "work")!
+    const runB = store.getActiveRunForStep(feature.id, "b", "work")!
+    await engine.report({ runId: runA.id, outcome: "failed", notes: "a broke" })
+    await engine.report({ runId: runB.id, outcome: "failed", notes: "b broke" })
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+
+    const result = await engine.recover(feature.id, {
+      notes: "shared outage over — retry both",
+      idempotencyKey: "multi-1",
+      targets: [
+        { jobId: "a", stepId: "work" },
+        { jobId: "b", stepId: "work" },
+      ],
+    })
+    expect(result.ok).toBe(true)
+    expect(result.recovered).toEqual([
+      { jobId: "a", stepId: "work" },
+      { jobId: "b", stepId: "work" },
+    ])
+    expect(store.getFeature(feature.id)?.status).toBe("running")
+    expect(store.getActiveRunForStep(feature.id, "a", "work")).not.toBeNull()
+    expect(store.getActiveRunForStep(feature.id, "b", "work")).not.toBeNull()
+
+    // One human.recovered transition row carrying BOTH execute_step decisions.
+    const recoveries = store.getTransitions(feature.id).filter(t => (t.event as { kind: string }).kind === "human.recovered")
+    expect(recoveries).toHaveLength(1)
+    expect(recoveries[0]?.decisions).toEqual([
+      { kind: "execute_step", jobId: "a", stepId: "work" },
+      { kind: "execute_step", jobId: "b", stepId: "work" },
+    ])
+
+    // A retried delivery with the same key is a duplicate no-op.
+    const retried = await engine.recover(feature.id, { notes: "again", idempotencyKey: "multi-1", targets: [{ jobId: "a", stepId: "work" }] })
+    expect(retried.duplicate).toBe(true)
+  })
+
+  it("recover with all: true re-arms every current candidate and the fan-in completes end to end", async () => {
+    const engine = makeEngine(fanInWorkflow)
+    const feature = await startedFeature(engine)
+    const runA = store.getActiveRunForStep(feature.id, "a", "work")!
+    const runB = store.getActiveRunForStep(feature.id, "b", "work")!
+    await engine.report({ runId: runA.id, outcome: "failed", notes: "a broke" })
+    await engine.report({ runId: runB.id, outcome: "failed", notes: "b broke" })
+
+    const result = await engine.recover(feature.id, { notes: "retry everything", all: true })
+    expect(result.ok).toBe(true)
+    expect(result.recovered).toHaveLength(2)
+
+    // Both recovered runs succeed → join arms, proving the cascade reset.
+    await engine.report({ runId: store.getActiveRunForStep(feature.id, "a", "work")!.id, outcome: "succeeded", notes: "a ok" })
+    await engine.report({ runId: store.getActiveRunForStep(feature.id, "b", "work")!.id, outcome: "succeeded", notes: "b ok" })
+    expect(store.getActiveRunForStep(feature.id, "join", "combine")).not.toBeNull()
+  })
+
+  it("multi-target recover rejects wholesale when any named target is stale — nothing re-armed", async () => {
+    const engine = makeEngine(fanInWorkflow)
+    const feature = await startedFeature(engine)
+    const runA = store.getActiveRunForStep(feature.id, "a", "work")!
+    const runB = store.getActiveRunForStep(feature.id, "b", "work")!
+    await engine.report({ runId: runA.id, outcome: "succeeded", notes: "a done" })
+    await engine.report({ runId: runB.id, outcome: "failed", notes: "b broke" })
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+
+    const before = store.getTransitions(feature.id).length
+    const result = await engine.recover(feature.id, {
+      notes: "retry both",
+      targets: [
+        { jobId: "a", stepId: "work" },
+        { jobId: "b", stepId: "work" },
+      ],
+    })
+    expect(result.ok).toBe(false)
+    expect(result.staleTarget).toBe(true)
+    expect(store.getTransitions(feature.id).length).toBe(before)
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    expect(store.getActiveRunForStep(feature.id, "b", "work")).toBeNull()
+  })
+
+  it("ambiguous rejection advertises allowAll; combined selection forms and empty targets are invalid", async () => {
+    const engine = makeEngine(fanInWorkflow)
+    const feature = await startedFeature(engine)
+    const runA = store.getActiveRunForStep(feature.id, "a", "work")!
+    const runB = store.getActiveRunForStep(feature.id, "b", "work")!
+    await engine.report({ runId: runA.id, outcome: "failed", notes: "a broke" })
+    await engine.report({ runId: runB.id, outcome: "failed", notes: "b broke" })
+
+    const ambiguous = await engine.recover(feature.id, { notes: "retry" })
+    expect(ambiguous.ambiguous).toBe(true)
+    expect(ambiguous.allowAll).toBe(true)
+
+    const combined = await engine.recover(feature.id, { notes: "retry", all: true, target: { jobId: "a", stepId: "work" } })
+    expect(combined.ok).toBe(false)
+    expect(combined.message).toContain("exactly one")
+
+    const empty = await engine.recover(feature.id, { notes: "retry", targets: [] })
+    expect(empty.ok).toBe(false)
+    expect(empty.message).toContain("non-empty")
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
   })
 
   it("recover grants a fresh retry budget: a post-recovery failure schedules a retry under a new chained episode instead of exhausting instantly", async () => {
@@ -916,6 +1035,16 @@ describe("Engine: failure classification and durable retry schedules", () => {
     expect(commandRun.failure).toMatchObject({ class: "invalid_config", source: "command" })
   })
 
+  it("a runner-connection prompt failure classifies transient_transport, not internal", async () => {
+    const engine = makeEngine(linearWorkflow)
+    sessions.promptError = new Error("Unable to connect. Is the computer able to access the url?")
+    const feature = await startedFeature(engine)
+
+    const run = store.listRuns(feature.id).find(r => r.stepId === "implement")!
+    expect(run.status).toBe("failed")
+    expect(run.failure).toMatchObject({ class: "transient_transport", source: "runner" })
+  })
+
   it("a reaped missing session carries class missing_session; TTL reap carries timeout", async () => {
     const engine = makeEngine(linearWorkflow, { runTtlMs: 1000 })
     const feature = await startedFeature(engine)
@@ -1167,7 +1296,7 @@ describe("Engine: failure classification and durable retry schedules", () => {
     // the FakeClock — advancing the FakeClock here would itself desync it
     // from the run's real-clock `time_started`, making every
     // freshly-dispatched run look TTL-stale on the very next reconcile.
-    connection.db.run("UPDATE run SET time_started = time_started - ? WHERE id = ?", [runTtlMs + 100, run.id])
+    connection.db.run("UPDATE run SET time_started = time_started - ?, time_last_activity = time_last_activity - ? WHERE id = ?", [runTtlMs + 100, runTtlMs + 100, run.id])
     await engine.reconcile()
     const episode = store.getOpenRetryEpisode(feature.id, "main", "implement")
     expect(episode).not.toBeNull()
@@ -1211,7 +1340,7 @@ describe("Engine: failure classification and durable retry schedules", () => {
     // advancing the FakeClock, so the FakeClock stays at "now" and every
     // freshly-dispatched run's real-clock `time_started` stays close to
     // it — no accumulated desync across this multi-dispatch scenario.
-    connection.db.run("UPDATE run SET time_started = time_started - ? WHERE id = ?", [runTtlMs + 100, run1.id])
+    connection.db.run("UPDATE run SET time_started = time_started - ?, time_last_activity = time_last_activity - ? WHERE id = ?", [runTtlMs + 100, runTtlMs + 100, run1.id])
     await engine.reconcile()
     const episode1 = store.getOpenRetryEpisode(feature.id, "main", "implement")!
     expect(episode1.attempts).toBe(1)
@@ -1272,7 +1401,7 @@ describe("Engine: failure classification and durable retry schedules", () => {
     connection.db.run("UPDATE feature SET paused_at = paused_at - 300000 WHERE id = ?", [feature.id])
     clock.advance(300_000)
     await engine.resume(feature.id)
-    connection.db.run("UPDATE run SET time_started = time_started - ? WHERE id = ?", [runTtlMs + 100, run.id])
+    connection.db.run("UPDATE run SET time_started = time_started - ?, time_last_activity = time_last_activity - ? WHERE id = ?", [runTtlMs + 100, runTtlMs + 100, run.id])
 
     // TTL-reap now schedules episode 1 — its snapshot baseline is the
     // feature's cumulative paused_ms as of run 1's dispatch (0, since the
@@ -1334,6 +1463,42 @@ describe("Engine: rerun loop with feedback", () => {
     }
     expect(store.getFeature(feature.id)?.status).toBe("escalated")
   })
+
+  it("a rerun-exhausted escalation is recoverable: the succeeded routing step re-arms with a fresh rerun budget", async () => {
+    const engine = makeEngine(reviewLoopWorkflow)
+    const feature = await startedFeature(engine)
+    for (let round = 0; round < 3; round++) {
+      let run = store.getActiveRunForStep(feature.id, "main", "implement")!
+      await engine.report({ runId: run.id, outcome: "succeeded", notes: `impl v${round + 1}` })
+      run = store.getActiveRunForStep(feature.id, "main", "review")!
+      await engine.report({ runId: run.id, verdict: "changes_requested", notes: "again" })
+    }
+    // Exhausted: the routing step SUCCEEDED but the job failed with the
+    // rerun counter still recorded — no failed step exists anywhere.
+    const exhausted = store.getFeature(feature.id)!
+    expect(exhausted.status).toBe("escalated")
+    expect(exhausted.jobs["main"]?.status).toBe("failed")
+    expect(exhausted.jobs["main"]?.steps["review"]?.status).toBe("succeeded")
+    expect((exhausted.jobs["main"]?.reruns["review"] ?? 0) > 0).toBe(true)
+
+    const result = await engine.recover(feature.id, { notes: "fresh loop budget" })
+    expect(result.ok).toBe(true)
+    expect(result.recovered).toEqual([{ jobId: "main", stepId: "review" }])
+    const recovered = store.getFeature(feature.id)!
+    expect(recovered.status).toBe("running")
+    expect(recovered.jobs["main"]?.currentStep).toBe("review")
+    expect(recovered.jobs["main"]?.reruns["review"]).toBeUndefined()
+    expect(store.getActiveRunForStep(feature.id, "main", "review")).not.toBeNull()
+
+    // Fresh budget holds: another changes_requested LOOPS instead of
+    // instantly re-exhausting.
+    const run = store.getActiveRunForStep(feature.id, "main", "review")!
+    await engine.report({ runId: run.id, verdict: "changes_requested", notes: "loop again" })
+    const looped = store.getFeature(feature.id)!
+    expect(looped.status).toBe("running")
+    expect(looped.jobs["main"]?.currentStep).toBe("implement")
+    expect(looped.jobs["main"]?.reruns["review"]).toBe(1)
+  })
 })
 
 describe("Engine: human reject re-runs", () => {
@@ -1373,6 +1538,24 @@ describe("Engine: nudge/reap", () => {
     expect(store.getFeature(feature.id)?.status).toBe("escalated")
   })
 
+  it("a nudge resumes the session as the STEP's agent, not the runner default", async () => {
+    const engine = makeEngine(reviewLoopWorkflow, { nudgeIdleCycles: 1, maxNudges: 1 })
+    const feature = await startedFeature(engine)
+    let run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    await engine.report({ runId: run.id, outcome: "succeeded", notes: "impl v1" })
+    run = store.getActiveRunForStep(feature.id, "main", "review")!
+    sessions.statuses.set(run.sessionId!, "idle")
+
+    await engine.reconcile()
+    const nudge = sessions.prompts.at(-1)!
+    expect(nudge.text).toContain("Your previous turn appears to have been interrupted")
+    // The review step's role is "reviewer" (agent "review", model
+    // "prov/review") — the nudge must carry it, or the resumed turn drops
+    // the step's system prompt and runs as the default build agent.
+    expect(nudge.agent).toBe("review")
+    expect(nudge.model).toBe("prov/review")
+  })
+
   it("a missing session is reaped immediately, no nudge", async () => {
     const engine = makeEngine(linearWorkflow, { nudgeIdleCycles: 5, maxNudges: 5 })
     const feature = await startedFeature(engine)
@@ -1393,6 +1576,127 @@ describe("Engine: nudge/reap", () => {
 
     await engine.reconcile()
     expect(store.getRunById(run.id)?.status).toBe("reaped")
+    expect(store.getRunById(run.id)?.reason).toContain("without activity")
+  })
+
+  it("TTL measures silence, not age: a busy run with recent activity outlives runTtlMs", async () => {
+    const engine = makeEngine(linearWorkflow, { runTtlMs: 1000, nudgeIdleCycles: 100, maxNudges: 100 }, { clock })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    sessions.statuses.set(run.sessionId!, "busy")
+
+    // The run is older than the TTL, but its logs prove it is alive.
+    clock.advance(2000)
+    store.appendRunLog(run.id, [{ source: "agent", text: "still working" }])
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("running")
+
+    // Activity stops: silence past the TTL reaps it.
+    clock.advance(1100)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+  })
+
+  it("restart does not grant stale runs a fresh window: persisted silence reaps on the first pass", async () => {
+    const engine = makeEngine(linearWorkflow, { runTtlMs: 1000, nudgeIdleCycles: 100, maxNudges: 100 }, { clock })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    sessions.statuses.set(run.sessionId!, "busy")
+    clock.advance(2000)
+
+    // A fresh Engine over the same store — the restart. The activity
+    // clock is durable, so the very first reconcile pass reaps.
+    const restarted = makeEngine(linearWorkflow, { runTtlMs: 1000, nudgeIdleCycles: 100, maxNudges: 100 }, { clock })
+    await restarted.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+  })
+
+  it("an agent step's ttlMs overrides the engine default for its runs", async () => {
+    const longImplement: WorkflowDef = workflow(
+      {
+        main: job([
+          agentStep("implement", "implementer", "Implement it.", { ttlMs: 10_000 }),
+          commandStep("verify", ["bun test"]),
+        ]),
+      },
+      roles,
+      "long-implement",
+    )
+    const engine = makeEngine(longImplement, { runTtlMs: 1000, nudgeIdleCycles: 100, maxNudges: 100 }, { clock })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    sessions.statuses.set(run.sessionId!, "busy")
+
+    // Past the engine default but inside the step's own budget: alive.
+    clock.advance(2000)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("running")
+
+    // Past the step's own budget: reaped.
+    clock.advance(9000)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+  })
+
+  it("reaping aborts the run's session; an abort failure never blocks the reap", async () => {
+    const engine = makeEngine(linearWorkflow, { runTtlMs: 1000, nudgeIdleCycles: 100, maxNudges: 100 }, { clock })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    sessions.statuses.set(run.sessionId!, "busy")
+    clock.advance(2000)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    expect(sessions.aborted).toContain(run.sessionId!)
+
+    // Second feature: abort throws — the reap still concludes.
+    const feature2 = await startedFeature(engine)
+    const run2 = store.getActiveRunForStep(feature2.id, "main", "implement")!
+    sessions.statuses.set(run2.sessionId!, "busy")
+    sessions.abortError = new Error("runner unreachable")
+    clock.advance(2000)
+    await engine.reconcile()
+    expect(store.getRunById(run2.id)?.status).toBe("reaped")
+  })
+
+  it("the nudge-budget reap path also aborts the session", async () => {
+    const engine = makeEngine(linearWorkflow, { nudgeIdleCycles: 1, maxNudges: 1 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    sessions.statuses.set(run.sessionId!, "idle")
+    await engine.reconcile() // nudge
+    await engine.reconcile() // reap
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    expect(sessions.aborted).toContain(run.sessionId!)
+  })
+
+  it("end to end: logs keep the run alive past the TTL, silence reaps with abort, and the retry budget re-dispatches", async () => {
+    const engine = makeEngine(retryWorkflow, { runTtlMs: 1000, nudgeIdleCycles: 100, maxNudges: 100 }, { clock })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    sessions.statuses.set(run.sessionId!, "busy")
+
+    // Streams logs past the engine TTL — alive.
+    clock.advance(1500)
+    store.appendRunLog(run.id, [{ source: "agent", text: "committing task 3" }])
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("running")
+
+    // Goes dark — reaped, session aborted, timeout classified.
+    clock.advance(1100)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    expect(store.getRunById(run.id)?.failure).toMatchObject({ class: "timeout", source: "reaper" })
+    expect(sessions.aborted).toContain(run.sessionId!)
+
+    // The step's retry budget schedules a fresh attempt; once due, a new
+    // run for the same step dispatches.
+    const episode = store.getOpenRetryEpisode(feature.id, "main", "implement")
+    expect(episode).toMatchObject({ status: "scheduled" })
+    clock.advance(60_000)
+    await engine.reconcile()
+    const rearmed = store.getActiveRunForStep(feature.id, "main", "implement")
+    expect(rearmed).not.toBeNull()
+    expect(rearmed!.id).not.toBe(run.id)
   })
 
   it("busy and retry sessions are never nudged", async () => {
@@ -2392,6 +2696,9 @@ describe("Engine: interactive steps (ask/answer)", () => {
     expect(delivered.sessionID).toBe(run.sessionId!)
     expect(delivered.text).toContain("A: SQLite")
     expect(delivered.text).toContain(`run_id="${run.id}"`)
+    // Delivered as the step's agent — see the nudge test above.
+    expect(delivered.agent).toBe("build")
+    expect(delivered.model).toBe("prov/impl")
 
     expect(store.getFeature(feature.id)!.status).toBe("running")
     expect(store.getRunById(run.id)!.pendingQuestion).toBeNull()

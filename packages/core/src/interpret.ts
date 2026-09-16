@@ -187,7 +187,10 @@ function onRerun(
   if (rounds > rerun.maxRounds) {
     return buildTransition(
       [{ kind: "escalate", reason: `"${routingJobId}/${routingStepId}" exhausted ${rerun.maxRounds} rerun round(s)` }],
-      { status: "escalated" },
+      {
+        status: "escalated",
+        jobs: { [routingJobId]: { currentStep: null, status: "failed" } },
+      },
     )
   }
 
