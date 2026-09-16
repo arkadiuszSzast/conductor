@@ -808,14 +808,14 @@ describe("agent log capture via runner push", () => {
       {
         runId: "run-1",
         lines: [
-          { text: "running command — git diff main...HEAD", source: "tool" },
-          { text: "searching content — findBundle", source: "tool" },
+          { text: "running command", source: "tool" },
+          { text: "searching content", source: "tool" },
         ],
       },
     ])
   })
 
-  it("preserves narrative/tool ordering and truncates oversized tool detail", async () => {
+  it("preserves narrative/tool ordering without exposing tool input", async () => {
     const client = new FakeLogClient()
     const logs = pusher({ client })
     logs.push(partEvent("ses-mapped", { id: "p1", text: "Reviewing the aggregate. " }))
@@ -831,10 +831,43 @@ describe("agent log capture via runner push", () => {
     const lines = client.pushes[0]!.lines
     expect(lines).toHaveLength(3)
     expect(lines[0]).toEqual({ text: "Reviewing the aggregate. ", source: "agent" })
-    expect(lines[1]!.source).toBe("tool")
-    expect(lines[1]!.text.length).toBeLessThanOrEqual("reading file — ".length + 161)
-    expect(lines[1]!.text.endsWith("…")).toBe(true)
+    expect(lines[1]).toEqual({ text: "reading file", source: "tool" })
     expect(lines[2]).toEqual({ text: "Looks sound.", source: "agent" })
+  })
+
+  it("omits credential-bearing arguments and unrecognized tool names from log payloads", async () => {
+    const client = new FakeLogClient()
+    const logs = pusher({ client })
+    const inputs = [
+      { command: 'curl -H "Authorization: Bearer synthetic-token" https://example.test' },
+      { command: "curl -H 'Authorization: Basic synthetic-base64' https://example.test" },
+      { command: 'export SOME_API_KEY="synthetic secret"\nexport PASSWORD=\'another secret\'' },
+      { command: 'API_TOKEN="first\nsecond" command', env: { AWS_SECRET_ACCESS_KEY: "synthetic-key" } },
+      { url: "https://user:synthetic-password@example.test/repo?token=synthetic-query" },
+      { filePath: "/private/synthetic-secret/file", path: "/private/synthetic-secret" },
+      { pattern: "synthetic-secret", description: "synthetic-secret", name: "synthetic-secret" },
+      { input: { headers: { Authorization: "synthetic-secret" } }, content: "synthetic-secret" },
+    ]
+    const tools = ["bash", "read", "webfetch", "custom_synthetic-secret", "Bearer synthetic-secret", "constructor", "__proto__", ""]
+    for (const [index, input] of inputs.entries()) {
+      for (const tool of tools) {
+        logs.push({
+          type: "message.part.updated",
+          properties: {
+            sessionID: "ses-mapped",
+            part: { id: `${index}-${tool}`, type: "tool", tool, state: { status: "running", input } },
+          },
+        })
+      }
+    }
+    await logs.flush()
+    expect(client.pushes).toEqual([{
+      runId: "run-1",
+      lines: inputs.flatMap(() => tools.map(tool => ({
+        source: "tool",
+        text: tool === "bash" ? "running command" : tool === "read" ? "reading file" : tool === "webfetch" ? "fetching URL" : "using tool",
+      }))),
+    }])
   })
 
   it("is best-effort: a failed push is logged and the buffer dropped, the run stays tracked", async () => {
