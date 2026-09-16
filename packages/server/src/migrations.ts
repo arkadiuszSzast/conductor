@@ -630,6 +630,14 @@ export const migrations: readonly Migration[] = [
       db.run("UPDATE run SET time_last_activity = time_started WHERE time_last_activity IS NULL")
     },
   },
+  {
+    id: "0019_run_recover_notes",
+    up(db) {
+      addColumn(db, "run", "recover_notes", "TEXT")
+      addColumn(db, "recovery_dispatch", "notes", "TEXT")
+      addColumn(db, "recovery_dispatch", "notes_consumed", "INTEGER NOT NULL DEFAULT 0")
+    },
+  },
 ]
 
 function validateMigrations(ordered: readonly Migration[]): void {

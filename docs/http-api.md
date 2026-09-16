@@ -172,6 +172,18 @@ means "at least one rerun has ever happened".
   so a subsequent failure of a recovered step gets its own
   attempt/elapsed allowance instead of inheriting the exhausted one's
   count.
+- **Recover notes reach the agent.** The `notes` string is stamped
+  onto the recovered step's `run` row (`run.recoverNotes`, surfaced by
+  `GET /v1/runs/:id`) AND injected into the agent session prompt as a
+  deterministic `[conductor] This step was recovered by an operator.
+  Operator notes:\n<notes>\n\n` block in the same header that already
+  carries the `[conductor] Job ... step ...` line. The propagation is
+  durable across a daemon restart between the recover commit and the
+  actual dispatch (the `recovery_dispatch` outbox row is the source of
+  truth), so the agent sees the operator's intent on every future
+  recovery, not just the one that motivated the change. A normal
+  first-attempt dispatch's prompt has no recovery block. See
+  `openspec/changes/recover-notes-to-agent` for the design.
 
 ## Starting a feature
 

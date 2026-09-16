@@ -330,6 +330,14 @@ describe("runner configuration is explicit", () => {
 })
 
 describe("session transport preserves the seed's opencode wire shape", () => {
+  it("delivers recovery guidance verbatim as an agent prompt, not a noReply note", async () => {
+    const server = new FakeOpencodeServer("/fallback")
+    const sessions = createOpencodeSessions(server.api())
+    const { id } = await sessions.createSession({ title: "recovered", directory: "/p" })
+    const text = '[conductor] This step was recovered by an operator. Operator notes:\nKeep {{ feature.title }} literal.\n\nImplement it.'
+    await sessions.prompt({ sessionID: id, text, agent: "build" })
+    expect(server.sessions.get(id)!.prompts).toEqual([{ text, agent: "build" }])
+  })
   it("routes the directory as a QUERY parameter on create — never the body", async () => {
     const server = new FakeOpencodeServer("/fallback")
     const sessions = createOpencodeSessions(server.api())

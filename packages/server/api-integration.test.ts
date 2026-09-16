@@ -91,6 +91,20 @@ jobs:
           rejected: { rerun: { scope: steps, stepIds: [implement], maxRounds: 3 } }
 `
 
+const agentOnlyWorkflow = `
+name: agent-only
+on: [manual]
+roles:
+  implementer: { agent: build }
+jobs:
+  main:
+    steps:
+      - id: implement
+        agent:
+          role: implementer
+          prompt: "Implement it."
+`
+
 function writeProject(source: string = gatedWorkflow): string {
   const project = tempDir("conductor-apiint-project-")
   writeFileSync(join(project, "conductor.yaml"), source)
@@ -414,6 +428,39 @@ describe("API integration: recovery across restart", () => {
     expect(
       second.daemon.store.getTransitions(feature.id).some(t => t.event.kind === "step.completed"),
     ).toBe(true)
+  })
+
+  it("recover notes survive a daemon restart between commit and dispatch (recovery_dispatch outbox is the source of truth)", async () => {
+    const project = writeProject(agentOnlyWorkflow)
+    const databasePath = join(tempDir("conductor-apiint-recover-notes-"), "state.db")
+
+    const first = await startStack({ project, databasePath, workflow: agentOnlyWorkflow })
+    const created = await post(first.base, "/v1/features", { title: "Recover-survivor", project })
+    const { feature, activeRun } = (await created.json()) as { feature: { id: string }; activeRun: { id: string } }
+    expect((await post(first.base, `/v1/runs/${activeRun.id}/report`, { outcome: "failed", notes: "first attempt broke" })).status).toBe(200)
+    expect(first.daemon.store.getFeature(feature.id)?.status).toBe("escalated")
+
+    const tx = first.daemon.store.recoverStepTargets(
+      feature.id,
+      [{ jobId: "main", stepId: "implement" }],
+      { notes: "runner is back, retry with the same prompt" },
+    )
+    expect(tx).toBe("recovered")
+    const dispatched = first.daemon.store.getUnhandledRecoveryDispatches(feature.id)
+    expect(dispatched).toHaveLength(1)
+    expect(dispatched[0]!.notes).toBe("runner is back, retry with the same prompt")
+
+    await first.server.stop()
+    await first.daemon.stop()
+
+    const second = await startStack({ project, databasePath, workflow: agentOnlyWorkflow })
+    const recoveredRun = second.daemon.store.getActiveRunForStep(feature.id, "main", "implement")
+    expect(recoveredRun).not.toBeNull()
+    expect(recoveredRun?.recoverNotes).toBe("runner is back, retry with the same prompt")
+    expect(second.sessions.prompts.length).toBeGreaterThan(0)
+    const lastPrompt = second.sessions.prompts[second.sessions.prompts.length - 1]!.text
+    expect(lastPrompt).toContain("[conductor] This step was recovered by an operator. Operator notes:")
+    expect(lastPrompt).toContain("runner is back, retry with the same prompt")
   })
 })
 
