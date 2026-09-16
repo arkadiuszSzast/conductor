@@ -169,33 +169,53 @@ describe("git/worktree-remove", () => {
 })
 
 describe("git/push", () => {
-  it("pushes with -u by default and resolves HEAD's sha", async () => {
-    const process_ = new FakeProcess()
-    process_.handlers = [() => ok(), () => ok("abc123def\n")]
-    const result = await gitPush(ctx({ branch: "feat/x" }), deps(process_))
+  const sha = "a".repeat(40)
 
-    expect(result).toEqual({ status: "succeeded", outputs: { sha: "abc123def" } })
+  it("pins the requested branch despite a different checkout and movement during push", async () => {
+    const process_ = new FakeProcess()
+    let branchSha = sha
+    const ambientHead = "b".repeat(40)
+    process_.handlers = [
+      () => ok(),
+      command => ok(command.includes("HEAD") ? ambientHead : branchSha),
+      command => {
+        branchSha = "c".repeat(40)
+        expect(command).toEqual(["git", "push", "--", "origin", `${sha}:refs/heads/feat/x`])
+        return ok()
+      },
+      () => ok(),
+    ]
+    const result = await gitPush(ctx({ branch: "feat/x" }), deps(process_))
+    expect(result).toEqual({ status: "succeeded", outputs: { sha } })
+    expect(branchSha).not.toBe(sha)
     expect(process_.argv()).toEqual([
-      ["git", "push", "-u", "origin", "feat/x"],
-      ["git", "rev-parse", "HEAD"],
+      ["git", "check-ref-format", "refs/heads/feat/x"],
+      ["git", "rev-parse", "--verify", "refs/heads/feat/x^{commit}"],
+      ["git", "push", "--", "origin", `${sha}:refs/heads/feat/x`],
+      ["git", "branch", "--set-upstream-to=origin/feat/x", "--", "feat/x"],
     ])
   })
 
-  it("omits -u when set_upstream is false and honours a custom remote", async () => {
+  it("omits upstream setup when disabled and honours a custom remote", async () => {
     const process_ = new FakeProcess()
-    process_.handlers = [() => ok(), () => ok("sha1\n")]
-    await gitPush(ctx({ branch: "feat/x", remote: "upstream", set_upstream: false }), deps(process_))
-
-    expect(process_.argv()[0]).toEqual(["git", "push", "upstream", "feat/x"])
+    process_.handlers = [() => ok(), () => ok(sha), () => ok()]
+    const result = await gitPush(ctx({ branch: "feat/x", remote: "upstream", set_upstream: false }), deps(process_))
+    expect(result.status).toBe("succeeded")
+    expect(process_.argv().at(-1)).toEqual(["git", "push", "--", "upstream", `${sha}:refs/heads/feat/x`])
+    expect(process_.calls).toHaveLength(3)
   })
 
-  it("fails when git push exits non-zero", async () => {
+  it.each(["invalid", "missing", "malformed", "rejected", "upstream"])("fails explicitly for %s", async failure => {
     const process_ = new FakeProcess()
-    process_.handlers = [() => fail(1, "rejected")]
+    process_.handlers = [
+      () => failure === "invalid" ? fail(1, failure) : ok(),
+      () => failure === "missing" ? fail(1, failure) : ok(failure === "malformed" ? "not-a-sha" : sha),
+      () => failure === "rejected" ? fail(1, failure) : ok(),
+      () => fail(1, "upstream"),
+    ]
     const result = await gitPush(ctx({ branch: "feat/x" }), deps(process_))
     expect(result.status).toBe("failed")
-    if (result.status !== "failed") return
-    expect(result.error).toContain("rejected")
+    expect(process_.calls).toHaveLength(failure === "invalid" ? 1 : ["missing", "malformed"].includes(failure) ? 2 : failure === "rejected" ? 3 : 4)
   })
 })
 
@@ -232,64 +252,91 @@ describe("github/pr-create", () => {
 })
 
 describe("github/await-checks", () => {
-  it("succeeds once all checks conclude with no failures", async () => {
+  const sha = "a".repeat(40)
+  const old = "b".repeat(40)
+  const inputs = { pr: 5, expected_sha: sha, required_checks: ["build", "test"], timeout_minutes: 1, poll_seconds: 15 }
+  const check = (name: string, conclusion: string | null = "success", status = "completed", head_sha = sha) => ({ name, conclusion, status, head_sha })
+  function observation(checks: unknown[] = [], statuses: unknown[] = [], firstHead = sha, lastHead = sha): FakeProcess {
     const process_ = new FakeProcess()
-    process_.handlers = [() => ok(JSON.stringify([{ name: "build", state: "SUCCESS" }, { name: "test", state: "SUCCESS" }]))]
-    const result = await githubAwaitChecks(ctx({ pr: 5 }), deps(process_))
+    process_.handlers = [
+      () => ok(JSON.stringify({ headRefOid: firstHead })),
+      () => ok(JSON.stringify([{ check_runs: checks }])),
+      () => ok(JSON.stringify([{ sha, statuses }])),
+      () => ok(JSON.stringify({ headRefOid: lastHead })),
+    ]
+    return process_
+  }
 
-    expect(result).toEqual({ status: "succeeded", outputs: { conclusion: "success" } })
+  it("succeeds for exact-head required checks and emits validated SHA", async () => {
+    const process_ = observation([check("build"), check("test")])
+    expect(await githubAwaitChecks(ctx(inputs), deps(process_))).toEqual({ status: "succeeded", outputs: { conclusion: "success", sha } })
+    expect(process_.argv()).toEqual([
+      ["gh", "pr", "view", "5", "--json", "headRefOid"],
+      ["gh", "api", `repos/{owner}/{repo}/commits/${sha}/check-runs?filter=latest&per_page=100`, "--paginate", "--slurp"],
+      ["gh", "api", `repos/{owner}/{repo}/commits/${sha}/status?per_page=100`, "--paginate", "--slurp"],
+      ["gh", "pr", "view", "5", "--json", "headRefOid"],
+    ])
   })
 
-  it("fails and lists the failing check names", async () => {
-    const process_ = new FakeProcess()
-    process_.handlers = [() => ok(JSON.stringify([
-      { name: "build", state: "SUCCESS" },
-      { name: "test", state: "FAILURE" },
-    ]))]
-    const result = await githubAwaitChecks(ctx({ pr: 5 }), deps(process_))
-
-    expect(result.status).toBe("failed")
-    if (result.status !== "failed") return
-    expect(result.error).toContain("test")
-    expect(result.error).not.toContain("build")
-  })
-
-  it("returns a durable pending result on first observation with unconcluded checks, one exec per invocation", async () => {
-    const process_ = new FakeProcess()
-    process_.handlers = [() => ok(JSON.stringify([{ name: "build", state: "PENDING" }]))]
-    const result = await githubAwaitChecks(ctx({ pr: 5, timeout_minutes: 1, poll_seconds: 15 }), deps(process_, undefined, () => 0))
-
-    expect(result.status).toBe("pending")
+  it.each(["absent", "old", "partial", "pending", "unknown"])("keeps %s evidence pending without renewing the deadline", async kind => {
+    const checks = kind === "absent" ? [] : kind === "old" ? [check("build", "success", "completed", old), check("test", "success", "completed", old)]
+      : kind === "partial" ? [check("build")] : [check("build"), check("test", kind === "unknown" ? "new-state" : null, kind === "pending" ? "queued" : "completed")]
+    const result = await githubAwaitChecks(ctx(inputs), deps(observation(checks), undefined, () => 0))
+    expect(result).toEqual({ status: "pending", nextPollMs: 15000, state: { deadline: 60000, sha } })
     if (result.status !== "pending") return
-    expect(result.nextPollMs).toBe(15000)
-    expect(result.state?.deadline).toBe(60_000)
-    expect(process_.calls).toHaveLength(1)
+    const resumed = await githubAwaitChecks(ctx(inputs, { resume: result.state }), deps(observation(checks), undefined, () => 60001))
+    expect(resumed.status).toBe("failed")
+    if (resumed.status === "failed") expect(resumed.error).toContain("timed out")
   })
 
-  it("resuming with the deadline passed and checks still pending fails with a timeout, without a fresh exec loop", async () => {
-    const process_ = new FakeProcess()
-    process_.handlers = [() => ok(JSON.stringify([{ name: "build", state: "PENDING" }]))]
-    const result = await githubAwaitChecks(
-      ctx({ pr: 5, timeout_minutes: 1 }, { resume: { deadline: 1000 } }),
-      deps(process_, undefined, () => 2000),
-    )
-
+  it.each(["failure", "timed_out", "cancelled", "action_required", "stale"])("fails on required %s", async conclusion => {
+    const result = await githubAwaitChecks(ctx(inputs), deps(observation([check("build"), check("test", conclusion)])))
     expect(result.status).toBe("failed")
-    if (result.status !== "failed") return
-    expect(result.error).toContain("timed out")
-    expect(process_.calls).toHaveLength(1)
+    if (result.status === "failed") expect(result.error).toContain("test")
   })
 
-  it("resuming succeeds once checks conclude, using the deadline carried in ctx.resume", async () => {
-    const process_ = new FakeProcess()
-    process_.handlers = [() => ok(JSON.stringify([{ name: "build", state: "SUCCESS" }]))]
-    const result = await githubAwaitChecks(
-      ctx({ pr: 5 }, { resume: { deadline: 999_999 } }),
-      deps(process_, undefined, () => 500),
-    )
+  it.each(["skipped", "neutral"])("accepts completed %s for required checks and ignores irrelevant failures", async conclusion => {
+    const result = await githubAwaitChecks(ctx(inputs), deps(observation([check("build", conclusion), check("test"), check("optional", "failure")])))
+    expect(result.status).toBe("succeeded")
+  })
 
-    expect(result).toEqual({ status: "succeeded", outputs: { conclusion: "success" } })
-    expect(process_.calls).toHaveLength(1)
+  it.each(["before", "during"])("fails when PR head moves %s observation", async when => {
+    const result = await githubAwaitChecks(ctx(inputs), deps(observation([check("build"), check("test")], [], when === "before" ? old : sha, old)))
+    expect(result.status).toBe("failed")
+    if (result.status === "failed") expect(result.error).toContain("head moved")
+  })
+
+  it("accepts latest status contexts, but requires both producers when names collide", async () => {
+    expect((await githubAwaitChecks(ctx(inputs), deps(observation([check("build")], [{ context: "test", state: "success" }])))).status).toBe("succeeded")
+    expect((await githubAwaitChecks(ctx(inputs), deps(observation([check("build"), check("test")], [{ context: "test", state: "pending" }])))).status).toBe("pending")
+    expect((await githubAwaitChecks(ctx(inputs), deps(observation([check("build")], [{ context: "test", state: "error" }])))).status).toBe("failed")
+  })
+
+  it("reads all paginated checks and status contexts", async () => {
+    const process_ = observation()
+    process_.handlers[1] = () => ok(JSON.stringify([{ check_runs: [check("optional")] }, { check_runs: [check("build")] }]))
+    process_.handlers[2] = () => ok(JSON.stringify([{ sha, statuses: [] }, { sha, statuses: [{ context: "test", state: "success" }] }]))
+    expect((await githubAwaitChecks(ctx(inputs), deps(process_))).status).toBe("succeeded")
+  })
+
+  it.each(["json", "shape", "row", "sha", "auth"])("fails closed on %s response", async kind => {
+    const process_ = observation([check("build"), check("test")])
+    if (kind === "sha") process_.handlers[2] = () => ok(JSON.stringify([{ sha: old, statuses: [] }]))
+    else process_.handlers[1] = () => kind === "auth" ? fail(1, "denied") : ok(kind === "json" ? "{" : JSON.stringify(kind === "row" ? [{ check_runs: [{}] }] : {}))
+    expect((await githubAwaitChecks(ctx(inputs), deps(process_))).status).toBe("failed")
+  })
+
+  it("rejects missing policy and changes to resumed identity", async () => {
+    for (const bad of [{ ...inputs, required_checks: [] }, { ...inputs, expected_sha: "" }, { pr: 5 }]) {
+      const process_ = new FakeProcess()
+      expect((await githubAwaitChecks(ctx(bad), deps(process_))).status).toBe("failed")
+      expect(process_.calls).toHaveLength(0)
+    }
+    expect((await githubAwaitChecks(ctx(inputs, { resume: { sha: old, deadline: 1000 } }), deps(new FakeProcess()))).status).toBe("failed")
+  })
+
+  it("resumes successfully when missing checks appear", async () => {
+    expect((await githubAwaitChecks(ctx(inputs, { resume: { sha, deadline: 1000 } }), deps(observation([check("build"), check("test")]), undefined, () => 500))).status).toBe("succeeded")
   })
 })
 

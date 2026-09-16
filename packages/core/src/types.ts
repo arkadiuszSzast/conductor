@@ -114,6 +114,10 @@ export interface AgentStep extends StepBase {
   /** Silence budget for THIS step's runs, in milliseconds — overrides
    *  the engine-wide TTL. Absent means the engine default governs. */
   readonly ttlMs?: number
+  readonly reviewHead?: string
+  readonly fixFrom?: string
+  readonly qualityFrom?: string
+  readonly fixPrompt?: string
 }
 
 export interface ActionStep extends StepBase {

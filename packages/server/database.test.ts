@@ -103,6 +103,31 @@ describe("database lifecycle and migrations", () => {
     connection.close()
   })
 
+  it("0020 closes historical consumed notes but preserves pending recovery intent across reopen", () => {
+    const path = temporaryPath()
+    let connection = openDatabase({ path })
+    const upTo = migrations.findIndex(m => m.id === "0020_recovery_note_episodes")
+    runMigrations(connection.db, migrations.slice(0, upTo))
+    connection.db.run(
+      `INSERT INTO feature (id, slug, project_dir, title, status, state, time_created, time_updated)
+       VALUES ('f1', 'f', '/p', 'F', 'running', '{}', 1, 1)`,
+    )
+    for (const [id, consumed] of [["historical", 1], ["pending", 0]] as const) {
+      connection.db.run(
+        `INSERT INTO recovery_dispatch (id, feature_id, job_id, step_id, status, time_created, time_updated, notes, notes_consumed)
+         VALUES (?, 'f1', ?, 'work', 'handled', 1, 1, ?, ?)`,
+        [id, id, id, consumed],
+      )
+    }
+    connection.close()
+    connection = openMigratedDatabase({ path })
+    const store = new Store(connection.db)
+    expect(store.getRecoverNotesForTarget("f1", "historical", "work")).toBeNull()
+    expect(store.getRecoverNotesForTarget("f1", "pending", "work")).toBe("pending")
+    expect(runMigrations(connection.db)).toEqual([])
+    connection.close()
+  })
+
   it("enforces one active run per job+step at the DB layer (idx_run_one_active_target)", () => {
     const connection = openMigratedDatabase({ path: temporaryPath() })
     connection.db.run(

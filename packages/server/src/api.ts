@@ -82,7 +82,7 @@ export interface EngineControl {
         readonly diagnostics: readonly WorkflowInputDiagnostic[]
       }
   >
-  report(input: { runId: string; outcome?: "succeeded" | "failed"; verdict?: string; notes?: string; ask?: string }): Promise<string>
+  report(input: { runId: string; outcome?: "succeeded" | "failed"; verdict?: string; notes?: string; ask?: string; review?: unknown }): Promise<string>
   answer(runId: string, notes: string): Promise<
     | { readonly ok: true; readonly message: string }
     | { readonly ok: false; readonly code: "unknown_run" | "no_pending_question" | "session_lost"; readonly message: string }
@@ -681,6 +681,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
               endpoint: entry.endpoint,
               projects: entry.projects,
               registeredAt: entry.registeredAt,
+              expiresAt: entry.expiresAt,
             })),
           },
           requestId,
@@ -1178,7 +1179,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     if (!run) return error(requestId, "not_found", `unknown run "${runId}"`)
     const parsed = await readJsonBody(request)
     if (!parsed.ok) return error(requestId, "invalid_json", "request body must be a JSON object")
-    const { outcome, verdict, notes, ask } = parsed.body
+    const { outcome, verdict, notes, ask, review } = parsed.body
     if (outcome !== undefined && outcome !== "succeeded" && outcome !== "failed") {
       return error(requestId, "invalid_request", "\"outcome\" must be \"succeeded\" or \"failed\"")
     }
@@ -1216,6 +1217,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       ...(verdict !== undefined ? { verdict } : {}),
       ...(notes !== undefined ? { notes } : {}),
       ...(ask !== undefined ? { ask } : {}),
+      ...(review !== undefined ? { review } : {}),
     })
     // A concurrent report can still win the engine's atomic claim between
     // the pre-check and this call — the loser maps to the same 409. The
@@ -1223,6 +1225,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     // already concluded`): success messages start with `Verdict "` /
     // `Step "`, so caller-controlled verdict/notes text can never spoof
     // the duplicate shape from inside a success message.
+    if (result.startsWith("Invalid review:")) return error(requestId, "invalid_request", result)
     if (result.startsWith(`Run ${runId} already concluded`)) {
       return error(requestId, "run_already_concluded", result)
     }

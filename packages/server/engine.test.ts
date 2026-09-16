@@ -4,6 +4,8 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { openMigratedDatabase, type DatabaseConnection } from "./src/database.ts"
 import { Store } from "./src/store.ts"
+import { createRunnerSessionClient, NoLiveRunnerError } from "./src/runner-transport.ts"
+import { RunnerRegistry } from "./src/runner-registry.ts"
 import { Engine, type EngineDeps, type EngineOptions } from "./src/engine.ts"
 import type { ProcessExecOptions, ProcessExecResult, ProcessRunner, SessionClient } from "./src/ports.ts"
 import type { WorkflowSnapshot } from "./src/workflow-registry.ts"
@@ -21,6 +23,8 @@ import {
 } from "@conductor/core/testing.ts"
 import type { ActionManifest, ActionRunContext, ActionStep, WorkflowDef } from "@conductor/core"
 import { computeActionDigest } from "@conductor/core"
+import { githubAwaitChecks } from "./src/actions/github-await-checks.ts"
+import { realProcessRunner } from "./src/process.ts"
 
 // ---------------------------------------------------------------- fakes
 
@@ -322,7 +326,250 @@ async function startedFeature(engine: Engine, projectDir = "/tmp/project") {
 
 // ---------------------------------------------------------------------------
 
+describe("Engine: structured review work orders", () => {
+  const head = "a".repeat(40)
+  const finding = { path: "src/a.ts", line: 1, severity: "major", blocking: true, body: "reachable bug", acceptanceTests: ["tests/a.test.ts: rejects invalid input"], status: "new" }
+  const def = workflow({ main: job([
+    { ...agentStep("implement", "implementer", "FULL IMPLEMENTATION"), fixFrom: "main/review", fixPrompt: "FIX ONLY" },
+    { ...agentStep("review", "reviewer", "Review", { outcomes: { approved: next, changes_requested: rerunSteps(["implement", "review"], 4) } }), reviewHead: head },
+  ]) }, roles)
+
+  it("runs an isolated review-fix-recovery-checks-cleanup flow with stand-in sessions and GitHub", async () => {
+    const init = await realProcessRunner.shell("git init -q && git -c user.name=Fixture -c user.email=fixture@example.invalid commit --allow-empty -qm initial", { cwd: directory })
+    expect(init.code).toBe(0)
+    const sha = (await realProcessRunner.exec(["git", "rev-parse", "HEAD"], { cwd: directory })).stdout.trim()
+    const fixture = workflow({ main: job([
+      { ...agentStep("implement", "implementer", "INITIAL", { retry: backoff(2, 10) }), fixFrom: "main/review", fixPrompt: "FIX ONLY" },
+      { ...agentStep("review", "reviewer", "Review", { outcomes: { approved: next, changes_requested: rerunSteps(["implement", "review"], 4) } }), reviewHead: sha },
+      actionStepDef("checks", "test/checks@v1", { pr: 1, expected_sha: sha, required_checks: ["PR Gate"] }),
+      commandStep("cleanup", ["git status --porcelain && git rev-parse HEAD"]),
+    ]) }, roles)
+    const bindings = actionBindings([{ jobId: "main", stepId: "checks", uses: "test/checks@v1", manifest: actionManifest({
+      inputs: { pr: { type: "number", presence: "required" }, expected_sha: { type: "string", presence: "required" }, required_checks: { type: "string[]", presence: "required" } },
+      outputs: { conclusion: "string", sha: "string" },
+    }) }])
+    let checks = 0
+    const host: ActionExecutor = { async execute(_binding, ctx) {
+      const result = await githubAwaitChecks(ctx, {
+        process: { shell: realProcessRunner.shell, async exec(argv) {
+          checks++
+          const payload = argv[1] === "pr" ? { headRefOid: sha } : String(argv[2]).includes("check-runs")
+            ? [{ check_runs: [{ name: "PR Gate", head_sha: sha, status: "completed", conclusion: "success" }] }]
+            : [{ sha, statuses: [] }]
+          return { code: 0, stdout: JSON.stringify(payload), stderr: "", output: "" }
+        } }, log: { log() {} }, runLog() {}, sleep: async () => {}, now: () => clock.now(),
+      })
+      if (result.status === "succeeded") return { ok: true, outputs: result.outputs }
+      throw new Error(JSON.stringify(result))
+    } }
+    const engine = makeEngine(fixture, {}, { process: realProcessRunner, actions: host }, bindings)
+    const feature = await startedFeature(engine, directory)
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "succeeded" })
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, verdict: "changes_requested", review: { head: sha, findings: [finding] } })
+    expect(store.listFindings(feature.id)[0]!.id).toBe("F1")
+    expect(sessions.prompts.at(-1)!.text).toContain("FIX ONLY")
+    expect(sessions.prompts.at(-1)!.text).toContain("F1")
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    clock.advance(1000)
+    await engine.reconcile()
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    expect(store.getFeature(feature.id)!.status).toBe("escalated")
+    await engine.recover(feature.id, { notes: "Retain F1 acceptance test", target: { jobId: "main", stepId: "implement" } })
+    expect(sessions.prompts.at(-1)!.text).toContain("Retain F1 acceptance test")
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    clock.advance(1000)
+    await engine.reconcile()
+    expect(sessions.prompts.at(-1)!.text).toContain("Retain F1 acceptance test")
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "succeeded" })
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, verdict: "approved", review: {
+      head: sha, findings: [{ ...finding, id: "F1", status: "fixed", resolution: "Acceptance test verified" }],
+    } })
+    for (let attempt = 0; attempt < 100 && store.getFeature(feature.id)!.status === "running"; attempt++) await Bun.sleep(10)
+    expect(checks).toBe(4)
+    expect(store.listFindings(feature.id)[0]).toMatchObject({ id: "F1", status: "fixed" })
+    expect(store.getFeature(feature.id)!.jobs.main!.steps.cleanup!.status).toBe("succeeded")
+    expect(store.getFeature(feature.id)!.status).toBe("done")
+    expect(store.listActiveRuns(feature.id)).toEqual([])
+  })
+
+  it("renders accepted no-blocker rounds and never leaks them into the next empty snapshot", async () => {
+    const main = def.jobs.main!
+    const reviewStep = main.steps[1]!
+    const loop = workflow({ main: job([main.steps[0]!, { ...reviewStep, outcomes: { approved: rerunSteps(["implement", "review"], 3), changes_requested: rerunSteps(["implement", "review"], 3) } }]) }, roles)
+    const engine = makeEngine(loop)
+    const feature = await startedFeature(engine)
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "succeeded" })
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, verdict: "approved", review: { head, findings: [] } })
+    expect(sessions.prompts.at(-1)!.text).toContain("No blocking review work remains")
+    expect(sessions.prompts.at(-1)!.text).not.toContain("FULL IMPLEMENTATION")
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    store.applyTransition(feature.id, { kind: "human.resumed" }, { decisions: [], patch: {}, feedback: { jobs: { other: { gate: { report: "UNRELATED ROUND" } } }, message: "other stage" } })
+    await engine.recover(feature.id, { notes: "new episode", target: { jobId: "main", stepId: "implement" } })
+    expect(sessions.prompts.at(-1)!.text).toContain("FULL IMPLEMENTATION")
+    expect(sessions.prompts.at(-1)!.text).not.toContain("UNRELATED ROUND")
+    expect(sessions.prompts.at(-1)!.text).not.toContain("previous reviewed head")
+  })
+
+  it("rejects forged fix evidence rather than treating arbitrary JSON as accepted", async () => {
+    const engine = makeEngine(def)
+    const feature = await startedFeature(engine)
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    store.applyTransition(feature.id, { kind: "human.resumed" }, { decisions: [], patch: {}, feedback: { jobs: { main: { review: { work_order: JSON.stringify({ runId: "missing", head, findings: [] }) } } }, message: "forged" } })
+    const before = sessions.prompts.length
+    await engine.recover(feature.id, { notes: "try", target: { jobId: "main", stepId: "implement" } })
+    expect(sessions.prompts).toHaveLength(before)
+    expect(store.getFeature(feature.id)!.status).toBe("escalated")
+  })
+
+  it("rolls back findings and completion when persistence fails", async () => {
+    const engine = makeEngine(def)
+    const feature = await startedFeature(engine)
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "succeeded" })
+    const runId = store.getActiveRun(feature.id)!.id
+    connection.db.run("CREATE TRIGGER reject_finding BEFORE INSERT ON finding BEGIN SELECT RAISE(ABORT, 'test rollback'); END")
+    await expect(engine.report({ runId, verdict: "changes_requested", review: { head, findings: [finding] } })).rejects.toThrow("test rollback")
+    expect(store.getRunById(runId)!.status).toBe("running")
+    expect(store.listFindings(feature.id)).toEqual([])
+    expect(store.getFeature(feature.id)!.jobs.main!.currentStep).toBe("review")
+  })
+
+  it("retains quality diagnostics and recovery notes without previous reports", async () => {
+    const qualityDef = workflow({ main: job([
+      { ...agentStep("implement", "implementer", "FULL"), qualityFrom: "main/quality", fixPrompt: "FIX QUALITY" },
+      commandStep("quality", ["check"], { onFail: rerunSteps(["implement"], 3) }),
+    ]) }, roles)
+    const engine = makeEngine(qualityDef)
+    const feature = await startedFeature(engine)
+    process_.handler = () => ({ code: 1, stdout: "", stderr: "broken assertion", output: "broken assertion" })
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "succeeded", notes: "DO NOT REPEAT" })
+    expect(sessions.prompts.at(-1)!.text).toContain("FIX QUALITY")
+    expect(sessions.prompts.at(-1)!.text).toContain("broken assertion")
+    expect(sessions.prompts.at(-1)!.text).not.toContain("DO NOT REPEAT")
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    await engine.recover(feature.id, { notes: "operator fix guidance", target: { jobId: "main", stepId: "implement" } })
+    expect(sessions.prompts.at(-1)!.text).toContain("operator fix guidance")
+    expect(sessions.prompts.at(-1)!.text).toContain("broken assertion")
+    process_.handler = null
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "succeeded" })
+    const other = await startedFeature(engine)
+    expect(sessions.prompts.at(-1)!.text).toContain("FULL")
+    expect(sessions.prompts.at(-1)!.text).not.toContain("operator fix guidance")
+    expect(store.getActiveRun(other.id)!.recoverNotes).toBeNull()
+  })
+
+  it("preserves initial prompt, rejects invalid reviews, persists IDs and scopes concise fixes across restart", async () => {
+    const engine = makeEngine(def)
+    const feature = await startedFeature(engine)
+    expect(sessions.prompts.at(-1)!.text).toContain("FULL IMPLEMENTATION")
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "succeeded", notes: "OLD IMPLEMENTER NARRATIVE" })
+    const runId = store.getActiveRun(feature.id)!.id
+    for (const review of [undefined, { head, findings: [{}] }, { head: "b".repeat(40), findings: [finding] }]) {
+      expect(await engine.report({ runId, verdict: "changes_requested", review })).toStartWith("Invalid review:")
+      expect(store.getRunById(runId)!.status).toBe("running")
+      expect(store.listFindings(feature.id)).toEqual([])
+    }
+    expect(await engine.report({ runId, verdict: "approved", review: { head, findings: [finding] } })).toStartWith("Invalid review:")
+    await engine.report({ runId, verdict: "changes_requested", review: { head, findings: [finding, { ...finding, blocking: false, body: "OPTIONAL NARRATIVE" }] } })
+    const fix = sessions.prompts.at(-1)!.text
+    expect(fix).toContain("FIX ONLY")
+    expect(fix).toContain(head)
+    expect(fix).toContain("F1")
+    expect(fix).toContain("tests/a.test.ts")
+    expect(fix).not.toContain("FULL IMPLEMENTATION")
+    expect(fix).not.toContain("OLD IMPLEMENTER NARRATIVE")
+    expect(fix).not.toContain("OPTIONAL NARRATIVE")
+    expect(store.listFindings(feature.id)[0]).toMatchObject({ id: "F1", blocking: true, sourceRunId: runId, reviewedHead: head })
+    await engine.report({ runId, verdict: "approved", review: { head, findings: [] } })
+    expect(store.listFindings(feature.id)).toHaveLength(2)
+    connection.close()
+    connection = openMigratedDatabase({ path: join(directory, "state.db") })
+    store = new Store(connection.db, clock)
+    const resumed = makeEngine(def)
+    await resumed.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "succeeded" })
+    const nextRun = store.getActiveRun(feature.id)!.id
+    expect(await resumed.report({ runId: nextRun, verdict: "approved", review: { head, findings: [] } })).toContain("every previous finding")
+    await resumed.report({ runId: nextRun, verdict: "approved", review: { head, findings: [
+      { ...finding, id: "F1", status: "fixed", resolution: "verified test" },
+      { ...finding, id: "F2", blocking: false, status: "dismissed", resolution: "not applicable" },
+    ] } })
+    expect(store.getFeature(feature.id)!.status).toBe("done")
+    expect(store.listFindings(feature.id).map(row => [row.id, row.status])).toEqual([["F1", "fixed"], ["F2", "dismissed"]])
+    expect(store.getRunById(runId)!.outputs.work_order).toContain("reachable bug")
+  })
+})
+
 describe("Engine: runner resource waits", () => {
+  it("keeps one bounded wait across failed probes, restart and recovery", async () => {
+    const runners = new RunnerRegistry(() => clock.now())
+    const register = () => runners.register({ name: "test", endpoint: "http://runner.test", projects: [] })
+    register()
+    let healthy = false
+    let creates = 0
+    const transport = createRunnerSessionClient({ runners, fetchImpl: async request => {
+      if (new URL(request.url).pathname === "/v1/health") {
+        if (!healthy) throw new Error("timeout")
+        return Response.json({ ok: true })
+      }
+      if (request.method === "POST" && new URL(request.url).pathname === "/v1/sessions") return Response.json({ id: `s${++creates}` })
+      return Response.json({ ok: true, status: "busy", exists: true })
+    } })
+    const deps = { sessions: transport, runnerAvailable: () => runners.hasAny() }
+    const engine = makeEngine(linearWorkflow, {}, deps)
+    const feature = await startedFeature(engine)
+    const wait = store.listResourceWaits(feature.id)[0]!
+    expect(store.listRuns(feature.id)[0]?.failure?.class).toBe("transient_transport")
+    expect(store.getFeature(feature.id)?.jobs.main?.attempts.implement ?? 0).toBe(0)
+    clock.current = wait.nextObservationAt!
+    await makeEngine(linearWorkflow, {}, deps).reconcile()
+    const repeated = store.listResourceWaits(feature.id)
+    expect(repeated).toHaveLength(1)
+    expect(repeated[0]?.deadlineAt).toBe(wait.deadlineAt)
+    expect(repeated[0]?.status).toBe("waiting")
+    healthy = true
+    register()
+    clock.current = repeated[0]!.nextObservationAt!
+    await engine.reconcile()
+    expect(store.listResourceWaits(feature.id)[0]?.status).toBe("closed")
+    expect(store.getActiveRun(feature.id)).not.toBeNull()
+    expect(creates).toBe(2)
+  })
+
+  it("recovers a claimed wait after a crash before run insertion", async () => {
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => false })
+    const feature = await startedFeature(engine)
+    const wait = store.listResourceWaits(feature.id)[0]!
+    clock.current = wait.nextObservationAt!
+    expect(store.claimResourceWait(wait.id, clock.now())).not.toBeNull()
+    await makeEngine(linearWorkflow, {}, { runnerAvailable: () => true }).reconcile()
+    expect(store.getResourceWait(wait.id)?.status).toBe("closed")
+    expect(sessions.prompts).toHaveLength(1)
+  })
+
+  it("waits after all stale endpoints refuse without consuming attempts", async () => {
+    const runners = new RunnerRegistry(() => clock.now())
+    runners.register({ name: "dead", endpoint: "http://dead.test", projects: [] })
+    const transport = createRunnerSessionClient({ runners, fetchImpl: async () => {
+      throw Object.assign(new Error("refused"), { code: "ConnectionRefused" })
+    } })
+    const engine = makeEngine(linearWorkflow, {}, { sessions: transport, runnerAvailable: () => runners.hasAny() })
+    const feature = await startedFeature(engine)
+    expect(runners.hasAny()).toBe(false)
+    expect(store.listResourceWaits(feature.id)[0]?.status).toBe("waiting")
+    expect(store.getFeature(feature.id)?.jobs.main?.attempts.implement ?? 0).toBe(0)
+    expect(store.getActiveRun(feature.id)).toBeNull()
+  })
+
+  it("bounds repeated unavailable dispatches even when registrations stay fresh", async () => {
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => true })
+    sessions.promptError = new NoLiveRunnerError()
+    const feature = await startedFeature(engine)
+    const wait = store.listResourceWaits(feature.id)[0]!
+    clock.current = wait.deadlineAt + 1
+    await makeEngine(linearWorkflow, {}, { runnerAvailable: () => true }).reconcile()
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    expect(store.listResourceWaits(feature.id)[0]?.closedReason).toBe("deadline_exhausted")
+  })
+
   it("waits without creating a run and dispatches once when a runner returns", async () => {
     let available = false
     const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => available })
@@ -816,7 +1063,144 @@ describe("Engine: runner resource waits", () => {
 })
 
 describe("Engine: durable recovery-dispatch replay", () => {
-  it("retains notes through a handled resource wait and consumes them only for the recovered run", async () => {
+  it("inherits literal notes through automatic retries and replaces them on subsequent recovery", async () => {
+    const engine = makeEngine(retryWorkflow)
+    const feature = await startedFeature(engine)
+    const fail = async () => engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    await fail()
+    await fail()
+    const notes = "Keep {{ feature.title }} literal\n" + "operator guidance ".repeat(80)
+    await engine.recover(feature.id, { notes })
+    await fail()
+    expect(store.getActiveRun(feature.id)?.recoverNotes).toBe(notes)
+    expect(sessions.prompts.at(-1)?.text).toContain(`Operator notes:\n${notes}\n\n`)
+    await fail()
+    expect(store.getRecoverNotesForTarget(feature.id, "main", "implement")).toBeNull()
+    await engine.recover(feature.id, { notes: "replacement guidance" })
+    await fail()
+    expect(store.getActiveRun(feature.id)?.recoverNotes).toBe("replacement guidance")
+    expect(sessions.prompts.at(-1)?.text).toContain("replacement guidance")
+    expect(sessions.prompts.at(-1)?.text).not.toContain(notes)
+  })
+
+  it("retains notes across a scheduled retry and database reopen without dispatching early", async () => {
+    let engine = makeEngine(retryWorkflow)
+    const feature = await startedFeature(engine)
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    await engine.recover(feature.id, { notes: "scheduled retry guidance" })
+    sessions.liveSessions.delete(store.getActiveRun(feature.id)!.sessionId!)
+    await engine.reconcile()
+    const episode = store.getOpenRetryEpisode(feature.id, "main", "implement")!
+    expect(episode.status).toBe("scheduled")
+    connection.close()
+    connection = openMigratedDatabase({ path: join(directory, "state.db") })
+    store = new Store(connection.db, clock)
+    engine = makeEngine(retryWorkflow)
+    await engine.reconcile()
+    expect(store.getActiveRun(feature.id)).toBeNull()
+    clock.advance(episode.nextAttemptAt! - clock.now())
+    await engine.reconcile()
+    expect(store.getActiveRun(feature.id)?.recoverNotes).toBe("scheduled retry guidance")
+    expect(sessions.prompts.at(-1)?.text).toContain("Operator notes:\nscheduled retry guidance\n\n")
+  })
+
+  it("keeps retry notes across database reopen and a runner resource wait", async () => {
+    let available = true
+    let engine = makeEngine(retryWorkflow, {}, { runnerAvailable: () => available })
+    const feature = await startedFeature(engine)
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    await engine.recover(feature.id, { notes: "durable retry guidance" })
+    available = false
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    expect(store.getOpenResourceWait(feature.id, "main", "implement")).not.toBeNull()
+    connection.close()
+    connection = openMigratedDatabase({ path: join(directory, "state.db") })
+    store = new Store(connection.db, clock)
+    engine = makeEngine(retryWorkflow, {}, { runnerAvailable: () => available })
+    await engine.reconcile()
+    available = true
+    clock.advance(60_000)
+    await engine.reconcile()
+    expect(store.getActiveRun(feature.id)?.recoverNotes).toBe("durable retry guidance")
+    expect(sessions.prompts.at(-1)?.text).toContain("Operator notes:\ndurable retry guidance\n\n")
+  })
+
+  it("retains notes when runner loss after run insertion sends recovery back to resource wait", async () => {
+    const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => true })
+    const feature = await startedFeature(engine)
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    sessions.promptError = new NoLiveRunnerError("runner disconnected")
+    await engine.recover(feature.id, { notes: "retain after dispatch race" })
+    expect(store.getActiveRun(feature.id)).toBeNull()
+    expect(store.getOpenResourceWait(feature.id, "main", "implement")).not.toBeNull()
+    clock.advance(60_000)
+    await engine.reconcile()
+    expect(store.getActiveRun(feature.id)?.recoverNotes).toBe("retain after dispatch race")
+    expect(sessions.prompts.at(-1)?.text).toContain("retain after dispatch race")
+  })
+
+  it("successful recovery does not leak into later steps or a later rerun of the same target", async () => {
+    const engine = makeEngine(reviewLoopWorkflow)
+    const feature = await startedFeature(engine)
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    await engine.recover(feature.id, { notes: "only this recovery episode" })
+    const recovered = store.getActiveRun(feature.id)!
+    await engine.report({ runId: recovered.id, outcome: "succeeded" })
+    const review = store.getActiveRun(feature.id)!
+    expect(review.stepId).toBe("review")
+    expect(review.recoverNotes).toBeNull()
+    expect(sessions.prompts.at(-1)?.text).not.toContain("only this recovery episode")
+    await engine.report({ runId: review.id, verdict: "changes_requested" })
+    expect(store.getActiveRun(feature.id)?.stepId).toBe("implement")
+    expect(store.getActiveRun(feature.id)?.recoverNotes).toBeNull()
+    expect(sessions.prompts.at(-1)?.text).not.toContain("Operator notes:")
+    expect(store.getRunById(recovered.id)?.recoverNotes).toBe("only this recovery episode")
+  })
+
+  it("ends guidance when exhausted failure routing reruns the same target", async () => {
+    const engine = makeEngine(retryWorkflow)
+    const feature = await startedFeature(engine)
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    await engine.recover(feature.id, { notes: "not for a new loop" })
+    const loop = workflow({ main: job([agentStep("implement", "implementer", "go", {
+      retry: backoff(2, 10), onFail: rerunSteps(["implement"], 2),
+    })]) }, roles)
+    const loopEngine = makeEngine(loop)
+    await loopEngine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    expect(store.getActiveRun(feature.id)?.recoverNotes).toBe("not for a new loop")
+    await loopEngine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    expect(store.getActiveRun(feature.id)?.recoverNotes).toBeNull()
+    expect(sessions.prompts.at(-1)?.text).not.toContain("Operator notes:")
+  })
+
+  it("store recovery without notes cannot fall back to a previous episode", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    await engine.recover(feature.id, { notes: "old guidance" })
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+    expect(store.recoverStepTargets(feature.id, [{ jobId: "main", stepId: "implement" }])).toBe("recovered")
+    await engine.reconcile()
+    expect(store.getActiveRun(feature.id)?.recoverNotes).toBeNull()
+    expect(sessions.prompts.at(-1)?.text).not.toContain("old guidance")
+  })
+
+  it("isolates notes by feature and job even when step IDs match", async () => {
+    const engine = makeEngine(fanInWorkflow)
+    const feature = await startedFeature(engine)
+    await engine.report({ runId: store.getActiveRunForStep(feature.id, "a", "work")!.id, outcome: "failed" })
+    await engine.report({ runId: store.getActiveRunForStep(feature.id, "b", "work")!.id, outcome: "failed" })
+    await engine.recover(feature.id, { notes: "only job a", target: { jobId: "a", stepId: "work" } })
+    expect(store.getActiveRunForStep(feature.id, "a", "work")?.recoverNotes).toBe("only job a")
+    expect(store.getRecoverNotesForTarget(feature.id, "b", "work")).toBeNull()
+    const other = await startedFeature(engine)
+    expect(store.listRuns(other.id).every(run => run.recoverNotes === null)).toBe(true)
+  })
+
+  it("retains notes through a handled resource wait for the recovery episode", async () => {
     let available = true
     const engine = makeEngine(linearWorkflow, {}, { runnerAvailable: () => available })
     const feature = await startedFeature(engine)
@@ -831,7 +1215,7 @@ describe("Engine: durable recovery-dispatch replay", () => {
     const run = store.getActiveRun(feature.id)!
     expect(run.recoverNotes).toBe("Keep {{ feature.title }} literal")
     expect(sessions.prompts.at(-1)?.text).toContain("Keep {{ feature.title }} literal")
-    expect(store.getRecoverNotesForTarget(feature.id, "main", "implement")).toBeNull()
+    expect(store.getRecoverNotesForTarget(feature.id, "main", "implement")).toBe("Keep {{ feature.title }} literal")
   })
   it("crash boundary: a recoverStepTargets commit with no dispatch yet is durably replayed by reconcile — one run, feature stays running (not invariant-escalated); a second reconcile is a no-op", async () => {
     const engine = makeEngine(retryWorkflow)
@@ -1506,6 +1890,43 @@ describe("Engine: failure classification and durable retry schedules", () => {
   })
 })
 
+describe("Engine: command quality feedback", () => {
+  const def = workflow({ main: job([
+    agentStep("implement", "implementer", 'Repair: {{ feedback.jobs["main"]["quality"]["diagnostic"] }}'),
+    commandStep("quality", ["bun run typecheck"], { onFail: rerunSteps(["implement", "quality"], 3) }),
+  ]) }, roles)
+
+  it.each([false, true])("delivers actual bounded command diagnostics with empty outputs (restart=%s)", async restart => {
+    let available = true
+    let engine = makeEngine(def, {}, { runnerAvailable: () => available })
+    const feature = await startedFeature(engine)
+    connection.db.run("UPDATE feature SET feedback = ? WHERE id = ?", [JSON.stringify({ message: "stale global", jobs: { main: { quality: { diagnostic: "stale diagnostic" } } } }), feature.id])
+    process_.handler = () => ({ code: 2, stdout: "", stderr: "", output: "x".repeat(5000) + "\nTS2322: expected number; api_key=secret-value" })
+    available = !restart
+    await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "succeeded" })
+    const failed = store.listRuns(feature.id).find(run => run.stepId === "quality")!
+    expect(failed.status).toBe("failed")
+    expect(failed.outputs).toEqual({})
+    const diagnostic = store.getFeedback(feature.id)?.jobs.main?.quality?.diagnostic
+    expect(diagnostic).toContain('"bun run typecheck" exited 2')
+    expect(diagnostic).toContain("TS2322")
+    expect(diagnostic).not.toContain("secret-value")
+    expect(diagnostic!.length).toBeLessThanOrEqual(4000)
+    if (restart) {
+      expect(store.getActiveRun(feature.id)).toBeNull()
+      connection.close()
+      connection = openMigratedDatabase({ path: join(directory, "state.db") })
+      store = new Store(connection.db, clock)
+      engine = makeEngine(def, {}, { runnerAvailable: () => true })
+      clock.advance(60_000)
+      await engine.reconcile()
+    }
+    expect(sessions.prompts.at(-1)?.text).toContain(diagnostic!)
+    expect(sessions.prompts.at(-1)?.text).not.toContain("stale")
+    expect(store.getActiveRun(feature.id)?.stepId).toBe("implement")
+  })
+})
+
 describe("Engine: rerun loop with feedback", () => {
   it("a rerun scope=steps loop surfaces feedback in the round-2 prompt", async () => {
     const engine = makeEngine(reviewLoopWorkflow)
@@ -1854,6 +2275,47 @@ describe("Engine: per-feature error isolation", () => {
     // feature B's run still got its nudge despite A's blowup
     expect(store.getRunById(runB.id)?.status).toBe("running")
     expect(store.getRunById(runA.id)?.status).toBe("running")
+  })
+})
+
+describe("Engine: stale reviewer completion outbox", () => {
+  it("does not redispatch a completed reviewer while its predecessor still awaits prompt acknowledgment", async () => {
+    const def = workflow({ main: job([
+      agentStep("implement", "implementer", "implement"),
+      agentStep("review", "reviewer", "review"),
+      agentStep("publish", "implementer", "publish"),
+    ]) }, roles)
+    const engine = makeEngine(def)
+    const feature = await startedFeature(engine)
+    let release!: () => void
+    let entered!: () => void
+    const barrier = new Promise<void>(resolve => { release = resolve })
+    const ready = new Promise<void>(resolve => { entered = resolve })
+    const prompt = sessions.prompt.bind(sessions)
+    sessions.prompt = async input => {
+      await prompt(input)
+      if (input.agent === "review") {
+        entered()
+        await barrier
+      }
+    }
+    const predecessor = store.getActiveRun(feature.id)!
+    const reporting = engine.report({ runId: predecessor.id, outcome: "succeeded" })
+    await ready
+    const reviewer = store.getActiveRunForStep(feature.id, "main", "review")!
+    await engine.report({ runId: reviewer.id, outcome: "succeeded" })
+    expect(store.getPendingRunAction(feature.id)?.runId).toBe(predecessor.id)
+    expect(store.getFeature(feature.id)?.jobs.main?.currentStep).toBe("publish")
+    sessions.prompt = prompt
+    try {
+      await engine.reconcile()
+      expect(store.listRuns(feature.id).filter(run => run.stepId === "review")).toHaveLength(1)
+      expect(store.getActiveRunForStep(feature.id, "main", "publish")).not.toBeNull()
+      expect(sessions.aborted).toHaveLength(0)
+    } finally {
+      release()
+      await reporting
+    }
   })
 })
 

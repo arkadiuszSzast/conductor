@@ -306,7 +306,69 @@ Performs LLM work.
 | `interactive` | no | Boolean, default `false`. Grants the step the right to pause mid-run and ask the human a question. |
 | `ttlMs` | no | Positive integer (ms). Silence budget for this step's runs, overriding the engine-wide `engine.runTtlMs` (default 1 h). The TTL measures time since the run's **last observed activity** (log appends, question flow, nudges) — not age since dispatch — so a long-running step that streams logs stays alive; use `ttlMs` when even the gaps between a step's activity legitimately exceed the engine default (e.g. a 90-minute quality gate inside an implement step). |
 
-**Outputs:** the agent's report is published as `outputs.report`.
+**Outputs:** the agent's report is published as `outputs.report`. Structured review
+steps additionally publish canonical JSON as `outputs.work_order`.
+
+#### Structured review and concise fix rounds
+
+Optional agent fields:
+
+| Field | Meaning |
+|---|---|
+| `reviewHead` | Template resolving to the full captured reviewed Git SHA; opts into structured reports and requires approved/changes_requested outcomes. |
+| `fixFrom` | Exact `job/step` of a structured gate whose current rerun feedback supplies accepted work. |
+| `qualityFrom` | Exact `job/step` of a command whose current rerun diagnostic supplies quality repair evidence. |
+| `fixPrompt` | Separate concise template, required with fixFrom and/or qualityFrom; must not interpolate feedback. |
+
+```yaml
+- id: implement
+  agent:
+    role: implementer
+    prompt: Implement the complete agreed change and verify its acceptance criteria.
+    fixFrom: main/review
+    qualityFrom: main/quality
+    fixPrompt: Fix the supplied blocking work or quality failure; verify locally and report concise results.
+- id: quality
+  command:
+    run: [bun test]
+  onFail:
+    rerun: { scope: steps, stepIds: [implement], maxRounds: 3 }
+- id: capture_head
+  command:
+    run:
+      - |
+        head=$(git rev-parse HEAD)
+        printf 'head=%s\n' "$head" >> "$CONDUCTOR_OUTPUT"
+- id: review
+  agent:
+    role: reviewer
+    reviewHead: "{{ steps.capture_head.outputs.head }}"
+    prompt: Review the captured head and submit a structured review using the HTTP API or CLI.
+  outcomes:
+    approved: next
+    changes_requested:
+      rerun: { scope: steps, stepIds: [implement, quality, capture_head, review], maxRounds: 3 }
+```
+
+The workflow must ensure capture describes a clean immutable review target; the
+daemon validates association, not git contents. Initial implementation uses the
+original prompt. A current accepted work order or scoped quality diagnostic selects
+fixPrompt, appending only active blocking IDs, locations, acceptance tests, source run
+and previous reviewed head, plus the configured quality diagnostic. No blockers is
+explicitly stated. Previous implementer narrative and optional suggestions are not
+injected. Source references obey rerun-feedback scope validation. Work orders must
+match the accepting run's persisted output, not merely parse as JSON. Missing current
+feedback never falls back to historical findings. Operator recovery notes remain in
+the existing header and inherit only within their recovery episode.
+
+Rollout coupling: upgrade daemon/schema, CLI and the opencode runner plugin before
+opting in an inactive workflow. The updated `conductor_report` accepts an optional
+`review` object matching the HTTP schema; older loaded MCP tools cannot submit it. Do not activate by merely editing
+an operator file. Existing narrative workflows remain valid. The bundled check
+action manifest now requires expected_sha and required_checks, so its operator
+wiring must be deployed together with the daemon. Removing opt-in fields can
+disable structured execution; binary rollback still requires a compatible migration
+ledger or a backed-up database.
 
 **Asking mid-step.** An `interactive: true` agent step may ask the human a
 question without ending its run (the runner reports an `ask` instead of an
@@ -354,15 +416,14 @@ named outputs. Non-zero exit → `step.failed`.
 
 ### `action`
 
-Invokes a versioned local action from the registry. **(planned)** — the
-registry (`workflow-format` section 3) has not landed; the step kind and its
-IR are stable.
+Invokes a versioned local action from the registry. Inputs and outputs are
+validated against the resolved action manifest.
 
 ```yaml
 - id: push
   action:
     uses: git/push@v1
-    with: { remote: origin }
+    with: { remote: origin, branch: "feature/{{ feature.slug }}" }
 ```
 
 | Field | Required | Description |
@@ -371,7 +432,7 @@ IR are stable.
 | `with` | no (default `{}`) | Typed inputs per the action's manifest. |
 
 **Outputs:** the typed outputs the manifest declares (e.g. `git/push@v1` →
-`sha`, `url`). Multiple named outputs are the norm, not a workaround.
+`sha`). Multiple named outputs are supported when declared by the manifest.
 
 ### `human`
 
@@ -436,6 +497,123 @@ with it, then quote the report in the gate prompt:
 ````
 
 ---
+
+## Bundled commit evidence actions
+
+`git/push@v1` resolves the named local branch to an immutable commit before
+pushing it. Its `sha` output is that published commit, even when the checkout
+is on another branch or the local branch moves during the operation. Push is
+non-force; `remote` defaults to `origin`, and `set_upstream` defaults to true.
+An upstream-configuration error after publication is reported as a failure
+that names the already-pushed SHA.
+
+`github/await-checks@v1` requires `pr`, `expected_sha` (full 40-character
+lowercase SHA), and `required_checks` (nonempty string array). Supply exact
+check-run names or status contexts, not workflow display names. This list is
+the workflow's required-check policy; the action does not discover GitHub
+branch protection or rulesets. Defaults: `timeout_minutes: 30`,
+`poll_seconds: 60`. The old `no_checks_grace_seconds` input is removed.
+
+```yaml
+- id: push
+  action:
+    uses: git/push@v1
+    with:
+      branch: "feature/{{ feature.slug }}"
+- id: pr
+  action:
+    uses: github/pr-create@v1
+    with:
+      title: "{{ feature.title }}"
+      head: "feature/{{ feature.slug }}"
+- id: checks
+  action:
+    uses: github/await-checks@v1
+    with:
+      pr: "{{ steps.pr.outputs.number }}"
+      expected_sha: "{{ steps.push.outputs.sha }}"
+      required_checks: [build, test]
+```
+
+The action reads paginated check runs and latest status contexts for the exact
+commit in the PR base repository, checking the PR head before and after each
+observation. Missing/old/pending/unknown results never pass; absent checks time
+out rather than succeed after grace. Malformed responses and API errors fail
+explicitly. Only declared names matter, but every returned producer matching
+a required name must pass. Completed `success`, `neutral`, and `skipped` check
+runs pass; commit statuses must be `success`. Head movement fails explicitly.
+Success outputs are `conclusion: success` and the validated `sha`.
+
+The polling deadline and SHA survive restart. Fork-only or synthetic merge-SHA
+checks do not qualify as head-SHA evidence. A head can still move after the
+final read: this gate is not an atomic merge authorization; a merge operation
+must independently enforce the validated commit identity.
+
+### Operator source rollout coupling
+
+The operator workflow and the updated `github/await-checks@v1` manifest/handler
+must roll out together: `expected_sha` and `required_checks` are now required.
+Source validation is not registration or activation. Do not register this source
+against the old daemon or restart/deploy it while the live feature is
+`waiting_human`. Leave that feature and its gate untouched; any later rollout
+requires a separately authorized operator plan after project features are inactive.
+
+The gloam operator source has one CI wait, in `post_pr`. Its initial pass runs
+`ship.push`, creates the PR, then runs the no-op fixer and `post_pr.fix_push`
+before waiting. Both initial and repair rounds therefore bind
+`expected_sha: "{{ steps.fix_push.outputs.sha }}"`, not the stale `ship.push`
+SHA. `steps` is local to `post_pr`; PR metadata crosses the job boundary through
+`needs.ship.outputs.pr_number`. The rerun explicitly includes `fix`, `fix_push`,
+and `await_checks`. If a wait is moved before the fixer, expose `ship.push`'s
+SHA as a declared ship output and consume it through `needs.ship`, never through
+another job's `steps` scope.
+
+Read-only GitHub inspection on 2026-09-15 of
+`repos/arkadiuszSzast/gloam-idle/rules/branches/main` showed active ruleset
+18894755 requiring only the exact context `PR Gate`. Classic branch protection
+returned 404 (no classic protection). The remote `.github/workflows/pr-gate.yml`
+names its aggregate job `PR Gate`, checks selected backend/web/Helm/docs lanes,
+and deliberately excludes Backend Allure reporting. Thus the source declares
+`required_checks: ["PR Gate"]`, not every optional/path-selected check.
+Recheck the effective rules before any later rollout.
+
+Run this read-only fixture from the Conductor source checkout, passing the
+operator source path explicitly:
+
+```sh
+bun scripts/validate-operator-workflow.ts <operator-checkout>/conductor.yaml
+```
+
+It parses and validates the entire source against this checkout's modified action
+manifests, renders distinct initial/repair push SHAs through runtime job scopes,
+rejects missing current push output, and validates the structured gate and
+scoped fixFrom/qualityFrom wiring with separate initial and fix prompts.
+The existing shell failure summary remains intact but is not the diagnostic
+contract. No workflow commands, network actions, registration, or recovery run.
+
+## Command repair feedback
+
+A failed command routed through `onFail.rerun` persists its actual command,
+exit code and bounded/redacted output diagnostic alongside the rerun snapshot.
+Reference `feedback.jobs["main"]["quality"]["diagnostic"]` in the repair
+agent prompt. It works with empty command outputs and after a daemon restart;
+`diagnostic` is reserved in that failed command's feedback map only, not added
+to or overwritten in command outputs. This does not inject global feedback into
+unrelated agents or change ordinary retry/goto behavior.
+
+```yaml
+- id: implement
+  agent:
+    role: implementer
+    prompt: |
+      Implement the task and repair this quality failure if present:
+      {{ feedback.jobs["main"]["quality"]["diagnostic"] }}
+- id: quality
+  command:
+    run: [bun run typecheck, bun test]
+  onFail:
+    rerun: { scope: steps, stepIds: [implement, quality], maxRounds: 3 }
+```
 
 ## Routes
 

@@ -367,6 +367,21 @@ not spend attempt budget at all, only its own finite wait deadline with
 bounded observation backoff. A satisfied resource wait dispatches its step
 automatically; an expired one escalates with an actionable diagnostic.
 
+Runner registrations use 60-second leases refreshed by the existing 15-second
+announce loop. Dispatch probes callback health before writes, skips only
+proven pre-connect failures, and routes known sessions owner-first. A dispatch
+that provably sent no prompt opens a durable runner resource wait atomically
+with run conclusion, without spending workflow attempts. Repeated unhealthy
+registrations do not reset its deadline. Ambiguous POST failures are not
+silently replayed or reclassified as undelivered work.
+
+Session reads remain conservative: unknown ownership plus an unavailable or
+invalid response means busy/existing, not missing. A known owner's valid
+answer is authoritative. After registration removal, unknown-owner reads
+remain conservative until daemon restart; TTL still bounds orphaned runs.
+The owner cache is bounded and in-memory, so cache loss sacrifices precision
+rather than risking incorrect reaping.
+
 ## Escalation, pausing, resuming
 
 **Escalation** is the safety valve: whenever the workflow cannot proceed

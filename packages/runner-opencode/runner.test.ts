@@ -31,6 +31,9 @@ import { resolveRunnerConfig, RunnerConfigError } from "./src/config.ts"
 import { createOpencodeSessions, type RawOpencodeSessionApi } from "./src/sessions.ts"
 import { OpencodeRunnerHub, type CallbackListener } from "./src/hub.ts"
 import { createConductorTools } from "./src/tools.ts"
+import { createReportTool } from "./src/plugin.ts"
+import { tool } from "@opencode-ai/plugin"
+import type { ReviewReport } from "@conductor/server"
 import { createAgentLogPusher } from "./src/agent-logs.ts"
 
 // ------------------------------------------------------------ fake opencode
@@ -475,6 +478,21 @@ describe("runner registration and daemon health", () => {
     expect(h.registry.hasAny()).toBe(false)
   })
 
+  it("health probes require callback authentication and report readiness", async () => {
+    const project = writeProject()
+    const h = await makeHarness({ projects: [project] })
+    const hub = h.makeHub()
+    await hub.registerProject(project, createOpencodeSessions(new FakeOpencodeServer(project).api()))
+    const url = `http://${RUNNER_ENDPOINT_HOST}:1/v1/health`
+    expect((await hub.handle(new Request(url))).status).toBe(401)
+    const response = await hub.handle(new Request(url, { headers: { authorization: `Bearer ${RUNNER_TOKEN}` } }))
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ ok: true })
+    const listing = await h.api.handle(new Request("http://daemon.test/v1/runners"))
+    const body = await listing.json() as { runners: Array<{ registeredAt: number; expiresAt: number }> }
+    expect(body.runners[0]!.expiresAt - body.runners[0]!.registeredAt).toBe(60_000)
+  })
+
   it("callback requests without the bearer token are rejected", async () => {
     const project = writeProject()
     const h = await makeHarness({ projects: [project] })
@@ -718,6 +736,88 @@ jobs:
     await h.daemon.beat() // reap + abort
     expect((await h.client.getRun(runId)).run.status).toBe("reaped")
     expect(opencode.aborted).toContain(sessionId)
+  })
+})
+
+describe("structured plugin report through hub and daemon API", () => {
+  const head = "a".repeat(40)
+  const finding = {
+    path: "src/task.ts", line: 2, severity: "minor" as const, blocking: true,
+    body: "Reachable failure", acceptanceTests: ["task.test.ts reproduces and prevents failure"], status: "new" as const,
+  }
+  const review = { head, findings: [finding] } satisfies ReviewReport
+
+  async function setup(structured = true) {
+    const project = writeProject(structured ? agentWorkflow.replace('prompt: "Implement it."', `prompt: "Review it."\n          reviewHead: "${head}"\n        outcomes:\n          approved: next\n          changes_requested: next`) : agentWorkflow)
+    const h = await makeHarness({ projects: [project] })
+    const hub = h.makeHub()
+    const opencode = new FakeOpencodeServer(project)
+    await hub.registerProject(project, createOpencodeSessions(opencode.api()))
+    const started = await h.client.startFeature({ title: "Structured gate", project })
+    const run = started.activeRun!
+    expect(opencode.sessions.get(run.sessionId!)!.prompts[0]!.text).toContain(run.id)
+    const descriptor = createReportTool(createConductorTools(h.client, project))
+    const schema = tool.schema.object(descriptor.args)
+    const submit = (args: unknown) => descriptor.execute(schema.parse(args), {} as Parameters<typeof descriptor.execute>[1])
+    return { ...h, run, featureId: started.feature.id, submit, schema }
+  }
+
+  it("accepts the actual optional tool payload, persists canonical IDs and rejects duplicates", async () => {
+    const h = await setup()
+    const args = { run_id: h.run.id, verdict: "changes_requested", notes: "Gate summary", review }
+    expect(h.schema.parse(args).review).toEqual(review)
+    expect(await h.submit(args)).toContain("changes_requested")
+    const findings = h.daemon.store.listFindings(h.featureId)
+    expect(findings).toHaveLength(1)
+    expect(findings[0]).toMatchObject({ id: "F1", blocking: true, severity: "minor", sourceRunId: h.run.id, reviewedHead: head })
+    expect(await h.submit(args)).toContain("already concluded")
+    expect(h.daemon.store.listFindings(h.featureId)).toEqual(findings)
+  })
+
+  it("keeps invalid heads, verdicts and lifecycle data from concluding or mutating the gate", async () => {
+    const h = await setup()
+    for (const input of [
+      { verdict: "approved", review },
+      { verdict: "changes_requested", review: { ...review, head: "b".repeat(40) } },
+      { verdict: "changes_requested", review: { head, findings: [{ ...finding, acceptanceTests: [] }] } },
+      { verdict: "changes_requested", review: { head, findings: [{ ...finding, path: "../escape.ts" }] } },
+      { verdict: "approved", review: { head, findings: [{ ...finding, id: "F1", status: "fixed", resolution: "fixed" }] } },
+      { verdict: "approved" },
+      { outcome: "failed", review },
+    ]) {
+      expect(await h.submit({ run_id: h.run.id, ...input })).toContain("Invalid review:")
+      expect((await h.client.getRun(h.run.id)).run.status).toBe("running")
+      expect(h.daemon.store.listFindings(h.featureId)).toEqual([])
+    }
+    expect(await h.submit({ run_id: h.run.id, verdict: "approved", review: { head, findings: [{ ...finding, severity: "blocker", blocking: false }] } })).toContain("approved")
+  })
+
+  it("rejects unknown fields and invalid primitive shapes instead of silently dropping them", async () => {
+    const h = await setup()
+    for (const invalid of [
+      { ...review, extra: true },
+      { head, findings: [{ ...finding, extra: true }] },
+      { head, findings: [{ ...finding, blocking: "true" }] },
+      { head, findings: [{ ...finding, line: 1.5 }] },
+      { head, findings: [{ ...finding, severity: "critical" }] },
+      { head: "short", findings: [] },
+      null,
+    ]) expect(h.schema.safeParse({ run_id: h.run.id, verdict: "approved", review: invalid }).success).toBe(false)
+    expect((await h.client.getRun(h.run.id)).run.status).toBe("running")
+    expect(h.daemon.store.listFindings(h.featureId)).toEqual([])
+  })
+
+  it("preserves ordinary reports and rejects structured opt-in by payload alone", async () => {
+    const h = await setup(false)
+    expect(await h.submit({ run_id: h.run.id, verdict: "approved", review: { head, findings: [] } })).toContain("not configured")
+    expect(await h.submit({ run_id: h.run.id, outcome: "succeeded", notes: "Plain report" })).toContain("succeeded")
+    expect(h.daemon.store.listFindings(h.featureId)).toEqual([])
+  })
+
+  it("allows failed structured gates to report without a review", async () => {
+    const h = await setup()
+    expect(await h.submit({ run_id: h.run.id, outcome: "failed", notes: "Cannot review" })).toContain("failed")
+    expect(h.daemon.store.listFindings(h.featureId)).toEqual([])
   })
 })
 

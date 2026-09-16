@@ -1,39 +1,3 @@
-/**
- * Daemon-side half of the runner callback transport: a runtime-neutral
- * `SessionClient` that routes session operations over HTTP to runner
- * endpoints registered in the `RunnerRegistry`. This is the v1
- * same-host topology from the design: the daemon never imports a
- * runtime SDK — a runner (the opencode adapter today) exposes a small
- * authenticated HTTP callback surface and registers its endpoint; the
- * daemon speaks this wire protocol and nothing else.
- *
- * Wire protocol (all JSON, bearer-authenticated with the token the
- * runner supplied at registration):
- *   POST <endpoint>/v1/sessions                {title, directory, parentID?} → 201 {id}
- *   GET  <endpoint>/v1/sessions/:id/status     → 200 {status: busy|idle|retry|missing}
- *   GET  <endpoint>/v1/sessions/:id/exists     → 200 {exists: boolean}
- *   POST <endpoint>/v1/sessions/:id/prompt     {text, agent?, model?} → 200 | 404 unknown session
- *   POST <endpoint>/v1/sessions/:id/note       {text} → 200 | 404 unknown session
- *   POST <endpoint>/v1/sessions/:id/abort      → 200 | 404 unknown session (no-op success)
- *
- * Safe directions, matching the daemon's stand-in client exactly:
- * with no registered runner (or an unreachable one), `status` claims
- * "busy" and `sessionExists` claims true — in-flight runs are never
- * nudged or reaped on missing information (TTL reaping still applies);
- * `createSession`/`prompt`/`note` fail loudly into the engine's normal
- * step-failure path.
- *
- * Multi-endpoint routing: `createSession` picks the runner whose
- * registered project is the longest path-prefix of the requested
- * directory; a worktree outside every registered project (the default
- * `worktreeDir: ".."` layout) deterministically falls back to the
- * first endpoint in sorted order — NEVER registration order. Reads
- * (`status`/`sessionExists`) aggregate across every endpoint so a
- * session is only "missing" when every runner disavows it; writes
- * (`prompt`/`note`) try endpoints in sorted order and skip the ones
- * that return 404 for the session.
- */
-
 import type { SessionClient } from "./ports.ts"
 import type { RunnerDirectory, RunnerRegistration } from "./runner-registry.ts"
 
@@ -44,162 +8,143 @@ export interface RunnerSessionClientDeps {
   readonly fetchImpl?: RunnerFetch
 }
 
-function isPathPrefix(prefix: string, directory: string): boolean {
-  return directory === prefix || directory.startsWith(prefix.endsWith("/") ? prefix : `${prefix}/`)
+export class NoLiveRunnerError extends Error {
+  constructor(message = "no live runner available") {
+    super(message)
+    this.name = "NoLiveRunnerError"
+  }
+}
+
+function isDefinitivePreConnectFailure(error: unknown): boolean {
+  const value = error as { code?: unknown; cause?: { code?: unknown } } | null
+  const code = value?.code ?? value?.cause?.code
+  return code === "ConnectionRefused" || code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "EAI_AGAIN"
 }
 
 function routeForDirectory(runners: readonly RunnerRegistration[], directory: string): RunnerRegistration {
-  let best: RunnerRegistration | null = null
-  let bestLength = -1
+  let best = runners[0]!
+  let length = -1
   for (const runner of runners) {
     for (const project of runner.projects) {
-      if (isPathPrefix(project, directory) && project.length > bestLength) {
+      const prefix = project.replace(/\/+$/, "")
+      if ((directory === prefix || directory.startsWith(`${prefix}/`)) && prefix.length > length) {
         best = runner
-        bestLength = project.length
+        length = prefix.length
       }
     }
   }
-  return best ?? runners[0]!
+  return best
 }
 
 export function createRunnerSessionClient(deps: RunnerSessionClientDeps): SessionClient {
   const fetchImpl = deps.fetchImpl ?? (request => fetch(request))
-
-  const call = async (
-    runner: RunnerRegistration,
-    method: string,
-    path: string,
-    body?: unknown,
-  ): Promise<Response> => {
+  const owners = new Map<string, string>()
+  const remember = (sessionID: string, runner: RunnerRegistration): void => {
+    owners.delete(sessionID)
+    owners.set(sessionID, runner.id)
+    if (owners.size > 1024) owners.delete(owners.keys().next().value!)
+  }
+  const ordered = (sessionID: string): readonly RunnerRegistration[] => {
+    const runners = deps.runners.list()
+    const owner = runners.find(runner => runner.id === owners.get(sessionID))
+    return owner ? [owner, ...runners.filter(runner => runner !== owner)] : runners
+  }
+  const call = (runner: RunnerRegistration, method: string, path: string, body?: unknown): Promise<Response> => {
     const headers: Record<string, string> = { accept: "application/json" }
+    if (runner.token !== undefined) headers.authorization = `Bearer ${runner.token}`
     if (body !== undefined) headers["content-type"] = "application/json"
-    if (runner.token !== undefined) headers["authorization"] = `Bearer ${runner.token}`
-    return fetchImpl(
-      new Request(`${runner.endpoint}${path}`, {
-        method,
-        headers,
-        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-      }),
-    )
+    return fetchImpl(new Request(`${runner.endpoint}${path}`, {
+      method, headers, redirect: "error", signal: AbortSignal.timeout(10_000),
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    }))
   }
-
-  const readJson = async (response: Response): Promise<Record<string, unknown>> => {
-    const parsed: unknown = await response.json()
-    if (typeof parsed !== "object" || parsed === null) throw new Error("runner returned a non-object body")
-    return parsed as Record<string, unknown>
+  const json = async (response: Response): Promise<Record<string, unknown>> => {
+    const body: unknown = await response.json()
+    if (typeof body !== "object" || body === null) throw new Error("runner returned a non-object body")
+    return body as Record<string, unknown>
   }
-
+  const probe = async (runner: RunnerRegistration): Promise<boolean> => {
+    try {
+      const response = await call(runner, "GET", "/v1/health")
+      if (!response.ok || (await json(response)).ok !== true) throw new NoLiveRunnerError("runner health probe failed")
+      return true
+    } catch (error) {
+      if (isDefinitivePreConnectFailure(error)) {
+        deps.runners.markUnreachable(runner)
+        return false
+      }
+      throw new NoLiveRunnerError("runner health probe unavailable; no write sent")
+    }
+  }
+  const write = async (runner: RunnerRegistration, path: string, body?: unknown): Promise<Response | null> => {
+    if (!(await probe(runner))) return null
+    try {
+      return await call(runner, "POST", path, body)
+    } catch (error) {
+      if (!isDefinitivePreConnectFailure(error)) throw error
+      deps.runners.markUnreachable(runner)
+      return null
+    }
+  }
+  const sessionWrite = async (sessionID: string, action: string, body?: unknown): Promise<void> => {
+    let unavailable = deps.runners.hasUnavailable()
+    const runners = ordered(sessionID)
+    for (const runner of runners) {
+      const response = await write(runner, `/v1/sessions/${encodeURIComponent(sessionID)}/${action}`, body)
+      if (response === null) { unavailable = true; continue }
+      if (response.status === 404) continue
+      if (!response.ok) throw new Error(`runner failed to ${action} (status ${response.status})`)
+      remember(sessionID, runner)
+      return
+    }
+    if (action === "abort") return
+    if (unavailable || runners.length === 0) throw new NoLiveRunnerError()
+    throw new Error(`no registered runner knows session ${sessionID}`)
+  }
+  const read = async (sessionID: string, action: "status" | "exists"): Promise<unknown> => {
+    const runners = ordered(sessionID)
+    let uncertain = deps.runners.hasUnavailable() || runners.length === 0
+    let found: unknown
+    for (const runner of runners) {
+      try {
+        const response = await call(runner, "GET", `/v1/sessions/${encodeURIComponent(sessionID)}/${action}`)
+        if (!response.ok) { uncertain = true; continue }
+        const value = (await json(response))[action]
+        const valid = action === "exists" ? typeof value === "boolean" : ["busy", "idle", "retry", "missing"].includes(String(value))
+        if (!valid) { uncertain = true; continue }
+        if (owners.get(sessionID) === runner.id) return value
+        if (value === true || value === "busy") return value
+        if (value === "retry" || (value === "idle" && found !== "retry")) found = value
+      } catch {
+        uncertain = true
+      }
+    }
+    if (uncertain) return action === "exists" ? true : "busy"
+    return found ?? (action === "exists" ? false : "missing")
+  }
   return {
     async createSession(input) {
-      const runners = deps.runners.list()
-      if (runners.length === 0) throw new Error("no runner registered with the daemon")
-      const runner = routeForDirectory(runners, input.directory)
-      const response = await call(runner, "POST", "/v1/sessions", {
-        title: input.title,
-        directory: input.directory,
-        ...(input.parentID !== undefined ? { parentID: input.parentID } : {}),
-        // Optional end-to-end: a runner that ignores it still creates the
-        // session; the field only enables agent-log attribution.
-        ...(input.runId !== undefined ? { runId: input.runId } : {}),
-      })
-      if (!response.ok) {
-        throw new Error(`runner ${runner.endpoint} failed to create session (status ${response.status})`)
+      let runners = deps.runners.list()
+      while (runners.length > 0) {
+        const runner = routeForDirectory(runners, input.directory)
+        const response = await write(runner, "/v1/sessions", input)
+        if (response === null) { runners = runners.filter(candidate => candidate !== runner); continue }
+        if (!response.ok) throw new Error(`runner failed to create session (status ${response.status})`)
+        const body = await json(response)
+        if (typeof body.id !== "string" || body.id === "") throw new Error("runner returned no session id")
+        remember(body.id, runner)
+        return { id: body.id }
       }
-      const body = await readJson(response)
-      if (typeof body.id !== "string" || body.id === "") {
-        throw new Error(`runner ${runner.endpoint} returned no session id`)
-      }
-      return { id: body.id }
+      throw new NoLiveRunnerError()
     },
-
-    async prompt(input) {
-      const runners = deps.runners.list()
-      if (runners.length === 0) throw new Error("no runner registered with the daemon")
-      // Writes fail LOUDLY on an unreachable runner (only a 404 — "not
-      // my session" — moves on to the next endpoint): a swallowed prompt
-      // would strand the run until TTL, whereas a thrown error flows into
-      // the engine's normal step-failure/retry path immediately.
-      for (const runner of runners) {
-        const response = await call(runner, "POST", `/v1/sessions/${encodeURIComponent(input.sessionID)}/prompt`, {
-          text: input.text,
-          ...(input.agent !== undefined ? { agent: input.agent } : {}),
-          ...(input.model !== undefined ? { model: input.model } : {}),
-        })
-        if (response.status === 404) continue
-        if (!response.ok) throw new Error(`runner ${runner.endpoint} failed to prompt (status ${response.status})`)
-        return
-      }
-      throw new Error(`no registered runner knows session ${input.sessionID}`)
-    },
-
-    async note(input) {
-      const runners = deps.runners.list()
-      if (runners.length === 0) throw new Error("no runner registered with the daemon")
-      for (const runner of runners) {
-        const response = await call(runner, "POST", `/v1/sessions/${encodeURIComponent(input.sessionID)}/note`, {
-          text: input.text,
-        })
-        if (response.status === 404) continue
-        if (!response.ok) throw new Error(`runner ${runner.endpoint} failed to post note (status ${response.status})`)
-        return
-      }
-      throw new Error(`no registered runner knows session ${input.sessionID}`)
-    },
-
-    async abort(sessionID) {
-      const runners = deps.runners.list()
-      // No runner, nothing to abort — the orphan cannot be running.
-      if (runners.length === 0) return
-      for (const runner of runners) {
-        // 404 = "not my session" (or already gone) — both fine: abort of
-        // a missing session is a no-op success by the port contract.
-        const response = await call(runner, "POST", `/v1/sessions/${encodeURIComponent(sessionID)}/abort`)
-        if (response.status === 404) continue
-        if (!response.ok) throw new Error(`runner ${runner.endpoint} failed to abort (status ${response.status})`)
-        return
-      }
-    },
-
-    async sessionExists(sessionID) {
-      const runners = deps.runners.list()
-      if (runners.length === 0) return true
-      for (const runner of runners) {
-        try {
-          const response = await call(runner, "GET", `/v1/sessions/${encodeURIComponent(sessionID)}/exists`)
-          if (!response.ok) return true
-          const body = await readJson(response)
-          if (body.exists === true) return true
-        } catch {
-          // Unreachable runner: claim the session exists — never treat a
-          // transport failure as a vanished session.
-          return true
-        }
-      }
-      return false
-    },
-
-    async status(sessionID) {
-      const runners = deps.runners.list()
-      if (runners.length === 0) return "busy"
-      let sawRetry = false
-      let sawIdle = false
-      for (const runner of runners) {
-        let status: unknown
-        try {
-          const response = await call(runner, "GET", `/v1/sessions/${encodeURIComponent(sessionID)}/status`)
-          if (!response.ok) return "busy"
-          status = (await readJson(response)).status
-        } catch {
-          return "busy"
-        }
-        if (status === "busy") return "busy"
-        if (status === "retry") sawRetry = true
-        else if (status === "idle") sawIdle = true
-        else if (status !== "missing") return "busy"
-      }
-      if (sawRetry) return "retry"
-      if (sawIdle) return "idle"
-      return "missing"
-    },
+    prompt: input => sessionWrite(input.sessionID, "prompt", {
+      text: input.text,
+      ...(input.agent !== undefined ? { agent: input.agent } : {}),
+      ...(input.model !== undefined ? { model: input.model } : {}),
+    }),
+    note: input => sessionWrite(input.sessionID, "note", { text: input.text }),
+    abort: sessionID => sessionWrite(sessionID, "abort"),
+    sessionExists: async sessionID => (await read(sessionID, "exists")) as boolean,
+    status: async sessionID => (await read(sessionID, "status")) as "busy" | "idle" | "retry" | "missing",
   }
 }

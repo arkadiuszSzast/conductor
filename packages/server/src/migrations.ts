@@ -638,6 +638,23 @@ export const migrations: readonly Migration[] = [
       addColumn(db, "recovery_dispatch", "notes_consumed", "INTEGER NOT NULL DEFAULT 0")
     },
   },
+  {
+    id: "0020_recovery_note_episodes",
+    up(db) {
+      addColumn(db, "recovery_dispatch", "episode_closed", "INTEGER NOT NULL DEFAULT 0")
+      db.run("UPDATE recovery_dispatch SET episode_closed = notes_consumed")
+    },
+  },
+  {
+    id: "0021_structured_findings",
+    up(db) {
+      addColumn(db, "finding", "blocking", "INTEGER CHECK(blocking IN (0, 1))")
+      addColumn(db, "finding", "acceptance_tests", "TEXT NOT NULL DEFAULT '[]'")
+      addColumn(db, "finding", "source_job_id", "TEXT")
+      addColumn(db, "finding", "source_run_id", "TEXT")
+      addColumn(db, "finding", "reviewed_head", "TEXT")
+    },
+  },
 ]
 
 function validateMigrations(ordered: readonly Migration[]): void {

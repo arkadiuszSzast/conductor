@@ -1,4 +1,5 @@
 export const name = "@conductor/server" as const
+export type { ReviewFinding, ReviewReport } from "./review.ts"
 
 export {
   migrateDatabase,
@@ -146,7 +147,7 @@ export type {
   PluginTarget,
 } from "./plugin-proxy.ts"
 
-export { createRunnerSessionClient } from "./runner-transport.ts"
+export { NoLiveRunnerError, createRunnerSessionClient } from "./runner-transport.ts"
 export type { RunnerFetch, RunnerSessionClientDeps } from "./runner-transport.ts"
 
 // Re-export the graph workflow IR types the server operates on, so

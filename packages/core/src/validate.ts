@@ -388,7 +388,7 @@ function collectRefs(def: WorkflowDef): ValidatedRefs {
     stepOutputs[jobId] = {}
     for (const step of job.steps) {
       stepOutputs[jobId]![step.id] = step.type === "agent"
-        ? { kind: "fixed", outputs: { report: "string" } }
+        ? { kind: "fixed", outputs: step.reviewHead !== undefined ? { report: "string", work_order: "string" } : { report: "string" } }
         : step.type === "human"
           ? { kind: "fixed", outputs: { notes: "string" } }
           : { kind: "dynamic" }
@@ -487,8 +487,35 @@ function validateExpressions(def: WorkflowDef, errors: string[], warnings: strin
         })
       }
 
+      if (step.type === "agent") {
+        if ((step.fixFrom !== undefined || step.qualityFrom !== undefined) !== (step.fixPrompt !== undefined)) {
+          errors.push(`${where}: fixPrompt requires fixFrom or qualityFrom and vice versa`)
+        }
+        if (step.reviewHead !== undefined && (!step.outcomes.approved || !step.outcomes.changes_requested)) {
+          errors.push(`${where}: reviewHead requires approved and changes_requested outcomes`)
+        }
+        for (const key of ["fixFrom", "qualityFrom"] as const) {
+          const ref = step[key]
+          if (ref === undefined) continue
+          const parts = ref.split("/")
+          const source = parts.length === 2 ? def.jobs[parts[0]!]?.steps.find(candidate => candidate.id === parts[1]) : undefined
+          if (!source || (key === "fixFrom" ? source.type !== "agent" || source.reviewHead === undefined : source.type !== "command")) {
+            errors.push(`${where}: ${key} must reference a ${key === "fixFrom" ? "structured review" : "command"} job/step`)
+          } else {
+            validateExpression(`feedback.jobs[${JSON.stringify(parts[0])}][${JSON.stringify(parts[1])}][${JSON.stringify(key === "fixFrom" ? "work_order" : "diagnostic")}]`, {
+              where: `${where}: ${key}`,
+              typeOfPath: path => typeOfStepPath(path, index, jobId, job, def, refs),
+              allowedRoots: new Set(["feedback"]), feedbackRoot: jobId, rerunRoutes, def, errors,
+            })
+          }
+        }
+        if (step.fixPrompt !== undefined && extractExpressions(step.fixPrompt).some(expression => /\bfeedback\b/.test(expression))) {
+          errors.push(`${where}: fixPrompt must not interpolate feedback; scoped fix evidence is supplied by the engine`)
+        }
+      }
       if (step.type === "agent" || (step.type === "human" && step.prompt !== undefined)) {
-        for (const expression of extractExpressions(step.prompt!)) {
+        const templates = step.type === "agent" ? [step.prompt, step.fixPrompt, step.reviewHead] : [step.prompt]
+        for (const expression of templates.flatMap(template => template === undefined ? [] : extractExpressions(template))) {
           validateExpression(expression, {
             where: `${where}: prompt`,
             typeOfPath: path => typeOfStepPath(path, index, jobId, job, def, refs),

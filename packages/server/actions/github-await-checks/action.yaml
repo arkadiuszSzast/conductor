@@ -1,12 +1,14 @@
 name: github/await-checks
 version: 1.0.0
-description: Poll a pull request's checks until they all conclude, fail, or time out.
+description: Await declared required checks on an exact PR head commit, failing on head movement.
 inputs:
   pr:              { type: number, required: true }
+  expected_sha:    { type: string, required: true }
+  required_checks: { type: "string[]", required: true }
   timeout_minutes: { type: number, default: 30 }
   poll_seconds:    { type: number, default: 60 }
-  no_checks_grace_seconds: { type: number, default: 120 }
 outputs:
   conclusion: { type: string }
+  sha: { type: string }
 capabilities: [process, network, credentials]
 run: { handler: github/await-checks }
