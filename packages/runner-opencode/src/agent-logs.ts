@@ -6,7 +6,7 @@
  *  - `source: "agent"` — the agent's narrative text, coalesced per
  *    debounce window so a chatty stream reads as one line of progress.
  *  - `source: "tool"` — one compact line per tool invocation
- *    ("running command — git diff main...HEAD"), emitted once per part
+ *    ("running command"), emitted once per part
  *    id the moment the input is known. Tool lines keep the activity
  *    clock honest for tool-heavy agents (a reviewer can run for an hour
  *    without emitting a single text part) and give the UI a live "what
@@ -49,8 +49,6 @@ const TOOL_PHRASES: Record<string, string> = {
   question: "asking question",
 }
 
-const TOOL_DETAIL_LIMIT = 160
-
 interface PartSnapshot {
   readonly sessionID?: string
   readonly id?: string
@@ -88,29 +86,11 @@ export interface AgentLogPusher {
   flush(): Promise<void>
 }
 
-/** The most salient input argument for a tool, for the detail suffix. */
-function toolDetail(tool: string, input: Readonly<Record<string, unknown>> | undefined): string {
-  if (!input) return ""
-  const candidates: unknown[] = [
-    input["command"],
-    input["pattern"],
-    input["filePath"],
-    input["path"],
-    input["url"],
-    input["description"],
-    input["name"],
-  ]
-  const found = candidates.find(value => typeof value === "string" && value !== "")
-  if (typeof found !== "string") return ""
-  const flattened = found.replace(/\s+/g, " ").trim()
-  return flattened.length > TOOL_DETAIL_LIMIT ? `${flattened.slice(0, TOOL_DETAIL_LIMIT)}…` : flattened
-}
-
 function toolLine(part: PartSnapshot): string {
-  const tool = typeof part.tool === "string" && part.tool !== "" ? part.tool : "tool"
-  const phrase = TOOL_PHRASES[tool] ?? `using ${tool}`
-  const detail = toolDetail(tool, part.state?.input)
-  return detail === "" ? phrase : `${phrase} — ${detail}`
+  const tool = part.tool
+  return typeof tool === "string" && Object.hasOwn(TOOL_PHRASES, tool)
+    ? TOOL_PHRASES[tool]!
+    : "using tool"
 }
 
 export function createAgentLogPusher(deps: AgentLogPusherDeps): AgentLogPusher {
