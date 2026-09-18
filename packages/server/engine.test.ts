@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
-import { mkdtempSync, rmSync } from "node:fs"
+import { existsSync, readFileSync, mkdtempSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { openMigratedDatabase, type DatabaseConnection } from "./src/database.ts"
@@ -325,6 +325,55 @@ async function startedFeature(engine: Engine, projectDir = "/tmp/project") {
 }
 
 // ---------------------------------------------------------------------------
+
+describe("command cancellation", () => {
+  it.skipIf(!process.env.VISUAL_SUPERVISOR)("abandon of an actual capture command kills its detached supervised child", async () => {
+    const pidfile = join(directory, 'capture-pid')
+    const code = `import os,time; open(${JSON.stringify(pidfile)},"w").write(str(os.getpid())); time.sleep(20)`
+    const command = `python3 "${process.env.VISUAL_SUPERVISOR}" 10 python3 -c '${code}'`
+    const engine = makeEngine(workflow({ main: job([agentStep('start', 'implementer', 'start'), commandStep('capture', [command])]) }, roles), {}, { process: realProcessRunner })
+    const feature = await startedFeature(engine, directory)
+    const completion = engine.report({ runId: store.listRuns(feature.id)[0]!.id, outcome: 'succeeded' })
+    try {
+      for (let tries = 0; tries < 100 && !existsSync(pidfile); tries++) await Bun.sleep(20)
+      expect(existsSync(pidfile)).toBe(true)
+      const pid = Number(readFileSync(pidfile, 'utf8'))
+      await engine.abandon(feature.id)
+      await completion
+      expect(existsSync(`/proc/${pid}`)).toBe(false)
+      expect(store.listRuns(feature.id).some(run => run.stepId === 'capture' && run.status === 'succeeded')).toBe(false)
+    } finally {
+      await engine.abandon(feature.id)
+      await completion
+    }
+  }, 15000)
+
+  it("abandon aborts the process port and prevents the next command", async () => {
+    let observed: AbortSignal | undefined
+    let calls = 0
+    const entered = Promise.withResolvers<void>()
+    const runner: ProcessRunner = {
+      exec: process_.exec.bind(process_),
+      shell: async (_command, options) => {
+        calls++
+        observed = options.signal
+        entered.resolve()
+        await new Promise<void>(resolve => options.signal?.addEventListener("abort", () => resolve(), { once: true }))
+        return { code: 0, stdout: "", stderr: "", output: "" }
+      },
+    }
+    const engine = makeEngine(workflow({ main: job([agentStep("start", "implementer", "start"), commandStep("capture", ["capture", "must-not-run"])]) }, roles), {}, { process: runner })
+    const feature = await startedFeature(engine)
+    const active = store.listRuns(feature.id)[0]!
+    const completion = engine.report({ runId: active.id, outcome: "succeeded" })
+    await entered.promise
+    await engine.abandon(feature.id)
+    await completion
+    expect(observed?.aborted).toBe(true)
+    expect(calls).toBe(1)
+    expect(store.getFeature(feature.id)?.status).toBe("abandoned")
+  })
+})
 
 describe("Engine: structured review work orders", () => {
   const head = "a".repeat(40)

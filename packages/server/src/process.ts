@@ -34,16 +34,22 @@ function run(
   args: readonly string[],
   options: ProcessExecOptions,
 ): Promise<ProcessExecResult> {
+  if (options.signal?.aborted) return Promise.resolve({ code: 130, stdout: "", stderr: "cancelled", output: "cancelled" })
   return new Promise(resolve => {
+    let stopping: number | null = null
+    let escalation: ReturnType<typeof setTimeout> | undefined
     let settled = false
     const settle = (result: ProcessExecResult) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      options.signal?.removeEventListener("abort", abort)
+      if (stopping === null) clearTimeout(escalation)
       resolve(result)
     }
     const child = spawn(command, args as string[], {
       cwd: options.cwd,
+      detached: process.platform !== "win32",
       stdio: [options.stdin !== undefined ? "pipe" : "ignore", "pipe", "pipe"],
       env: options.env !== undefined ? { ...process.env, ...options.env } : process.env,
     })
@@ -81,13 +87,30 @@ function run(
     child.stdout?.on("data", capture(stdoutChunks, () => stdoutBytes, n => { stdoutBytes = n }))
     child.stderr?.on("data", capture(stderrChunks, () => stderrBytes, n => { stderrBytes = n }))
 
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL")
-    }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+    const signalTree = (signal: NodeJS.Signals) => {
+      try {
+        if (child.pid !== undefined && process.platform !== "win32") process.kill(-child.pid, signal)
+        else child.kill(signal)
+      } catch {}
+    }
+    const stop = (code: number) => {
+      if (stopping !== null) return
+      stopping = code
+      signalTree("SIGTERM")
+      escalation = setTimeout(() => {
+        signalTree("SIGKILL")
+        child.stdout?.destroy()
+        child.stderr?.destroy()
+      }, 4000)
+    }
+    const abort = () => stop(130)
+    const timer = setTimeout(() => stop(124), options.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+    options.signal?.addEventListener("abort", abort, { once: true })
+    if (options.signal?.aborted) abort()
 
     child.on("close", code => {
       settle({
-        code: code ?? 1,
+        code: stopping ?? code ?? 1,
         stdout: Buffer.concat(stdoutChunks).toString("utf-8"),
         stderr: Buffer.concat(stderrChunks).toString("utf-8"),
         output: Buffer.concat(combinedChunks).toString("utf-8"),

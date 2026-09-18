@@ -191,6 +191,7 @@ export class Engine {
    * workflow's retry/onFail policy decides what happens next).
    */
   private readonly actionRuns = new Map<string, Promise<void>>()
+  private readonly commandRuns = new Map<string, { featureId: string; controller: AbortController }>()
   private readonly runTtlMs: number
   private readonly nudgeIdleCycles: number
   private readonly maxNudges: number
@@ -569,21 +570,26 @@ export class Engine {
       attempt,
     })
 
+    const controller = new AbortController()
+    this.commandRuns.set(runId, { featureId, controller })
     const outputDir = await mkdtemp(join(tmpdir(), "conductor-output-"))
     const outputPath = join(outputDir, "outputs")
     try {
       let failureReason: string | null = null
       let failureClass: FailureClass = "deterministic_failure"
       for (const raw of step.run) {
+        if (controller.signal.aborted) return
         const command = renderTemplate(raw, context).text
         const result = await process.shell(command, {
           cwd,
+          signal: controller.signal,
           env: { CONDUCTOR_OUTPUT: outputPath },
           ...(step.timeoutMs !== undefined ? { timeoutMs: step.timeoutMs } : {}),
         })
         // The interleaved capture becomes the run's narrative log — the
         // failure `reason` below keeps carrying the output tail exactly as
         // before; the log supplements it, never replaces it.
+        if (controller.signal.aborted) return
         if (result.output !== "") store.appendRunLog(runId, [{ source: "process", text: result.output }])
         if (result.code !== 0) {
           // Secret-safe diagnostics: a failing command's captured output
@@ -621,6 +627,7 @@ export class Engine {
         { kind: "step.completed", jobId, stepId: step.id, outcome: DEFAULT_OUTCOME, outputs },
       )
     } finally {
+      this.commandRuns.delete(runId)
       await rm(outputDir, { recursive: true, force: true })
     }
   }
@@ -1636,6 +1643,9 @@ export class Engine {
   }
 
   async abandon(featureId: string): Promise<void> {
+    for (const run of this.commandRuns.values()) {
+      if (run.featureId === featureId) run.controller.abort()
+    }
     await this.dispatch(featureId, { kind: "human.abandoned" })
   }
 
@@ -2056,6 +2066,7 @@ export class Engine {
     // session an orphan burning tokens against a closed run — exactly
     // the failure this exists to prevent. Best-effort by contract: a
     // runner that cannot abort must never block the conclusion.
+    this.commandRuns.get(active.id)?.controller.abort()
     if (active.sessionId) {
       try {
         await this.deps.sessions.abort(active.sessionId)
