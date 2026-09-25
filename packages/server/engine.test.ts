@@ -280,6 +280,7 @@ let sessions: FakeSessions
 let process_: FakeProcess
 let clock: FakeClock
 let actions: FakeActionHost
+let engines: Engine[]
 
 beforeEach(() => {
   directory = mkdtempSync(join(tmpdir(), "conductor-engine-"))
@@ -289,9 +290,11 @@ beforeEach(() => {
   sessions = new FakeSessions()
   process_ = new FakeProcess()
   actions = new FakeActionHost()
+  engines = []
 })
 
-afterEach(() => {
+afterEach(async () => {
+  await Promise.all(engines.map(engine => engine.settleActions()))
   connection.close()
   rmSync(directory, { recursive: true, force: true })
 })
@@ -303,7 +306,7 @@ function makeEngine(
   actionBindings: ResolvedActionBindings = {},
 ): Engine {
   const snapshot = snapshotOf(def, actionBindings)
-  return new Engine(
+  const engine = new Engine(
     {
       store,
       workflows: () => snapshot,
@@ -316,6 +319,8 @@ function makeEngine(
     },
     options,
   )
+  engines.push(engine)
+  return engine
 }
 
 async function startedFeature(engine: Engine, projectDir = "/tmp/project") {
@@ -384,7 +389,7 @@ describe("Engine: structured review work orders", () => {
     await engine.report({ runId: store.getActiveRun(feature.id)!.id, verdict: "approved", review: {
       head: sha, findings: [{ ...finding, id: "F1", status: "fixed", resolution: "Acceptance test verified" }],
     } })
-    for (let attempt = 0; attempt < 100 && store.getFeature(feature.id)!.status === "running"; attempt++) await Bun.sleep(10)
+    await engine.settleActions()
     expect(checks).toBe(4)
     expect(store.listFindings(feature.id)[0]).toMatchObject({ id: "F1", status: "fixed" })
     expect(store.getFeature(feature.id)!.jobs.main!.steps.cleanup!.status).toBe("succeeded")
@@ -2541,24 +2546,24 @@ describe("Engine: action steps", () => {
 
   it("TTL reaps a hung action run just like a command run", async () => {
     actions.calls = []
-    const pending = new Promise<never>(() => {}) // never resolves — simulates a hung host call
-    actions.handler = () => { throw new Error("unused") }
-    const originalExecute = actions.execute.bind(actions)
+    let release!: () => void
+    const pending = new Promise<void>(resolve => { release = resolve })
     actions.execute = async (binding, ctx) => {
       actions.calls.push({ binding, ctx })
-      return pending
+      await pending
+      return { ok: true, outputs: { path: "/x" } }
     }
     const engine = makeEngine(actionWorkflow, { runTtlMs: 1000 }, { clock }, bindingsFor(worktreeManifest))
-    void engine.startFeature("/tmp/project", { title: "Ship it" })
-    // let the dispatch reach the (hung) host call before reconciling
-    await new Promise(resolve => setTimeout(resolve, 10))
+    await engine.startFeature("/tmp/project", { title: "Ship it" })
     const feature = store.listFeatures()[0]!
     clock.advance(2000)
     await engine.reconcile()
 
     const run = store.listRuns(feature.id).find(r => r.stepId === "worktree")!
+    release()
+    await engine.settleActions()
     expect(run.status).toBe("reaped")
-    void originalExecute
+    expect(store.getRunById(run.id)!.status).toBe("reaped")
   })
 
   it("a slow action does not block reconciliation of other features", async () => {
