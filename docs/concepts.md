@@ -344,14 +344,16 @@ first one exhausted stops the retry, whichever it is:
   default's attempt count and backoff shape for a step. A step with no
   `retry:` declared gets exactly one attempt, same as always.
 - **Elapsed time** — measured from the first attempt's dispatch, **excluding
-  time spent paused** (see below). This is currently always the failure
-  class's own fixed default from the table above; there is no workflow
-  syntax yet to override it per step (the parsed `retry.maxElapsed` field
-  is validated but has no runtime effect — see the reference page). When
-  the next scheduled attempt would start after this deadline, it is never
-  dispatched — the step reaches its terminal route (`onFail`, or job
-  failure with no `onFail`) at the deadline, exactly as if attempts had run
-  out, without spending one attempt over budget.
+  time spent paused** (see below). `steps[*].retry.maxElapsed` (see the
+  [workflow reference](workflow-reference.md#stepsretry)), when declared,
+  overrides the failure class's own fixed default from the table above for
+  that step's retry episode; recovery after an operator retry keeps the same
+  deadline rather than resetting to the class default. A step with no
+  `maxElapsed` declared uses the class default. When the next scheduled
+  attempt would start after this deadline, it is never dispatched — the step
+  reaches its terminal route (`onFail`, or job failure with no `onFail`) at
+  the deadline, exactly as if attempts had run out, without spending one
+  attempt over budget.
 
 A retry that has a non-zero backoff delay is a **durable scheduled
 episode**, not an in-memory timer: it survives a daemon restart, and

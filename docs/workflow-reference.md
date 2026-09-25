@@ -252,7 +252,7 @@ escalation event (install-wide); see the decision log in
 ```yaml
 retry:
   maxAttempts: 3            # total attempts INCLUDING the first
-  maxElapsed: PT10M         # optional ISO-8601 wall-clock cap (planned — see below)
+  maxElapsed: PT10M         # optional ISO-8601 wall-clock cap for this step
   backoff:
     strategy: constant      # constant | exponential
     delay: 10000            # ms (constant)
@@ -269,17 +269,18 @@ backoff:
 
 Retry applies only to `step.failed` — an outcome never consumes retry
 budget. See [Retries, failure classes and recovery](concepts.md#retries-failure-classes-and-recovery)
-for how a failure is classified and which elapsed deadline actually governs
-it — the step's own `maxAttempts`/`backoff` here take effect, but the
-**elapsed** deadline is currently always the classified failure's class
-default, not this field.
+for how a failure is classified. The step's own `maxAttempts`/`backoff` here
+take effect, and `maxElapsed` — when present — is the elapsed deadline for the
+step's retry episode, overriding the classified failure's class default (which
+governs when the field is absent).
 
-**(planned)** `maxElapsed` is parsed and validated (a valid ISO-8601
-duration is required if present) but is not yet consulted by the engine —
-declaring it has no runtime effect today. The elapsed deadline the engine
-actually enforces always comes from the failure's classified class default
-(see the concepts page linked above); there is no YAML syntax yet to
-override it per step or per class.
+`maxElapsed: PT0S` is a valid, parseable zero-length deadline — it means "no
+elapsed budget for a delayed retry": the very first candidate retry time
+(dispatch time plus the backoff delay) already lands past a zero deadline,
+so the episode escalates on the FIRST failure regardless of `maxAttempts` or
+`backoff`. This is a scheduling constraint on the retry episode, not a claim
+about the step's own execution runtime — an in-flight attempt is bounded by
+`ttlMs` (or the engine's `runTtlMs`), never by `maxElapsed`.
 
 ---
 
@@ -304,6 +305,9 @@ Performs LLM work.
 | `role` | yes | Must exist in `roles`. |
 | `prompt` | yes | Template; see [Expressions](expressions.md). |
 | `interactive` | no | Boolean, default `false`. Grants the step the right to pause mid-run and ask the human a question. |
+| `idleSilenceNudgeMs` | no | Positive integer ms; overrides daemon idle silence (default 120000). Every idle nudge or exhausted reap requires elapsed silence plus cycle debounce. |
+| `busySilenceNudgeMs` | no | Positive integer ms; overrides daemon busy/retry silence (default 600000). |
+| `maxNudges` | no | Positive integer; overrides daemon shared per-run idle/busy budget (default 2). Activity and restart do not reset consumed nudges. |
 | `ttlMs` | no | Positive integer (ms). Silence budget for this step's runs, overriding the engine-wide `engine.runTtlMs` (default 1 h). The TTL measures time since the run's **last observed activity** (log appends, question flow, nudges) — not age since dispatch — so a long-running step that streams logs stays alive; use `ttlMs` when even the gaps between a step's activity legitimately exceed the engine default (e.g. a 90-minute quality gate inside an implement step). |
 
 **Outputs:** the agent's report is published as `outputs.report`. Structured review

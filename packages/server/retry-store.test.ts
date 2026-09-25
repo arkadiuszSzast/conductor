@@ -6,6 +6,16 @@ import { openMigratedDatabase, type DatabaseConnection } from "./src/database.ts
 import { Store } from "./src/store.ts"
 import type { FailureEnvelope, PipelineEvent, Transition } from "@conductor/core"
 
+class FakeClock {
+  current = Date.now()
+  now(): number {
+    return this.current
+  }
+  advance(ms: number): void {
+    this.current += ms
+  }
+}
+
 let directory: string
 let connection: DatabaseConnection
 let store: Store
@@ -529,34 +539,30 @@ describe("pause accounting", () => {
     expect(paused.pausedAt).not.toBeNull()
     expect(paused.pausedMs).toBe(0)
 
-    // Simulate elapsed wall-clock time under pause directly at the row level
-    // (this suite drives applyTransition with real Date.now(), so we assert
-    // the shape/monotonic direction rather than an exact duration).
     store.applyTransition(feature.id, { kind: "human.resumed" }, { decisions: [], patch: { status: "running" } })
     const resumed = store.getPauseAccounting(feature.id)!
     expect(resumed.pausedAt).toBeNull()
     expect(resumed.pausedMs).toBeGreaterThanOrEqual(0)
   })
 
-  it("accumulates across multiple pause/resume cycles rather than overwriting", () => {
-    // The store's constructor clock only throttles run_log notifications
-    // (see emitRunLogChange) — pause timestamps use Date.now() directly,
-    // same as every other store timestamp, so this drives real spans and
-    // asserts monotonic accumulation directly on the feature row instead
-    // of an injected clock.
-    const feature = store.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
+  it("accumulates across multiple pause/resume cycles rather than overwriting, with exact spans from an injected clock", () => {
+    // `applyTransitionTx`'s pause fold reads `this.clock.now()` (M1 fix:
+    // consistent with every other store timestamp) — an injected
+    // `FakeClock` gives EXACT spans instead of the SQL-backdate-then-
+    // assert-monotonic workaround this test used before.
+    const clock = new FakeClock()
+    const clockedStore = new Store(connection.db, clock)
+    const feature = clockedStore.createFeature({ title: "F", slug: "f", projectDir: "/p", workflow: "wf" })
 
-    store.applyTransition(feature.id, { kind: "human.paused" }, { decisions: [{ kind: "pause" }], patch: { status: "paused" } })
-    connection.db.run("UPDATE feature SET paused_at = paused_at - 5000 WHERE id = ?", [feature.id])
-    store.applyTransition(feature.id, { kind: "human.resumed" }, { decisions: [], patch: { status: "running" } })
-    const afterFirst = store.getPauseAccounting(feature.id)!.pausedMs
-    expect(afterFirst).toBeGreaterThanOrEqual(5000)
+    clockedStore.applyTransition(feature.id, { kind: "human.paused" }, { decisions: [{ kind: "pause" }], patch: { status: "paused" } })
+    clock.advance(5000)
+    clockedStore.applyTransition(feature.id, { kind: "human.resumed" }, { decisions: [], patch: { status: "running" } })
+    expect(clockedStore.getPauseAccounting(feature.id)!.pausedMs).toBe(5000)
 
-    store.applyTransition(feature.id, { kind: "human.paused" }, { decisions: [{ kind: "pause" }], patch: { status: "paused" } })
-    connection.db.run("UPDATE feature SET paused_at = paused_at - 3000 WHERE id = ?", [feature.id])
-    store.applyTransition(feature.id, { kind: "human.resumed" }, { decisions: [], patch: { status: "running" } })
-    const afterSecond = store.getPauseAccounting(feature.id)!.pausedMs
-    expect(afterSecond).toBeGreaterThanOrEqual(afterFirst + 3000)
+    clockedStore.applyTransition(feature.id, { kind: "human.paused" }, { decisions: [{ kind: "pause" }], patch: { status: "paused" } })
+    clock.advance(3000)
+    clockedStore.applyTransition(feature.id, { kind: "human.resumed" }, { decisions: [], patch: { status: "running" } })
+    expect(clockedStore.getPauseAccounting(feature.id)!.pausedMs).toBe(8000)
   })
 
   it("re-entering paused status while already paused does not reset pausedAt", () => {

@@ -106,7 +106,7 @@ export interface DaemonConfig {
   readonly projects: readonly string[]
   /** Reconciler heartbeat interval in milliseconds. */
   readonly heartbeatIntervalMs: number
-  /** Engine tuning (runTtlMs, nudgeIdleCycles, maxNudges). Defaults match the seed's operational values. */
+  /** Engine tuning: runTtlMs, nudgeIdleCycles, idleSilenceNudgeMs, busySilenceNudgeMs, maxNudges. */
   readonly engine?: EngineOptions
   /**
    * Local action registry search paths. `bundledPath` defaults to the
@@ -295,7 +295,7 @@ export class Daemon {
     this.connection = connection
     this.appliedNow = migrateDatabase(connection)
     for (const id of this.appliedNow) this.log("info", "migration applied", { migration: id })
-    this.storeInstance = new Store(connection.db)
+    this.storeInstance = new Store(connection.db, this.clock)
 
     const actionRegistry = this.deps.actionRegistry ?? (await this.loadActionRegistry())
     this.registryInstance = new WorkflowRegistry({

@@ -1069,7 +1069,7 @@ describe("CLI: daemon config parsing", () => {
       auth: { mode: "bearer", token: "t" },
       heartbeatIntervalMs: 250,
       createDatabaseDirectory: false,
-      engine: { runTtlMs: 1000, nudgeIdleCycles: 2, maxNudges: 3 },
+      engine: { runTtlMs: 1000, busySilenceNudgeMs: 500, nudgeIdleCycles: 2, maxNudges: 3 },
       actions: { bundledPath: "/actions", localPaths: ["/more"] },
       plugins: { enabled: false, disabled: ["openspec"], paths: ["/opt/conductor-plugins"] },
     })
@@ -1078,7 +1078,7 @@ describe("CLI: daemon config parsing", () => {
       projects: ["/p1"],
       heartbeatIntervalMs: 250,
       createDatabaseDirectory: false,
-      engine: { runTtlMs: 1000, nudgeIdleCycles: 2, maxNudges: 3 },
+      engine: { runTtlMs: 1000, busySilenceNudgeMs: 500, nudgeIdleCycles: 2, maxNudges: 3 },
       actions: { bundledPath: "/actions", localPaths: ["/more"] },
     })
     expect(config.api).toEqual({
@@ -1114,6 +1114,8 @@ describe("CLI: daemon config parsing", () => {
     ["removed ui field", { ...base, ui: { staticDir: "/x" } }, "ui"],
     ["bad localPaths", { ...base, actions: { localPaths: [""] } }, "actions.localPaths"],
     ["fractional nudgeIdleCycles", { ...base, engine: { nudgeIdleCycles: 2.5 } }, "positive integer"],
+    ...[0, -1, 1.5, Infinity, NaN, "600000", null].map(value => ["invalid busySilenceNudgeMs", { ...base, engine: { busySilenceNudgeMs: value } }, "engine.busySilenceNudgeMs"] as const),
+    ...[0, -1, 1.5, Infinity, NaN, "120000", null].map(value => ["invalid idleSilenceNudgeMs", { ...base, engine: { idleSilenceNudgeMs: value } }, "engine.idleSilenceNudgeMs"] as const),
     ["fractional maxNudges", { ...base, engine: { maxNudges: 1.5 } }, "positive integer"],
     ["non-boolean plugins.enabled", { ...base, plugins: { enabled: "yes" } }, "plugins.enabled"],
     ["relative plugins.paths entry", { ...base, plugins: { paths: ["relative/dir"] } }, "plugins.paths"],

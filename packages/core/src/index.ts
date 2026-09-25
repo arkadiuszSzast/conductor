@@ -115,6 +115,7 @@ export {
   computeScheduledDelayMs,
   elapsedBudgetMs,
   nextAttemptAt,
+  parseIsoDurationMs,
   systemRandom,
 } from "./scheduling.ts"
 export type { BudgetCheckInput, BudgetCheckResult, ElapsedBudgetState, Random } from "./scheduling.ts"

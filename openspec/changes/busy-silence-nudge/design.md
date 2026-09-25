@@ -23,8 +23,7 @@ reachable and recoverable by a single prompt.
 
 **Non-Goals**
 
-- No per-step busy-silence override (the engine default is enough until
-  proven otherwise; `ttlMs` remains the per-step knob).
+- Original scope excluded per-step overrides; superseded by `idle-silence-nudge`, which adds independently inherited step limits.
 - No streaming-liveness probe into the runtime (e.g. asking opencode
   whether the stream is actually moving) — the activity clock is the
   engine's only truth about liveness, by design.
@@ -43,14 +42,21 @@ or busy-silent; the instruction is identical: finish the step, report.
 ### D2 — Threshold check inline in the busy branch, before the TTL call
 
 The `busy`/`retry` branch computes `silence = now − max(timeLastActivity,
-timeStarted) − pausedCredit` (same formula as `reconcileTtl`). If
+timeStarted)`, the same formula as `reconcileTtl`. It checks the governing
+TTL first: expired TTL reaps, and a TTL at or below the busy-silence
+threshold disables busy-silence nudging. Otherwise, if
 `silence > busySilenceNudgeMs`: nudge (budget permitting) or reap
 (budget exhausted). Since a nudge touches the activity clock
 (`incrementNudges` already does), the threshold naturally re-arms —
 no per-run timer state, no idle-cycle-style debounce map. The reap
-reuses `reap()` (abort + timeout envelope), and the branch still falls
-through to `reconcileTtl` when silence is under the threshold, so
-step-level `ttlMs` floors keep working unchanged.
+reuses `reap()` (abort + timeout envelope).
+
+Implementation verification found that the existing TTL did not subtract
+paused credit. Resume now transactionally advances each running run's
+activity anchor by the overlap between its latest silence window and the
+closed pause span. This excludes paused silence for both checks, preserves
+pre-pause silence, and avoids over-crediting activity received during a
+pause. It needs no new columns and survives restart.
 
 *Alternative considered*: reusing the idle-cycle debounce counter for
 busy-silence — rejected: the debounce exists because `idle` is a cheap,

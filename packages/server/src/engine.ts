@@ -13,7 +13,14 @@
  * Confirmation-of-effect rule: an agent step is only "done" when its
  * session (or a human) reports through `report()`/`approve()`/
  * `requestChanges()` — never merely because a session went idle.
- * Idle-without-report after debounce ⇒ nudged, then reaped.
+ * Idle-without-report after debounce ⇒ nudged, then reaped (governed by
+ * `idleSilenceNudgeMs`/`nudgeIdleCycles`); a `busy`/`retry` session gone
+ * silent past `busySilenceNudgeMs` is nudged the same way. Both paths
+ * share one durable per-run `maxNudges` budget; either can be overridden
+ * per agent step (see `runLimits`). `runTtlMs` (or a step's own `ttlMs`)
+ * is the outer bound in both directions: a TTL at or below either
+ * silence threshold makes that threshold's recovery unreachable, so the
+ * engine skips its debounce/nudge machinery entirely and reaps on TTL.
  *
  * Every dependency (store, workflow resolver, sessions, process
  * execution, clock, logger) is injected via `EngineDeps` — nothing here
@@ -40,6 +47,7 @@ import {
   makeFailureEnvelope,
   normalizeResourceWaitPolicy,
   normalizeRetryPolicy,
+  parseIsoDurationMs,
   renderTemplate,
   resolveWorkflowInputs,
   systemRandom,
@@ -72,6 +80,8 @@ import { actionBindingsForReconciler } from "./workflow-reservation.ts"
 import type { ResolvedActionBinding } from "./workflow-reservation.ts"
 
 const DEFAULT_RUN_TTL_MS = 3_600_000
+const DEFAULT_IDLE_SILENCE_NUDGE_MS = 120_000
+const DEFAULT_BUSY_SILENCE_NUDGE_MS = 600_000
 const DEFAULT_NUDGE_IDLE_CYCLES = 2
 const DEFAULT_MAX_NUDGES = 2
 /** Claim lease for an answer delivery attempt (harden-interactive-answer-
@@ -95,6 +105,8 @@ export interface EngineDeps {
 
 export interface EngineOptions {
   readonly runTtlMs?: number
+  readonly idleSilenceNudgeMs?: number
+  readonly busySilenceNudgeMs?: number
   readonly nudgeIdleCycles?: number
   readonly maxNudges?: number
 }
@@ -192,6 +204,8 @@ export class Engine {
    */
   private readonly actionRuns = new Map<string, Promise<void>>()
   private readonly runTtlMs: number
+  private readonly idleSilenceNudgeMs: number
+  private readonly busySilenceNudgeMs: number
   private readonly nudgeIdleCycles: number
   private readonly maxNudges: number
 
@@ -200,6 +214,8 @@ export class Engine {
     options: EngineOptions = {},
   ) {
     this.runTtlMs = options.runTtlMs ?? DEFAULT_RUN_TTL_MS
+    this.idleSilenceNudgeMs = options.idleSilenceNudgeMs ?? DEFAULT_IDLE_SILENCE_NUDGE_MS
+    this.busySilenceNudgeMs = options.busySilenceNudgeMs ?? DEFAULT_BUSY_SILENCE_NUDGE_MS
     this.nudgeIdleCycles = options.nudgeIdleCycles ?? DEFAULT_NUDGE_IDLE_CYCLES
     this.maxNudges = options.maxNudges ?? DEFAULT_MAX_NUDGES
   }
@@ -908,9 +924,13 @@ export class Engine {
     const patchedState = applyPatch(state, transition.patch)
     const attempts = patchedState.jobs[event.jobId]?.attempts[event.stepId] ?? 1
     const classBehaviour = behaviourForClass(normalizeRetryPolicy(), failure.class)
-    const backoff = step !== undefined && step.retry.strategy === "backoff" ? step.retry.backoff : classBehaviour.backoff
-    const maxAttempts = step !== undefined && step.retry.strategy === "backoff" ? step.retry.maxAttempts : classBehaviour.budget.maxAttempts
-    const maxElapsedMs = classBehaviour.budget.maxElapsedMs
+    const stepRetry = step !== undefined && step.retry.strategy === "backoff" ? step.retry : undefined
+    const backoff = stepRetry?.backoff ?? classBehaviour.backoff
+    const maxAttempts = stepRetry?.maxAttempts ?? classBehaviour.budget.maxAttempts
+    // The step's own `retry.maxElapsed`, when declared, is the episode's
+    // elapsed deadline; absent (or unparseable, which validation already
+    // rejects at load time) falls back to the failure class's default.
+    const maxElapsedMs = (stepRetry?.maxElapsed !== undefined ? parseIsoDurationMs(stepRetry.maxElapsed) : undefined) ?? classBehaviour.budget.maxElapsedMs
     const schedule = computeScheduledDelayMs(backoff, attempts, systemRandom, failure.retryHintMs)
     const now = clock.now()
 
@@ -1439,11 +1459,15 @@ export class Engine {
       .at(-1)
     if (!latest) return
     const classBehaviour = behaviourForClass(normalizeRetryPolicy(), latest.lastFailure?.class ?? "internal")
-    const maxAttempts = step.retry.strategy === "backoff" ? step.retry.maxAttempts : classBehaviour.budget.maxAttempts
+    const stepRetry = step.retry.strategy === "backoff" ? step.retry : undefined
+    const maxAttempts = stepRetry?.maxAttempts ?? classBehaviour.budget.maxAttempts
+    // Recovery keeps the step's own elapsed deadline so a long step is not
+    // reset to the (much smaller) class default on the operator's retry.
+    const maxElapsedMs = (stepRetry?.maxElapsed !== undefined ? parseIsoDurationMs(stepRetry.maxElapsed) : undefined) ?? classBehaviour.budget.maxElapsedMs
     const recovered = store.recoverRetryEpisode(latest.id, latest.version, {
       startedAt: clock.now(),
       maxAttempts,
-      maxElapsedMs: classBehaviour.budget.maxElapsedMs,
+      maxElapsedMs,
     })
     if (recovered) store.closeRetryEpisode(recovered.id, "attempt_dispatched")
   }
@@ -1955,7 +1979,7 @@ export class Engine {
   private async reconcileAgentRun(
     feature: FeatureState,
     snapshot: WorkflowSnapshot,
-    active: { id: string; jobId: string; stepId: string; sessionId: string | null; nudges: number; timeStarted: number; pendingQuestion?: string | null },
+    active: RunSummary,
   ): Promise<void> {
     const { log } = this.deps
     // Waiting for a human answer is not being stuck: no idle nudging, no
@@ -1979,47 +2003,88 @@ export class Engine {
         await this.reap(feature, active, "session disappeared before reporting", "missing_session")
         return
       }
+      const limits = this.runLimits(snapshot, active)
+      const silence = this.deps.clock.now() - Math.max(active.timeLastActivity, active.timeStarted)
+      if (silence > limits.ttlMs) {
+        await this.reconcileTtl(feature, snapshot, active)
+        return
+      }
       if (status === "busy" || status === "retry") {
         this.idleCycles.delete(active.id)
+        if (limits.ttlMs <= limits.busySilenceNudgeMs) {
+          await this.reconcileTtl(feature, snapshot, active)
+          return
+        }
+        if (silence > limits.busySilenceNudgeMs) {
+          if (active.nudges < limits.maxNudges) {
+            await this.nudgeAgentRun(feature, snapshot, active, limits.maxNudges)
+          } else {
+            await this.reap(feature, active, `${status} without activity after ${active.nudges} nudge(s)`)
+          }
+          return
+        }
       } else {
+        // Mirrors the busy/retry branch's early skip just above: when the
+        // TTL is at or below the idle threshold, TTL always wins first
+        // (identical to `silence > limits.ttlMs` firing before idle ever
+        // gets a chance) — idle nudging is structurally dead for this
+        // run/step. Skip straight to `reconcileTtl` WITHOUT touching
+        // `idleCycles`: incrementing (and never clearing, since the
+        // threshold this debounce exists for can never be reached) would
+        // grow the map by one entry per reconcile cycle for the run's
+        // entire lifetime — a slow, unbounded leak for any workflow using
+        // a short `ttlMs` alongside the default idle threshold.
+        if (limits.ttlMs <= limits.idleSilenceNudgeMs) {
+          this.idleCycles.delete(active.id)
+          await this.reconcileTtl(feature, snapshot, active)
+          return
+        }
         const cycles = (this.idleCycles.get(active.id) ?? 0) + 1
         this.idleCycles.set(active.id, cycles)
-        if (cycles >= this.nudgeIdleCycles) {
+        if (cycles >= this.nudgeIdleCycles && silence > limits.idleSilenceNudgeMs) {
           this.idleCycles.delete(active.id)
-          if (active.nudges < this.maxNudges) {
-            const nudgeNo = this.deps.store.incrementNudges(active.id)
-            log.log(`reconcile ${feature.slug}: run ${active.id} idle without report — nudge ${nudgeNo}/${this.maxNudges}`)
-            // Resume as the STEP's agent, not the runner default: a nudge
-            // dispatched without the role lands as the default build agent,
-            // dropping the step's system prompt (reporting discipline,
-            // tool rules) for the resumed turn.
-            const nudgeStep = findStep(snapshot.workflow, active.jobId, active.stepId)
-            const nudgeRole = nudgeStep?.type === "agent" ? snapshot.workflow.roles[nudgeStep.role] : undefined
-            try {
-              await this.deps.sessions.prompt({
-                sessionID: active.sessionId,
-                text:
-                  `[conductor] Your previous turn appears to have been interrupted (session idle, no report received). ` +
-                  `The work state is in your context. Finish step "${active.stepId}" and report ` +
-                  `run_id="${active.id}" with the appropriate outcome.`,
-                ...(nudgeRole
-                  ? { agent: nudgeRole.agent, ...(nudgeRole.model !== undefined ? { model: nudgeRole.model } : {}) }
-                  : {}),
-              })
-            } catch (err) {
-              // Secret-safe diagnostics: a log line, but still built from
-              // a raw runner exception that could embed a credential.
-              log.log(`nudge failed: ${boundDiagnostic(errorMessage(err))}`)
-            }
+          if (active.nudges < limits.maxNudges) {
+            await this.nudgeAgentRun(feature, snapshot, active, limits.maxNudges)
             return
           }
-          log.log(`reconcile ${feature.slug}: run ${active.id} idle after ${this.maxNudges} nudges — reaping`)
+          log.log(`reconcile ${feature.slug}: run ${active.id} idle after ${limits.maxNudges} nudges — reaping`)
           await this.reap(feature, active, `idle without report after ${active.nudges} nudge(s)`)
           return
         }
       }
     }
     await this.reconcileTtl(feature, snapshot, active)
+  }
+
+  private runLimits(snapshot: WorkflowSnapshot, active: { jobId: string; stepId: string }) {
+    const candidate = findStep(snapshot.workflow, active.jobId, active.stepId)
+    const step = candidate?.type === "agent" ? candidate : undefined
+    return {
+      ttlMs: step?.ttlMs ?? this.runTtlMs,
+      idleSilenceNudgeMs: step?.idleSilenceNudgeMs ?? this.idleSilenceNudgeMs,
+      busySilenceNudgeMs: step?.busySilenceNudgeMs ?? this.busySilenceNudgeMs,
+      maxNudges: step?.maxNudges ?? this.maxNudges,
+    }
+  }
+
+  private async nudgeAgentRun(feature: FeatureState, snapshot: WorkflowSnapshot, active: RunSummary, maxNudges: number): Promise<void> {
+    if (!active.sessionId) return
+    const nudgeNo = this.deps.store.incrementNudges(active.id)
+    this.deps.log.log(`reconcile ${feature.slug}: run ${active.id} without report — nudge ${nudgeNo}/${maxNudges}`)
+    const step = findStep(snapshot.workflow, active.jobId, active.stepId)
+    const role = step?.type === "agent" ? snapshot.workflow.roles[step.role] : undefined
+    try {
+      await this.deps.sessions.prompt({
+        sessionID: active.sessionId,
+        text:
+          `[conductor] Your previous turn appears to have been interrupted (no report received). ` +
+          `The work state is in your context. Finish step "${active.stepId}" and report ` +
+          `run_id="${active.id}" with the appropriate outcome.`,
+        ...(role ? { agent: role.agent, ...(role.model !== undefined ? { model: role.model } : {}) } : {}),
+      })
+    } catch (err) {
+      this.deps.log.log(`nudge failed: ${boundDiagnostic(errorMessage(err))}`)
+    }
   }
 
   /**
@@ -2034,8 +2099,7 @@ export class Engine {
     snapshot: WorkflowSnapshot,
     active: { id: string; jobId: string; stepId: string; sessionId?: string | null; timeStarted: number; timeLastActivity?: number },
   ): Promise<void> {
-    const step = findStep(snapshot.workflow, active.jobId, active.stepId)
-    const ttlMs = (step?.type === "agent" ? step.ttlMs : undefined) ?? this.runTtlMs
+    const { ttlMs } = this.runLimits(snapshot, active)
     const lastActivity = Math.max(active.timeLastActivity ?? active.timeStarted, active.timeStarted)
     const silence = this.deps.clock.now() - lastActivity
     if (silence > ttlMs) {

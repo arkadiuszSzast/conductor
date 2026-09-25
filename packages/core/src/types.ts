@@ -114,6 +114,9 @@ export interface AgentStep extends StepBase {
   /** Silence budget for THIS step's runs, in milliseconds — overrides
    *  the engine-wide TTL. Absent means the engine default governs. */
   readonly ttlMs?: number
+  readonly idleSilenceNudgeMs?: number
+  readonly busySilenceNudgeMs?: number
+  readonly maxNudges?: number
   readonly reviewHead?: string
   readonly fixFrom?: string
   readonly qualityFrom?: string
@@ -155,8 +158,9 @@ export type RetryPolicy =
       readonly strategy: "backoff"
       /** Total attempts including the first. Must be ≥ 1. */
       readonly maxAttempts: number
-      /** ISO-8601 duration (e.g. "PT10M") capping total elapsed time.
-       *  Absent means only the attempt count bounds the retry. */
+      /** ISO-8601 duration (e.g. "PT10M") capping total elapsed time for this
+       *  step's retry episode. Absent falls back to the failure class's
+       *  default elapsed budget. */
       readonly maxElapsed?: string
       /** Backoff strategy — always required for a "backoff" policy. */
       readonly backoff: BackoffDef

@@ -103,8 +103,9 @@ happening" from raw job/run state:
 - `waiting_retry` — a durable retry episode is scheduled; `reason` is the
   classified failure class, `diagnostic` its bounded message, `nextAt` the
   scheduled attempt time, and `deadlineAt` the retry's elapsed budget
-  deadline (`startedAt + maxElapsedMs` for that class — see
-  [Retries, failure classes and recovery](concepts.md#retries-failure-classes-and-recovery)).
+  deadline (`startedAt + maxElapsedMs`, where `maxElapsedMs` is the step's
+  own `retry.maxElapsed` when declared, else that failure class's default —
+  see [Retries, failure classes and recovery](concepts.md#retries-failure-classes-and-recovery)).
   An attempt past `deadlineAt` is never dispatched — the client should not
   expect `nextAt` to still fire once `deadlineAt` has passed.
 - `waiting_human` | `paused` | `escalated` | `terminal` (`done`/

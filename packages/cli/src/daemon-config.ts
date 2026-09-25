@@ -47,7 +47,7 @@ const TOP_LEVEL_FIELDS = new Set([
   "plugins",
 ])
 
-const ENGINE_FIELDS = new Set(["runTtlMs", "nudgeIdleCycles", "maxNudges"])
+const ENGINE_FIELDS = new Set(["runTtlMs", "idleSilenceNudgeMs", "busySilenceNudgeMs", "nudgeIdleCycles", "maxNudges"])
 const ACTIONS_FIELDS = new Set(["bundledPath", "localPaths"])
 const BIND_FIELDS = new Set(["host", "port"])
 const AUTH_FIELDS = new Set(["mode", "token"])
@@ -269,9 +269,12 @@ auth:
 # Reconciler heartbeat interval in milliseconds (default: 5000).
 heartbeatIntervalMs: 5000
 
-# Optional engine tuning (runTtlMs, nudgeIdleCycles, maxNudges).
+# Optional engine tuning (runTtlMs, idleSilenceNudgeMs, busySilenceNudgeMs,
+# nudgeIdleCycles, maxNudges) — see docs/install.md#engine-tuning.
 # engine:
 #   runTtlMs: 3600000
+#   idleSilenceNudgeMs: 120000
+#   busySilenceNudgeMs: 600000
 
 # Optional local action registry paths. In a compiled binary the bundled
 # action manifests are not on disk: point "bundledPath" at a checkout's

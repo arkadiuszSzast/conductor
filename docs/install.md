@@ -105,6 +105,63 @@ heartbeatIntervalMs: 5000
 #   paths: [/path/to/extra/plugins]
 ```
 
+### Engine tuning
+
+Optional daemon configuration:
+
+```yaml
+engine:
+  runTtlMs: 3600000
+  idleSilenceNudgeMs: 120000
+  busySilenceNudgeMs: 600000
+  nudgeIdleCycles: 2
+  maxNudges: 2
+```
+
+`runTtlMs` is the silence TTL (default one hour), overridden by an agent
+step's `ttlMs`. `busySilenceNudgeMs` is a positive integer in milliseconds
+(default ten minutes): a `busy` or `retry` session silent longer than this
+threshold gets a recovery prompt. Both busy-silence and idle recovery use
+one durable per-run `maxNudges` budget. A nudge restarts the silence clock;
+once the budget is exhausted, another full silent window reaps the run
+with a timeout, aborts the session, and applies normal retry/onFail routing.
+Recent log activity prevents nudging or reaping without resetting the budget.
+
+`idleSilenceNudgeMs` defaults to two minutes. Before every idle nudge or
+exhausted-budget reap, both elapsed silence and `nudgeIdleCycles` debounce
+must pass. Failed nudge delivery consumes budget and restarts grace too.
+Agent steps override each silence threshold and `maxNudges` independently;
+omitted fields inherit daemon settings, then the defaults above.
+Restart the daemon to load changed daemon settings or code, and reload the
+OpenCode runner to activate timeline fixes. Reload workflow configuration
+after applying step overrides. These are operator actions, not automatic deployment.
+
+An expired TTL wins before idle or busy recovery; a TTL at or below the
+busy-silence threshold never receives a busy-silence nudge, and likewise a
+TTL at or below the idle-silence threshold never receives an idle nudge —
+in both cases the TTL floor makes recovery unreachable, so the engine skips
+straight to the TTL reap instead of debouncing toward a threshold silence
+can never cross. Pending human questions are exempt from nudging, but
+retain TTL protection. Paused features are not reconciled, and resume
+excludes paused silence from the activity clock (without crediting time
+before the latest activity).
+
+Deploy the runner's tool-activity logging before enabling this behavior:
+otherwise legitimate tool-heavy turns can appear silent. Existing runs keep
+their activity timestamps and consumed nudge budget across daemon restarts,
+so stale runs can be nudged or reaped on the first heartbeat after upgrade.
+No schema migration or workflow changes are required for this option.
+
+For a long implementation step, the approved operator profile can later be
+applied under its `agent` body (not a daemon-wide default):
+
+```yaml
+idleSilenceNudgeMs: 120000
+busySilenceNudgeMs: 1200000
+maxNudges: 3
+ttlMs: 10800000
+```
+
 ### Plugins
 
 An optional `plugins` section — see [Plugins](plugins.md) for the manifest

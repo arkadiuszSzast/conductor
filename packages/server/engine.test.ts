@@ -242,6 +242,20 @@ const retryWorkflow: WorkflowDef = workflow(
   "retry",
 )
 
+/** Same single-step shape, but the step declares its own elapsed deadline. */
+const elapsedRetryWorkflow = (maxElapsed: string): WorkflowDef =>
+  workflow(
+    {
+      main: job([
+        agentStep("implement", "implementer", "go", {
+          retry: { strategy: "backoff", maxAttempts: 2, maxElapsed, backoff: { strategy: "constant", delay: 10 } },
+        }),
+      ]),
+    },
+    roles,
+    "retry-elapsed",
+  )
+
 /** unmapped outcome escalates */
 const unmappedOutcomeWorkflow: WorkflowDef = workflow(
   {
@@ -1669,6 +1683,57 @@ describe("Engine: failure classification and durable retry schedules", () => {
     expect(store.getEscalation(feature.id)).toContain("elapsed retry budget")
   })
 
+  it("a step's own retry.maxElapsed extends the elapsed budget past the class default, so the retry is scheduled instead of escalated", async () => {
+    const engine = makeEngine(elapsedRetryWorkflow("PT1H"), { runTtlMs: 1000 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    // 600_001ms would exhaust the 600_000ms timeout class default; the step's
+    // one-hour deadline still admits a retry.
+    clock.advance(600_001)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    expect(store.getOpenRetryEpisode(feature.id, "main", "implement")).toMatchObject({ status: "scheduled" })
+    expect(store.getFeature(feature.id)?.status).toBe("running")
+  })
+
+  it("a step retry.maxElapsed tighter than the class default escalates where the class default would have retried", async () => {
+    const engine = makeEngine(elapsedRetryWorkflow("PT1S"), { runTtlMs: 1000 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    // 1001ms is far inside the 600_000ms class default but past the step's own
+    // one-second deadline, so no retry is scheduled.
+    clock.advance(1001)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    expect(store.getOpenRetryEpisode(feature.id, "main", "implement")).toBeNull()
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    expect(store.getEscalation(feature.id)).toContain("1000ms elapsed retry budget")
+  })
+
+  it("maxElapsed: PT0S means zero elapsed budget for a DELAYED retry — the very first failure escalates immediately, on the first attempt, before maxAttempts is ever reached", async () => {
+    // M3: `PT0S` is a valid, parseable duration (`parseIsoDurationMs`
+    // already tests this: "PT0S" → 0) — it is NOT rejected by
+    // validation, and it is not "no runtime effect". Its actual engine
+    // semantics: the candidate retry time is always STRICTLY after the
+    // episode start (even a 0ms backoff delay still advances the clock
+    // by however long the failed attempt itself ran), so
+    // `elapsedAtCandidate > 0` on literally the first failure — the step
+    // never gets a second attempt, regardless of `maxAttempts`. This is
+    // a scheduling constraint on DELAYED retry, not a claim about the
+    // step's own runtime TTL (unaffected, still governed by `ttlMs`).
+    const engine = makeEngine(elapsedRetryWorkflow("PT0S"), { runTtlMs: 1000 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
+    clock.advance(1001)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    // No retry episode is EVER scheduled — the very first failure already
+    // exhausts the zero elapsed budget, even though maxAttempts is 2.
+    expect(store.getOpenRetryEpisode(feature.id, "main", "implement")).toBeNull()
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    expect(store.getEscalation(feature.id)).toContain("0ms elapsed retry budget")
+  })
+
   it("a due episode claimed past its elapsed deadline (e.g. a daemon outage spanning the due time) is escalated instead of dispatched", async () => {
     const engine = makeEngine(retryWorkflow, { runTtlMs: 1000 })
     const feature = await startedFeature(engine)
@@ -1733,6 +1798,11 @@ describe("Engine: failure classification and durable retry schedules", () => {
     // the RUN's own `pausedMsAtDispatch` as the streak anchor for a
     // genuinely first episode (`planFailureDisposition`), so the pause is
     // accounted for even though it happened before any episode existed.
+    //
+    // Store and Engine share ONE injected FakeClock (see beforeEach):
+    // `applyTransitionTx`'s pause-span fold reads the same clock the
+    // engine advances, so the whole scenario drives through plain
+    // `clock.advance` calls — no SQL backdating needed.
     const runTtlMs = 100_000
     const engine = makeEngine(retryWorkflow, { runTtlMs })
     const feature = await startedFeature(engine)
@@ -1740,23 +1810,16 @@ describe("Engine: failure classification and durable retry schedules", () => {
     expect(run.pausedMsAtDispatch).toBe(0)
 
     // Pause while the run is still genuinely RUNNING — no episode exists.
-    // applyTransitionTx's pause fold uses real Date.now() (see
-    // retry-store.test.ts's "pause accounting" suite), not the injected
-    // FakeClock, so the pause span itself is produced entirely by
-    // backdating `paused_at` in real-clock terms — the FakeClock is never
-    // advanced across the pause/resume pair, so it cannot itself drift
-    // away from the run's own real-clock `time_started` in the meantime.
     await engine.pause(feature.id)
-    connection.db.run("UPDATE feature SET paused_at = paused_at - 700000 WHERE id = ?", [feature.id])
+    clock.advance(700_000)
     await engine.resume(feature.id)
     expect(store.getPauseAccounting(feature.id)!.pausedMs).toBeGreaterThanOrEqual(700_000)
 
-    // Trip the TTL reap deterministically by backdating the run's own
-    // `time_started` (also real-clock, same split) rather than advancing
-    // the FakeClock — advancing the FakeClock here would itself desync it
-    // from the run's real-clock `time_started`, making every
-    // freshly-dispatched run look TTL-stale on the very next reconcile.
-    connection.db.run("UPDATE run SET time_started = time_started - ?, time_last_activity = time_last_activity - ? WHERE id = ?", [runTtlMs + 100, runTtlMs + 100, run.id])
+    // Resume fully credits the closed pause span onto the run's activity
+    // anchor (design.md D2: excludes paused silence from TTL too), so
+    // silence is back to ~0 here — advance past the TTL threshold to
+    // trip the reap deterministically.
+    clock.advance(runTtlMs + 100)
     await engine.reconcile()
     const episode = store.getOpenRetryEpisode(feature.id, "main", "implement")
     expect(episode).not.toBeNull()
@@ -1795,12 +1858,7 @@ describe("Engine: failure classification and durable retry schedules", () => {
     const feature = await startedFeature(engine)
     const run1 = store.getActiveRunForStep(feature.id, "main", "implement")!
 
-    // TTL-reap attempt 1 via a real-clock backdate of `time_started`
-    // (same reasoning as the first-attempt test above) rather than
-    // advancing the FakeClock, so the FakeClock stays at "now" and every
-    // freshly-dispatched run's real-clock `time_started` stays close to
-    // it — no accumulated desync across this multi-dispatch scenario.
-    connection.db.run("UPDATE run SET time_started = time_started - ?, time_last_activity = time_last_activity - ? WHERE id = ?", [runTtlMs + 100, runTtlMs + 100, run1.id])
+    clock.advance(runTtlMs + 100)
     await engine.reconcile()
     const episode1 = store.getOpenRetryEpisode(feature.id, "main", "implement")!
     expect(episode1.attempts).toBe(1)
@@ -1817,9 +1875,11 @@ describe("Engine: failure classification and durable retry schedules", () => {
 
     // Pause DURING run 2's execution — no episode is open right now.
     await engine.pause(feature.id)
-    connection.db.run("UPDATE feature SET paused_at = paused_at - 500000 WHERE id = ?", [feature.id])
     clock.advance(500_000)
     await engine.resume(feature.id)
+    // Same activity-credit reasoning as the first-attempt test: resume
+    // zeroes run 2's silence, so trip the TTL with a further advance.
+    clock.advance(runTtlMs + 100)
 
     await engine.reconcile()
     const episode2 = store.getOpenRetryEpisode(feature.id, "main", "implement")
@@ -1834,11 +1894,7 @@ describe("Engine: failure classification and durable retry schedules", () => {
 
     // Claim-time re-check: well inside the 600_000ms budget once the
     // 500_000ms pause is correctly excluded, so this dispatches instead
-    // of escalating (rather than asserting "running" after this dispatch:
-    // the freshly-created run 3's real-clock `time_started` would need
-    // its own FakeClock re-pin, same as run 2 above, to survive a further
-    // reconcile — the dispatch-not-escalate outcome itself is the
-    // assertion that matters here).
+    // of escalating.
     clock.advance(episode2!.nextAttemptAt! - clock.now())
     await engine.reconcile()
     expect(store.getRetryEpisode(episode2!.id)?.closedReason).toBe("attempt_dispatched")
@@ -1848,20 +1904,15 @@ describe("Engine: failure classification and durable retry schedules", () => {
     const runTtlMs = 100_000
     const engine = makeEngine(retryWorkflow, { runTtlMs })
     const feature = await startedFeature(engine)
-    const run = store.getActiveRunForStep(feature.id, "main", "implement")!
 
-    // Span 1: pause DURING execution (no episode exists yet). The pause
-    // span itself is produced via a FakeClock advance paired 1:1 with a
-    // matching `paused_at` backdate, so the two clocks agree on ITS
-    // duration — but that pairing necessarily leaves the FakeClock 300s
-    // ahead of the run's own real-clock `time_started`. Trip the TTL reap
-    // via a direct `time_started` backdate instead of a further
-    // FakeClock advance, so no additional desync accrues on top of it.
+    // Span 1: pause DURING execution (no episode exists yet). Resume
+    // fully credits the closed span onto the run's activity anchor, so
+    // trip the TTL reap with a further advance rather than expecting the
+    // pause span itself to look stale.
     await engine.pause(feature.id)
-    connection.db.run("UPDATE feature SET paused_at = paused_at - 300000 WHERE id = ?", [feature.id])
     clock.advance(300_000)
     await engine.resume(feature.id)
-    connection.db.run("UPDATE run SET time_started = time_started - ?, time_last_activity = time_last_activity - ? WHERE id = ?", [runTtlMs + 100, runTtlMs + 100, run.id])
+    clock.advance(runTtlMs + 100)
 
     // TTL-reap now schedules episode 1 — its snapshot baseline is the
     // feature's cumulative paused_ms as of run 1's dispatch (0, since the
@@ -1877,7 +1928,6 @@ describe("Engine: failure classification and durable retry schedules", () => {
     // (the OLD per-episode fold's own supported case) — both spans must
     // land in the SAME cumulative total, counted once each.
     await engine.pause(feature.id)
-    connection.db.run("UPDATE feature SET paused_at = paused_at - 200000 WHERE id = ?", [feature.id])
     clock.advance(200_000)
     await engine.resume(feature.id)
 
@@ -2017,16 +2067,141 @@ describe("Engine: human reject re-runs", () => {
 })
 
 describe("Engine: nudge/reap", () => {
+  it.each([false, true])("idle grace protects activity and every nudge attempt (failure: %s)", async failure => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    sessions.statuses.set(run.sessionId!, "idle")
+    clock.advance(120_001)
+    store.appendRunLog(run.id, [{ source: "tool", text: "working" }])
+    await engine.reconcile()
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.nudges).toBe(0)
+    clock.advance(120_001)
+    if (failure) sessions.promptError = new Error("unreachable")
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.nudges).toBe(1)
+    clock.advance(10_000)
+    await engine.reconcile()
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.nudges).toBe(1)
+    clock.advance(110_001)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.nudges).toBe(2)
+    clock.advance(10_000)
+    await engine.reconcile()
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("running")
+    clock.advance(110_001)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+  })
+
+  it.each(["idle", "busy", "retry"] as const)("per-step %s limits override independently without leaking to siblings", async status => {
+    const def = workflow({
+      custom: job([{ ...agentStep("work", "implementer", "go"), idleSilenceNudgeMs: 200, busySilenceNudgeMs: 200, maxNudges: 3, ttlMs: 10_000 }]),
+      inherited: job([agentStep("work", "implementer", "go")]),
+    }, roles)
+    const logs: string[] = []
+    const engine = makeEngine(def, { idleSilenceNudgeMs: 100, busySilenceNudgeMs: 100, maxNudges: 1, nudgeIdleCycles: 1, runTtlMs: 1000 }, { log: { log: text => logs.push(text) } })
+    const feature = await startedFeature(engine)
+    const a = store.getActiveRunForStep(feature.id, "custom", "work")!
+    const b = store.getActiveRunForStep(feature.id, "inherited", "work")!
+    sessions.statuses.set(a.sessionId!, status)
+    sessions.statuses.set(b.sessionId!, status)
+    clock.advance(101)
+    await engine.reconcile()
+    expect(store.getRunById(a.id)?.nudges).toBe(0)
+    expect(store.getRunById(b.id)?.nudges).toBe(1)
+    clock.advance(101)
+    await engine.reconcile()
+    expect(store.getRunById(a.id)?.nudges).toBe(1)
+    expect(store.getRunById(b.id)?.status).toBe("reaped")
+    expect(logs.some(text => text.includes(`run ${a.id}`) && text.includes("1/3"))).toBe(true)
+    expect(logs.some(text => text.includes(`run ${b.id}`) && text.includes("1/1"))).toBe(true)
+  })
+
+  it("partial overrides inherit idle grace and TTL while idle debounce survives as a separate gate", async () => {
+    const def = workflow({ main: job([{ ...agentStep("work", "implementer", "go"), maxNudges: 3, busySilenceNudgeMs: 2000 }]) }, roles)
+    let engine = makeEngine(def, { idleSilenceNudgeMs: 100, runTtlMs: 1000, nudgeIdleCycles: 2 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    sessions.statuses.set(run.sessionId!, "idle")
+    clock.advance(101)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.nudges).toBe(0)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.nudges).toBe(1)
+    connection.close()
+    connection = openMigratedDatabase({ path: join(directory, "state.db") })
+    store = new Store(connection.db, clock)
+    engine = makeEngine(def, { idleSilenceNudgeMs: 100, runTtlMs: 1000, nudgeIdleCycles: 2 })
+    clock.advance(100)
+    await engine.reconcile()
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.nudges).toBe(1)
+    clock.advance(1)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.nudges).toBe(2)
+    sessions.statuses.set(run.sessionId!, "busy")
+    clock.advance(1001)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    expect(store.getRunById(run.id)?.nudges).toBe(2)
+  })
+
+  it("shorter idle TTL wins before any nudge", async () => {
+    const engine = makeEngine(linearWorkflow, { runTtlMs: 100, nudgeIdleCycles: 1 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    sessions.statuses.set(run.sessionId!, "idle")
+    clock.advance(101)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    expect(store.getRunById(run.id)?.nudges).toBe(0)
+  })
+
+  it("a ttlMs at or below the idle threshold never nudges no matter how many idle reconcile cycles pass — the idle debounce is structurally skipped, not merely never satisfied (L1: no unbounded idleCycles growth)", async () => {
+    // ttlMs (1000) < the default idleSilenceNudgeMs (120_000): idle
+    // nudging can NEVER fire for this run — `reconcileAgentRun`'s idle
+    // branch must skip straight to `reconcileTtl` instead of incrementing
+    // a debounce counter every cycle that can never reach its own
+    // threshold (an unbounded per-run leak in the idleCycles map for the
+    // run's entire lifetime, one entry never cleared).
+    const engine = makeEngine(linearWorkflow, { runTtlMs: 1000, nudgeIdleCycles: 1 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    sessions.statuses.set(run.sessionId!, "idle")
+    // Many reconcile cycles, each nudging silence forward but always
+    // staying under the 1000ms TTL — if the idle branch were still
+    // incrementing debounce cycles, this repeated-but-bounded silence
+    // would eventually satisfy nudgeIdleCycles and fire a nudge; it must
+    // not, every single cycle, all the way up to the TTL boundary.
+    for (let i = 0; i < 50; i += 1) {
+      clock.advance(19)
+      await engine.reconcile()
+      expect(store.getRunById(run.id)?.nudges).toBe(0)
+      expect(store.getRunById(run.id)?.status).toBe("running")
+    }
+    // Cross the TTL: reaped by TTL, still zero nudges ever.
+    clock.advance(51)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    expect(store.getRunById(run.id)?.nudges).toBe(0)
+  })
+
   it("idle debounce then nudge, then reap on exhausted nudges", async () => {
     const engine = makeEngine(linearWorkflow, { nudgeIdleCycles: 1, maxNudges: 1 })
     const feature = await startedFeature(engine)
     const run = store.getActiveRunForStep(feature.id, "main", "implement")!
     sessions.statuses.set(run.sessionId!, "idle")
+    clock.advance(120_001)
 
     await engine.reconcile()
     expect(sessions.prompts.length).toBe(2) // initial dispatch + nudge
     expect(store.getRunById(run.id)?.status).toBe("running")
 
+    clock.advance(120_001)
     await engine.reconcile()
     expect(store.getRunById(run.id)?.status).toBe("reaped")
     // "implement" has no retry policy (default: one attempt) and no
@@ -2042,6 +2217,7 @@ describe("Engine: nudge/reap", () => {
     await engine.report({ runId: run.id, outcome: "succeeded", notes: "impl v1" })
     run = store.getActiveRunForStep(feature.id, "main", "review")!
     sessions.statuses.set(run.sessionId!, "idle")
+    clock.advance(120_001)
 
     await engine.reconcile()
     const nudge = sessions.prompts.at(-1)!
@@ -2160,7 +2336,9 @@ describe("Engine: nudge/reap", () => {
     const feature = await startedFeature(engine)
     const run = store.getActiveRunForStep(feature.id, "main", "implement")!
     sessions.statuses.set(run.sessionId!, "idle")
+    clock.advance(120_001)
     await engine.reconcile() // nudge
+    clock.advance(120_001)
     await engine.reconcile() // reap
     expect(store.getRunById(run.id)?.status).toBe("reaped")
     expect(sessions.aborted).toContain(run.sessionId!)
@@ -2196,7 +2374,132 @@ describe("Engine: nudge/reap", () => {
     expect(rearmed!.id).not.toBe(run.id)
   })
 
-  it("busy and retry sessions are never nudged", async () => {
+  it.each(["busy", "retry"] as const)("%s silence uses the durable shared budget across restart", async status => {
+    const def = elapsedRetryWorkflow("PT1H")
+    let engine = makeEngine(def, { nudgeIdleCycles: 1 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    sessions.statuses.set(run.sessionId!, "idle")
+    clock.advance(120_001)
+    await engine.reconcile()
+    sessions.statuses.set(run.sessionId!, status)
+    clock.advance(600_000)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.nudges).toBe(1)
+    clock.advance(1)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.nudges).toBe(2)
+    expect(store.getRunById(run.id)?.timeLastActivity).toBe(clock.now())
+    expect(sessions.prompts.at(-1)?.text).toContain(`run_id="${run.id}"`)
+    expect(sessions.prompts.at(-1)?.text).toContain('Finish step "implement"')
+    expect(sessions.prompts.at(-1)?.agent).toBe(roles.implementer!.agent)
+    await engine.reconcile()
+    expect(sessions.prompts).toHaveLength(3)
+    connection.close()
+    connection = openMigratedDatabase({ path: join(directory, "state.db") })
+    store = new Store(connection.db, clock)
+    engine = makeEngine(def)
+    clock.advance(600_001)
+    await engine.reconcile()
+    expect(sessions.prompts).toHaveLength(3)
+    expect(store.getRunById(run.id)?.nudges).toBe(2)
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    expect(store.getRunById(run.id)?.failure).toMatchObject({ class: "timeout", source: "reaper" })
+    expect(sessions.aborted).toContain(run.sessionId!)
+    expect(store.getOpenRetryEpisode(feature.id, "main", "implement")?.status).toBe("scheduled")
+    clock.advance(60_000)
+    await engine.reconcile()
+    expect(store.getActiveRun(feature.id)?.id).not.toBe(run.id)
+    expect(store.getActiveRun(feature.id)?.stepId).toBe("implement")
+  })
+
+  it("recent logs protect an exhausted busy run and do not reset its budget", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    store.incrementNudges(run.id)
+    store.incrementNudges(run.id)
+    clock.advance(10_800_000)
+    store.appendRunLog(run.id, [{ source: "agent", text: "working" }])
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("running")
+    expect(store.getRunById(run.id)?.nudges).toBe(2)
+    expect(sessions.prompts).toHaveLength(1)
+    clock.advance(600_001)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    expect(sessions.prompts).toHaveLength(1)
+  })
+
+  it.each([300_000, 600_000, 900_000])("TTL %i wins when already expired, without a nudge", async ttlMs => {
+    const def = workflow({ main: job([agentStep("implement", "implementer", "Implement", { ttlMs })]) }, roles)
+    const engine = makeEngine(def)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    clock.advance(1_000_000)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+    expect(store.getRunById(run.id)?.reason).toContain("without activity")
+    expect(store.getRunById(run.id)?.nudges).toBe(0)
+    expect(sessions.prompts).toHaveLength(1)
+  })
+
+  it("pending questions are exempt from busy nudges but retain TTL protection", async () => {
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    store.setRunQuestion(run.id, "Need a decision")
+    clock.advance(600_001)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("running")
+    expect(store.getRunById(run.id)?.nudges).toBe(0)
+    expect(sessions.prompts).toHaveLength(1)
+    clock.advance(3_600_001)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+  })
+
+  it.each([false, true])("pause credits only silence overlapping the pause (activity during pause: %s)", async activity => {
+    // Store and Engine share ONE injected FakeClock (see beforeEach) —
+    // no `spyOn(Date, "now")` workaround needed: `applyTransitionTx`'s
+    // pause-span fold reads the same clock the engine advances below.
+    const engine = makeEngine(linearWorkflow)
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    clock.advance(300_000)
+    await engine.pause(feature.id)
+    clock.advance(3_600_000)
+    if (activity) store.appendRunLog(run.id, [{ source: "agent", text: "paused work completed" }])
+    clock.advance(3_600_000)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.nudges).toBe(0)
+    await engine.resume(feature.id)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("running")
+    clock.advance(activity ? 600_000 : 300_000)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.nudges).toBe(0)
+    clock.advance(1)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.nudges).toBe(1)
+  })
+
+  it("failed busy nudges consume budget and rearm the silence window", async () => {
+    const engine = makeEngine(linearWorkflow, { busySilenceNudgeMs: 100, maxNudges: 1 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    sessions.promptError = new Error("unreachable")
+    clock.advance(101)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.nudges).toBe(1)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("running")
+    clock.advance(101)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.status).toBe("reaped")
+  })
+
+  it("busy and retry sessions with recent activity are never nudged", async () => {
     const engine = makeEngine(linearWorkflow, { nudgeIdleCycles: 1, maxNudges: 1 })
     const feature = await startedFeature(engine)
     const run = store.getActiveRunForStep(feature.id, "main", "implement")!

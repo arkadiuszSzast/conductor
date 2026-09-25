@@ -661,7 +661,7 @@ export class Store {
   }
 
   createFeature(input: CreateFeatureInput): FeatureState {
-    const now = Date.now()
+    const now = this.clock.now()
     const state = initialFeatureState({ ...input, id: randomUUID() })
     this.db.run(
       `INSERT INTO feature (id, slug, project_dir, title, workflow, description, status, pr, escalation, state, feedback, time_created, time_updated)
@@ -745,7 +745,7 @@ export class Store {
    * a stranded feature.
    */
   markEscalated(featureId: string, reason: string): boolean {
-    const now = Date.now()
+    const now = this.clock.now()
     const changed = this.db.transaction(() => {
       const row = this.db.query("SELECT status, state FROM feature WHERE id = ?").get(featureId) as { status: string; state: string } | null
       if (!row || row.status === "escalated" || row.status === "done" || row.status === "abandoned") return false
@@ -766,7 +766,7 @@ export class Store {
   }
 
   setFeatureStatus(featureId: string, status: FeatureStatus): boolean {
-    const now = Date.now()
+    const now = this.clock.now()
     const changed = this.db.transaction(() => {
       const row = this.db.query("SELECT status, state FROM feature WHERE id = ?").get(featureId) as { status: string; state: string } | null
       if (!row || row.status === status) return false
@@ -809,7 +809,7 @@ export class Store {
     targets: readonly { jobId: string; stepId: string }[],
     options: { readonly expectedVersion?: number; readonly idempotencyKey?: string; readonly notes?: string | null } = {},
   ): "recovered" | "duplicate" | "stale_version" | "not_escalated" | "not_found" {
-    const now = Date.now()
+    const now = this.clock.now()
     let featureIdForEmit: string | null = null
     const result = this.db.transaction((): "recovered" | "duplicate" | "stale_version" | "not_escalated" | "not_found" => {
       const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(featureId) as FeatureRow | null
@@ -913,7 +913,7 @@ export class Store {
   markRecoveryDispatchHandled(id: string): boolean {
     return this.db.run(
       "UPDATE recovery_dispatch SET status = 'handled', time_updated = ? WHERE id = ? AND status = 'unhandled'",
-      [Date.now(), id],
+      [this.clock.now(), id],
     ).changes > 0
   }
 
@@ -949,7 +949,7 @@ export class Store {
         this.db.run("UPDATE recovery_dispatch SET episode_closed = 1 WHERE id = ?", [episode.id])
       }
     }
-    const now = Date.now()
+    const now = this.clock.now()
     const escalation = transition.patch.status === "escalated"
       ? escalationReason(transition.decisions)
       : (transition.patch.status !== undefined ? null : undefined)
@@ -989,6 +989,10 @@ export class Store {
       } else if (current.status === "paused" && row.paused_at !== null) {
         sets.push("paused_at = NULL", "paused_ms = ?")
         params.push(accumulatePausedMs(row.paused_ms, row.paused_at, now))
+        this.db.run(
+          "UPDATE run SET time_last_activity = MAX(COALESCE(time_last_activity, time_started), time_started) + MAX(0, ? - MAX(COALESCE(time_last_activity, time_started), time_started, ?)) WHERE feature_id = ? AND status = 'running'",
+          [now, row.paused_at, featureId],
+        )
       }
     }
     params.push(featureId)
@@ -1044,7 +1048,7 @@ export class Store {
       ...("pr" in fields ? { pr: fields.pr ?? null } : {}),
     }
     const sets: string[] = ["time_updated = ?", "state = ?"]
-    const params: (string | number | null)[] = [Date.now(), JSON.stringify(next)]
+    const params: (string | number | null)[] = [this.clock.now(), JSON.stringify(next)]
     if ("pr" in fields) {
       sets.push("pr = ?")
       params.push(next.pr)
@@ -1072,7 +1076,7 @@ export class Store {
         },
       },
     }
-    this.db.run("UPDATE feature SET time_updated = ?, state = ? WHERE id = ?", [Date.now(), JSON.stringify(next), featureId])
+    this.db.run("UPDATE feature SET time_updated = ?, state = ? WHERE id = ?", [this.clock.now(), JSON.stringify(next), featureId])
     this.emit({ kind: "feature", featureId })
   }
 
@@ -1091,7 +1095,7 @@ export class Store {
       const run = this.db.query("SELECT * FROM run WHERE id = ?").get(runId) as RunRow | undefined
       if (!run || run.status !== "running") return false
       featureId = run.feature_id
-      const now = Date.now()
+      const now = this.clock.now()
       this.db.run(
         "UPDATE run SET pending_question = ?, asked_at = ?, time_last_activity = ? WHERE id = ?",
         [question, now, now, runId],
@@ -1121,7 +1125,7 @@ export class Store {
       const run = this.db.query("SELECT * FROM run WHERE id = ?").get(runId) as RunRow | undefined
       if (!run || run.status !== "running" || run.pending_question === null) return false
       featureId = run.feature_id
-      const now = Date.now()
+      const now = this.clock.now()
       this.db.run("UPDATE run SET pending_question = NULL, asked_at = NULL, time_last_activity = ? WHERE id = ?", [now, runId])
       const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(run.feature_id) as FeatureRow | null
       if (!row) return false
@@ -1154,7 +1158,7 @@ export class Store {
    * outstanding question) until confirmed delivery clears it.
    */
   acceptAnswer(runId: string, notes: string): AcceptAnswerResult {
-    const now = Date.now()
+    const now = this.clock.now()
     let featureId: string | null = null
     const result = this.db.transaction((): AcceptAnswerResult => {
       const run = this.db.query("SELECT * FROM run WHERE id = ?").get(runId) as RunRow | undefined
@@ -1282,7 +1286,7 @@ export class Store {
        SET status = 'pending', claimed_at = NULL, lease_expires_at = NULL,
            attempt_count = attempt_count + 1, next_attempt_at = ?, version = version + 1, time_updated = ?
        WHERE id = ? AND status = 'claimed'`,
-      [nextAttemptAtMs, Date.now(), deliveryId],
+      [nextAttemptAtMs, this.clock.now(), deliveryId],
     ).changes > 0
   }
 
@@ -1293,7 +1297,7 @@ export class Store {
   releaseAnswerDelivery(deliveryId: string): boolean {
     return this.db.run(
       "UPDATE answer_delivery SET status = 'pending', claimed_at = NULL, lease_expires_at = NULL, version = version + 1, time_updated = ? WHERE id = ? AND status = 'claimed'",
-      [Date.now(), deliveryId],
+      [this.clock.now(), deliveryId],
     ).changes > 0
   }
 
@@ -1327,7 +1331,7 @@ export class Store {
       if (!delivery) return { kind: "not_claimed" }
       const run = this.db.query("SELECT * FROM run WHERE id = ? AND status = 'running'").get(delivery.run_id) as RunRow | undefined
       if (!run) return { kind: "not_claimed" }
-      const now = Date.now()
+      const now = this.clock.now()
       if (run.pending_question === null || run.asked_at !== delivery.question_generation) {
         this.db.run(
           "UPDATE answer_delivery SET status = 'cancelled', failure_detail = ?, version = version + 1, time_updated = ? WHERE id = ?",
@@ -1367,7 +1371,7 @@ export class Store {
   failAnswerDelivery(deliveryId: string, detail: string): boolean {
     return this.db.run(
       "UPDATE answer_delivery SET status = 'failed', failure_detail = ?, version = version + 1, time_updated = ? WHERE id = ? AND status IN ('pending','claimed')",
-      [boundDiagnostic(detail), Date.now(), deliveryId],
+      [boundDiagnostic(detail), this.clock.now(), deliveryId],
     ).changes > 0
   }
 
@@ -1381,7 +1385,7 @@ export class Store {
   cancelAnswerDelivery(deliveryId: string, reason: string): boolean {
     return this.db.run(
       "UPDATE answer_delivery SET status = 'cancelled', failure_detail = ?, version = version + 1, time_updated = ? WHERE id = ? AND status IN ('pending','claimed')",
-      [boundDiagnostic(reason), Date.now(), deliveryId],
+      [boundDiagnostic(reason), this.clock.now(), deliveryId],
     ).changes > 0
   }
 
@@ -1453,7 +1457,7 @@ export class Store {
         detail?.failure?.class ?? null,
         detail?.failure?.source ?? null,
         detail?.failure?.retryHintMs ?? null,
-        Date.now(),
+        this.clock.now(),
         runId,
       ],
     )
@@ -1566,7 +1570,7 @@ export class Store {
           detail?.failure?.retryHintMs ?? null,
           JSON.stringify(event),
           JSON.stringify(options?.persistDecisions ?? transition.decisions),
-          Date.now(),
+          this.clock.now(),
           runId,
         ],
       )
@@ -1586,7 +1590,7 @@ export class Store {
                reviewed_head=excluded.reviewed_head, synced=0, time_updated=excluded.time_updated`,
             [`${run.feature_id}:${finding.id}`, run.feature_id, Number(finding.id.slice(1)), review.stepId,
               finding.path, finding.line, finding.severity, finding.body, finding.status, finding.resolution ?? null,
-              finding.blocking ? 1 : 0, JSON.stringify(finding.acceptanceTests), review.jobId, runId, review.head, Date.now(), Date.now()],
+              finding.blocking ? 1 : 0, JSON.stringify(finding.acceptanceTests), review.jobId, runId, review.head, this.clock.now(), this.clock.now()],
           )
         }
       }
@@ -1728,7 +1732,7 @@ export class Store {
     failure: FailureEnvelope
   }): RetryEpisodeRecord | null {
     const id = randomUUID()
-    const now = Date.now()
+    const now = this.clock.now()
     // The partial unique index on (feature_id, job_id, step_id) WHERE
     // status IN ('scheduled','claimed') enforces "one active attempt per
     // target" (design.md risk: "database uniqueness invariant for one
@@ -1813,7 +1817,7 @@ export class Store {
     return this.db.run(
       `UPDATE retry_episode SET status = 'closed', closed_reason = ?, time_updated = ?
        WHERE id = ? AND status IN ('scheduled','claimed')`,
-      [reason, Date.now(), episodeId],
+      [reason, this.clock.now(), episodeId],
     ).changes > 0
   }
 
@@ -1835,7 +1839,7 @@ export class Store {
     return this.db.transaction(() => {
       const prior = this.db.query("SELECT * FROM retry_episode WHERE id = ? AND version = ?").get(episodeId, expectedVersion) as RetryEpisodeRow | null
       if (!prior) return null
-      const now = Date.now()
+      const now = this.clock.now()
       if (prior.status !== "closed") {
         this.db.run(
           "UPDATE retry_episode SET status = 'closed', closed_reason = 'recovered', version = version + 1, time_updated = ? WHERE id = ?",
@@ -1902,7 +1906,7 @@ export class Store {
     diagnostic?: string
   }): ResourceWaitRecord {
     const id = randomUUID()
-    const now = Date.now()
+    const now = this.clock.now()
     const row = this.db.query(
       `INSERT INTO resource_wait (
          id, feature_id, job_id, step_id, status, reason,
@@ -1991,7 +1995,7 @@ export class Store {
     return this.db.run(
       `UPDATE resource_wait SET status = 'closed', closed_reason = ?, time_updated = ?
        WHERE id = ? AND status IN ('waiting','claimed')`,
-      [reason, Date.now(), waitId],
+      [reason, this.clock.now(), waitId],
     ).changes > 0
   }
 
@@ -2165,7 +2169,7 @@ export class Store {
     tags: readonly string[]
     body: string
   }>): string[] {
-    const now = Date.now()
+    const now = this.clock.now()
     const row = this.db.query("SELECT COALESCE(MAX(seq), 0) AS maxSeq FROM finding WHERE feature_id = ?").get(featureId) as { maxSeq: number }
     const ids: string[] = []
     this.db.transaction(() => {
@@ -2188,7 +2192,7 @@ export class Store {
     const result = this.db.run(
       `UPDATE finding SET status = ?, resolution = COALESCE(?, resolution), synced = 0, time_updated = ?
        WHERE id = ?`,
-      [status, resolution ?? null, Date.now(), `${featureId}:${shortId}`],
+      [status, resolution ?? null, this.clock.now(), `${featureId}:${shortId}`],
     )
     if (result.changes > 0) this.emit({ kind: "finding", featureId })
     return result.changes > 0
