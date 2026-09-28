@@ -34,3 +34,17 @@ export {
   platformPaths,
 } from "./daemon-config.ts"
 export type { AddProjectResult, DaemonFileConfig, PlatformPaths } from "./daemon-config.ts"
+
+export {
+  ReportMcpConfigError,
+  createReportMcpServer,
+  readReportMcpConfig,
+  runReportMcp,
+} from "./report-mcp.ts"
+export type {
+  ReportMcpConfig,
+  ReportMcpDeps,
+  ReportMcpEnv,
+  ReportMcpFetch,
+  ReportMcpRequestInit,
+} from "./report-mcp.ts"

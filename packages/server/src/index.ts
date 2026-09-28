@@ -25,6 +25,7 @@ export type {
   RetryEpisodeRecord,
   RetryEpisodeStatus,
   RunActionMetadata,
+  RunStatus,
   RunSummary,
   StoreChange,
   TransitionEntry,
@@ -67,25 +68,126 @@ export type {
 export { Engine } from "./engine.ts"
 export type { EngineDeps, EngineOptions, StartFeatureInput, StartFeatureResult } from "./engine.ts"
 
+export { composeManagedRunners, routeNewDispatch, transportOfBinding } from "./runner-router.ts"
+export type { RouteDecision } from "./runner-router.ts"
+
 export { ActionHost, CapabilityDeniedError, realSleep } from "./action-host.ts"
 export type { ActionHandler, ActionHostDeps, ActionHostExecuteResult } from "./action-host.ts"
 export { bundledHandlers } from "./actions/bundled.ts"
 
 export { realPluginProcessSpawner, realPortAllocator, realProcessRunner } from "./process.ts"
-export { systemClock } from "./ports.ts"
+export { NATIVE_SESSION_CAPABILITIES, RunnerOperationError, sessionCapabilitiesOf, systemClock } from "./ports.ts"
 export type {
   Clock,
   Logger,
+  OperationObservation,
+  OperationObservationStatus,
+  OperationPurpose,
   PluginProcessExit,
   PluginProcessHandle,
   PluginProcessSpawnOptions,
   PluginProcessSpawner,
   PortAllocator,
+  PrepareInput,
+  PrepareResult,
   ProcessExecOptions,
   ProcessExecResult,
   ProcessRunner,
+  RunnerOperationDelivery,
+  SessionCapabilities,
   SessionClient,
+  SessionStatus,
 } from "./ports.ts"
+
+export {
+  createFakeReportingReadiness,
+  createReportingReadiness,
+  deriveOperationLogicalKey,
+  isTerminalOperationPhase,
+  operationKindForPurpose,
+  operationPotentiallyDelivered,
+  requiresFence,
+} from "./runner-execution.ts"
+export type {
+  FenceRequest,
+  ManagedReportingReadiness,
+  ReportingReadinessPort,
+  RunCredentialRecord,
+  RunnerBindingRecord,
+  RunnerCleanupState,
+  RunnerFenceReasonCode,
+  RunnerFenceRecord,
+  RunnerOperationKind,
+  RunnerOperationPhase,
+  RunnerOperationRecord,
+  RunnerSafetyStore,
+  RunnerTransport,
+  UncertainAnswerDisposition,
+} from "./runner-execution.ts"
+
+export {
+  DEFAULT_ACP_DEADLINES,
+  FORBIDDEN_INHERITED_ENV_NAMES,
+  directoryWithinRoots,
+  resolveAcpDeadlines,
+  resolveAcpProfileForProject,
+} from "./acp/config.ts"
+export type {
+  AcpDeadlines,
+  AcpPermissionPolicy,
+  AcpProfileConfig,
+  AcpReportBridgeConfig,
+  AcpRoleBinding,
+  RunnersConfig,
+} from "./acp/config.ts"
+export {
+  AcpSpawnValidationFailure,
+  BoundedProcessSlots,
+  realAcpProcessSpawner,
+  validateAcpSpawn,
+} from "./acp/process.ts"
+export type {
+  AcpProcessExit,
+  AcpProcessHandle,
+  AcpProcessSpawnOptions,
+  AcpProcessSpawner,
+  AcpSpawnValidationError,
+} from "./acp/process.ts"
+
+export {
+  MAX_ACP_FRAME_BYTES,
+  connectAcp,
+  createLinkedStdioStreamPair,
+  createLinkedStreamPair,
+} from "./acp/connection.ts"
+export type {
+  AcpClientHandlers,
+  AcpConnectOptions,
+  AcpConnectionHandle,
+  AcpInitializeOutcome,
+} from "./acp/connection.ts"
+
+export { ACP_SESSION_CAPABILITIES, ManagedSessions } from "./acp/sessions.ts"
+export type { ManagedSessionsDeps } from "./acp/sessions.ts"
+
+export {
+  BoundedActivityLog,
+  boundAndRedact,
+  sanitizeStderrTail,
+  summarizeSessionUpdate,
+} from "./acp/diagnostics.ts"
+export type { SessionActivitySummary } from "./acp/diagnostics.ts"
+
+export {
+  decidePermission,
+  decidePermissionBounded,
+  recordPermissionDecision,
+} from "./acp/permissions.ts"
+export type {
+  PermissionDecision,
+  PermissionDecisionContext,
+  PermissionDecisionRecord,
+} from "./acp/permissions.ts"
 
 export { Daemon, jsonLineLogger, systemIntervalScheduler } from "./daemon.ts"
 export type {
@@ -149,6 +251,37 @@ export type {
 
 export { NoLiveRunnerError, createRunnerSessionClient } from "./runner-transport.ts"
 export type { RunnerFetch, RunnerSessionClientDeps } from "./runner-transport.ts"
+
+export {
+  constantTimeEquals,
+  extractBearerToken,
+  generateRunToken,
+  hashRunToken,
+  issueRunCredential,
+  verifyRunCredential,
+} from "./run-auth.ts"
+export type { IssuedRunCredential, VerifyRunCredentialResult } from "./run-auth.ts"
+
+export {
+  decideAskDedup,
+  isAlreadyConcludedMessage,
+  ownRunStatusProjection,
+  parseReportBody,
+} from "./run-reporting.ts"
+export type {
+  AskDedupOutcome,
+  AskDedupStore,
+  OwnRunStatusProjection,
+  ParsedReportBody,
+} from "./run-reporting.ts"
+
+export {
+  createWorkerRoutes,
+  handleWorkerReady,
+  handleWorkerReport,
+  handleWorkerStatus,
+} from "./worker-routes.ts"
+export type { WorkerRouteResult, WorkerRoutesDeps } from "./worker-routes.ts"
 
 // Re-export the graph workflow IR types the server operates on, so
 // consumers (CLI, runner adapter) can depend on @conductor/server alone

@@ -384,6 +384,40 @@ remain conservative until daemon restart; TTL still bounds orphaned runs.
 The owner cache is bounded and in-memory, so cache loss sacrifices precision
 rather than risking incorrect reaping.
 
+### Execution-uncertain runs (opt-in ACP integration only)
+
+A run dispatched through the opt-in ACP runner (see
+[Install § Connecting an ACP agent](install.md#connecting-an-acp-agent-opencode))
+can end up in a fifth outcome besides succeeded/failed/blocked/escalated:
+`uncertain`. This happens only when a create or prompt operation may have
+already taken effect but its outcome could not be proven — a lost
+response, a process/daemon crash, a restart, a turn/no-report deadline,
+or cancellation while a write might already be in flight. Conductor never
+treats these as evidence of either success or a normal `step.failed`:
+the run is durably fenced instead, its worker credential is revoked, and
+no retry, `onFail`, nudge or downstream dispatch is scheduled for it
+automatically. This is a native-runner-unaffected, ACP-only addition —
+existing failure classes, retry budgets and resource waits above are
+unchanged for native runs, and an ACP run that completes with an
+explicit `conductor_report` behaves exactly like a native completion.
+
+Recovering an `uncertain` run uses the same `recover` action as an
+exhausted retry/resource-wait escalation, but requires stronger operator
+attestation: acknowledgment that the effects are unproven (not confirmed
+absent), the usual optimistic-concurrency/idempotency fields, and — only
+after independently confirming the old process was actually terminated —
+confirmation that cleanup happened. See
+[Recovering an escalated feature](http-api.md#recovering-an-escalated-feature)
+for the exact fields and CLI flags. Plain `resume` never clears this kind
+of fence (HTTP returns `409 conflict` naming `acknowledgeUncertain`).
+
+An operator pause fences only unresolved in-flight ACP turns. An idle run
+waiting for a human answer retains its durable question and live session;
+an answer accepted during the pause is delivered on resume and reconciliation,
+not discarded or replayed as a new attempt. Startup is different: completed
+answer operations are settled before ownership-loss fencing, even when the
+workflow is unavailable; no old ACP session is assumed live after restart.
+
 ## Escalation, pausing, resuming
 
 **Escalation** is the safety valve: whenever the workflow cannot proceed

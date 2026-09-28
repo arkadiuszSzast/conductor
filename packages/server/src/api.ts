@@ -34,6 +34,8 @@ import type { RunnerRegistry } from "./runner-registry.ts"
 import { proxyPluginRequest } from "./plugin-proxy.ts"
 import type { PluginControl } from "./plugin-proxy.ts"
 import { pickStaticFile, serveStaticFile } from "./static-files.ts"
+import { isAlreadyConcludedMessage, parseReportBody } from "./run-reporting.ts"
+import { createWorkerRoutes, type WorkerRoutesDeps } from "./worker-routes.ts"
 
 // ------------------------------------------------------------ configuration
 
@@ -83,6 +85,8 @@ export interface EngineControl {
       }
   >
   report(input: { runId: string; outcome?: "succeeded" | "failed"; verdict?: string; notes?: string; ask?: string; review?: unknown }): Promise<string>
+  /** Must invoke authorize synchronously at the mutation commit boundary. */
+  reportWorker?(input: { runId: string; outcome?: "succeeded" | "failed"; verdict?: string; notes?: string; ask?: string; review?: unknown; invocationId?: string; authorize: () => void }): Promise<string>
   answer(runId: string, notes: string): Promise<
     | { readonly ok: true; readonly message: string }
     | { readonly ok: false; readonly code: "unknown_run" | "no_pending_question" | "session_lost"; readonly message: string }
@@ -101,6 +105,8 @@ export interface EngineControl {
       readonly target?: { readonly jobId: string; readonly stepId: string }
       readonly targets?: readonly { readonly jobId: string; readonly stepId: string }[]
       readonly all?: boolean
+      readonly acknowledgeUncertain?: boolean
+      readonly cleanupAttested?: boolean
     },
   ): Promise<{
     ok: boolean
@@ -143,6 +149,14 @@ export interface ApiDeps {
   /** Plugin listing + proxy resolution (`/v1/plugins`). Absent → those routes 404. */
   readonly plugins?: PluginControl
   readonly logger?: DaemonLogger
+  /**
+   * The restricted `/v1/worker/{report,status,ready}` namespace (D8,
+   * task 4.1) — present only when ACP is configured (a store implementing
+   * `RunnerSafetyStore` plus a reporting-readiness port). Absent → those
+   * routes 404, matching the "existing native configuration omits
+   * runners" contract (native deployments never gain this surface).
+   */
+  readonly worker?: WorkerRoutesDeps
 }
 
 // ------------------------------------------------------------------ errors
@@ -529,9 +543,40 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
    */
   function withAnswerDelivery(run: RunSummary | null): unknown {
     if (run === null) return null
+    const withUncertainty = withRunnerSafetyProjection(run) as Record<string, unknown>
     const delivery = store.getOpenAnswerDelivery(run.id)
-    if (delivery === null) return run
-    return { ...run, answerDelivery: { status: delivery.status, acceptedAt: delivery.createdAt } }
+    if (delivery === null) return withUncertainty
+    return { ...withUncertainty, answerDelivery: { status: delivery.status, acceptedAt: delivery.createdAt } }
+  }
+
+  /**
+   * Safe run/feature projection for D5/D6 uncertainty (task 4.4):
+   * transport/profile, unresolved fence reason and required recovery
+   * action — never tokens, env or raw configs (D10: "never tokens, env
+   * or raw configs"). Absent entirely for a native run with no binding,
+   * so existing native consumers see NO shape change (additive-only).
+   */
+  function withRunnerSafetyProjection(run: RunSummary): Record<string, unknown> {
+    const binding = store.getRunnerBinding(run.id)
+    if (binding === null) return run as unknown as Record<string, unknown>
+    const fence = store.getFence(run.id)
+    return {
+      ...run,
+      transport: binding.transport,
+      ...(binding.profileId !== null ? { profileId: binding.profileId } : {}),
+      ...(fence !== null && fence.resolvedAt === null
+        ? {
+            uncertain: {
+              reasonCode: fence.reasonCode,
+              cleanupState: fence.cleanupState,
+              // Honest signal for the operator surface (5.4): cleanup
+              // must be independently confirmed/attested before recovery
+              // is safe — never claimed automatically.
+              recoveryRequiresCleanupAcknowledgement: fence.cleanupState === "unconfirmed",
+            },
+          }
+        : {}),
+    }
   }
 
   async function handle(request: Request): Promise<Response> {
@@ -582,6 +627,20 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     if (staticRoot !== null && !path.startsWith("/v1") && (method === "GET" || method === "HEAD")) {
       const served = serveStatic(staticRoot, path, requestId)
       if (served !== null) return served
+    }
+
+    // Restricted worker namespace (D8, task 4.1): authenticated by its
+    // OWN hashed run-scoped credential, BEFORE the broad admin
+    // `authorized()` check below — a worker credential must never be
+    // upgraded by (or need) the admin bearer token, and `auth.mode:
+    // "none"` must never leave this namespace open (worker requests
+    // still require a valid credential even when the admin API itself
+    // requires none).
+    if (path === "/v1/worker" || path.startsWith("/v1/worker/")) {
+      if (deps.worker === undefined) return error(requestId, "not_found", "worker reporting is not configured")
+      const result = await createWorkerRoutes(deps.worker, request, method, path)
+      if (result !== null) return json(result.status, result.body, requestId)
+      return error(requestId, "not_found", "unknown worker route")
     }
 
     if (!authorized(request, path)) return error(requestId, "unauthorized", "missing or invalid bearer token")
@@ -1008,6 +1067,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         return json(200, featurePayload(featureId), requestId)
       }
       case "resume":
+        if (store.hasUnresolvedRunnerFence(featureId)) return error(requestId, "conflict", "Uncertain execution requires recover with acknowledgeUncertain and cleanup evidence; resume cannot clear a fence.")
         await engine.resume(featureId)
         return json(200, featurePayload(featureId), requestId)
       case "recover": {
@@ -1062,8 +1122,15 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         if ([target !== undefined, targets !== undefined, all].filter(Boolean).length > 1) {
           return error(requestId, "invalid_request", "pass exactly one of \"target\", \"targets\", or \"all\" — they cannot be combined")
         }
+        const acknowledgeUncertain = parsed.body["acknowledgeUncertain"]
+        const cleanupAttested = parsed.body["cleanupAttested"]
+        if ((acknowledgeUncertain !== undefined && typeof acknowledgeUncertain !== "boolean") || (cleanupAttested !== undefined && typeof cleanupAttested !== "boolean")) {
+          return error(requestId, "invalid_request", "acknowledgeUncertain and cleanupAttested must be booleans")
+        }
         const result = await engine.recover(featureId, {
           notes,
+          ...(acknowledgeUncertain !== undefined ? { acknowledgeUncertain } : {}),
+          ...(cleanupAttested !== undefined ? { cleanupAttested } : {}),
           ...(expectedVersion !== undefined ? { expectedVersion } : {}),
           ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
           ...(target !== undefined ? { target } : {}),
@@ -1179,32 +1246,10 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     if (!run) return error(requestId, "not_found", `unknown run "${runId}"`)
     const parsed = await readJsonBody(request)
     if (!parsed.ok) return error(requestId, "invalid_json", "request body must be a JSON object")
-    const { outcome, verdict, notes, ask, review } = parsed.body
-    if (outcome !== undefined && outcome !== "succeeded" && outcome !== "failed") {
-      return error(requestId, "invalid_request", "\"outcome\" must be \"succeeded\" or \"failed\"")
-    }
-    if (verdict !== undefined && (typeof verdict !== "string" || verdict.trim() === "")) {
-      return error(requestId, "invalid_request", "\"verdict\" must be a non-empty string")
-    }
-    if (notes !== undefined && typeof notes !== "string") {
-      return error(requestId, "invalid_request", "\"notes\" must be a string")
-    }
-    if (ask !== undefined && (typeof ask !== "string" || ask.trim() === "")) {
-      return error(requestId, "invalid_request", "\"ask\" must be a non-empty string")
-    }
-    const shapes = [outcome !== undefined, verdict !== undefined, ask !== undefined].filter(Boolean).length
-    if (shapes === 0) {
-      return error(requestId, "invalid_request", "one of \"outcome\", \"verdict\" or \"ask\" is required")
-    }
-    if (ask !== undefined && shapes > 1) {
-      return error(requestId, "invalid_request", "\"ask\" cannot be combined with \"outcome\" or \"verdict\"")
-    }
-    // outcome:"succeeded" + verdict is redundant, not contradictory —
-    // agents naturally send both and the verdict routes. Only a failed
-    // outcome contradicts a verdict (a verdict concludes successfully).
-    if (outcome === "failed" && verdict !== undefined) {
-      return error(requestId, "invalid_request", "\"outcome\": \"failed\" and \"verdict\" are contradictory — a verdict implies successful completion")
-    }
+    // Shared with the restricted /v1/worker/report route (run-reporting.ts,
+    // task 4.2) — ONE validation authority for every reporting caller.
+    const validated = parseReportBody(parsed.body)
+    if (!validated.ok) return error(requestId, "invalid_request", validated.message)
     // Duplicate reports are rejected idempotently: the engine's atomic
     // conclusion claim is the authority; this pre-check only projects the
     // already-concluded state onto a 409 without touching the engine.
@@ -1213,11 +1258,11 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     }
     const result = await engine.report({
       runId,
-      ...(outcome !== undefined ? { outcome } : {}),
-      ...(verdict !== undefined ? { verdict } : {}),
-      ...(notes !== undefined ? { notes } : {}),
-      ...(ask !== undefined ? { ask } : {}),
-      ...(review !== undefined ? { review } : {}),
+      ...(validated.outcome !== undefined ? { outcome: validated.outcome } : {}),
+      ...(validated.verdict !== undefined ? { verdict: validated.verdict } : {}),
+      ...(validated.notes !== undefined ? { notes: validated.notes } : {}),
+      ...(validated.ask !== undefined ? { ask: validated.ask } : {}),
+      ...(validated.review !== undefined ? { review: validated.review } : {}),
     })
     // A concurrent report can still win the engine's atomic claim between
     // the pre-check and this call — the loser maps to the same 409. The
@@ -1226,7 +1271,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     // `Step "`, so caller-controlled verdict/notes text can never spoof
     // the duplicate shape from inside a success message.
     if (result.startsWith("Invalid review:")) return error(requestId, "invalid_request", result)
-    if (result.startsWith(`Run ${runId} already concluded`)) {
+    if (isAlreadyConcludedMessage(result, runId)) {
       return error(requestId, "run_already_concluded", result)
     }
     return json(200, { result, run: withAnswerDelivery(store.getRunById(runId)) }, requestId)

@@ -58,11 +58,17 @@ describe("progressAnchors", () => {
       hasDueRetry: true,
       hasResourceWait: true,
       hasUnhandledOutboxDecision: true,
+      hasPreparingTarget: true,
     }
     const state = featureState({ a: jobRuntime({ status: "running" }) }, { status: "running" })
     expect(progressAnchors(state, external)).toEqual(
-      expect.arrayContaining(["active_run", "due_retry", "resource_wait", "unhandled_outbox_decision"]),
+      expect.arrayContaining(["active_run", "due_retry", "resource_wait", "unhandled_outbox_decision", "preparing_target"]),
     )
+  })
+
+  it("reports preparing_target purely from the external anchor state (F1: blocked ACP prepare)", () => {
+    const state = featureState({ a: jobRuntime({ status: "running" }) }, { status: "running" })
+    expect(progressAnchors(state, { ...NO_EXTERNAL_ANCHORS, hasPreparingTarget: true })).toEqual(["preparing_target"])
   })
 })
 
@@ -134,5 +140,10 @@ describe("checkActiveStateInvariant", () => {
   it("a running feature anchored only by an unhandled outbox decision is ok", () => {
     const state = featureState({ a: jobRuntime({ status: "running" }) }, { status: "running" })
     expect(checkActiveStateInvariant(state, { ...NO_EXTERNAL_ANCHORS, hasUnhandledOutboxDecision: true })).toEqual({ kind: "ok" })
+  })
+
+  it("a running feature anchored only by a preparing target (F1: blocked ACP prepare) is ok, never stranded", () => {
+    const state = featureState({ a: jobRuntime({ status: "running" }) }, { status: "running" })
+    expect(checkActiveStateInvariant(state, { ...NO_EXTERNAL_ANCHORS, hasPreparingTarget: true })).toEqual({ kind: "ok" })
   })
 })

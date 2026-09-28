@@ -126,6 +126,36 @@ function makeDaemon(input: {
 }
 
 describe("Daemon: startup", () => {
+  it("DB1 settles completed answer before startup fencing, with no replay on repeated initialization", async () => {
+    const project = writeProject()
+    const path = join(tempDir("acp-restart-"), "state.db")
+    const db = openMigratedDatabase({ path })
+    const store = new Store(db.db)
+    const feature = store.createFeature({ title: "restart", slug: "restart", projectDir: project, workflow: "minimal" })
+    store.applyTransition(feature.id, { kind: "feature.start" }, { decisions: [], patch: { status: "running", jobs: { main: { status: "running", currentStep: "implement", steps: { implement: { status: "running" } } } } } })
+    const runId = store.insertRun({ featureId: feature.id, jobId: "main", stepId: "implement", stepType: "agent", attempt: 1,
+      binding: { transport: "acp", directory: project, daemonGeneration: 1 } })
+    store.setRunQuestion(runId, "N")
+    const accepted = store.acceptAnswer(runId, "durable answer")
+    if (accepted.kind !== "accepted") throw new Error("accept failed")
+    store.claimAnswerDelivery(accepted.delivery.id, Date.now(), 1000)
+    store.markAnswerDeliverySubmitted(accepted.delivery.id)
+    const op = store.claimOperation({ runId, kind: "answer", logicalKey: accepted.delivery.deliveryToken, payloadDigest: "synthetic", ownerGeneration: 1 })
+    store.transitionOperationPhase(op.id, "prepared", "sending")
+    store.transitionOperationPhase(op.id, "sending", "submitted")
+    store.transitionOperationPhase(op.id, "submitted", "completed")
+    db.close()
+    for (let i = 0; i < 2; i++) {
+      const sessions = new FakeSessions()
+      const { daemon } = makeDaemon({ databasePath: path, projects: [project], deps: { sessions } })
+      await daemon.initialize()
+      expect(daemon.store.getRunById(runId)?.status).toBe("uncertain")
+      expect(daemon.store.getRunById(runId)?.pendingQuestion).toBeNull()
+      expect(daemon.store.getAnswerDelivery(accepted.delivery.id)?.status).toBe("delivered")
+      expect(sessions.prompts).toHaveLength(0)
+      await daemon.stop()
+    }
+  })
   it("starts with a mix of valid and invalid projects — invalid ones get diagnostics, valid ones register", async () => {
     const valid = writeProject()
     const invalid = writeProject("not: valid: yaml: [")

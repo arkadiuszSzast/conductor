@@ -20,6 +20,7 @@ export type ProgressAnchor =
   | "resource_wait"
   | "paused_pending_work"
   | "unhandled_outbox_decision"
+  | "preparing_target"
 
 /** External durable anchors the pure core cannot see for itself. */
 export interface AnchorState {
@@ -27,6 +28,19 @@ export interface AnchorState {
   readonly hasDueRetry: boolean
   readonly hasResourceWait: boolean
   readonly hasUnhandledOutboxDecision: boolean
+  /**
+   * True while some step for this feature is between "prepare() called"
+   * and "run inserted or prepare failed" (acp-runner review F1). An ACP
+   * `prepare()` call can await a bounded resource/process wait with no
+   * durable run row and no resource_wait row yet — without this anchor a
+   * reconcile pass racing that in-flight await sees NO anchor at all and
+   * wrongly marks the feature stranded/escalated out from under
+   * in-progress preparation. Naturally absent after a restart (a fresh
+   * engine holds no in-flight prepare calls), which is the correct
+   * behavior: restart legitimately re-attempts the target rather than
+   * needing to durably resume "was preparing".
+   */
+  readonly hasPreparingTarget: boolean
 }
 
 export const NO_EXTERNAL_ANCHORS: AnchorState = {
@@ -34,6 +48,7 @@ export const NO_EXTERNAL_ANCHORS: AnchorState = {
   hasDueRetry: false,
   hasResourceWait: false,
   hasUnhandledOutboxDecision: false,
+  hasPreparingTarget: false,
 }
 
 const TERMINAL_JOB_STATUSES = new Set<JobStatus>(["succeeded", "failed", "skipped"])
@@ -67,6 +82,7 @@ export function progressAnchors(state: FeatureState, external: AnchorState): rea
   if (external.hasResourceWait) anchors.push("resource_wait")
   if (state.status === "paused") anchors.push("paused_pending_work")
   if (external.hasUnhandledOutboxDecision) anchors.push("unhandled_outbox_decision")
+  if (external.hasPreparingTarget) anchors.push("preparing_target")
   return anchors
 }
 

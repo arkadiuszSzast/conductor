@@ -9,7 +9,7 @@ interpreter.
 
 | Document | What it covers |
 |---|---|
-| [Install](install.md) | Installing from the repo (dev `bun link`, compiled binary), running `conductor daemon`, connecting the opencode runner, first feature, troubleshooting. |
+| [Install](install.md) | Installing from the repo (dev `bun link`, compiled binary), running `conductor daemon`, connecting the opencode runner, the opt-in ACP (OpenCode) runner path, first feature, troubleshooting. |
 | [Concepts](concepts.md) | The execution model: features, jobs, steps, outcomes vs failures, loops, retries/failure classes, pausing/escalation/recovery, interactive answer delivery. Read this first. |
 | [Workflow reference](workflow-reference.md) | Every YAML field, with types, defaults and examples — the `conductor.yaml` counterpart to GHA's workflow syntax reference. |
 | [Expressions](expressions.md) | The `{{ }}` template contexts: `inputs`, `steps`, `needs`, `feedback` — what resolves when, and what is validated. |
@@ -39,3 +39,10 @@ For design rationale and the decision log, see the OpenSpec changes:
   delivered split for answering a mid-step question.
 - `openspec/changes/plugin-system/` — the plugin manifest, registry,
   supervisor/proxy, panel rail and bridge, and the bundled OpenSpec plugin.
+- `openspec/changes/acp-runner/` — the opt-in Agent Client Protocol (ACP)
+  runner (see [Install § Connecting an ACP agent](install.md#connecting-an-acp-agent-opencode)):
+  design decisions, durable execution-uncertainty fencing and explicit
+  operator recovery (fenced attempts require acknowledged recovery, not
+  resume), and pause-safe interactive answers. The install ACP YAML example
+  is checked by the real CLI daemon-config parser. Its Stage 2 live-compatibility gate was waived by
+  the user, not passed; live OpenCode dogfood is a separate, later step.

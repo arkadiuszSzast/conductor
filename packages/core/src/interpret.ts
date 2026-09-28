@@ -48,6 +48,7 @@ export function interpret(
     case "step.completed":    return onCompleted(workflow, state, event.jobId, event.stepId, event.outcome ?? DEFAULT_OUTCOME, event.outputs)
     case "step.failed":       return onFailed(workflow, state, event.jobId, event.stepId, event.reason)
     case "step.budget_exhausted": return onBudgetExhausted(workflow, state, event.jobId, event.stepId, event.reason)
+    case "step.execution_unknown": return onExecutionUnknown(state, event.jobId, event.stepId, event.reason)
     case "human.paused":      return buildTransition([{ kind: "pause" }], { status: "paused" })
     case "human.resumed":     return onResumed(workflow, state)
     case "human.abandoned":   return buildTransition([{ kind: "abandon" }], { status: "abandoned" })
@@ -600,6 +601,45 @@ function onBudgetExhausted(
   return applyRoute(
     step.onFail, workflow, state, job, step, reason,
     { jobs: { [jobId]: failedPatch } },
+  )
+}
+
+/**
+ * A potentially-delivered runner effect whose outcome cannot be
+ * established (acp-runner design.md D6: "durable escalation, never
+ * ordinary failed routing"). Unlike `onFailed`/`onBudgetExhausted`, this
+ * NEVER applies the step's `onFail` route and NEVER cascades to sibling
+ * or dependent jobs — an unknown external effect must not spend the
+ * step's retry budget, and jobs that never touched the uncertain target
+ * keep their exact current state ("parallel job state preserved"). The
+ * targeted job/step is marked failed (the SAME shape
+ * `Engine.recoveryCandidates`'s durable frontier already scans for, so
+ * operator recovery already finds it) and the feature escalates
+ * directly — there is no route left to evaluate, only an operator
+ * decision (`acknowledgeUncertain` recovery, D6) to make.
+ */
+function onExecutionUnknown(
+  state: FeatureState,
+  jobId: string,
+  stepId: string,
+  reason: string,
+): Transition {
+  const jobRuntime = state.jobs[jobId]
+  if (!jobRuntime || jobRuntime.currentStep !== stepId) {
+    return noopTransition(`stale execution-unknown for "${jobId}/${stepId}"`)
+  }
+  return buildTransition(
+    [{ kind: "escalate", reason }],
+    {
+      status: "escalated",
+      jobs: {
+        [jobId]: {
+          status: "failed",
+          currentStep: null,
+          steps: { [stepId]: { status: "failed" } },
+        },
+      },
+    },
   )
 }
 

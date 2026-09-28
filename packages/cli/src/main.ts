@@ -15,6 +15,8 @@ import { dirname, resolve } from "node:path"
 import { spawnSync } from "node:child_process"
 import {
   Daemon,
+  composeManagedRunners,
+  createReportingReadiness,
   PluginRegistry,
   PluginSupervisor,
   RunnerRegistry,
@@ -105,7 +107,10 @@ function startDaemon(input: DaemonStartInput): DaemonProcessHandle {
   const logger = { log: input.log }
   const runners = new RunnerRegistry()
   const sessions = createRunnerSessionClient({ runners })
+  const readiness = createReportingReadiness()
+  const reportingHost = input.api.bind.host === "0.0.0.0" ? "127.0.0.1" : input.api.bind.host === "::" ? "[::1]" : input.api.bind.host
   const daemon = new Daemon(input.daemon, {
+    ...(input.daemon.runners ? { sessionFactory: (store, clock, observe) => composeManagedRunners(input.daemon.runners!, store, clock, readiness, () => `http://${reportingHost}:${input.api.bind.port}`, process.env, observe) } : {}),
     sessions,
     runnerAvailability: () => runners.list().length > 0,
     logger,
@@ -128,6 +133,7 @@ function startDaemon(input: DaemonStartInput): DaemonProcessHandle {
     input.log({ level: "info", message: `received ${signal} — shutting down` })
     void (async () => {
       try {
+        await daemon.drainWorkers()
         await server?.stop()
         await pluginStop?.()
         await daemon.stop()
@@ -146,7 +152,7 @@ function startDaemon(input: DaemonStartInput): DaemonProcessHandle {
   const apiConfig = uiRoot !== null ? { ...input.api, ui: { staticDir: uiRoot } } : input.api
 
   const started = (async () => {
-    await daemon.start()
+    await daemon.initialize()
 
     const plugins = await preparePluginSubsystem(input.plugins, {
       scan: () =>
@@ -179,6 +185,7 @@ function startDaemon(input: DaemonStartInput): DaemonProcessHandle {
 
     server = startApiServer(apiConfig, {
       store: daemon.store,
+      ...(input.daemon.runners ? { worker: { store: daemon.store, engine: daemon.engine, readiness, clock: { now: () => Date.now() } } } : {}),
       engine: daemon.engine,
       health: () => daemon.health(),
       resolveWorkflow: daemon.registry.resolver,
@@ -191,12 +198,34 @@ function startDaemon(input: DaemonStartInput): DaemonProcessHandle {
 
     // Plugin backends are started once the daemon's own API is bound —
     // their CONDUCTOR_URL env only becomes answerable at this point.
+    await daemon.activate()
     await plugins.start()
-  })()
+  })().catch(async error => {
+    await daemon.drainWorkers()
+    await server?.stop()
+    await pluginStop?.()
+    await daemon.stop()
+    throw error
+  })
 
   return { started, exited }
 }
 
+// Worker stdio must bypass all administrator configuration discovery.
+if (process.argv[2] === "report-mcp") {
+  try {
+    if (process.argv.length !== 3) throw new Error("report-mcp accepts only injected run environment, no arguments")
+    const { runReportMcp } = await import("./report-mcp.ts")
+    await runReportMcp({
+      CONDUCTOR_RUN_URL: process.env.CONDUCTOR_RUN_URL,
+      CONDUCTOR_RUN_ID: process.env.CONDUCTOR_RUN_ID,
+      CONDUCTOR_RUN_TOKEN: process.env.CONDUCTOR_RUN_TOKEN,
+    })
+  } catch {
+    console.error("report-mcp startup failed; verify injected run configuration")
+    process.exit(2)
+  }
+} else {
 const code = await runCli(process.argv.slice(2), {
   env: process.env,
   stdout: line => console.log(line),
@@ -209,3 +238,4 @@ const code = await runCli(process.argv.slice(2), {
   startDaemon,
 })
 process.exit(code)
+}

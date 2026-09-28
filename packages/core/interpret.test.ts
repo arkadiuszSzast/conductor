@@ -219,6 +219,90 @@ describe("step.failed", () => {
 })
 
 // ---------------------------------------------------------------------------
+// step.execution_unknown (acp-runner design.md D6: durable escalation,
+// never ordinary failed routing)
+// ---------------------------------------------------------------------------
+
+describe("step.execution_unknown", () => {
+  it("escalates directly, ignoring retry budget and onFail", () => {
+    // "gate" has retry: backoff(2) and onFail: goto("fix_gate") — a plain
+    // step.failed at attempt 1 would retry, never escalate. Unknown must
+    // never take that route: no retry, no onFail, straight to escalation.
+    const t = interpret(
+      workflow,
+      state({ jobs: { main: job({ currentStep: "gate" }) } }),
+      evt({ kind: "step.execution_unknown", stepId: "gate", reason: "lost prompt response" }),
+    )
+    expect(t.decisions).toEqual([{ kind: "escalate", reason: "lost prompt response" }])
+    expect(t.patch.status).toBe("escalated")
+    expect(t.patch.jobs?.main?.status).toBe("failed")
+    expect(t.patch.jobs?.main?.currentStep).toBeNull()
+    expect(t.patch.jobs?.main?.steps?.gate?.status).toBe("failed")
+  })
+
+  it("does not increment the step's attempt counter", () => {
+    const t = interpret(
+      workflow,
+      state({ jobs: { main: job({ currentStep: "gate", attempts: { gate: 1 } }) } }),
+      evt({ kind: "step.execution_unknown", stepId: "gate", reason: "uncertain create" }),
+    )
+    // attempts is untouched by the patch (JobPatch omits it) — the run
+    // stays uncertain, never counted as a spent retry attempt.
+    expect(t.patch.jobs?.main?.attempts).toBeUndefined()
+  })
+
+  it("routes even a step with rerun outcomes straight to escalation, never a rerun", () => {
+    const t = interpret(
+      workflow,
+      state({ jobs: { main: job({ currentStep: "review" }) } }),
+      evt({ kind: "step.execution_unknown", stepId: "review", reason: "lost turn response" }),
+    )
+    expect(t.decisions).toEqual([{ kind: "escalate", reason: "lost turn response" }])
+    expect(t.patch.jobs?.main?.reruns).toBeUndefined()
+  })
+
+  it("is a stale noop for a step that is no longer current", () => {
+    const t = interpret(
+      workflow,
+      state({ jobs: { main: job({ currentStep: "review" }) } }),
+      evt({ kind: "step.execution_unknown", stepId: "implement", reason: "stale" }),
+    )
+    expect(t.decisions[0]?.kind).toBe("noop")
+    expect(t.patch).toEqual({})
+  })
+
+  it("preserves sibling/dependent job state exactly — no cascade", () => {
+    const dagWorkflow = mkWorkflow(
+      {
+        build: defineJob([commandStep("compile", ["make"])]),
+        "test-a": defineJob([agentStep("run", "implementer", "test a")], ["build"]),
+        "test-b": defineJob([agentStep("run", "implementer", "test b")], ["build"]),
+      },
+      roles,
+      "parallel-unknown",
+    )
+    const before = {
+      build: job({ status: "succeeded", currentStep: null }),
+      "test-a": job({ status: "running", currentStep: "run" }),
+      "test-b": job({ status: "running", currentStep: "run" }),
+    }
+    const t = interpret(
+      dagWorkflow,
+      { ...state({ jobs: before }) },
+      { kind: "step.execution_unknown", jobId: "test-a", stepId: "run", reason: "lost create response" },
+    )
+    expect(t.decisions).toEqual([{ kind: "escalate", reason: "lost create response" }])
+    expect(t.patch.status).toBe("escalated")
+    // Only the targeted job is patched — "test-b" (a parallel, unrelated
+    // job with its own live run) never appears in the patch at all, so
+    // applying it leaves "test-b"'s runtime byte-for-byte unchanged.
+    expect(t.patch.jobs?.["test-b"]).toBeUndefined()
+    expect(t.patch.jobs?.build).toBeUndefined()
+    expect(t.patch.jobs?.["test-a"]?.status).toBe("failed")
+  })
+})
+
+// ---------------------------------------------------------------------------
 // step.completed outcomes (review loops)
 // ---------------------------------------------------------------------------
 

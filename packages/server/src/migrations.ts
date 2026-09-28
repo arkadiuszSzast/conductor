@@ -655,6 +655,274 @@ export const migrations: readonly Migration[] = [
       addColumn(db, "finding", "reviewed_head", "TEXT")
     },
   },
+  {
+    id: "0022_runner_safety",
+    up(db) {
+      // acp-runner design.md D5: durable binding/operation/fence/credential
+      // records, plus the `uncertain` run status and `submitted`/`unknown`
+      // answer-delivery dispositions. SQLite cannot ALTER a CHECK
+      // constraint in place, so `run` and `answer_delivery` are rebuilt.
+      // Unlike 0008/0009's `ALTER TABLE run RENAME TO run_old` (safe only
+      // because no OTHER table referenced `run` by foreign key yet at
+      // that point), `run_log`/`answer_delivery`/`retry_episode`/
+      // `resource_wait`/`recovery_dispatch` all now hold a live `REFERENCES
+      // run(id)` — and SQLite's ALTER TABLE RENAME follows those
+      // references, silently repointing every dependent table's foreign
+      // key at the renamed `run_old`, permanently orphaning them from the
+      // table that is about to become `run` again. The fix: build the
+      // replacement under a NEW name, copy rows into it, drop the
+      // original, then rename the new table into the vacated `run` name
+      // — no dependent table's schema ever mentions `run_old`, so no
+      // foreign key needs to (or can) follow a rename. Preserves every
+      // existing row: every pre-migration run/delivery keeps its exact
+      // status, only new values become newly reachable going forward.
+      // Every EXISTING run row implicitly stays "native" transport-less
+      // (no runner_binding row at all) — `runner_binding` is populated
+      // only for a run dispatched AFTER this migration, which is exactly
+      // the "native default, existing native behavior preserved" contract:
+      // an absent binding always means native.
+
+      // Preserve cascading children while replacing the parent table.
+      db.run("CREATE TEMP TABLE acp_saved_run_log AS SELECT * FROM run_log")
+      db.run("CREATE TEMP TABLE acp_saved_answers AS SELECT * FROM answer_delivery")
+      db.run(`
+        CREATE TABLE run_new (
+          id                    TEXT PRIMARY KEY,
+          feature_id            TEXT NOT NULL REFERENCES feature(id) ON DELETE CASCADE,
+          job_id                TEXT NOT NULL,
+          step_id               TEXT NOT NULL,
+          step_type             TEXT NOT NULL CHECK(step_type IN ('agent','command','action')),
+          attempt               INTEGER NOT NULL DEFAULT 1,
+          status                TEXT NOT NULL DEFAULT 'running'
+                                  CHECK(status IN ('running','succeeded','failed','reaped','uncertain')),
+          session_id            TEXT,
+          outputs               TEXT NOT NULL DEFAULT '{}',
+          reason                TEXT,
+          nudges                INTEGER NOT NULL DEFAULT 0,
+          completion_event      TEXT,
+          completion_decisions  TEXT,
+          action_handled        INTEGER NOT NULL DEFAULT 0,
+          metadata              TEXT,
+          pending_state         TEXT,
+          next_observation      INTEGER,
+          pending_question      TEXT,
+          asked_at              INTEGER,
+          failure_class         TEXT CHECK(failure_class IS NULL OR failure_class IN (
+                                   'transient_upstream','transient_transport','capacity','timeout',
+                                   'deterministic_failure','invalid_config','missing_session','cancelled','internal'
+                                 )),
+          failure_source        TEXT,
+          failure_retry_hint_ms INTEGER,
+          paused_ms_at_dispatch INTEGER NOT NULL DEFAULT 0,
+          time_started          INTEGER NOT NULL,
+          time_last_activity    INTEGER,
+          time_finished         INTEGER,
+          recover_notes         TEXT
+        )
+      `)
+      db.run(`
+        INSERT INTO run_new (id, feature_id, job_id, step_id, step_type, attempt, status, session_id,
+                          outputs, reason, nudges, completion_event, completion_decisions, action_handled,
+                          metadata, pending_state, next_observation, pending_question, asked_at,
+                          failure_class, failure_source, failure_retry_hint_ms, paused_ms_at_dispatch,
+                          time_started, time_last_activity, time_finished, recover_notes)
+        SELECT id, feature_id, job_id, step_id, step_type, attempt, status, session_id,
+               outputs, reason, nudges, completion_event, completion_decisions, action_handled,
+               metadata, pending_state, next_observation, pending_question, asked_at,
+               failure_class, failure_source, failure_retry_hint_ms, paused_ms_at_dispatch,
+               time_started, time_last_activity, time_finished, recover_notes
+        FROM run
+      `)
+      db.run("DROP TABLE run")
+      db.run("ALTER TABLE run_new RENAME TO run")
+      db.run("INSERT INTO run_log SELECT * FROM acp_saved_run_log")
+      db.run("DROP TABLE acp_saved_run_log")
+      db.run("CREATE INDEX IF NOT EXISTS idx_run_feature ON run(feature_id, time_started)")
+      db.run(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_run_one_active_target
+        ON run(feature_id, job_id, step_id) WHERE status = 'running'
+      `)
+
+      // answer_delivery: add `submitted` (open, non-reclaimable — a lease
+      // cannot resend it) and `unknown` (terminal for automatic handling,
+      // fences the run) alongside the existing five statuses. The open-
+      // delivery uniqueness index must include `submitted` too (D5:
+      // "open uniqueness includes pending/claimed/submitted/unknown") —
+      // `unknown` is terminal so it does not need to join that index, but
+      // is listed in the design note for completeness; only pending,
+      // claimed and submitted are ever "in flight" at once.
+      db.run(`
+        CREATE TABLE answer_delivery_new (
+          id                    TEXT PRIMARY KEY,
+          feature_id            TEXT NOT NULL REFERENCES feature(id) ON DELETE CASCADE,
+          run_id                TEXT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+          job_id                TEXT NOT NULL,
+          step_id               TEXT NOT NULL,
+          question_generation   INTEGER NOT NULL,
+          notes                 TEXT NOT NULL,
+          target_session_id     TEXT,
+          delivery_token        TEXT NOT NULL,
+          status                TEXT NOT NULL DEFAULT 'pending'
+                                  CHECK(status IN ('pending','claimed','delivered','failed','cancelled','submitted','unknown')),
+          failure_detail        TEXT,
+          claimed_at            INTEGER,
+          lease_expires_at      INTEGER,
+          attempt_count         INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at       INTEGER,
+          deadline_at           INTEGER,
+          version               INTEGER NOT NULL DEFAULT 0,
+          time_created          INTEGER NOT NULL,
+          time_updated          INTEGER NOT NULL
+        )
+      `)
+      db.run(`
+        INSERT INTO answer_delivery_new (id, feature_id, run_id, job_id, step_id, question_generation, notes,
+                                      target_session_id, delivery_token, status, failure_detail, claimed_at,
+                                      lease_expires_at, attempt_count, next_attempt_at, deadline_at, version,
+                                      time_created, time_updated)
+        SELECT id, feature_id, run_id, job_id, step_id, question_generation, notes,
+               target_session_id, delivery_token, status, failure_detail, claimed_at,
+               lease_expires_at, attempt_count, next_attempt_at, deadline_at, version,
+               time_created, time_updated
+        FROM acp_saved_answers
+      `)
+      db.run("DROP TABLE acp_saved_answers")
+      db.run("DROP TABLE answer_delivery")
+      db.run("ALTER TABLE answer_delivery_new RENAME TO answer_delivery")
+      db.run(`
+        CREATE UNIQUE INDEX idx_answer_delivery_open_run
+        ON answer_delivery(run_id) WHERE status IN ('pending','claimed','submitted','unknown')
+      `)
+      db.run(`
+        CREATE INDEX idx_answer_delivery_due
+        ON answer_delivery(status, lease_expires_at) WHERE status IN ('pending','claimed')
+      `)
+      db.run("CREATE INDEX idx_answer_delivery_feature ON answer_delivery(feature_id, time_created)")
+
+      // runner_binding: persisted at run insertion, BEFORE process/session
+      // awaits (D5) — one row per run, transport tagged permanently.
+      // `session_ref` is UNIQUE (opaque per-attempt identity: an ACP
+      // process/session identity, or the reporting bridge's own name) so
+      // two attempts can never collide on the same reference.
+      db.run(`
+        CREATE TABLE runner_binding (
+          run_id              TEXT PRIMARY KEY REFERENCES run(id) ON DELETE CASCADE,
+          transport           TEXT NOT NULL CHECK(transport IN ('native','acp')),
+          profile_id          TEXT,
+          config_digest       TEXT,
+          directory           TEXT NOT NULL,
+          daemon_generation   INTEGER NOT NULL,
+          session_ref         TEXT UNIQUE,
+          remote_session_id   TEXT,
+          process_generation  INTEGER NOT NULL DEFAULT 0,
+          phase               TEXT NOT NULL DEFAULT 'active' CHECK(phase IN ('active','fenced','concluded')),
+          time_created        INTEGER NOT NULL,
+          time_updated        INTEGER NOT NULL
+        )
+      `)
+      db.run("CREATE INDEX idx_runner_binding_generation ON runner_binding(daemon_generation)")
+
+      // runner_operation: the durable create/prompt/answer/nudge journal
+      // (D5). UNIQUE(run_id, kind, logical_key) is the operation-dedup
+      // primitive; "at most one unresolved turn per binding" is enforced
+      // in the store layer (task 2.2), not as a second partial index here,
+      // because "unresolved" spans multiple kinds (create OR prompt OR
+      // answer) which a single-column partial index cannot express
+      // without also encoding kind-specific phase sets.
+      db.run(`
+        CREATE TABLE runner_operation (
+          id                TEXT PRIMARY KEY,
+          run_id            TEXT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+          kind              TEXT NOT NULL CHECK(kind IN ('create','prompt','answer','nudge')),
+          logical_key       TEXT NOT NULL,
+          payload_digest    TEXT NOT NULL,
+          phase             TEXT NOT NULL DEFAULT 'prepared'
+                              CHECK(phase IN ('prepared','sending','submitted','completed','not_sent','unknown')),
+          owner_generation  INTEGER NOT NULL,
+          stop_reason       TEXT,
+          diagnostic_code   TEXT,
+          time_created      INTEGER NOT NULL,
+          time_updated      INTEGER NOT NULL,
+          UNIQUE(run_id, kind, logical_key)
+        )
+      `)
+      db.run("CREATE INDEX idx_runner_operation_run ON runner_operation(run_id, time_created)")
+      db.run(
+        "CREATE INDEX idx_runner_operation_generation ON runner_operation(owner_generation) WHERE phase IN ('prepared','sending','submitted')",
+      )
+
+      // runner_fence: durable fencing survives process/daemon exit.
+      // run_id is the primary key — at most one fence per run, matching
+      // "the run itself records uncertain" (a run is fenced once, never
+      // re-fenced under a new reason while the old fence is unresolved).
+      db.run(`
+        CREATE TABLE runner_fence (
+          run_id           TEXT PRIMARY KEY REFERENCES run(id) ON DELETE CASCADE,
+          reason_code      TEXT NOT NULL CHECK(reason_code IN (
+                             'lost_create_response','lost_prompt_response','lost_answer_response',
+                             'process_or_daemon_restart','turn_deadline_exceeded','no_report_timeout',
+                             'cancellation_during_uncertain_write','startup_recovery'
+                           )),
+          operation_id     TEXT REFERENCES runner_operation(id),
+          cleanup_state    TEXT NOT NULL DEFAULT 'unconfirmed'
+                             CHECK(cleanup_state IN ('confirmed_terminated','operator_attested','unconfirmed')),
+          created_at       INTEGER NOT NULL,
+          resolved_at      INTEGER,
+          resolution_note  TEXT
+        )
+      `)
+      db.run("CREATE INDEX idx_runner_fence_unresolved ON runner_fence(run_id) WHERE resolved_at IS NULL")
+
+      // run_credential: random high-entropy token digest only — no
+      // plaintext recovery requirement (D8). `token_hash` is UNIQUE so a
+      // hash collision (astronomically unlikely, but the index is the
+      // durable proof) can never authorize two attempts at once.
+      db.run(`
+        CREATE TABLE run_credential (
+          id                  TEXT PRIMARY KEY,
+          run_id              TEXT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+          attempt             INTEGER NOT NULL,
+          process_generation  INTEGER NOT NULL,
+          token_hash          TEXT NOT NULL UNIQUE,
+          issued_at           INTEGER NOT NULL,
+          expires_at          INTEGER,
+          revoked_at          INTEGER,
+          revocation_reason   TEXT
+        )
+      `)
+      db.run("CREATE INDEX idx_run_credential_run ON run_credential(run_id)")
+
+      // worker_request_dedup: MCP ask invocation-id dedup (D8: "bridge
+      // assigns an invocation id per MCP request and reuses it across
+      // bounded HTTP retries, daemon persists dedup scoped to run and
+      // question generation"). One row per (run_id, invocation_id);
+      // `question_generation` records which ask this invocation created
+      // so a late replay can be compared against the run's CURRENT
+      // generation and rejected as stale without creating a second one.
+      db.run(`
+        CREATE TABLE worker_request_dedup (
+          run_id                TEXT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+          invocation_id         TEXT NOT NULL,
+          question_generation   INTEGER NOT NULL,
+          time_created          INTEGER NOT NULL,
+          PRIMARY KEY (run_id, invocation_id)
+        )
+      `)
+    },
+  },
+  {
+    id: "0023_runner_operation_version",
+    up(db) {
+      db.run("ALTER TABLE runner_operation ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
+    },
+  },
+  {
+    id: "0024_worker_request_payload",
+    up(db) {
+      db.run("ALTER TABLE worker_request_dedup ADD COLUMN payload_digest TEXT")
+      db.run("ALTER TABLE worker_request_dedup ADD COLUMN disposition TEXT")
+    },
+  },
 ]
 
 function validateMigrations(ordered: readonly Migration[]): void {

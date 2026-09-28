@@ -31,6 +31,7 @@
 
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
+import { createHash } from "node:crypto"
 import { prepareReview, renderFixPack, validateReview, type AcceptedReview, type ReviewReport } from "./review.ts"
 import { join } from "node:path"
 import {
@@ -74,10 +75,13 @@ import type { RunSummary, Store } from "./store.ts"
 import { applyPatch } from "./state.ts"
 import { NoLiveRunnerError } from "./runner-transport.ts"
 import type { WorkflowResolver, WorkflowSnapshot } from "./workflow-registry.ts"
-import type { Clock, Logger, ProcessRunner, SessionClient } from "./ports.ts"
+import { RunnerOperationError, type Clock, type Logger, type ProcessRunner, type SessionClient } from "./ports.ts"
 import type { ActionExecutor } from "./action-host.ts"
 import { actionBindingsForReconciler } from "./workflow-reservation.ts"
 import type { ResolvedActionBinding } from "./workflow-reservation.ts"
+import { routeNewDispatch } from "./runner-router.ts"
+import { deriveOperationLogicalKey, type RunnerFenceReasonCode, type RunnerOperationRecord } from "./runner-execution.ts"
+import type { RunnersConfig } from "./acp/config.ts"
 
 const DEFAULT_RUN_TTL_MS = 3_600_000
 const DEFAULT_IDLE_SILENCE_NUDGE_MS = 120_000
@@ -94,6 +98,8 @@ const ANSWER_DELIVERY_LEASE_MS = 60_000
 export interface EngineDeps {
   readonly store: Store
   readonly workflows: WorkflowResolver
+  /** The NATIVE SessionClient — used whenever a run's transport (new or
+   *  bound) resolves to "native". */
   readonly sessions: SessionClient
   readonly process: ProcessRunner
   readonly clock: Clock
@@ -101,6 +107,20 @@ export interface EngineDeps {
   readonly actions: ActionExecutor
   readonly runnerAvailable?: () => boolean
   readonly notify?: (title: string, message: string) => void
+  /** Optional ACP runner configuration (D3) — absent means native-only,
+   *  the existing default behavior is completely unchanged. */
+  readonly runners?: RunnersConfig
+  /** The ACP SessionClient (`ManagedSessions`, task 3.x) — required only
+   *  when `runners` is configured with at least one ACP profile. */
+  readonly acpSessions?: SessionClient
+  /** Composition must release an unused preparation; abort is not cleanup evidence. */
+  readonly releaseAcpReservation?: (reservationId: string) => Promise<void>
+  readonly cleanupAcpRun?: (runId: string, sessionId: string | null) => Promise<"confirmed_terminated" | "unconfirmed">
+  /** Monotonic daemon generation (D5/D10) — incremented every process
+   *  start, persisted alongside bindings/operations so a restart can
+   *  identify and fence stale-generation work before dispatching new
+   *  work. Defaults to 0 for callers (most tests) that never restart. */
+  readonly daemonGeneration?: number
 }
 
 export interface EngineOptions {
@@ -153,6 +173,10 @@ type AnswerDeliveryAttemptResult =
   | { readonly kind: "transient"; readonly message: string }
   | { readonly kind: "cancelled" }
   | { readonly kind: "not_claimed" }
+  /** ACP-only (D5/D7): the delivery's local write submitted but is not
+   *  yet (or never will be) confirmed — the run has been fenced; no
+   *  replay, no step failure. */
+  | { readonly kind: "fenced"; readonly message: string }
 
 /** `planFailureDisposition`'s pure computation result: what
  *  `concludeAndDispatch` hands to `store.concludeRun` as ONE transaction
@@ -405,7 +429,41 @@ export class Engine {
 
   // ------------------------------------------------------------- execution
 
+  private readonly preparingTargets = new Set<string>()
+
+  /**
+   * True while ANY step for `featureId` is between `executeAgent`'s entry
+   * and its `finally` release — in particular while an ACP `prepare()`
+   * call is awaiting a bounded resource/process wait (acp-runner review
+   * F1). This is the "blocked prepare" progress anchor: no durable run
+   * row or resource_wait row exists yet, so without this in-memory
+   * anchor a concurrent reconcile pass sees zero anchors and would
+   * wrongly mark the feature stranded/escalated while preparation is
+   * still legitimately in flight on THIS SAME engine instance. Naturally
+   * empty after a process restart (a fresh engine holds no in-flight
+   * prepare calls) — restart correctly re-attempts instead of trying to
+   * durably resume "was preparing".
+   */
+  private isPreparingAnyTargetFor(featureId: string): boolean {
+    for (const key of this.preparingTargets) {
+      const parsed = JSON.parse(key) as [string, string, string]
+      if (parsed[0] === featureId) return true
+    }
+    return false
+  }
+
   private async executeAgent(featureId: string, snapshot: WorkflowSnapshot, jobId: string, step: AgentStep): Promise<void> {
+    const key = JSON.stringify([featureId, jobId, step.id])
+    if (this.preparingTargets.has(key)) return
+    this.preparingTargets.add(key)
+    try {
+      await this.executeAgentGuarded(featureId, snapshot, jobId, step)
+    } finally {
+      this.preparingTargets.delete(key)
+    }
+  }
+
+  private async executeAgentGuarded(featureId: string, snapshot: WorkflowSnapshot, jobId: string, step: AgentStep): Promise<void> {
     const { store, sessions, log } = this.deps
     const state = store.getFeature(featureId)
     if (!state) return
@@ -415,7 +473,15 @@ export class Engine {
       return
     }
 
-    if (this.deps.runnerAvailable?.() === false) {
+    if (store.getActiveRunForStep(featureId, jobId, step.id) || store.hasUnresolvedRunnerFence(featureId, jobId, step.id)) return
+    const directory = state.worktree ?? state.projectDir
+    const route = routeNewDispatch(this.deps.runners, state.projectDir, directory)
+    if (route.transport === "acp_misconfigured") {
+      await this.dispatch(featureId, { kind: "step.failed", jobId, stepId: step.id, reason: route.reason })
+      return
+    }
+
+    if (route.transport === "native" && this.deps.runnerAvailable?.() === false) {
       const now = this.deps.clock.now()
       const policy = this.resourceWaitPolicy()
       const waitState = { firstObservedAtMs: now, observationCount: 0 }
@@ -468,6 +534,42 @@ export class Engine {
     const rendered = renderTemplate(prompt, context)
     for (const error of rendered.errors) log.log(`job=${jobId} step=${step.id}: ${error}`)
 
+    // Route BEFORE claiming the run: immutable binding-based routing
+    // (D1/D3/D5) decides the transport for this NEW dispatch. An
+    // existing run always keeps reading its persisted binding instead —
+    // this call site only ever runs for a fresh attempt (executeAgent is
+    // never called for an already-running run; the active-run guard in
+    // actDecision/reconcile ensures that).
+    let reservationId: string | undefined
+    if (route.transport === "acp") {
+      if (!this.deps.releaseAcpReservation) {
+        await this.dispatch(featureId, { kind: "step.failed", jobId, stepId: step.id, reason: "ACP requires a reservation release hook before preparation" })
+        return
+      }
+      const prepared = await this.deps.acpSessions?.prepare?.({ projectDir: state.projectDir, directory, agent: role.agent, ...(role.model !== undefined ? { model: role.model } : {}) })
+      if (!prepared?.ok) {
+        if (prepared?.reason === "unavailable") {
+          const now = this.deps.clock.now()
+          const policy = this.resourceWaitPolicy()
+          const prior = store.getOpenResourceWait(featureId, jobId, step.id)
+          store.upsertResourceWait({ featureId, jobId, stepId: step.id, reason: "runner_unavailable", observedAt: now,
+            nextObservationAt: now + 1000, deadlineAt: prior?.deadlineAt ?? now + policy.maxWaitMs, diagnostic: prepared.diagnostic })
+        } else {
+          await this.dispatch(featureId, { kind: "step.failed", jobId, stepId: step.id, reason: prepared?.diagnostic ?? "ACP preparation unavailable" })
+        }
+        return
+      }
+      reservationId = prepared.reservationId
+      const current = store.getFeature(featureId)
+      if (!current || !["running", "waiting_human"].includes(current.status)
+        || current.jobs[jobId]?.currentStep !== step.id
+        || store.getActiveRunForStep(featureId, jobId, step.id)
+        || store.hasUnresolvedRunnerFence(featureId, jobId, step.id)) {
+        await this.deps.releaseAcpReservation?.(reservationId)
+        return
+      }
+    }
+
     // Claim the run synchronously, BEFORE any await: this closes the
     // reconcile race a live daemon can hit — a concurrent reconcile pass
     // would otherwise see no run for this step while session setup below
@@ -478,7 +580,18 @@ export class Engine {
       stepId: step.id,
       stepType: "agent",
       attempt,
+      binding: {
+        transport: route.transport,
+        directory,
+        daemonGeneration: this.deps.daemonGeneration ?? 0,
+        ...(route.transport === "acp" ? { profileId: route.profileId, configDigest: acpConfigDigest(route.profile) } : {}),
+      },
     })
+
+    if (route.transport === "acp") {
+      await this.executeAgentAcp(featureId, jobId, step, role, route.profileId, route.profile, runId, attempt, directory, rendered.text + fixEvidence, reservationId!)
+      return
+    }
 
     try {
       let parentId = state.sessionId
@@ -566,6 +679,162 @@ export class Engine {
         { kind: "step.failed", jobId, stepId: step.id, reason },
       )
     }
+  }
+
+  /**
+   * ACP execution path (D4/D5/D6/D7): prepare a bounded reservation,
+   * create the session, submit the initial prompt through the durable
+   * operation journal, and observe completion asynchronously — never
+   * blocking dispatch on turn completion. Every failure mode that could
+   * mean a create/prompt effect landed on the agent side fences the run
+   * (D6) instead of routing through ordinary `step.failed`.
+   */
+  private async executeAgentAcp(
+    featureId: string,
+    jobId: string,
+    step: AgentStep,
+    role: { agent: string; model?: string; variant?: string },
+    profileId: string,
+    profile: import("./acp/config.ts").AcpProfileConfig,
+    runId: string,
+    attempt: number,
+    directory: string,
+    promptText: string,
+    reservationId: string,
+  ): Promise<void> {
+    const { store, log } = this.deps
+    const acpSessions = this.deps.acpSessions
+    if (!acpSessions) {
+      await this.fenceOrFail(featureId, runId, jobId, step.id, "acp_not_configured", "ACP profile is routed but no ACP session client is wired into the engine")
+      return
+    }
+    // role→mode binding validation (D3: "each must map explicitly to an
+    // advertised ACP mode") lives inside ManagedSessions.prepare() itself
+    // — this call site only routes to the transport, never duplicates
+    // that validation.
+
+    // Preparation already completed under the target guard before run insertion.
+    // Only consume the reserved process here; never prepare a second process.
+    const prepareResult = { ok: true as const, reservationId }
+
+    let sessionId: string
+    try {
+      sessionId = (await acpSessions.createSession({
+        title: `[${role.agent}] run ${runId}`,
+        directory,
+        runId,
+        reservationId: prepareResult.reservationId,
+        operationId: deriveOperationLogicalKey("create", { runId }),
+      })).id
+    } catch (err) {
+      if (!(err instanceof RunnerOperationError) || err.delivery === "unknown") {
+        await this.fenceOrFail(featureId, runId, jobId, step.id, "lost_create_response", err instanceof RunnerOperationError ? err.diagnostic : "ACP create outcome unknown")
+        return
+      }
+      const reason = boundDiagnostic(`ACP session creation failed: ${errorMessage(err)}`)
+      await this.concludeAndDispatch(
+        featureId, runId, "failed",
+        { reason, failure: makeFailureEnvelope({ class: acpFailureClass(err), diagnostic: reason, source: "acp" }) },
+        { kind: "step.failed", jobId, stepId: step.id, reason },
+      )
+      return
+    }
+
+    if (!store.setRunSession(runId, sessionId)) {
+      log.log(`run ${runId}: concluded before its ACP session was ready — not prompting`)
+      return
+    }
+
+    const recoverNotes = store.getRunById(runId)?.recoverNotes ?? null
+    const header =
+      `[conductor] Job "${jobId}" step "${step.id}" (attempt ${attempt}) — run ${runId}.\n` +
+      `When this step is complete you MUST report run_id="${runId}" and its outcome.\n\n` +
+      (recoverNotes !== null ? `[conductor] This step was recovered by an operator. Operator notes:\n${recoverNotes}\n\n` : "")
+
+    try {
+      await acpSessions.prompt({
+        sessionID: sessionId,
+        text: header + promptText,
+        agent: role.agent,
+        ...(role.model !== undefined ? { model: role.model } : {}),
+        operationId: deriveOperationLogicalKey("prompt", { runId }),
+        purpose: "initial",
+      })
+      // A resolved `void`/`{kind:"submitted"}` both mean "engine calls
+      // return after bounded write submission ... not turn completion"
+      // (D7) — the actual turn outcome is observed later via
+      // observeOperation from reconcileAgentRun/nudge/report paths, not
+      // awaited here.
+    } catch (err) {
+      if (!(err instanceof RunnerOperationError) || err.delivery === "unknown") {
+        await this.fenceOrFail(featureId, runId, jobId, step.id, "lost_prompt_response", err instanceof RunnerOperationError ? err.diagnostic : "ACP prompt outcome unknown")
+        return
+      }
+      const reason = boundDiagnostic(`ACP prompt failed: ${errorMessage(err)}`)
+      await this.concludeAndDispatch(
+        featureId, runId, "failed",
+        { reason, failure: makeFailureEnvelope({ class: acpFailureClass(err), diagnostic: reason, source: "acp" }) },
+        { kind: "step.failed", jobId, stepId: step.id, reason },
+      )
+    }
+    void profileId
+    void profile
+  }
+
+  /** Fences a run for durable execution uncertainty (D6) — the
+   *  transaction wrapper every ACP call site with `delivery: "unknown"`
+   *  goes through. Best-effort: if the fence transaction itself finds
+   *  the run no longer fenceable (already concluded another way), that
+   *  is the SAFE outcome (a report won the race) and is silently
+   *  accepted. */
+  private async fenceOrFail(
+    featureId: string,
+    runId: string,
+    jobId: string,
+    stepId: string,
+    reasonCode: RunnerFenceReasonCode | "acp_not_configured",
+    diagnostic: string,
+  ): Promise<void> {
+    const { store, log } = this.deps
+    if (reasonCode === "acp_not_configured") {
+      // A pure configuration/wiring defect — never a "might have
+      // executed" uncertainty. Ordinary step.failed, not a fence.
+      await this.concludeAndDispatch(
+        featureId, runId, "failed",
+        { reason: diagnostic, failure: makeFailureEnvelope({ class: "invalid_config", diagnostic, source: "acp" }) },
+        { kind: "step.failed", jobId, stepId, reason: diagnostic },
+      )
+      return
+    }
+    const result = store.fenceRunnerExecution(
+      { runId, jobId, stepId, reasonCode, diagnostic: boundDiagnostic(diagnostic) },
+      projectDir => this.deps.workflows(projectDir) ?? undefined,
+    )
+    if (!result.fenced) {
+      log.log(`run ${runId}: fence request (${reasonCode}) did not apply (${result.reason}) — another disposition already won`)
+    } else {
+      this.cleanupRunner(runId)
+      // Notification is delivered by the durable completion outbox.
+    }
+  }
+
+  private readonly runnerCleanupTasks = new Set<Promise<void>>()
+
+  private cleanupRunner(runId: string): void {
+    const run = this.deps.store.getRunById(runId)
+    if (!run || this.deps.store.getRunnerBinding(runId)?.transport !== "acp") return
+    const task = Promise.resolve().then(async () => {
+      if (this.deps.cleanupAcpRun) {
+        const evidence = await this.deps.cleanupAcpRun(runId, run.sessionId)
+        this.deps.store.recordRunnerCleanup(runId, evidence)
+      } else if (run.sessionId) await this.deps.acpSessions?.abort(run.sessionId)
+    }).catch(error => this.deps.log.log(`ACP cleanup unconfirmed: ${boundDiagnostic(errorMessage(error))}`))
+    this.runnerCleanupTasks.add(task)
+    void task.finally(() => this.runnerCleanupTasks.delete(task))
+  }
+
+  async drainRunnerCleanup(): Promise<void> {
+    await Promise.all(this.runnerCleanupTasks)
   }
 
   private async executeCommand(featureId: string, snapshot: WorkflowSnapshot, jobId: string, step: CommandStep): Promise<void> {
@@ -813,6 +1082,7 @@ export class Engine {
     detail: { outputs?: Readonly<Record<string, string>>; reason?: string; failure?: FailureEnvelope } | undefined,
     event: PipelineEvent,
     review?: AcceptedReview,
+    authorize?: () => void,
   ): Promise<boolean> {
     const { store, log } = this.deps
     const state = store.getFeature(featureId)
@@ -848,11 +1118,13 @@ export class Engine {
 
     const result = store.concludeRun(runId, status, detail, event, transition, {
       persistDecisions: decisions,
+      ...(authorize ? { authorize } : {}),
       ...(review ? { review } : {}),
       ...(plan?.retrySchedule ? { retrySchedule: plan.retrySchedule } : {}),
       ...(plan?.followUp ? { followUp: plan.followUp } : {}),
     })
     if (!result.claimed) return false
+    this.cleanupRunner(runId)
     log.log(`feature=${state.slug} event=${event.kind} → ${transition.decisions.map(decisionLabel).join(",")}`)
 
     if (plan?.retrySchedule) {
@@ -1011,6 +1283,15 @@ export class Engine {
    * ONLY path by which an agent step concludes — idle never does.
    */
   async report(input: { runId: string; outcome?: "succeeded" | "failed"; verdict?: string; notes?: string; ask?: string; review?: unknown }): Promise<string> {
+    return this.reportAuthorized(input)
+  }
+
+  async reportWorker(input: { runId: string; outcome?: "succeeded" | "failed"; verdict?: string; notes?: string; ask?: string; review?: unknown; invocationId?: string; authorize: () => void }): Promise<string> {
+    return this.reportAuthorized(input, input)
+  }
+
+  /** Shared validation and dispatch; only synchronous Store mutations receive the guard. */
+  private async reportAuthorized(input: { runId: string; outcome?: "succeeded" | "failed"; verdict?: string; notes?: string; ask?: string; review?: unknown }, worker?: { authorize: () => void; invocationId?: string }): Promise<string> {
     const { store } = this.deps
     const run = store.getRunById(input.runId)
     if (!run) return `Unknown run_id "${input.runId}".`
@@ -1053,7 +1334,13 @@ export class Engine {
       }
       // An ask parks the run on a human question WITHOUT concluding it:
       // the session stays alive so the answer resumes with full context.
-      const parked = store.setRunQuestion(input.runId, input.ask)
+      const disposition = `Question recorded for step "${run.stepId}" — the run is waiting for a human answer.`
+      if (worker && !worker.invocationId) throw new Error("ask requires invocationId")
+      const parked = store.setRunQuestion(input.runId, input.ask, worker ? {
+        authorize: worker.authorize, invocationId: worker.invocationId!, disposition,
+        payloadDigest: createHash("sha256").update(JSON.stringify({ ask: input.ask, notes: input.notes ?? null })).digest("hex"),
+      } : undefined)
+      if (typeof parked === "string") return parked
       if (!parked) return alreadyConcludedText(input.runId, store.getRunById(input.runId)?.status ?? run.status)
       this.deps.notify?.(
         `Conductor: question — ${state?.slug ?? run.featureId}`,
@@ -1093,7 +1380,7 @@ export class Engine {
     const status: "succeeded" | "failed" = input.outcome === "failed" ? "failed" : "succeeded"
     const detail = status === "failed" ? { reason: input.notes ?? "reported failed" } : { outputs }
 
-    const claimed = await this.concludeAndDispatch(run.featureId, input.runId, status, detail, event, review)
+    const claimed = await this.concludeAndDispatch(run.featureId, input.runId, status, detail, event, review, worker?.authorize)
     if (!claimed) {
       const after = store.getRunById(input.runId)
       return alreadyConcludedText(input.runId, after?.status ?? run.status)
@@ -1156,10 +1443,18 @@ export class Engine {
       const after = store.getFeature(run.featureId)
       return { ok: true, message: `Answer delivered to step "${run.stepId}". Feature is now: ${after?.status ?? "running"}.` }
     }
+    if (attempt.kind === "fenced") {
+      // Notes remain accepted/durable; the ANSWER call itself never
+      // fails — the run's uncertainty is now operator-visible and
+      // requires explicit recovery acknowledgment (D6), never an
+      // automatic replay from here.
+      return { ok: true, message: attempt.message }
+    }
     // "transient" (a retryable prompt failure, released for the next
-    // attempt), "not_claimed" (a concurrent reconcile pass or another
-    // answer() call already claimed it) and "cancelled" (the run
-    // concluded in the gap) never fail the ANSWER call itself —
+    // attempt, OR — for ACP — a local write successfully submitted and
+    // awaiting turn confirmation), "not_claimed" (a concurrent reconcile
+    // pass or another answer() call already claimed it) and "cancelled"
+    // (the run concluded in the gap) never fail the ANSWER call itself —
     // acceptance already succeeded durably; reconciliation resolves the
     // rest.
     return { ok: true, message: `Answer accepted for step "${run.stepId}" — delivery to the session is in progress.` }
@@ -1174,6 +1469,24 @@ export class Engine {
    */
   private async attemptAnswerDelivery(deliveryId: string): Promise<AnswerDeliveryAttemptResult> {
     const { store, log, clock } = this.deps
+    const pending = store.getAnswerDelivery(deliveryId)
+    if (pending && store.getRunnerBinding(pending.runId)?.transport === "acp") {
+      const operation = store.findOperation(pending.runId, "answer", pending.deliveryToken)
+      if (operation) {
+        if (operation.phase === "completed") store.confirmAnswerDelivered(deliveryId)
+        else if (operation.phase === "unknown") await this.observeRunnerOperation(operation.id)
+        return { kind: "not_claimed" }
+      }
+      const run = store.getRunById(pending.runId)
+      if (!run || run.status !== "running") return { kind: "not_claimed" }
+      let status: string = "unknown"
+      try { status = run.sessionId ? await this.deps.acpSessions?.status(run.sessionId) ?? "unknown" : "unknown" } catch { /* conservative */ }
+      if (status === "busy" || status === "retry") return { kind: "not_claimed" }
+      if (status !== "idle") {
+        await this.fenceOrFail(run.featureId, run.id, run.jobId, run.stepId, "lost_answer_response", "ACP answer ownership unknown")
+        return { kind: "fenced", message: "ACP answer ownership unknown" }
+      }
+    }
     const claimed = store.claimAnswerDelivery(deliveryId, clock.now(), ANSWER_DELIVERY_LEASE_MS)
     if (!claimed) return { kind: "not_claimed" }
 
@@ -1184,8 +1497,30 @@ export class Engine {
     }
 
     const sessionId = claimed.targetSessionId ?? run.sessionId
-    const sessionAlive = sessionId !== null && (await this.deps.sessions.status(sessionId)) !== "missing"
+    const binding = store.getRunnerBinding(run.id)
+    const isAcp = binding?.transport === "acp"
+    const sessionClient = isAcp ? this.deps.acpSessions : this.deps.sessions
+    if (!sessionClient) {
+      // A wiring defect (ACP-bound run but no acpSessions dependency) —
+      // treat the same as a lost session: fail the step honestly rather
+      // than silently dropping the answer forever.
+      const reason = `run ${run.id} is bound to acp transport but no ACP session client is configured`
+      store.failAnswerDelivery(claimed.id, reason)
+      await this.concludeAndDispatch(
+        run.featureId, run.id, "failed",
+        { reason, failure: makeFailureEnvelope({ class: "invalid_config", diagnostic: reason, source: "answer" }) },
+        { kind: "step.failed", jobId: run.jobId, stepId: run.stepId, reason },
+      )
+      return { kind: "session_lost", message: `Delivering the answer failed — step "${run.stepId}" failed and normal failure routing applies.` }
+    }
+    const sessionAlive = sessionId !== null && (await sessionClient.status(sessionId)) !== "missing"
     if (!sessionAlive) {
+      // ACP's "missing" never fires (D4: no receiver-side session
+      // query) — this branch is reachable only for native. An ACP
+      // session reporting "unknown" status intentionally does NOT reach
+      // here; it is handled by the fence path below via a thrown
+      // RunnerOperationError from prompt(), matching D6's "silence is
+      // not interpreted as ... missing".
       const reason = `session ${sessionId ?? "(none)"} was lost while waiting for a human answer`
       store.failAnswerDelivery(claimed.id, reason)
       log.log(`answer ${claimed.runId}: ${reason} — failing the step`)
@@ -1205,7 +1540,7 @@ export class Engine {
       const answerSnapshot = answerState ? this.deps.workflows(answerState.projectDir) : undefined
       const answerStep = answerSnapshot ? findStep(answerSnapshot.workflow, run.jobId, run.stepId) : undefined
       const answerRole = answerStep?.type === "agent" ? answerSnapshot!.workflow.roles[answerStep.role] : undefined
-      await this.deps.sessions.prompt({
+      const promptResult = await sessionClient.prompt({
         sessionID: sessionId!,
         text:
           `[conductor] The human answered your question:\n\n${claimed.notes}\n\n` +
@@ -1215,8 +1550,31 @@ export class Engine {
         ...(answerRole
           ? { agent: answerRole.agent, ...(answerRole.model !== undefined ? { model: answerRole.model } : {}) }
           : {}),
+        ...(isAcp
+          ? { operationId: deriveOperationLogicalKey("answer", { runId: run.id, deliveryToken: claimed.deliveryToken }), purpose: "answer" as const }
+          : {}),
       })
+      if (isAcp && promptResult) {
+        // D5/D7: local write submitted, NOT yet confirmed delivered —
+        // open but non-reclaimable. The matching turn's eventual
+        // completion (observed elsewhere, e.g. a subsequent report or
+        // reconcile pass) is what would confirm it; this path never
+        // blocks on that.
+        store.markAnswerDeliverySubmitted(claimed.id)
+        return { kind: "transient", message: "answer submitted to ACP; awaiting turn completion" }
+      }
     } catch (err) {
+      if (isAcp && (!(err instanceof RunnerOperationError) || err.delivery === "unknown")) {
+        // D6: uncertain ACP delivery fences the run — retains accepted
+        // notes/question for audit, never replays, never fails the step.
+        const result = store.fenceRunnerExecution(
+          { runId: run.id, jobId: run.jobId, stepId: run.stepId, reasonCode: "lost_answer_response", diagnostic: err instanceof RunnerOperationError ? boundDiagnostic(err.diagnostic) : "ACP answer outcome unknown" },
+          projectDir => this.deps.workflows(projectDir) ?? undefined,
+        )
+        if (!result.fenced) log.log(`answer ${claimed.runId}: fence request did not apply (${result.reason})`)
+        else this.cleanupRunner(run.id)
+        return { kind: "fenced", message: `The answer's delivery is uncertain — step "${run.stepId}" is fenced pending operator recovery.` }
+      }
       const failureClass = classifyThrownBoundary(err)
       // Secret-safe diagnostics: a prompt-delivery exception's message
       // can embed a huge upstream error body carrying a credential —
@@ -1517,6 +1875,8 @@ export class Engine {
       readonly target?: { readonly jobId: string; readonly stepId: string }
       readonly targets?: readonly { readonly jobId: string; readonly stepId: string }[]
       readonly all?: boolean
+      readonly acknowledgeUncertain?: boolean
+      readonly cleanupAttested?: boolean
     },
   ): Promise<{
     ok: boolean
@@ -1619,9 +1979,13 @@ export class Engine {
         expectedVersion: input.expectedVersion,
         idempotencyKey: input.idempotencyKey,
         notes: input.notes ?? null,
+        acknowledgeUncertain: input.acknowledgeUncertain,
+        cleanupAttested: input.cleanupAttested,
       },
     )
     switch (txResult) {
+      case "uncertainty_prerequisites":
+        return { ok: false, message: "Uncertain execution requires acknowledgeUncertain, expectedVersion, idempotencyKey, notes and confirmed cleanup or cleanupAttested." }
       case "not_found":
         return { ok: false, message: `unknown feature "${featureId}"` }
       case "duplicate":
@@ -1653,13 +2017,26 @@ export class Engine {
 
   async pause(featureId: string): Promise<void> {
     await this.dispatch(featureId, { kind: "human.paused" })
+    await this.fenceActiveRunners(featureId, true)
+  }
+
+  private async fenceActiveRunners(featureId: string, interruptedOnly = false): Promise<void> {
+    for (const run of this.deps.store.listRuns(featureId)) {
+      if (run.status === "running" && this.deps.store.getRunnerBinding(run.id)?.transport === "acp") {
+        if (interruptedOnly && !this.deps.store.listRunnerOperations(run.id).some(operation =>
+          operation.phase === "sending" || operation.phase === "submitted" || operation.phase === "unknown")) continue
+        await this.fenceOrFail(featureId, run.id, run.jobId, run.stepId, "cancellation_during_uncertain_write", "ACP interrupted without authoritative report")
+      }
+    }
   }
 
   async resume(featureId: string): Promise<void> {
+    if (this.deps.store.hasUnresolvedRunnerFence(featureId)) throw new Error("Uncertain execution requires cleanup-aware recover, not resume")
     await this.dispatch(featureId, { kind: "human.resumed" })
   }
 
   async abandon(featureId: string): Promise<void> {
+    await this.fenceActiveRunners(featureId)
     await this.dispatch(featureId, { kind: "human.abandoned" })
   }
 
@@ -1671,7 +2048,42 @@ export class Engine {
    * state. Per-feature errors are isolated — one feature's failure never
    * blocks another's reconciliation.
    */
+  /** Adapter callbacks may call this after journaling. Never trusts callback payloads. */
+  async observeRunnerOperation(operationId: string): Promise<void> {
+    const { store } = this.deps
+    const operation = store.getOperation(operationId)
+    if (!operation) return
+    const run = store.getRunById(operation.runId)
+    if (!run || run.status !== "running") return
+    if (operation.phase === "unknown") {
+      await this.fenceOrFail(run.featureId, run.id, run.jobId, run.stepId,
+        acpFenceReasonCode(operation), "ACP operation outcome unknown")
+    } else if (operation.kind === "answer" && operation.phase === "completed") {
+      const delivery = store.listAnswerDeliveries(run.featureId).find(d => d.runId === run.id && d.deliveryToken === operation.logicalKey)
+      if (delivery) store.confirmAnswerDelivered(delivery.id)
+    }
+  }
+
   async reconcile(): Promise<void> {
+    for (const feature of this.deps.store.listFeatures({ activeOnly: true })) {
+      for (const run of this.deps.store.listRuns(feature.id)) {
+        if (run.status !== "running" || this.deps.store.getRunnerBinding(run.id)?.transport !== "acp") continue
+        for (const operation of this.deps.store.listRunnerOperations(run.id)) await this.observeRunnerOperation(operation.id)
+        if ((this.deps.store.getRunnerBinding(run.id)?.daemonGeneration ?? 0) < (this.deps.daemonGeneration ?? 0)) {
+          await this.fenceOrFail(feature.id, run.id, run.jobId, run.stepId, "startup_recovery", "ACP ownership lost across restart")
+        }
+      }
+    }
+    for (const operation of this.deps.store.listStaleGenerationOperations(this.deps.daemonGeneration ?? 0)) {
+      if (operation.phase === "prepared") continue
+      const run = this.deps.store.getRunById(operation.runId)
+      if (!run || this.deps.store.getRunnerBinding(run.id)?.transport !== "acp") continue
+      this.deps.store.fenceRunnerExecution({
+        runId: run.id, jobId: run.jobId, stepId: run.stepId,
+        reasonCode: "startup_recovery", operationId: operation.id,
+        diagnostic: "ACP execution ownership lost across daemon restart",
+      }, projectDir => this.deps.workflows(projectDir) ?? undefined)
+    }
     const { store, log } = this.deps
     const features = store.listFeatures({ activeOnly: true })
     for (const feature of features) {
@@ -1687,6 +2099,16 @@ export class Engine {
 
   private async reconcileFeature(input: FeatureState): Promise<void> {
     const { store, log, clock } = this.deps
+    // Fence notifications need no workflow; drain them even while the
+    // operator is repairing an unavailable project configuration.
+    let fenceAction = store.getPendingRunAction(input.id)
+    while (fenceAction && store.getFence(fenceAction.runId) && fenceAction.decisions.every(d => d.kind === "escalate")) {
+      for (const decision of fenceAction.decisions) {
+        if (decision.kind === "escalate") this.deps.notify?.(`Conductor: escalation — ${input.slug}`, decision.reason)
+      }
+      store.markRunActionHandled(fenceAction.runId)
+      fenceAction = store.getPendingRunAction(input.id)
+    }
     const snapshot = this.deps.workflows(input.projectDir)
     if (!snapshot) return
 
@@ -1711,7 +2133,7 @@ export class Engine {
         })
         continue
       }
-      if (this.deps.runnerAvailable?.() === true) {
+      if (this.deps.runnerAvailable?.() === true || routeNewDispatch(this.deps.runners, input.projectDir, input.worktree ?? input.projectDir).transport === "acp") {
         const claimed = store.claimResourceWait(wait.id, clock.now())
         if (!claimed) continue
         const step = findStep(snapshot.workflow, wait.jobId, wait.stepId)
@@ -1857,7 +2279,23 @@ export class Engine {
     // Defensive: an escalated feature with an active run means recovery
     // succeeded but the status wasn't cleared (e.g. crash between
     // executeAgent and setFeatureFields). Transition to running.
-    if (feature.status === "escalated" && store.getActiveRun(feature.id) !== null) {
+    //
+    // F2 guard: an unresolved runner fence (D6 uncertainty) MUST NOT be
+    // silently reset by this defensive path. A parallel DAG can have one
+    // job fenced (uncertain, escalated) while an UNRELATED sibling job's
+    // run is still legitimately active (propagate never touched it) —
+    // that sibling's active run must not be read as "recovery already
+    // happened", or this would erase the escalated status the fence
+    // depends on (recover()/recoverStepTargets require status ===
+    // "escalated" to ever apply operator acknowledgment to the fenced
+    // target). With the fence still unresolved, the feature stays
+    // escalated: the per-job loop below still reconciles the sibling's
+    // active run (it only checks jobRuntime.status, not feature.status),
+    // so the sibling continues; the fenced job waits for an explicit
+    // targeted `recover()` naming it, never an implicit whole-feature
+    // reset.
+    if (feature.status === "escalated" && store.getActiveRun(feature.id) !== null
+      && !store.hasUnresolvedRunnerFence(feature.id)) {
       log.log(`reconcile ${feature.slug}: escalated but has active run — transitioning to running`)
       store.setFeatureStatus(feature.id, "running")
       return
@@ -1874,6 +2312,7 @@ export class Engine {
       // feature is not escalated out from under a recovery still in flight.
       hasUnhandledOutboxDecision: store.getPendingRunAction(feature.id) !== null
         || store.getUnhandledRecoveryDispatches(feature.id).length > 0,
+      hasPreparingTarget: this.isPreparingAnyTargetFor(feature.id),
     })
     if (invariant.kind === "stranded_legacy_failure" || invariant.kind === "stranded_no_anchor") {
       log.log(`reconcile ${feature.slug}: ${invariant.reason} — marking escalated`)
@@ -1919,7 +2358,7 @@ export class Engine {
         // (guarding against double-invocation if an observation for this
         // run is already in flight — e.g. this pass raced dispatch).
         if (clock.now() - Math.max(active.timeLastActivity, active.timeStarted) > this.runTtlMs) {
-          await this.reconcileTtl(feature, snapshot, active)
+          await this.reconcileTtl(feature, snapshot, active, false)
         } else if (!this.actionRuns.has(active.id) && clock.now() >= active.nextObservation) {
           await this.reconcileActionRun(feature, snapshot, jobId, step, active)
         }
@@ -1936,7 +2375,7 @@ export class Engine {
           { kind: "step.failed", jobId, stepId, reason: "daemon restarted while action was executing" },
         )
       } else {
-        await this.reconcileTtl(feature, snapshot, active)
+        await this.reconcileTtl(feature, snapshot, active, false)
       }
     }
   }
@@ -1981,9 +2420,26 @@ export class Engine {
     snapshot: WorkflowSnapshot,
     active: RunSummary,
   ): Promise<void> {
-    const { log } = this.deps
+    const { log, store } = this.deps
+    const binding = store.getRunnerBinding(active.id)
+    const isAcp = binding?.transport === "acp"
+    const sessionClient = isAcp ? this.deps.acpSessions : this.deps.sessions
+    if (isAcp) {
+      const unknown = store.listRunnerOperations(active.id).find(operation => operation.phase === "unknown")
+      if (unknown) {
+        store.fenceRunnerExecution({
+          runId: active.id, jobId: active.jobId, stepId: active.stepId,
+          reasonCode: acpFenceReasonCode(unknown), operationId: unknown.id,
+          diagnostic: "ACP operation outcome unknown",
+        }, projectDir => this.deps.workflows(projectDir) ?? undefined)
+        return
+      }
+    }
+
     // Waiting for a human answer is not being stuck: no idle nudging, no
-    // idle reaping. The TTL below still bounds an abandoned question.
+    // idle reaping. The TTL below still bounds an abandoned question —
+    // fenced (never reaped-as-retryable) for ACP, since a pending
+    // question means a prompt may already be in flight to answer it.
     if (active.pendingQuestion != null) {
       this.idleCycles.delete(active.id)
       // A pause/resume cycle rewrites feature.status to `running` without
@@ -1992,12 +2448,25 @@ export class Engine {
       if (feature.status === "running") {
         this.deps.store.setRunQuestion(active.id, active.pendingQuestion)
       }
-      await this.reconcileTtl(feature, snapshot, active)
+      await this.reconcileTtl(feature, snapshot, active, isAcp)
       return
     }
-    if (active.sessionId) {
-      const status = await this.deps.sessions.status(active.sessionId)
+    if (active.sessionId && sessionClient) {
+      const status = await sessionClient.status(active.sessionId)
+      // D4/D6: "unknown" is distinct from idle or missing — it SHALL NOT
+      // trigger speculative nudges or missing-session failure. Only the
+      // TTL bound below may act on it, and for ACP that action is a
+      // fence, never a reap-as-retryable.
       if (status === "missing") {
+        if (isAcp) {
+          // ACP has no receiver-side session query (D4) — a
+          // implementation reporting "missing" anyway is treated
+          // exactly as conservatively as "unknown": TTL-bounded fence
+          // only, never an immediate reap (which would look like proof
+          // of no effects).
+          await this.reconcileTtl(feature, snapshot, active, true)
+          return
+        }
         log.log(`reconcile ${feature.slug}: run ${active.id} session is gone — reaping immediately`)
         this.idleCycles.delete(active.id)
         await this.reap(feature, active, "session disappeared before reporting", "missing_session")
@@ -2006,13 +2475,26 @@ export class Engine {
       const limits = this.runLimits(snapshot, active)
       const silence = this.deps.clock.now() - Math.max(active.timeLastActivity, active.timeStarted)
       if (silence > limits.ttlMs) {
-        await this.reconcileTtl(feature, snapshot, active)
+        await this.reconcileTtl(feature, snapshot, active, isAcp)
+        return
+      }
+      if (status === "unknown") {
+        // Never nudge, never reap on missing information — the TTL
+        // check above (and the next pass's) is the ONLY thing that can
+        // act on a persistently unknown observation, and it fences.
+        this.idleCycles.delete(active.id)
         return
       }
       if (status === "busy" || status === "retry") {
         this.idleCycles.delete(active.id)
+        if (isAcp) {
+          // D6: "For healthy ACP busy turns, do not enqueue native-style
+          // busy nudges: only one prompt may be in flight." No nudge
+          // path at all for ACP busy — TTL is the only bound.
+          return
+        }
         if (limits.ttlMs <= limits.busySilenceNudgeMs) {
-          await this.reconcileTtl(feature, snapshot, active)
+          await this.reconcileTtl(feature, snapshot, active, false)
           return
         }
         if (silence > limits.busySilenceNudgeMs) {
@@ -2024,11 +2506,17 @@ export class Engine {
           return
         }
       } else {
+        // status === "idle". For ACP this only follows an observed
+        // end_turn with no report — D6: "end_turn without report
+        // records idle and allows an explicitly journaled idle nudge
+        // only while the same live connection still proves the turn
+        // ended." Exhaustion still fences for ACP rather than reaping.
+        //
         // Mirrors the busy/retry branch's early skip just above: when the
         // TTL is at or below the idle threshold, TTL always wins first
         // (identical to `silence > limits.ttlMs` firing before idle ever
         // gets a chance) — idle nudging is structurally dead for this
-        // run/step. Skip straight to `reconcileTtl` WITHOUT touching
+        // run/step. Skip straight to the TTL path WITHOUT touching
         // `idleCycles`: incrementing (and never clearing, since the
         // threshold this debounce exists for can never be reached) would
         // grow the map by one entry per reconcile cycle for the run's
@@ -2036,7 +2524,7 @@ export class Engine {
         // a short `ttlMs` alongside the default idle threshold.
         if (limits.ttlMs <= limits.idleSilenceNudgeMs) {
           this.idleCycles.delete(active.id)
-          await this.reconcileTtl(feature, snapshot, active)
+          await this.reconcileTtl(feature, snapshot, active, isAcp)
           return
         }
         const cycles = (this.idleCycles.get(active.id) ?? 0) + 1
@@ -2047,13 +2535,18 @@ export class Engine {
             await this.nudgeAgentRun(feature, snapshot, active, limits.maxNudges)
             return
           }
+          if (isAcp) {
+            log.log(`reconcile ${feature.slug}: run ${active.id} idle after ${limits.maxNudges} ACP nudge(s) — fencing (no-report timeout)`)
+            await this.fenceOrFail(feature.id, active.id, active.jobId, active.stepId, "no_report_timeout", `idle without report after ${active.nudges} ACP nudge(s)`)
+            return
+          }
           log.log(`reconcile ${feature.slug}: run ${active.id} idle after ${limits.maxNudges} nudges — reaping`)
           await this.reap(feature, active, `idle without report after ${active.nudges} nudge(s)`)
           return
         }
       }
     }
-    await this.reconcileTtl(feature, snapshot, active)
+    await this.reconcileTtl(feature, snapshot, active, isAcp)
   }
 
   private runLimits(snapshot: WorkflowSnapshot, active: { jobId: string; stepId: string }) {
@@ -2069,20 +2562,33 @@ export class Engine {
 
   private async nudgeAgentRun(feature: FeatureState, snapshot: WorkflowSnapshot, active: RunSummary, maxNudges: number): Promise<void> {
     if (!active.sessionId) return
+    const isAcp = this.deps.store.getRunnerBinding(active.id)?.transport === "acp"
+    const sessionClient = isAcp ? this.deps.acpSessions : this.deps.sessions
+    if (!sessionClient) return
     const nudgeNo = this.deps.store.incrementNudges(active.id)
     this.deps.log.log(`reconcile ${feature.slug}: run ${active.id} without report — nudge ${nudgeNo}/${maxNudges}`)
     const step = findStep(snapshot.workflow, active.jobId, active.stepId)
     const role = step?.type === "agent" ? snapshot.workflow.roles[step.role] : undefined
     try {
-      await this.deps.sessions.prompt({
+      await sessionClient.prompt({
         sessionID: active.sessionId,
         text:
           `[conductor] Your previous turn appears to have been interrupted (no report received). ` +
           `The work state is in your context. Finish step "${active.stepId}" and report ` +
           `run_id="${active.id}" with the appropriate outcome.`,
         ...(role ? { agent: role.agent, ...(role.model !== undefined ? { model: role.model } : {}) } : {}),
+        ...(isAcp
+          ? { operationId: deriveOperationLogicalKey("nudge", { runId: active.id, nudgeOrdinal: nudgeNo }), purpose: "nudge" as const }
+          : {}),
       })
     } catch (err) {
+      if (isAcp && (!(err instanceof RunnerOperationError) || err.delivery === "unknown")) {
+        // D6: an uncertain nudge delivery is exactly the same durable
+        // uncertainty as a lost prompt — fence, never treat the failed
+        // nudge as proof of anything, never keep silently retrying.
+        await this.fenceOrFail(feature.id, active.id, active.jobId, active.stepId, "lost_prompt_response", `ACP nudge delivery uncertain: ${err instanceof RunnerOperationError ? err.diagnostic : "unknown boundary failure"}`)
+        return
+      }
       this.deps.log.log(`nudge failed: ${boundDiagnostic(errorMessage(err))}`)
     }
   }
@@ -2093,18 +2599,29 @@ export class Engine {
    * the floor), so a run that demonstrably makes progress is never
    * reaped by wall-clock while a run gone dark is. An agent step's own
    * `ttlMs` overrides the engine default for its runs.
+   *
+   * For an ACP-bound run (`isAcp: true`), TTL exhaustion NEVER reaps as
+   * a retryable failure (D6: "Exhaustion/TTL without report fences
+   * rather than automatic retry" — potentially-executed work with no
+   * authoritative report cannot be proven safe to replace).
    */
   private async reconcileTtl(
     feature: FeatureState,
     snapshot: WorkflowSnapshot,
     active: { id: string; jobId: string; stepId: string; sessionId?: string | null; timeStarted: number; timeLastActivity?: number },
+    isAcp: boolean,
   ): Promise<void> {
     const { ttlMs } = this.runLimits(snapshot, active)
     const lastActivity = Math.max(active.timeLastActivity ?? active.timeStarted, active.timeStarted)
     const silence = this.deps.clock.now() - lastActivity
     if (silence > ttlMs) {
-      this.deps.log.log(`reconcile ${feature.slug}: run ${active.id} (step ${active.stepId}) exceeded TTL — reaping`)
       this.idleCycles.delete(active.id)
+      if (isAcp) {
+        this.deps.log.log(`reconcile ${feature.slug}: run ${active.id} (step ${active.stepId}) exceeded TTL — fencing (no-report timeout)`)
+        await this.fenceOrFail(feature.id, active.id, active.jobId, active.stepId, "no_report_timeout", `ACP run exceeded ${Math.round(silence / 60000)} min without a report`)
+        return
+      }
+      this.deps.log.log(`reconcile ${feature.slug}: run ${active.id} (step ${active.stepId}) exceeded TTL — reaping`)
       await this.reap(feature, active, `run reaped after ${Math.round(silence / 60000)} min without activity`)
     }
   }
@@ -2262,6 +2779,23 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/** Nonsecret digest of the resolved ACP profile config — D5:
+ *  "runner_binding: ... config_digest (nonsecret)". Never includes env
+ *  values (only their key names) so a rotated secret does not change
+ *  the digest and no credential can leak through it. */
+function acpConfigDigest(profile: import("./acp/config.ts").AcpProfileConfig): string {
+  const shape = {
+    command: profile.command,
+    args: profile.args,
+    allowedRoots: profile.allowedRoots,
+    envKeys: Object.keys(profile.env ?? {}).sort(),
+    inheritEnv: profile.inheritEnv ?? [],
+    maxConcurrent: profile.maxConcurrent,
+    bindings: Object.keys(profile.bindings).sort(),
+  }
+  return createHash("sha256").update(JSON.stringify(shape)).digest("hex")
+}
+
 /**
  * Coarse execution-boundary classification for command/action/prompt
  * failures — pattern-matching on transport-level symptoms only (exit
@@ -2283,6 +2817,46 @@ function classifyThrownBoundary(error: unknown): FailureClass {
   if (/502|503|504|bad gateway|service unavailable|gateway timeout/i.test(message)) return "transient_upstream"
   if (/timeout|timed out/i.test(message)) return "timeout"
   return "internal"
+}
+
+/**
+ * Maps an unknown-phase `RunnerOperation`'s durable `diagnosticCode`
+ * (D5 `runner_operation.diagnostic_code`, set by `ManagedSessions`'
+ * `markUnknown`) to the SPECIFIC `RunnerFenceReasonCode` it actually
+ * represents, rather than collapsing every unknown-outcome cause into
+ * the generic `lost_prompt_response`/`lost_answer_response` pair. Purely
+ * descriptive/audit — review fix: `turn_deadline_exceeded` and
+ * `lost_create_response` existed as reason-code union members but were
+ * never actually produced by any call site; every unknown observation
+ * silently reported the wrong specific reason. Falls back to the
+ * pre-existing generic mapping when no code is present (e.g. an
+ * operation observed unknown for a reason this adapter never recorded
+ * a code for, or a future adapter that never sets one at all).
+ */
+function acpFenceReasonCode(operation: Pick<RunnerOperationRecord, "kind" | "diagnosticCode">): RunnerFenceReasonCode {
+  switch (operation.diagnosticCode) {
+    case "create_response_lost": return "lost_create_response"
+    case "turn_deadline_exceeded": return "turn_deadline_exceeded"
+    case "write_timeout":
+    case "response_lost":
+      return operation.kind === "answer" ? "lost_answer_response" : "lost_prompt_response"
+    default:
+      return operation.kind === "answer" ? "lost_answer_response" : "lost_prompt_response"
+  }
+}
+
+/** A `RunnerOperationError` with an explicit `failureClass` (e.g. an
+ *  unsupported/unadvertised ACP mode or model selection — a
+ *  configuration defect, not weather) is ALWAYS a more reliable
+ *  classification than `classifyThrownBoundary`'s message-text
+ *  heuristic, which would otherwise fall through to "internal" (a
+ *  budgeted, RETRYABLE class) for a defect that can never succeed on
+ *  retry. Only consulted for `delivery: "not_sent"` errors — the
+ *  caller has already routed `delivery: "unknown"` to fenceOrFail
+ *  before reaching this classification. */
+function acpFailureClass(error: unknown): FailureClass {
+  if (error instanceof RunnerOperationError && error.failureClass !== undefined) return error.failureClass
+  return classifyThrownBoundary(error)
 }
 
 /** Transient weather classes keep an answer delivery pending for bounded
