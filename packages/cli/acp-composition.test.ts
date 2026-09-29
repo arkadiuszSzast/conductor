@@ -39,7 +39,7 @@ test("docs/install.md ACP YAML example parses through the real daemon config par
     maxConcurrent: 2,
     deadlines: { startupMs: 30000, writeMs: 5000, turnMs: 3600000, cancelMs: 5000, killMs: 2000 },
     permissions: { allowKinds: [] },
-    bindings: { build: { mode: "build", configOptions: {} } },
+    bindings: { build: { mode: "build", configOptions: { model: "provider/model-id" } } },
   })
   expect(config.daemon.runners?.reportBridge).toEqual({ command: "/opt/conductor/conductor", args: ["report-mcp"] })
 })

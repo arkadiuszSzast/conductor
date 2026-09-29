@@ -208,6 +208,12 @@ The adapter requires an injected operation Store, journals sending before execut
 
 A subsequent adversarial/security regression pass (tasks 6.1–6.4, 7.2) completed the requested matrices: a transport-independent conformance suite factory (in-memory and real NDJSON-framed stdio peers, plus native's actually-supported subset with explicit negatives); ACP-specific pause/resume/abandon interaction coverage including the fenced-resume's required-acknowledgment message at both the engine and HTTP API layers; specific `turn_deadline_exceeded`/`lost_create_response` fence-reason propagation (previously defined but never produced); and a client-capability security audit that found and fixed a critical gap — the pinned SDK's legacy `client()` wrapper unconditionally grants a fabricated success for `fs/read_text_file`/`fs/write_text_file`/`terminal/*` when the implementation omits them, rather than failing closed as D9 requires and the prior code's own (incorrect) comment assumed; every finding has a regression test proving the fix. This remains offline synthetic-peer verification, not live OpenCode compatibility, sandbox containment or deployment evidence — those stay explicitly out of scope for this change.
 
+### Live-run corrections (2026-09-28/29)
+
+Live OpenCode runs (a micro-project smoke and a full multi-agent production workflow) surfaced three defects that deterministic peers could not: (1) OpenCode advertises the agent mode only as a `mode` config option, not ACP `modes`, so mode selection accepts either advertisement and still fails closed; (2) OpenCode shell tools `setsid` their commands, so cleanup snapshots the whole `/proc` descendant tree before and after TERM and reports `confirmed_terminated` only when every observed descendant is gone; (3) selecting an OpenCode mode over ACP does not apply the mode's own model, so operators must bind `configOptions.model` per role. Operational notes are in `docs/install.md`.
+
+Migrations 0022-0024 are intentionally **not** squashed: a production database has already applied them and the ledger requires an exact monotonic prefix, so a squash would make the daemon refuse to start.
+
 ## Open Questions
 
 No blocking architecture decisions are left to the implementer. Later live testing will determine operational deadline/concurrency tuning and actual OpenCode profile/model compatibility; it does not change the fail-closed contract. Other runtimes and automatic conversation recovery are follow-up changes, not hidden tasks here.

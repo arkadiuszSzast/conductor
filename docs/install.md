@@ -268,7 +268,7 @@ runners:
       permissions:
         allowKinds: []           # deny-all is the example's intentional default
       bindings:
-        build: {mode: build}     # workflow role.agent -> advertised session mode — either `modes` or a `mode` config option
+        build: {mode: build, configOptions: {model: provider/model-id}}   # mode must be advertised; always bind the model too (see Operational notes)
   reportBridge:
     command: /opt/conductor/conductor
     args: [report-mcp]
@@ -393,6 +393,44 @@ may already have executed. While a turn streams, ACP activity notifications
 refresh the run's liveness (silence TTL), throttled to once per second;
 activity is not a report and does not extend the separate turn deadline.
 
+### Operational notes from live runs
+
+- **Always bind the model per role.** In OpenCode, selecting a session
+  mode through ACP does not apply the mode/agent's own configured `model`;
+  the session keeps the profile's default model. Put the role's model in
+  `bindings.<role>.configOptions.model` (it must be an advertised option;
+  Conductor sets the mode, then the model, and fails closed if either is
+  not confirmed), for example
+  `conductor-implementer: {mode: conductor-implementer, configOptions: {model: provider/model-id}}`.
+- **MCP tool names are namespaced.** OpenCode exposes the report bridge's
+  tools as `<server>_<tool>`, and Conductor names the server
+  `conductor-<runId>`, so the tools appear as
+  `conductor-<runId>_conductor_report` etc. An agent whose OpenCode
+  permissions are deny-by-default must allow the pattern
+  `"conductor-*_conductor_report"` (and `_conductor_ask`/`_conductor_status`
+  as needed); allowing only the native plugin tool name `conductor_report`
+  leaves the agent unable to report, which surfaces as `no_report_timeout`
+  after idle nudges.
+- **Overriding `XDG_CONFIG_HOME` hides every other tool's config.** Tools
+  the agent runs (`gh`, `git`, `mise`, …) look under `$XDG_CONFIG_HOME`
+  too; if the profile uses a dedicated `XDG_CONFIG_HOME`, symlink or copy
+  the configs those tools need (for example `gh`) into it, or the agent's
+  `gh pr review` etc. silently lose authentication.
+- **Remove the native runner plugin from the ACP profile.** If the
+  OpenCode profile used for ACP still loads the Conductor native runner
+  plugin, each ACP agent process would also register as a native runner.
+  Use a profile without it.
+- **Gateways that reject empty completions.** Some OpenAI-compatible
+  gateways (observed: OmniRoute, `502 empty_content`) treat an empty
+  assistant turn as an error; OpenCode then retries internally and the ACP
+  turn never ends, which Conductor fences as uncertain. Prompts for
+  interactive steps should instruct the agent to always end a turn with a
+  short non-empty sentence (e.g. after `conductor_ask`: "Waiting for the
+  human answer.").
+- **Cold start.** The first `opencode acp` start in a fresh profile
+  installs plugins and can take over a minute; size `deadlines.startupMs`
+  accordingly (warm starts ~2 s).
+
 ### Rollback
 
 Disabling ACP only affects **future** dispatch: removing or editing
@@ -409,20 +447,31 @@ retry them blindly.
 
 ### Status of this integration
 
-This is offline, deterministic integration correctness — protocol
+Beyond the offline, deterministic integration checks (protocol
 negotiation, configuration, permissions, process supervision, durable
-crash-safety and full repository quality checks — not a live
-compatibility certification. The design's Stage 2 compatibility
-evidence gate was **explicitly waived by the user, not passed**: no
-live OpenCode run, real provider call, host authentication read or
-production dogfood was performed as part of building this feature, and
-none is claimed here. A separate, later live project run against a
-real OpenCode installation is required before relying on this path in
-production, and is expected to inform deadline/concurrency tuning and
-actual profile/model compatibility — it does not change the fail-closed
-contract described above. See `openspec/changes/acp-runner/design.md`
-for the full decision record and `docs/acp-gap-analysis.md` for the
-ACP-vs-native capability comparison this change was built from.
+crash-safety and full repository quality checks), this path was run live
+against OpenCode 1.18.32/1.18.33 over ACP (verified 2026-09-28/29):
+
+- **Micro-project smoke**: ask → human answer → file effect →
+  `conductor_report` → done. A daemon restart during a pending ask fenced
+  the run and required an explicit `recover`. Abandon during a long shell
+  tool killed the full process tree, including a `setsid`'d descendant
+  (after a fix found by that live run).
+- **Full production workflow**: a 19-job multi-agent workflow — planning
+  architects in parallel, consensus with a rerun loop, implementer, 7
+  parallel reviewers, doc writer, push, PR, CI wait, PR reviewers and a
+  human merge gate — ran end to end on ACP with 21 agent runs and was
+  merged.
+
+This is still not a universal compatibility certification. The design's
+Stage 2 multi-runtime compatibility evidence gate was **explicitly waived
+by the user, not passed**: only OpenCode was exercised live, with no
+second runtime. Expect provider/model compatibility and
+deadline/concurrency tuning to vary per installation — it does not change
+the fail-closed contract described above. See
+`openspec/changes/acp-runner/design.md` for the full decision record and
+`docs/acp-gap-analysis.md` for the ACP-vs-native capability comparison
+this change was built from.
 
 ## First feature
 
