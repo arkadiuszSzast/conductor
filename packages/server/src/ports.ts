@@ -40,6 +40,7 @@ export interface ProcessExecResult {
 export interface ProcessExecOptions {
   readonly cwd: string
   readonly timeoutMs?: number
+  readonly signal?: AbortSignal
   readonly env?: Readonly<Record<string, string>>
   /** Piped to the child's stdin, then closed. Avoids shell heredoc construction for untrusted content. */
   readonly stdin?: string
