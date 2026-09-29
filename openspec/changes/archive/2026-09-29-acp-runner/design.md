@@ -4,7 +4,7 @@
 
 Implementation and blocking-review remediation are in progress under the user's authorization. This is not acceptance of the whole change; outstanding review and conformance work remains.
 
-Stage 2 evidence gate is **WAIVED BY USER, NOT PASSED**. The instruction was: “możesz po prostu założyć że to działa i lecieć z implementacją. Przetestujemy to na żywym projekcie z opencodem”. Future live OpenCode testing is separate; this change does not authorize executing providers, reading host authentication, installing system tools, deploying or dogfooding during acceptance.
+Stage 2 evidence gate is **WAIVED BY USER, NOT PASSED**. The instruction was (translated from Polish): “you can just assume it works and go ahead with the implementation. We will test it on a live project with opencode”. Future live OpenCode testing is separate; this change does not authorize executing providers, reading host authentication, installing system tools, deploying or dogfooding during acceptance.
 
 ## Context
 

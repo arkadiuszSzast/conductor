@@ -43,7 +43,7 @@ dot + popover.
          (⟲ back-edge drawn only while implement is re-running; afterwards
           the job keeps a "⟲ round 2" chip and the edge disappears)
  gate approve-pr · review: approved · ⚑3 new · next: post-merge
- [✓ Approve]  [✎ Request changes]              otwórz pełny widok →
+ [✓ Approve]  [✎ Request changes]                 open full view →
 ```
 
 - Columns: `waiting_human` + `escalated` fused into a leftmost **NEEDS YOU**
@@ -56,7 +56,7 @@ dot + popover.
   escalation reason (verbatim string, 2-line clamp).
 - No per-row "running for X m" clock — consciously deferred with GAP-8.
 
-### Graph expansion (the answer to "gdzie jesteśmy i co dalej")
+### Graph expansion (the answer to "where are we and what comes next")
 
 Selecting a card pins a full-width **graph strip** below the board. It
 renders the complete workflow DAG for that feature:
@@ -134,7 +134,7 @@ renders the complete workflow DAG for that feature:
 the gate's decision row → click `Approve` (2). `Request changes` opens an
 inline note field in the strip (required — mirrors the API's `400`). The
 strip answers "where are we" *while* deciding — no navigation away.
-**Deep path:** card → `otwórz pełny widok` → feature view → modal with
+**Deep path:** card → `open full view` → feature view → modal with
 report excerpt + findings → confirm. `409` → toast "state changed" +
 refetch.
 
@@ -166,7 +166,7 @@ refetch.
 ## Trade-offs
 
 **Great at:** instant structural comprehension — the graph strip answers
-"na jakim kroku jesteśmy i co będzie dalej" directly on the board, one
+"which step are we on and what comes next" directly on the board, one
 click from any card; the GHA-familiar metaphor needs zero learning; gate
 decisions happen with the pipeline visible. **Sacrifices:** lowest board
 density (open strip halves the visible cards — mitigated: strip collapses

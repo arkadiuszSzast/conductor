@@ -194,11 +194,11 @@ describe("the docs' feature-delivery example (IR form)", () => {
   }
 
   const architectPrompt = (self: string, other: string): string => [
-    "Zaproponuj architekturę dla {{ inputs.feature }}.",
-    `Twoja poprzednia propozycja: {{ feedback.jobs["${self}"]["design"]["report"] }}`,
-    `Propozycja drugiego architekta: {{ feedback.jobs["${other}"]["design"]["report"] }}`,
-    'Uwagi sędziego: {{ feedback.jobs["consensus"]["agree"]["report"] }}',
-    "Powód zwrotki: {{ feedback.message }}",
+    "Propose an architecture for {{ inputs.feature }}.",
+    `Your previous proposal: {{ feedback.jobs["${self}"]["design"]["report"] }}`,
+    `The other architect's proposal: {{ feedback.jobs["${other}"]["design"]["report"] }}`,
+    `Judge's notes: {{ feedback.jobs["consensus"]["agree"]["report"] }}`,
+    "Reason for sending back: {{ feedback.message }}",
   ].join("\n")
 
   const def = workflow(
@@ -239,22 +239,22 @@ describe("the docs' feature-delivery example (IR form)", () => {
           agentStep(
             "openspec",
             "implementer",
-            'Pracuj w {{ steps.worktree.outputs.path }}. Architektura: {{ needs["consensus"].outputs.decision }}',
+            'Work in {{ steps.worktree.outputs.path }}. Architecture: {{ needs["consensus"].outputs.decision }}',
           ),
           agentStep(
             "implement",
             "implementer",
             [
-              "Zaimplementuj {{ inputs.feature }} według {{ steps.openspec.outputs.report }}.",
-              'Poprzednia iteracja: {{ feedback.jobs["deliver"]["implement"]["report"] }}',
-              'Uwagi quality: {{ feedback.jobs["deliver"]["quality"]["report"] }}',
-              'Uwagi z PR: {{ feedback.jobs["deliver"]["pr-review"]["notes"] }}',
+              "Implement {{ inputs.feature }} according to {{ steps.openspec.outputs.report }}.",
+              'Previous iteration: {{ feedback.jobs["deliver"]["implement"]["report"] }}',
+              'Quality notes: {{ feedback.jobs["deliver"]["quality"]["report"] }}',
+              'PR notes: {{ feedback.jobs["deliver"]["pr-review"]["notes"] }}',
             ].join("\n"),
           ),
-          agentStep("quality", "quality", "Build, testy, lint.", {
+          agentStep("quality", "quality", "Build, tests, lint.", {
             outcomes: { approved: next, issues: rerunSteps(["implement"], 3) },
           }),
-          agentStep("internal-review", "reviewer", "Zreviewuj diff.", {
+          agentStep("internal-review", "reviewer", "Review the diff.", {
             outcomes: { approved: next, changes_requested: rerunSteps(["implement", "quality"], 3) },
           }),
           actionStep("push", "git/push@v1"),

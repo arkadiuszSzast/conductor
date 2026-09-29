@@ -229,7 +229,7 @@ consensus:
   steps:
     - id: agree
       agent:
-        prompt: "Architektura A: {{ needs['architect-a'].outputs.design }}"
+        prompt: "Architecture A: {{ needs['architect-a'].outputs.design }}"
 ```
 
 The two-layer design is deliberate: step outputs are the job's private

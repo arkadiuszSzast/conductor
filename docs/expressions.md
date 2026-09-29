@@ -67,7 +67,7 @@ executes"). "Soft" means an empty result is a legal, meaningful state.
 ## `inputs` — trigger inputs
 
 ```yaml
-prompt: "Zaimplementuj {{ inputs.feature }}"
+prompt: "Implement {{ inputs.feature }}"
 ```
 
 Available everywhere. Typed per the workflow's `inputs` declaration;
@@ -100,7 +100,7 @@ OpenSpec change name) and read it via `{{ feature.description }}`.
 ```yaml
 - id: openspec
   agent:
-    prompt: "Pracuj w {{ steps.worktree.outputs.path }}"
+    prompt: "Work in {{ steps.worktree.outputs.path }}"
 ```
 
 `steps.<stepId>.outputs.<name>` reads a named output of an **earlier step in
@@ -161,13 +161,13 @@ Example — round 2 of a consensus loop, inside `architect-a`'s prompt:
 
 ```yaml
 prompt: |
-  Twoja poprzednia propozycja:
+  Your previous proposal:
   {{ feedback.jobs["architect-a"]["design"]["report"] }}
-  Propozycja drugiego architekta:
+  The other architect's proposal:
   {{ feedback.jobs["architect-b"]["design"]["report"] }}
-  Uwagi sędziego:
+  Judge's notes:
   {{ feedback.jobs["consensus"]["agree"]["report"] }}
-  Powód zwrotki: {{ feedback.message }}
+  Reason for sending back: {{ feedback.message }}
 ```
 
 ### Why `feedback` is soft
