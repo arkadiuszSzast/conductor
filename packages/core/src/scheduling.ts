@@ -154,3 +154,39 @@ export function checkRetryBudget(input: BudgetCheckInput): BudgetCheckResult {
   if (elapsedAtCandidate > input.maxElapsedMs) return { ok: false, exhaustedBy: "elapsed" }
   return { ok: true }
 }
+
+/** The ISO-8601 duration grammar `validateRetry` accepts, with capture
+ *  groups ordered year/month/week/day/hour/minute/second. */
+const ISO_DURATION_RE = /^P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$/
+
+const MS_PER_YEAR = 365 * 24 * 60 * 60 * 1000
+const MS_PER_MONTH = 30 * 24 * 60 * 60 * 1000
+const MS_PER_WEEK = 7 * 24 * 60 * 60 * 1000
+const MS_PER_DAY = 24 * 60 * 60 * 1000
+const MS_PER_HOUR = 60 * 60 * 1000
+const MS_PER_MINUTE = 60 * 1000
+
+/** Milliseconds for an ISO-8601 duration string (e.g. "PT10M", "PT6H",
+ *  "P1DT2H") — the same grammar `validateRetry` enforces. Returns `undefined`
+ *  when the text is not a duration or carries no component, so callers fall
+ *  back to the failure class's default elapsed budget rather than an
+ *  unbounded/NaN deadline. Year and month use the conventional 365/30-day
+ *  approximation; retry budgets are minute-to-hour scale, so it never bites. */
+export function parseIsoDurationMs(text: string): number | undefined {
+  const match = ISO_DURATION_RE.exec(text)
+  if (match === null) return undefined
+  const [, years, months, weeks, days, hours, minutes, seconds] = match
+  if (years === undefined && months === undefined && weeks === undefined && days === undefined && hours === undefined && minutes === undefined && seconds === undefined) {
+    return undefined
+  }
+  const total =
+    (years !== undefined ? Number(years) * MS_PER_YEAR : 0) +
+    (months !== undefined ? Number(months) * MS_PER_MONTH : 0) +
+    (weeks !== undefined ? Number(weeks) * MS_PER_WEEK : 0) +
+    (days !== undefined ? Number(days) * MS_PER_DAY : 0) +
+    (hours !== undefined ? Number(hours) * MS_PER_HOUR : 0) +
+    (minutes !== undefined ? Number(minutes) * MS_PER_MINUTE : 0) +
+    (seconds !== undefined ? Number(seconds) * 1000 : 0)
+  if (!Number.isFinite(total)) return undefined
+  return Math.min(total, MAX_DELAY_MS)
+}

@@ -56,14 +56,23 @@ class FakeOpencodeServer {
   sessions = new Map<string, FakeSession>()
   statuses = new Map<string, "busy" | "idle" | "retry">()
   /** Message timelines per session for the status fallback probe. */
-  timelines = new Map<string, Array<{ info?: { role?: string; time?: { completed?: number } } }>>()
+  timelines = new Map<string, Array<{ info?: { role?: string; time?: { completed?: number } }; parts?: Array<{ type?: string; state?: { status?: string } }> }>>()
   statusEndpointBroken = false
+  /** Simulates a genuine transport failure (network down, DNS) — the SDK
+   *  promise REJECTS, distinct from a non-throwing HTTP error response. */
+  getBroken = false
+  /** Simulates the SDK's default non-throwing behaviour for an HTTP error
+   *  OTHER than 404 (e.g. a transient 500) — `get` resolves normally with
+   *  `data` undefined, `error` set and `response.status` this value. Real
+   *  opencode's `/session/{id}` only documents 400/404, but the SDK client
+   *  itself never assumes the server only ever returns documented codes. */
+  getErrorStatus: number | null = null
   aborted: string[] = []
   private counter = 0
 
   constructor(readonly defaultDirectory: string) {}
 
-  api(): RawOpencodeSessionApi {
+  api(boundDirectory: string = this.defaultDirectory): RawOpencodeSessionApi {
     return {
       session: {
         create: async input => {
@@ -73,7 +82,7 @@ class FakeOpencodeServer {
           const session: FakeSession = {
             id,
             title: input.body.title ?? "",
-            directory: input.query?.directory ?? this.defaultDirectory,
+            directory: input.query?.directory ?? boundDirectory,
             ...(input.body.parentID !== undefined ? { parentID: input.body.parentID } : {}),
             prompts: [],
           }
@@ -81,14 +90,26 @@ class FakeOpencodeServer {
           return { data: { id } }
         },
         get: async input => {
+          if (this.getBroken) throw new Error("get endpoint unavailable")
+          if (this.getErrorStatus !== null) {
+            return { error: { name: "InternalError", data: { message: "boom" } }, response: { status: this.getErrorStatus } }
+          }
           const session = this.sessions.get(input.path.id)
-          if (!session) throw new Error("not found")
-          return { data: { id: session.id } }
+          if (!session) {
+            // Real opencode's 404: the SDK's non-throwing shape — `data`
+            // undefined, `error` a `NotFoundError`, `response.status` 404.
+            return { error: { name: "NotFoundError", data: { message: "not found" } }, response: { status: 404 } }
+          }
+          return { data: { id: session.id, directory: session.directory } }
         },
-        status: async () => {
+        status: async input => {
           if (this.statusEndpointBroken) throw new Error("status endpoint unavailable")
+          const directory = input?.query?.directory ?? boundDirectory
           const data: Record<string, { type: string }> = {}
-          for (const [id, type] of this.statuses) data[id] = { type }
+          for (const [id, type] of this.statuses) {
+            if (this.sessions.get(id)?.directory !== directory) continue
+            data[id] = { type }
+          }
           return { data }
         },
         messages: async input => {
@@ -105,6 +126,21 @@ class FakeOpencodeServer {
             ...(input.body.model !== undefined ? { model: input.body.model } : {}),
             ...(input.body.noReply !== undefined ? { noReply: input.body.noReply } : {}),
           })
+          // Real opencode's timeline for a session that has been prompted
+          // and is currently NOT streaming (nobody set `statuses` and the
+          // caller didn't stage a specific `timelines` shape) shows a
+          // completed assistant turn — mirrors a genuinely idle session
+          // ("dispatched, then nothing happening") rather than the
+          // unrealistic all-messages-vanish shape an empty array implies.
+          // Tests that need something else (an in-flight turn, a
+          // user-only window, no evidence at all) stage `timelines`
+          // explicitly AFTER this call, overwriting this default.
+          if (!input.body.noReply) {
+            this.timelines.set(input.path.id, [
+              { info: { role: "user", time: { completed: Date.now() } } },
+              { info: { role: "assistant", time: { completed: Date.now() } } },
+            ])
+          }
           return {}
         },
         abort: async input => {
@@ -194,6 +230,7 @@ interface Harness {
   registry: RunnerRegistry
   logger: CollectingLogger
   makeHub: () => OpencodeRunnerHub
+  advance: (ms: number) => void
 }
 
 /**
@@ -216,6 +253,7 @@ async function makeHarness(input?: { projects?: string[] }): Promise<Harness> {
 
   const sessions = createRunnerSessionClient({ runners: registry, fetchImpl: runnerFetch })
   const logger = new CollectingLogger()
+  let offset = 0
   const daemon = new Daemon(
     {
       databasePath: join(tempDir("conductor-runner-db-"), "state.db"),
@@ -225,6 +263,7 @@ async function makeHarness(input?: { projects?: string[] }): Promise<Harness> {
     },
     {
       sessions,
+      clock: { now: () => Date.now() + offset },
       runnerAvailability: () => registry.hasAny(),
       logger,
       scheduler: { setInterval: () => ({}), clearInterval: () => {} },
@@ -272,7 +311,7 @@ async function makeHarness(input?: { projects?: string[] }): Promise<Harness> {
     return hub
   }
 
-  return { daemon, api, client, registry, logger, makeHub }
+  return { daemon, api, client, registry, logger, makeHub, advance: ms => { offset += ms } }
 }
 
 // ------------------------------------------------------------------- tests
@@ -368,6 +407,9 @@ describe("session transport preserves the seed's opencode wire shape", () => {
     server.statuses.set(id, "retry")
     expect(await sessions.status(id)).toBe("retry")
     server.statuses.delete(id)
+    // Unlisted in the status map: the timeline fallback decides. A
+    // completed assistant turn (no trailing unfinished tool) is idle.
+    server.timelines.set(id, [{ info: { role: "assistant", time: { completed: Date.now() } } }])
     expect(await sessions.status(id)).toBe("idle")
     server.sessions.delete(id)
     expect(await sessions.status(id)).toBe("missing")
@@ -409,6 +451,84 @@ describe("session transport preserves the seed's opencode wire shape", () => {
       { info: { role: "assistant", time: { completed: Date.now() } } },
     ])
     expect(await sessions.status(id)).toBe("idle")
+  })
+
+  it.each(["pending", "running", "completed", "error"])("trailing users preserve latest assistant tool state %s, not stale history", async status => {
+    const server = new FakeOpencodeServer("/p")
+    const sessions = createOpencodeSessions(server.api())
+    const { id } = await sessions.createSession({ title: "t", directory: "/p" })
+    server.timelines.set(id, [
+      { info: { role: "assistant", time: {} } },
+      { info: { role: "assistant", time: { completed: 123 } }, parts: [{ type: "tool", state: { status } }] },
+      { info: { role: "user" } },
+    ])
+    expect(await sessions.status(id)).toBe(status === "pending" || status === "running" ? "busy" : "idle")
+    server.timelines.set(id, [{ info: { role: "assistant", time: {} } }, { info: { role: "user" } }])
+    expect(await sessions.status(id)).toBe("busy")
+    server.timelines.set(id, Array.from({ length: 5 }, () => ({ info: { role: "user" } })))
+    expect(await sessions.status(id)).toBe("busy")
+  })
+
+  it("status resolves the session's own directory before querying — never the client's bound default", async () => {
+    const server = new FakeOpencodeServer("/project-a")
+    const sessionsA = createOpencodeSessions(server.api("/project-a"))
+    const sessionsB = createOpencodeSessions(server.api("/project-b"))
+    const { id } = await sessionsB.createSession({ title: "b work", directory: "/project-b" })
+    server.statuses.set(id, "busy")
+    expect(await sessionsA.status(id)).toBe("busy")
+  })
+
+  it("claims busy, not missing, when resolving the session's directory fails", async () => {
+    const server = new FakeOpencodeServer("/fallback")
+    const sessions = createOpencodeSessions(server.api())
+    const { id } = await sessions.createSession({ title: "t", directory: "/p" })
+    server.getBroken = true
+    expect(await sessions.status(id)).toBe("busy")
+  })
+
+  describe("session.get evidence: only an explicit 404 proves missing (H1)", () => {
+    it("a confirmed 404 (session.get resolves NotFoundError/response.status 404) reports missing and sessionExists false", async () => {
+      const server = new FakeOpencodeServer("/fallback")
+      const sessions = createOpencodeSessions(server.api())
+      // No session was ever created with this id — the fake's `get`
+      // resolves the SDK's real non-throwing 404 shape.
+      expect(await sessions.status("ses-never-existed")).toBe("missing")
+      expect(await sessions.sessionExists("ses-never-existed")).toBe(false)
+    })
+
+    it("a non-throwing 500 (data undefined, no 404 evidence) claims busy and sessionExists true — never mistaken for gone", async () => {
+      const server = new FakeOpencodeServer("/fallback")
+      const sessions = createOpencodeSessions(server.api())
+      const { id } = await sessions.createSession({ title: "t", directory: "/p" })
+      server.getErrorStatus = 500
+      expect(await sessions.status(id)).toBe("busy")
+      expect(await sessions.sessionExists(id)).toBe(true)
+    })
+
+    it("a rejected promise (genuine transport failure) claims busy and sessionExists true, same as a 500", async () => {
+      const server = new FakeOpencodeServer("/fallback")
+      const sessions = createOpencodeSessions(server.api())
+      const { id } = await sessions.createSession({ title: "t", directory: "/p" })
+      server.getBroken = true
+      expect(await sessions.status(id)).toBe("busy")
+      expect(await sessions.sessionExists(id)).toBe(true)
+    })
+
+    it("abort against a session lost to a transient 500 still calls abort (never treated as a no-op-missing case)", async () => {
+      const server = new FakeOpencodeServer("/fallback")
+      const sessions = createOpencodeSessions(server.api())
+      const { id } = await sessions.createSession({ title: "t", directory: "/p" })
+      server.getErrorStatus = 500
+      await sessions.abort(id)
+      expect(server.aborted).toEqual([id])
+    })
+
+    it("abort against a confirmed-404 session is a no-op — no abort call reaches the SDK", async () => {
+      const server = new FakeOpencodeServer("/fallback")
+      const sessions = createOpencodeSessions(server.api())
+      await sessions.abort("ses-never-existed")
+      expect(server.aborted).toEqual([])
+    })
   })
 })
 
@@ -619,6 +739,46 @@ describe("multi-project directory routing", () => {
     // the session's working directory even when no project path-prefixes it.
     expect(opencode.sessions.get(id)?.directory).toBe(outside)
   })
+
+  it("a B session polls B's status through the hub even though A's transport answers first", async () => {
+    const projectA = tempDir("aaa-conductor-runner-project-")
+    const projectB = tempDir("zzz-conductor-runner-project-")
+    const h = await makeHarness({ projects: [projectA, projectB] })
+    const hub = h.makeHub()
+    const opencode = new FakeOpencodeServer(projectA)
+    await hub.registerProject(projectA, createOpencodeSessions(opencode.api(projectA)))
+    await hub.registerProject(projectB, createOpencodeSessions(opencode.api(projectB)))
+
+    const created = await hub.handle(
+      new Request(`http://${RUNNER_ENDPOINT_HOST}:1/v1/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${RUNNER_TOKEN}` },
+        body: JSON.stringify({ title: "b work", directory: projectB }),
+      }),
+    )
+    const { id } = (await created.json()) as { id: string }
+    expect(opencode.sessions.get(id)?.directory).toBe(projectB)
+
+    opencode.statuses.set(id, "busy")
+    const status = await hub.handle(
+      new Request(`http://${RUNNER_ENDPOINT_HOST}:1/v1/sessions/${id}/status`, {
+        headers: { authorization: `Bearer ${RUNNER_TOKEN}` },
+      }),
+    )
+    expect(await status.json()).toEqual({ status: "busy" })
+
+    opencode.statuses.delete(id)
+    opencode.timelines.set(id, [
+      { info: { role: "user", time: {} } },
+      { info: { role: "assistant", time: {} } },
+    ])
+    const stillBusy = await hub.handle(
+      new Request(`http://${RUNNER_ENDPOINT_HOST}:1/v1/sessions/${id}/status`, {
+        headers: { authorization: `Bearer ${RUNNER_TOKEN}` },
+      }),
+    )
+    expect(await stillBusy.json()).toEqual({ status: "busy" })
+  })
 })
 
 describe("session states drive the engine's idle/retry/missing policy", () => {
@@ -695,15 +855,14 @@ jobs:
     const { featureId, runId, sessionId } = await startedRun(h, project, opencode)
     const initialPrompts = opencode.sessions.get(sessionId)!.prompts.length
 
-    // no status entry → idle. nudgeIdleCycles=1: first beat nudges.
+    h.advance(120_001)
     await h.daemon.beat()
     const afterNudge = opencode.sessions.get(sessionId)!.prompts
     expect(afterNudge.length).toBe(initialPrompts + 1)
     expect(afterNudge[afterNudge.length - 1]!.text).toContain("report")
     expect((await h.client.getRun(runId)).run.status).toBe("running")
 
-    // maxNudges=1 exhausted → next idle cycle reaps; the step FAILS, it
-    // never silently succeeds off an idle session.
+    h.advance(120_001)
     await h.daemon.beat()
     expect((await h.client.getRun(runId)).run.status).toBe("reaped")
     const feature = await h.client.getFeature(featureId)
@@ -732,7 +891,9 @@ jobs:
 
     // Idle through the nudge budget (nudgeIdleCycles=1, maxNudges=1):
     // the second beat reaps — and the reap must reach opencode's abort.
+    h.advance(120_001)
     await h.daemon.beat() // nudge
+    h.advance(120_001)
     await h.daemon.beat() // reap + abort
     expect((await h.client.getRun(runId)).run.status).toBe("reaped")
     expect(opencode.aborted).toContain(sessionId)

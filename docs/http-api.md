@@ -29,6 +29,7 @@ Authentication is explicit (`auth.mode: "none"` or `"bearer"`); only
 | `POST /v1/runs/:id/answer` | Human answers a run's pending question; the notes flow into the live session. |
 | `GET /v1/projects/workflow?dir=<projectDir>` | Structure-only workflow projection (below). |
 | `GET/POST /v1/runners`, `DELETE /v1/runners/:id` | Runner endpoint registration (when a registry is configured). |
+| `POST /v1/worker/report`, `GET /v1/worker/status`, `POST /v1/worker/ready` | Restricted, run-scoped namespace for the opt-in ACP integration's MCP reporting bridge (below; only reachable when `runners` is configured). |
 | `GET /v1/plugins`, `POST /v1/plugins/session`, `ANY /v1/plugins/:id/*` | Plugin listing, session cookie exchange, and per-plugin reverse proxy (below; when a plugin control is configured). |
 
 ## Runner registration and callback health
@@ -53,6 +54,43 @@ Deploy the updated runner callback before the daemon, or update both together.
 An old callback without health support safely blocks writes until upgraded.
 No database migration or configuration change is required.
 
+## Restricted worker namespace (ACP reporting bridge)
+
+`/v1/worker/{report,status,ready}` exists only for the opt-in ACP runner
+(see [Install § Connecting an ACP agent](install.md#connecting-an-acp-agent-opencode))
+and is never reachable without a `runners` config. It authenticates with
+its own hashed, run- and attempt-scoped bearer credential — issued fresh
+per attempt and injected into the `conductor report-mcp` bridge process
+via `CONDUCTOR_RUN_TOKEN` — **before** the broad admin `authorized()`
+check, and independently of the daemon's own `auth.mode`: a worker
+credential is never accepted on the admin API, and the admin token is
+never accepted here. `run_id`, if present in a request body/query, must
+match the credential's own run or the request is rejected — one worker
+can never read or mutate another run.
+
+- `POST /v1/worker/report` — the SAME validated path as
+  `POST /v1/runs/:id/report` (below), reached with a scoped credential
+  instead of the admin token. A credential whose run already concluded
+  is still accepted for exactly one purpose: returning the stable
+  `409 run_already_concluded` response for a duplicate/late report,
+  without any further mutation — this lets a worker safely resolve "did
+  my report actually land" after a lost ACK, without ever leaving a
+  mutation-capable token alive past conclusion. The MCP bridge maps this
+  specific 409 to a non-error `Already reported: …` tool result (already
+  concluded), rather than inviting another report or repeating the work.
+- `GET /v1/worker/status` — a minimal projection of the credential's
+  OWN run only (never another attempt's data).
+- `POST /v1/worker/ready` — internal readiness signal from the bridge:
+  body `{"phase": "initialized" | "tools_listed"}`. The daemon holds
+  the first ACP prompt until both phases are observed for that
+  attempt's bridge generation — proving the runtime actually connected
+  and listed the three MCP tools, not merely that the process spawned.
+
+A credential is revoked on terminal outcome, execution fencing,
+replacement, abandonment, and daemon shutdown/restart — a stale or
+superseded credential, or one for a fenced run, is rejected outright
+(not silently downgraded to read-only).
+
 ## Feature payloads
 
 Both list items and the detail carry the feature state plus projection
@@ -73,6 +111,33 @@ from the store row — not part of the core interpreter state).
   additionally carries `recoverableTargets: [{jobId, stepId}]` — every
   currently recoverable job/step, in the order `POST .../recover` would
   pick as its default (untargeted) choice; absent otherwise.
+
+### Runner transport and execution-uncertainty projection
+
+`GET /v1/runs/:id` (and any run embedded in a feature/answer-delivery
+payload) is additive-only for the opt-in ACP runner: a native run with
+no runner binding is shaped exactly as before. A run dispatched through
+a configured ACP profile additionally carries:
+
+- `transport: "native" | "acp"` and, when known, `profileId` (the
+  configured ACP profile id) — never the executable path, env or token.
+- `uncertain: {reasonCode, cleanupState, recoveryRequiresCleanupAcknowledgement}`
+  while an unresolved execution fence is open (see
+  [Install § Restart, shutdown and unknown execution](install.md#restart-shutdown-and-unknown-execution)) —
+  absent once the fence is resolved by a recover. `reasonCode` is one of
+  `lost_create_response`, `lost_prompt_response`, `lost_answer_response`,
+  `process_or_daemon_restart`, `turn_deadline_exceeded`, `no_report_timeout`,
+  `cancellation_during_uncertain_write`, or `startup_recovery`.
+
+`POST /v1/features/:id/resume` on a feature with an unresolved fence returns
+`409` with `error.code: "conflict"`; its message explicitly requires
+`recover` with `acknowledgeUncertain` and cleanup evidence. Resume never
+clears a fence, even if recovery fields are supplied.
+
+`end_turn` (or any other ACP stop reason) is never reflected as
+`status: "succeeded"` by itself — only an accepted `conductor_report`
+call (via the run-scoped MCP bridge or the plain HTTP report route)
+moves a run out of `running`.
 
 ### Activity projection
 
@@ -103,8 +168,9 @@ happening" from raw job/run state:
 - `waiting_retry` — a durable retry episode is scheduled; `reason` is the
   classified failure class, `diagnostic` its bounded message, `nextAt` the
   scheduled attempt time, and `deadlineAt` the retry's elapsed budget
-  deadline (`startedAt + maxElapsedMs` for that class — see
-  [Retries, failure classes and recovery](concepts.md#retries-failure-classes-and-recovery)).
+  deadline (`startedAt + maxElapsedMs`, where `maxElapsedMs` is the step's
+  own `retry.maxElapsed` when declared, else that failure class's default —
+  see [Retries, failure classes and recovery](concepts.md#retries-failure-classes-and-recovery)).
   An attempt past `deadlineAt` is never dispatched — the client should not
   expect `nextAt` to still fire once `deadlineAt` has passed.
 - `waiting_human` | `paused` | `escalated` | `terminal` (`done`/
@@ -189,6 +255,31 @@ means "at least one rerun has ever happened".
 - `idempotencyKey` dedupes a retried delivery of the same logical
   recover: a repeat with the same key returns `200` with the fresh
   feature payload and no new work armed.
+- **Execution-uncertain targets require extra fields.** A target the ACP
+  integration fenced as `uncertain` (a create/prompt whose outcome could
+  not be proven — see
+  [Install § Restart, shutdown and unknown execution](install.md#restart-shutdown-and-unknown-execution))
+  rejects a plain recover. It additionally requires:
+  - `acknowledgeUncertain: true` — the operator explicitly acknowledges
+    the target's effects are unproven, not confirmed absent;
+  - `expectedVersion` and `idempotencyKey` — both become REQUIRED
+    (not merely optional) once `acknowledgeUncertain` is set;
+  - `cleanupAttested: true` — only after the operator has independently
+    confirmed the old process/group was actually terminated (a
+    confirmed-stopped process group observed by the daemon, OR explicit
+    operator confirmation after a daemon crash where the daemon cannot
+    observe it itself). `cleanupAttested` without `acknowledgeUncertain`
+    is rejected.
+
+  Recovery never resends the old create/prompt operation and never
+  reuses the old attempt's credential or delivery token: it revokes the
+  old credential, leaves the old run's `uncertain` disposition and audit
+  evidence exactly as it was, and arms a brand-new attempt with a new
+  credential through the same `recovery_dispatch` outbox as any other
+  recover. A late result from the old (fenced or replaced) worker can
+  never modify the new attempt. `conductor recover` exposes the matching
+  `--acknowledge-uncertain`, `--expected-version <n>`,
+  `--idempotency-key <key>` and `--cleanup-attested` flags.
 - On success, every recovered step's retry budget resets — a fresh
   finite episode per step, chained to its prior one for audit history —
   so a subsequent failure of a recovered step gets its own

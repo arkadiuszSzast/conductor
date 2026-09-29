@@ -67,7 +67,7 @@ export class ApiError extends Error {
  *  `packages/server/src/api.ts` (harden-interactive-answer-delivery task
  *  3.1). Additive: an older daemon simply omits the field. */
 export interface RunAnswerDelivery {
-  readonly status: "pending" | "claimed"
+  readonly status: "pending" | "claimed" | "submitted" | "unknown"
   readonly acceptedAt: number
 }
 
@@ -78,7 +78,7 @@ export interface ActiveRun {
   readonly stepId: string
   readonly stepType: "agent" | "command"
   readonly attempt: number
-  readonly status: "running" | "succeeded" | "failed" | "reaped"
+  readonly status: "running" | "succeeded" | "failed" | "reaped" | "uncertain"
   readonly sessionId: string | null
   readonly outputs: Readonly<Record<string, string>>
   readonly reason: string | null
@@ -233,6 +233,8 @@ export class ApiClient {
       readonly target?: { readonly jobId: string; readonly stepId: string }
       readonly targets?: readonly { readonly jobId: string; readonly stepId: string }[]
       readonly all?: boolean
+      readonly acknowledgeUncertain?: boolean
+      readonly cleanupAttested?: boolean
     },
   ): Promise<CommandResult> {
     return this.request("POST", `/v1/features/${encodeURIComponent(featureId)}/recover`, {
@@ -242,6 +244,8 @@ export class ApiClient {
       ...(options?.target !== undefined ? { target: options.target } : {}),
       ...(options?.targets !== undefined ? { targets: options.targets } : {}),
       ...(options?.all === true ? { all: true } : {}),
+      ...(options?.acknowledgeUncertain === true ? { acknowledgeUncertain: true } : {}),
+      ...(options?.cleanupAttested === true ? { cleanupAttested: true } : {}),
     })
   }
 

@@ -16,6 +16,7 @@
 
 import { collectPaths, formatPath, parseExpression, typecheckExpression } from "./expression.ts"
 import type { ExprType } from "./expression.ts"
+import { parseIsoDurationMs } from "./scheduling.ts"
 import { extractExpressions } from "./template.ts"
 import type { AgentStep, BackoffDef, JobDef, RerunTarget, RetryPolicy, Route, StepDef, WorkflowDef } from "./types.ts"
 
@@ -155,7 +156,18 @@ function validateRetry(retry: RetryPolicy, where: string, errors: string[]): voi
   if (retry.maxAttempts < 1) {
     errors.push(`${where}: retry.maxAttempts must be ≥ 1`)
   }
-  if (retry.maxElapsed !== undefined && !/^P(?:\d+[YMWD])?(?:T(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?)?$/.test(retry.maxElapsed)) {
+  // `parseIsoDurationMs` (scheduling.ts) is the canonical grammar/validity
+  // check — the ONE parser the engine actually consults at runtime
+  // (`planFailureDisposition`/`resetRetryEpisodeForRecover`). Validating
+  // against a separately-hand-maintained regex here risked exactly the
+  // drift a reviewer flagged: a string this check accepted but the real
+  // parser rejected (or vice versa) would only surface as a silent
+  // fallback to the class default at runtime, never a validation error.
+  // `parseIsoDurationMs` returns `undefined` for both a malformed string
+  // AND a syntactically valid-but-componentless duration ("P", "PT") —
+  // both are rejected here for the same reason: neither expresses an
+  // actual bound.
+  if (retry.maxElapsed !== undefined && parseIsoDurationMs(retry.maxElapsed) === undefined) {
     errors.push(`${where}: retry.maxElapsed must be an ISO-8601 duration (e.g. "PT10M")`)
   }
   validateBackoff(retry.backoff, where, errors)

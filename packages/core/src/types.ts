@@ -114,6 +114,9 @@ export interface AgentStep extends StepBase {
   /** Silence budget for THIS step's runs, in milliseconds — overrides
    *  the engine-wide TTL. Absent means the engine default governs. */
   readonly ttlMs?: number
+  readonly idleSilenceNudgeMs?: number
+  readonly busySilenceNudgeMs?: number
+  readonly maxNudges?: number
   readonly reviewHead?: string
   readonly fixFrom?: string
   readonly qualityFrom?: string
@@ -155,8 +158,9 @@ export type RetryPolicy =
       readonly strategy: "backoff"
       /** Total attempts including the first. Must be ≥ 1. */
       readonly maxAttempts: number
-      /** ISO-8601 duration (e.g. "PT10M") capping total elapsed time.
-       *  Absent means only the attempt count bounds the retry. */
+      /** ISO-8601 duration (e.g. "PT10M") capping total elapsed time for this
+       *  step's retry episode. Absent falls back to the failure class's
+       *  default elapsed budget. */
       readonly maxElapsed?: string
       /** Backoff strategy — always required for a "backoff" policy. */
       readonly backoff: BackoffDef
@@ -297,6 +301,17 @@ export type PipelineEvent =
    *  attempt counter again — the failed attempt this exhausts was already
    *  recorded by the `step.failed` that scheduled it. */
   | { readonly kind: "step.budget_exhausted"; readonly jobId: string; readonly stepId: string; readonly reason: string }
+  /** A potentially-delivered runner effect (create/prompt/answer) whose
+   *  outcome cannot be established — acp-runner's durable uncertainty
+   *  fence (design.md D6). Engine-issued ONLY: a worker cannot request
+   *  this event as a way around gate policy. Marks the targeted step/job
+   *  failed (the existing recovery-frontier shape `recoveryCandidates`
+   *  already scans for) and escalates the feature directly — no retry
+   *  budget, no `onFail` route, no cascade to sibling/dependent jobs
+   *  (their state is untouched: "parallel job state preserved"). The
+   *  run itself records `uncertain` at the store layer, never `failed`;
+   *  this event only carries the pure workflow-routing half of that. */
+  | { readonly kind: "step.execution_unknown"; readonly jobId: string; readonly stepId: string; readonly reason: string }
   | { readonly kind: "human.paused" }
   | { readonly kind: "human.resumed" }
   | { readonly kind: "human.abandoned" }

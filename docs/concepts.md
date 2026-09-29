@@ -344,14 +344,16 @@ first one exhausted stops the retry, whichever it is:
   default's attempt count and backoff shape for a step. A step with no
   `retry:` declared gets exactly one attempt, same as always.
 - **Elapsed time** — measured from the first attempt's dispatch, **excluding
-  time spent paused** (see below). This is currently always the failure
-  class's own fixed default from the table above; there is no workflow
-  syntax yet to override it per step (the parsed `retry.maxElapsed` field
-  is validated but has no runtime effect — see the reference page). When
-  the next scheduled attempt would start after this deadline, it is never
-  dispatched — the step reaches its terminal route (`onFail`, or job
-  failure with no `onFail`) at the deadline, exactly as if attempts had run
-  out, without spending one attempt over budget.
+  time spent paused** (see below). `steps[*].retry.maxElapsed` (see the
+  [workflow reference](workflow-reference.md#stepsretry)), when declared,
+  overrides the failure class's own fixed default from the table above for
+  that step's retry episode; recovery after an operator retry keeps the same
+  deadline rather than resetting to the class default. A step with no
+  `maxElapsed` declared uses the class default. When the next scheduled
+  attempt would start after this deadline, it is never dispatched — the step
+  reaches its terminal route (`onFail`, or job failure with no `onFail`) at
+  the deadline, exactly as if attempts had run out, without spending one
+  attempt over budget.
 
 A retry that has a non-zero backoff delay is a **durable scheduled
 episode**, not an in-memory timer: it survives a daemon restart, and
@@ -381,6 +383,40 @@ answer is authoritative. After registration removal, unknown-owner reads
 remain conservative until daemon restart; TTL still bounds orphaned runs.
 The owner cache is bounded and in-memory, so cache loss sacrifices precision
 rather than risking incorrect reaping.
+
+### Execution-uncertain runs (opt-in ACP integration only)
+
+A run dispatched through the opt-in ACP runner (see
+[Install § Connecting an ACP agent](install.md#connecting-an-acp-agent-opencode))
+can end up in a fifth outcome besides succeeded/failed/blocked/escalated:
+`uncertain`. This happens only when a create or prompt operation may have
+already taken effect but its outcome could not be proven — a lost
+response, a process/daemon crash, a restart, a turn/no-report deadline,
+or cancellation while a write might already be in flight. Conductor never
+treats these as evidence of either success or a normal `step.failed`:
+the run is durably fenced instead, its worker credential is revoked, and
+no retry, `onFail`, nudge or downstream dispatch is scheduled for it
+automatically. This is a native-runner-unaffected, ACP-only addition —
+existing failure classes, retry budgets and resource waits above are
+unchanged for native runs, and an ACP run that completes with an
+explicit `conductor_report` behaves exactly like a native completion.
+
+Recovering an `uncertain` run uses the same `recover` action as an
+exhausted retry/resource-wait escalation, but requires stronger operator
+attestation: acknowledgment that the effects are unproven (not confirmed
+absent), the usual optimistic-concurrency/idempotency fields, and — only
+after independently confirming the old process was actually terminated —
+confirmation that cleanup happened. See
+[Recovering an escalated feature](http-api.md#recovering-an-escalated-feature)
+for the exact fields and CLI flags. Plain `resume` never clears this kind
+of fence (HTTP returns `409 conflict` naming `acknowledgeUncertain`).
+
+An operator pause fences only unresolved in-flight ACP turns. An idle run
+waiting for a human answer retains its durable question and live session;
+an answer accepted during the pause is delivered on resume and reconciliation,
+not discarded or replayed as a new attempt. Startup is different: completed
+answer operations are settled before ownership-loss fencing, even when the
+workflow is unavailable; no old ACP session is assumed live after restart.
 
 ## Escalation, pausing, resuming
 

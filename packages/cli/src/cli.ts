@@ -137,7 +137,10 @@ commands:
   resume <feature-id>  resume a paused feature
   abandon <feature-id> abandon the feature
   recover <feature-id> --notes <text|@file> [--job <jobId> --step <stepId>]...
-                       [--all] [--expected-version <n>] [--idempotency-key <key>]
+                        [--all] [--expected-version <n>] [--idempotency-key <key>]
+                        [--acknowledge-uncertain] [--cleanup-attested]
+                        uncertain execution requires version/key/acknowledgment;
+                        attest cleanup only after verifying orphan termination
                        re-arm an escalated feature's currently recoverable
                        failed/blocked step(s): repeat --job/--step pairs
                        to select several (pairs match positionally), or
@@ -151,7 +154,7 @@ commands:
 exit codes: 0 ok, 1 failure, 2 usage, 3 unauthorized, 4 not found,
             5 conflict, 6 duplicate report, 7 daemon unreachable`
 
-const BOOLEAN_FLAGS = new Set(["json", "active", "force", "help", "no-register", "no-ui", "all"])
+const BOOLEAN_FLAGS = new Set(["json", "active", "force", "help", "no-register", "no-ui", "all", "acknowledge-uncertain", "cleanup-attested"])
 
 /** Flags that may repeat (collected in order); `stringFlag` still sees the
  *  last occurrence, so single-use callers behave unchanged. */
@@ -660,7 +663,7 @@ function printFeature(
       /** Additive (harden-interactive-answer-delivery task 3.1): set
        *  while a human answer was accepted but not yet confirmed
        *  delivered — see `withAnswerDelivery` in `packages/server/src/api.ts`. */
-      answerDelivery?: { status: "pending" | "claimed"; acceptedAt: number }
+      answerDelivery?: { status: "pending" | "claimed" | "submitted" | "unknown"; acceptedAt: number }
     } | null
   },
 ): void {
@@ -675,7 +678,12 @@ function printFeature(
   if (activeRun) deps.stdout(`run      ${activeRun.id} (${activeRun.stepId}, attempt ${activeRun.attempt})`)
   if (activeRun?.pendingQuestion != null && activeRun.pendingQuestion.trim() !== "") {
     if (activeRun.answerDelivery !== undefined) {
-      deps.stdout(`question ${activeRun.jobId}/${activeRun.stepId} (answer accepted, delivery in progress):`)
+      const disposition = activeRun.answerDelivery.status === "unknown"
+        ? "answer accepted; delivery unknown — do not resend"
+        : activeRun.answerDelivery.status === "submitted"
+          ? "answer submitted; awaiting turn confirmation"
+          : "answer accepted, delivery in progress"
+      deps.stdout(`question ${activeRun.jobId}/${activeRun.stepId} (${disposition}):`)
     } else {
       deps.stdout(`question ${activeRun.jobId}/${activeRun.stepId} (answer with: conductor answer ${activeRun.id} --notes <text>):`)
     }
@@ -838,7 +846,7 @@ async function commandAnswer(parsed: Parsed, deps: CliDeps, client: ApiClient, j
 }
 
 async function commandRecover(parsed: Parsed, deps: CliDeps, client: ApiClient, json: boolean): Promise<number> {
-  requireFlags(parsed, ["notes", "job", "step", "all", "expected-version", "idempotency-key"])
+  requireFlags(parsed, ["notes", "job", "step", "all", "expected-version", "idempotency-key", "acknowledge-uncertain", "cleanup-attested"])
   const featureId = requireId(parsed, "recover requires a feature id")
   const notes = resolveNotes(stringFlag(parsed, "notes"), deps)
   if (notes === undefined || notes.trim() === "") {
@@ -849,6 +857,12 @@ async function commandRecover(parsed: Parsed, deps: CliDeps, client: ApiClient, 
     throw new UsageError("--expected-version must be an integer (the feature's updatedAt from `conductor show`)")
   }
   const idempotencyKey = stringFlag(parsed, "idempotency-key")
+  const acknowledgeUncertain = parsed.flags.has("acknowledge-uncertain")
+  const cleanupAttested = parsed.flags.has("cleanup-attested")
+  if (cleanupAttested && !acknowledgeUncertain) throw new UsageError("--cleanup-attested requires --acknowledge-uncertain")
+  if (acknowledgeUncertain && (versionText === undefined || !idempotencyKey?.trim())) {
+    throw new UsageError("--acknowledge-uncertain requires --expected-version and --idempotency-key; attest cleanup only after independently verifying orphan termination")
+  }
   const all = parsed.flags.get("all") === true
   const jobIds = parsed.repeated.get("job") ?? []
   const stepIds = parsed.repeated.get("step") ?? []
@@ -868,6 +882,8 @@ async function commandRecover(parsed: Parsed, deps: CliDeps, client: ApiClient, 
       ...(target !== undefined ? { target } : {}),
       ...(targets !== undefined ? { targets } : {}),
       ...(all ? { all } : {}),
+      ...(acknowledgeUncertain ? { acknowledgeUncertain } : {}),
+      ...(cleanupAttested ? { cleanupAttested } : {}),
     })
     if (json) {
       deps.stdout(JSON.stringify(payload))

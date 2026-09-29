@@ -117,7 +117,7 @@ type FullOutputsState =
 
 function OutputsTab(props: {
   readonly step: { readonly outputs: Readonly<Record<string, string>>; readonly truncated?: boolean; readonly runId?: string } | undefined
-  readonly run: { readonly status: string; readonly reason: string | null } | null
+  readonly run: { readonly status: string; readonly reason: string | null; readonly uncertain?: { readonly reasonCode: string; readonly cleanupState: string } } | null
   readonly runId: string | null
 }): React.ReactNode {
   const { client } = useApp()
@@ -158,6 +158,14 @@ function OutputsTab(props: {
       {run !== null && (run.status === "failed" || run.status === "reaped") && run.reason !== null ? (
         <div className={styles.error}>
           <strong>{run.status}</strong> — {run.reason}
+        </div>
+      ) : null}
+      {run?.status === "uncertain" ? (
+        <div className={styles.error}>
+          <strong>Execution uncertain — not confirmed failed or succeeded.</strong>
+          <p>{run.reason ?? run.uncertain?.reasonCode}</p>
+          <p>Do not resend the previous operation. Recovery requires operator notes, current version, an idempotency key and explicit uncertainty acknowledgment.</p>
+          <p>Process cleanup: {run.uncertain?.cleanupState ?? "unconfirmed"}. Unconfirmed cleanup must be independently verified before attesting it.</p>
         </div>
       ) : null}
       {entries.length === 0 ? <div className={styles.empty}>no outputs reported for this step</div> : null}

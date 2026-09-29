@@ -205,6 +205,13 @@ describe("steps", () => {
     expect(messages(errors)).toContain("timeoutMs must be ≥ 1")
   })
 
+  it.each(["idleSilenceNudgeMs", "busySilenceNudgeMs", "maxNudges", "ttlMs"])("validates %s as a positive integer agent-only limit", key => {
+    expect(parsed(wrap(`      - id: s\n        agent: { role: r, prompt: p, ${key}: 123 }\n`)).jobs.main!.steps[0]).toMatchObject({ [key]: 123 })
+    for (const value of ["0", "-1", "1.5", ".inf", ".nan", "null", "true", '"123"', "[]", "{}"])
+      expect(messages(failed(wrap(`      - id: s\n        agent: { role: r, prompt: p, ${key}: ${value} }\n`)))).toContain(key)
+    expect(messages(failed(wrap(`      - id: s\n        command: { run: [ls], ${key}: 123 }\n`)))).toContain(`unknown field "${key}"`)
+  })
+
   it("accepts ttlMs on agent steps, absent means engine default", () => {
     const on = parsed(wrap("      - id: s\n        agent: { role: r, prompt: p, ttlMs: 10800000 }\n")).jobs.main!.steps[0]!
     expect(on).toMatchObject({ type: "agent", ttlMs: 10800000 })

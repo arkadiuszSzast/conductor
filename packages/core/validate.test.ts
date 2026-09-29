@@ -200,6 +200,50 @@ describe("validateWorkflow", () => {
     const r = validateWorkflow(withJobs({ main: job([commandStep("a", ["x"], { retry })]) }))
     expect(r.errors).toEqual([])
   })
+
+  it("accepts a mixed date+time ISO-8601 maxElapsed (P1DT2H) — validation shares parseIsoDurationMs's grammar, not a separately-maintained regex", () => {
+    const retry: RetryPolicy = {
+      strategy: "backoff",
+      maxAttempts: 2,
+      maxElapsed: "P1DT2H",
+      backoff: { strategy: "constant", delay: 10 },
+    }
+    const r = validateWorkflow(withJobs({ main: job([commandStep("a", ["x"], { retry })]) }))
+    expect(r.errors).toEqual([])
+  })
+
+  it.each(["P", "PT", ""])("rejects a componentless ISO-8601 duration %j — syntactically well-formed but expresses no bound", maxElapsed => {
+    const retry: RetryPolicy = {
+      strategy: "backoff",
+      maxAttempts: 2,
+      maxElapsed,
+      backoff: { strategy: "constant", delay: 10 },
+    }
+    const r = validateWorkflow(withJobs({ main: job([commandStep("a", ["x"], { retry })]) }))
+    expect(r.errors.join("\n")).toContain("ISO-8601")
+  })
+
+  it("accepts a zero-duration PT0S maxElapsed — a valid, parseable duration of zero ms", () => {
+    const retry: RetryPolicy = {
+      strategy: "backoff",
+      maxAttempts: 2,
+      maxElapsed: "PT0S",
+      backoff: { strategy: "constant", delay: 10 },
+    }
+    const r = validateWorkflow(withJobs({ main: job([commandStep("a", ["x"], { retry })]) }))
+    expect(r.errors).toEqual([])
+  })
+
+  it("rejects a syntactically matching but non-finite maxElapsed", () => {
+    const retry: RetryPolicy = {
+      strategy: "backoff",
+      maxAttempts: 2,
+      maxElapsed: `P${"9".repeat(400)}Y`,
+      backoff: { strategy: "constant", delay: 10 },
+    }
+    const r = validateWorkflow(withJobs({ main: job([commandStep("a", ["x"], { retry })]) }))
+    expect(r.errors.join("\n")).toContain("ISO-8601")
+  })
 })
 
 describe("feature context in expressions", () => {

@@ -3,7 +3,7 @@ import type { AcceptedReview } from "./review.ts"
 import type { Database } from "./database.ts"
 import { applyPatch, initialFeatureState } from "./state.ts"
 import type { CreateFeatureInput } from "./state.ts"
-import { DEFAULT_RETRY_BUDGET, accumulatePausedMs, boundDiagnostic } from "@conductor/core"
+import { DEFAULT_RETRY_BUDGET, accumulatePausedMs, boundDiagnostic, interpret } from "@conductor/core"
 import type {
   Decision,
   FailureClass,
@@ -16,6 +16,18 @@ import type {
   ResourceReason,
   Transition,
 } from "@conductor/core"
+import type {
+  FenceRequest,
+  RunCredentialRecord,
+  RunnerBindingRecord,
+  RunnerCleanupState,
+  RunnerFenceRecord,
+  RunnerOperationKind,
+  RunnerOperationPhase,
+  RunnerOperationRecord,
+  RunnerSafetyStore,
+  RunnerTransport,
+} from "./runner-execution.ts"
 
 /**
  * Post-commit change notification — the invalidation signal the API's
@@ -106,6 +118,11 @@ function featureWhere(filter?: FeatureFilter): { where: string; params: (string 
   return { where: clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "", params }
 }
 
+/** D5: `uncertain` is terminal for automatic execution (never an
+ *  assertion of failure or success) — a run the safety layer fenced
+ *  because a create/prompt/answer effect could not be established. */
+export type RunStatus = "running" | "succeeded" | "failed" | "reaped" | "uncertain"
+
 interface RunRow {
   id: string
   feature_id: string
@@ -113,7 +130,7 @@ interface RunRow {
   step_id: string
   step_type: "agent" | "command" | "action"
   attempt: number
-  status: "running" | "succeeded" | "failed" | "reaped"
+  status: RunStatus
   session_id: string | null
   outputs: string
   reason: string | null
@@ -152,7 +169,7 @@ export interface RunSummary {
   readonly stepId: string
   readonly stepType: "agent" | "command" | "action"
   readonly attempt: number
-  readonly status: "running" | "succeeded" | "failed" | "reaped"
+  readonly status: RunStatus
   readonly sessionId: string | null
   readonly outputs: Readonly<Record<string, string>>
   readonly reason: string | null
@@ -465,7 +482,10 @@ function toResourceWaitRecord(row: ResourceWaitRow): ResourceWaitRecord {
 
 // --------------------------------------------------------------- answer deliveries
 
-export type AnswerDeliveryStatus = "pending" | "claimed" | "delivered" | "failed" | "cancelled"
+/** D5 adds `submitted` (open but non-reclaimable — a lease cannot resend
+ *  it) and `unknown` (terminal for automatic handling; fences the run,
+ *  retains notes/question for audit) to the five existing dispositions. */
+export type AnswerDeliveryStatus = "pending" | "claimed" | "delivered" | "failed" | "cancelled" | "submitted" | "unknown"
 
 interface AnswerDeliveryRow {
   id: string
@@ -626,7 +646,125 @@ export type ConfirmAnswerDeliveredResult =
   | { readonly kind: "stale_superseded" }
   | { readonly kind: "not_claimed" }
 
-export class Store {
+// --------------------------------------------------------------- runner safety
+
+interface RunnerBindingRow {
+  run_id: string
+  transport: RunnerTransport
+  profile_id: string | null
+  config_digest: string | null
+  directory: string
+  daemon_generation: number
+  session_ref: string | null
+  remote_session_id: string | null
+  process_generation: number
+  phase: "active" | "fenced" | "concluded"
+  time_created: number
+  time_updated: number
+}
+
+function toRunnerBindingRecord(row: RunnerBindingRow): RunnerBindingRecord {
+  return {
+    runId: row.run_id,
+    transport: row.transport,
+    profileId: row.profile_id,
+    configDigest: row.config_digest,
+    directory: row.directory,
+    daemonGeneration: row.daemon_generation,
+    sessionRef: row.session_ref,
+    remoteSessionId: row.remote_session_id,
+    processGeneration: row.process_generation,
+    phase: row.phase,
+    createdAt: row.time_created,
+    updatedAt: row.time_updated,
+  }
+}
+
+interface RunnerOperationRow {
+  id: string
+  run_id: string
+  kind: RunnerOperationKind
+  logical_key: string
+  payload_digest: string
+  phase: RunnerOperationPhase
+  owner_generation: number
+  version: number
+  stop_reason: string | null
+  diagnostic_code: string | null
+  time_created: number
+  time_updated: number
+}
+
+function toRunnerOperationRecord(row: RunnerOperationRow): RunnerOperationRecord {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    kind: row.kind,
+    logicalKey: row.logical_key,
+    payloadDigest: row.payload_digest,
+    phase: row.phase,
+    ownerGeneration: row.owner_generation,
+    version: row.version,
+    stopReason: row.stop_reason,
+    diagnosticCode: row.diagnostic_code,
+    createdAt: row.time_created,
+    updatedAt: row.time_updated,
+  }
+}
+
+interface RunnerFenceRow {
+  run_id: string
+  reason_code: RunnerFenceRecord["reasonCode"]
+  operation_id: string | null
+  cleanup_state: RunnerCleanupState
+  created_at: number
+  resolved_at: number | null
+  resolution_note: string | null
+}
+
+function toRunnerFenceRecord(row: RunnerFenceRow): RunnerFenceRecord {
+  return {
+    runId: row.run_id,
+    reasonCode: row.reason_code,
+    operationId: row.operation_id,
+    cleanupState: row.cleanup_state,
+    createdAt: row.created_at,
+    resolvedAt: row.resolved_at,
+    resolutionNote: row.resolution_note,
+  }
+}
+
+interface RunCredentialRow {
+  id: string
+  run_id: string
+  attempt: number
+  process_generation: number
+  token_hash: string
+  issued_at: number
+  expires_at: number | null
+  revoked_at: number | null
+  revocation_reason: string | null
+}
+
+function toRunCredentialRecord(row: RunCredentialRow): RunCredentialRecord {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    attempt: row.attempt,
+    processGeneration: row.process_generation,
+    tokenHash: row.token_hash,
+    issuedAt: row.issued_at,
+    expiresAt: row.expires_at,
+    revokedAt: row.revoked_at,
+    revocationReason: row.revocation_reason,
+  }
+}
+
+export class WorkerInvocationConflict extends Error {
+  constructor() { super("Ask invocation_id already used with a different payload") }
+}
+
+export class Store implements RunnerSafetyStore {
   private readonly changeListeners = new Set<(change: StoreChange) => void>()
   /** run id → last run_log emission time; throttles run_log notifications at the source. */
   private readonly runLogEmits = new Map<string, number>()
@@ -661,7 +799,7 @@ export class Store {
   }
 
   createFeature(input: CreateFeatureInput): FeatureState {
-    const now = Date.now()
+    const now = this.clock.now()
     const state = initialFeatureState({ ...input, id: randomUUID() })
     this.db.run(
       `INSERT INTO feature (id, slug, project_dir, title, workflow, description, status, pr, escalation, state, feedback, time_created, time_updated)
@@ -745,7 +883,7 @@ export class Store {
    * a stranded feature.
    */
   markEscalated(featureId: string, reason: string): boolean {
-    const now = Date.now()
+    const now = this.clock.now()
     const changed = this.db.transaction(() => {
       const row = this.db.query("SELECT status, state FROM feature WHERE id = ?").get(featureId) as { status: string; state: string } | null
       if (!row || row.status === "escalated" || row.status === "done" || row.status === "abandoned") return false
@@ -766,7 +904,7 @@ export class Store {
   }
 
   setFeatureStatus(featureId: string, status: FeatureStatus): boolean {
-    const now = Date.now()
+    const now = this.clock.now()
     const changed = this.db.transaction(() => {
       const row = this.db.query("SELECT status, state FROM feature WHERE id = ?").get(featureId) as { status: string; state: string } | null
       if (!row || row.status === status) return false
@@ -807,17 +945,28 @@ export class Store {
   recoverStepTargets(
     featureId: string,
     targets: readonly { jobId: string; stepId: string }[],
-    options: { readonly expectedVersion?: number; readonly idempotencyKey?: string; readonly notes?: string | null } = {},
-  ): "recovered" | "duplicate" | "stale_version" | "not_escalated" | "not_found" {
-    const now = Date.now()
+    options: { readonly expectedVersion?: number; readonly idempotencyKey?: string; readonly notes?: string | null; readonly acknowledgeUncertain?: boolean; readonly cleanupAttested?: boolean } = {},
+  ): "recovered" | "duplicate" | "stale_version" | "not_escalated" | "not_found" | "uncertainty_prerequisites" {
+    const now = this.clock.now()
     let featureIdForEmit: string | null = null
-    const result = this.db.transaction((): "recovered" | "duplicate" | "stale_version" | "not_escalated" | "not_found" => {
+    const result = this.db.transaction((): "recovered" | "duplicate" | "stale_version" | "not_escalated" | "not_found" | "uncertainty_prerequisites" => {
       const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(featureId) as FeatureRow | null
       if (!row || targets.length === 0) return "not_found"
       if (options.idempotencyKey !== undefined && this.hasRecoverKey(featureId, options.idempotencyKey)) return "duplicate"
       if (row.status !== "escalated") return "not_escalated"
       if (options.expectedVersion !== undefined && options.expectedVersion !== row.time_updated) return "stale_version"
 
+      const fences = targets.flatMap(target => this.listRuns(featureId)
+        .filter(run => run.jobId === target.jobId && run.stepId === target.stepId)
+        .map(run => this.getFence(run.id)).filter((fence): fence is RunnerFenceRecord => fence !== null && fence.resolvedAt === null))
+      if (fences.length > 0 && (options.acknowledgeUncertain !== true || options.expectedVersion === undefined
+        || !options.idempotencyKey?.trim() || !options.notes?.trim()
+        || fences.some(fence => fence.cleanupState === "unconfirmed" && options.cleanupAttested !== true))) return "uncertainty_prerequisites"
+      for (const fence of fences) {
+        if (fence.cleanupState === "unconfirmed") this.recordRunnerCleanup(fence.runId, "operator_attested")
+        this.resolveFence(fence.runId, options.notes!)
+        this.revokeCredentialsForRun(fence.runId, "recovered")
+      }
       const state = toFeatureState(row)
       const jobs: Record<string, JobRuntime> = { ...state.jobs }
       const appliedTargets: { jobId: string; stepId: string }[] = []
@@ -913,7 +1062,7 @@ export class Store {
   markRecoveryDispatchHandled(id: string): boolean {
     return this.db.run(
       "UPDATE recovery_dispatch SET status = 'handled', time_updated = ? WHERE id = ? AND status = 'unhandled'",
-      [Date.now(), id],
+      [this.clock.now(), id],
     ).changes > 0
   }
 
@@ -949,7 +1098,7 @@ export class Store {
         this.db.run("UPDATE recovery_dispatch SET episode_closed = 1 WHERE id = ?", [episode.id])
       }
     }
-    const now = Date.now()
+    const now = this.clock.now()
     const escalation = transition.patch.status === "escalated"
       ? escalationReason(transition.decisions)
       : (transition.patch.status !== undefined ? null : undefined)
@@ -989,6 +1138,10 @@ export class Store {
       } else if (current.status === "paused" && row.paused_at !== null) {
         sets.push("paused_at = NULL", "paused_ms = ?")
         params.push(accumulatePausedMs(row.paused_ms, row.paused_at, now))
+        this.db.run(
+          "UPDATE run SET time_last_activity = MAX(COALESCE(time_last_activity, time_started), time_started) + MAX(0, ? - MAX(COALESCE(time_last_activity, time_started), time_started, ?)) WHERE feature_id = ? AND status = 'running'",
+          [now, row.paused_at, featureId],
+        )
       }
     }
     params.push(featureId)
@@ -1044,7 +1197,7 @@ export class Store {
       ...("pr" in fields ? { pr: fields.pr ?? null } : {}),
     }
     const sets: string[] = ["time_updated = ?", "state = ?"]
-    const params: (string | number | null)[] = [Date.now(), JSON.stringify(next)]
+    const params: (string | number | null)[] = [this.clock.now(), JSON.stringify(next)]
     if ("pr" in fields) {
       sets.push("pr = ?")
       params.push(next.pr)
@@ -1072,7 +1225,7 @@ export class Store {
         },
       },
     }
-    this.db.run("UPDATE feature SET time_updated = ?, state = ? WHERE id = ?", [Date.now(), JSON.stringify(next), featureId])
+    this.db.run("UPDATE feature SET time_updated = ?, state = ? WHERE id = ?", [this.clock.now(), JSON.stringify(next), featureId])
     this.emit({ kind: "feature", featureId })
   }
 
@@ -1085,16 +1238,34 @@ export class Store {
    * Returns false when the run already concluded — the caller must not
    * park it.
    */
-  setRunQuestion(runId: string, question: string): boolean {
+  setRunQuestion(runId: string, question: string): boolean
+  setRunQuestion(runId: string, question: string, worker: { authorize: () => void; invocationId: string; payloadDigest: string; disposition: string } | undefined): boolean | string
+  setRunQuestion(runId: string, question: string, worker?: { authorize: () => void; invocationId: string; payloadDigest: string; disposition: string }): boolean | string {
     let featureId: string | null = null
     const ok = this.db.transaction(() => {
+      worker?.authorize()
+      if (worker) {
+        const existing = this.db.query("SELECT payload_digest, disposition FROM worker_request_dedup WHERE run_id = ? AND invocation_id = ?").get(runId, worker.invocationId) as { payload_digest: string | null; disposition: string | null } | null
+        if (existing) {
+          if (existing.payload_digest !== worker.payloadDigest || existing.disposition === null) throw new WorkerInvocationConflict()
+          return existing.disposition
+        }
+      }
       const run = this.db.query("SELECT * FROM run WHERE id = ?").get(runId) as RunRow | undefined
       if (!run || run.status !== "running") return false
       featureId = run.feature_id
-      const now = Date.now()
+      const now = this.clock.now()
+      const last = worker ? this.db.query("SELECT MAX(question_generation) AS generation FROM worker_request_dedup WHERE run_id = ?").get(runId) as { generation: number | null } : { generation: null }
+      const generation = run.pending_question === question && run.asked_at !== null
+        ? run.asked_at : Math.max(now, (run.asked_at ?? 0) + 1, (last.generation ?? 0) + 1)
+      if (worker) this.db.run(
+        "INSERT INTO worker_request_dedup (run_id, invocation_id, question_generation, time_created, payload_digest, disposition) VALUES (?, ?, ?, ?, ?, ?)",
+        [runId, worker.invocationId, generation, now, worker.payloadDigest, worker.disposition],
+      )
+      if (worker && run.pending_question === question) { featureId = null; return worker.disposition }
       this.db.run(
         "UPDATE run SET pending_question = ?, asked_at = ?, time_last_activity = ? WHERE id = ?",
-        [question, now, now, runId],
+        [question, generation, now, runId],
       )
       const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(run.feature_id) as FeatureRow | null
       if (!row) return false
@@ -1121,7 +1292,7 @@ export class Store {
       const run = this.db.query("SELECT * FROM run WHERE id = ?").get(runId) as RunRow | undefined
       if (!run || run.status !== "running" || run.pending_question === null) return false
       featureId = run.feature_id
-      const now = Date.now()
+      const now = this.clock.now()
       this.db.run("UPDATE run SET pending_question = NULL, asked_at = NULL, time_last_activity = ? WHERE id = ?", [now, runId])
       const row = this.db.query("SELECT * FROM feature WHERE id = ?").get(run.feature_id) as FeatureRow | null
       if (!row) return false
@@ -1154,14 +1325,14 @@ export class Store {
    * outstanding question) until confirmed delivery clears it.
    */
   acceptAnswer(runId: string, notes: string): AcceptAnswerResult {
-    const now = Date.now()
+    const now = this.clock.now()
     let featureId: string | null = null
     const result = this.db.transaction((): AcceptAnswerResult => {
       const run = this.db.query("SELECT * FROM run WHERE id = ?").get(runId) as RunRow | undefined
       if (!run || run.status !== "running") return { kind: "run_not_active" }
       if (run.pending_question === null) return { kind: "not_asking" }
       const existing = this.db.query(
-        "SELECT 1 FROM answer_delivery WHERE run_id = ? AND status IN ('pending','claimed') LIMIT 1",
+        "SELECT 1 FROM answer_delivery WHERE run_id = ? AND status IN ('pending','claimed','submitted','unknown') LIMIT 1",
       ).get(runId)
       if (existing) return { kind: "already_accepted" }
       const id = randomUUID()
@@ -1201,10 +1372,13 @@ export class Store {
     return row ? toAnswerDeliveryRecord(row) : null
   }
 
-  /** The current non-terminal (pending/claimed) delivery for a run, if any. */
+  /** The current non-terminal (pending/claimed/submitted) delivery for a
+   *  run, if any. `submitted` (D5, ACP-only) is included: it is open
+   *  but non-reclaimable — an answering surface must still be able to
+   *  see it as "in flight", exactly like pending/claimed. */
   getOpenAnswerDelivery(runId: string): AnswerDeliveryRecord | null {
     const row = this.db.query(
-      "SELECT * FROM answer_delivery WHERE run_id = ? AND status IN ('pending','claimed')",
+      "SELECT * FROM answer_delivery WHERE run_id = ? AND status IN ('pending','claimed','submitted')",
     ).get(runId) as AnswerDeliveryRow | null
     return row ? toAnswerDeliveryRecord(row) : null
   }
@@ -1256,9 +1430,14 @@ export class Store {
              (answer_delivery.status = 'pending' AND (answer_delivery.next_attempt_at IS NULL OR answer_delivery.next_attempt_at <= ?))
              OR (answer_delivery.status = 'claimed' AND answer_delivery.lease_expires_at <= ?)
            )
-           AND feature.status != 'paused'
-       )
-       RETURNING *`,
+            AND feature.status IN ('running','waiting_human')
+            AND EXISTS (SELECT 1 FROM run r WHERE r.id = answer_delivery.run_id AND r.status = 'running')
+            AND NOT EXISTS (SELECT 1 FROM runner_fence f WHERE f.run_id = answer_delivery.run_id)
+            AND NOT EXISTS (SELECT 1 FROM runner_operation o WHERE o.run_id = answer_delivery.run_id
+              AND o.kind = 'answer' AND o.logical_key = answer_delivery.delivery_token
+              AND o.phase != 'not_sent')
+        )
+        RETURNING *`,
     ).get(nowMs, nowMs + leaseMs, nowMs, deliveryId, nowMs, nowMs) as AnswerDeliveryRow | null
     return row ? toAnswerDeliveryRecord(row) : null
   }
@@ -1282,7 +1461,7 @@ export class Store {
        SET status = 'pending', claimed_at = NULL, lease_expires_at = NULL,
            attempt_count = attempt_count + 1, next_attempt_at = ?, version = version + 1, time_updated = ?
        WHERE id = ? AND status = 'claimed'`,
-      [nextAttemptAtMs, Date.now(), deliveryId],
+      [nextAttemptAtMs, this.clock.now(), deliveryId],
     ).changes > 0
   }
 
@@ -1293,7 +1472,7 @@ export class Store {
   releaseAnswerDelivery(deliveryId: string): boolean {
     return this.db.run(
       "UPDATE answer_delivery SET status = 'pending', claimed_at = NULL, lease_expires_at = NULL, version = version + 1, time_updated = ? WHERE id = ? AND status = 'claimed'",
-      [Date.now(), deliveryId],
+      [this.clock.now(), deliveryId],
     ).changes > 0
   }
 
@@ -1323,11 +1502,13 @@ export class Store {
   confirmAnswerDelivered(deliveryId: string): ConfirmAnswerDeliveredResult {
     let featureId: string | null = null
     const result = this.db.transaction((): ConfirmAnswerDeliveredResult => {
-      const delivery = this.db.query("SELECT * FROM answer_delivery WHERE id = ? AND status = 'claimed'").get(deliveryId) as AnswerDeliveryRow | undefined
+      const delivery = this.db.query("SELECT * FROM answer_delivery WHERE id = ? AND status IN ('claimed','submitted')").get(deliveryId) as AnswerDeliveryRow | undefined
       if (!delivery) return { kind: "not_claimed" }
+      if (this.getRunnerBinding(delivery.run_id)?.transport === "acp"
+        && this.findOperation(delivery.run_id, "answer", delivery.delivery_token)?.phase !== "completed") return { kind: "not_claimed" }
       const run = this.db.query("SELECT * FROM run WHERE id = ? AND status = 'running'").get(delivery.run_id) as RunRow | undefined
       if (!run) return { kind: "not_claimed" }
-      const now = Date.now()
+      const now = this.clock.now()
       if (run.pending_question === null || run.asked_at !== delivery.question_generation) {
         this.db.run(
           "UPDATE answer_delivery SET status = 'cancelled', failure_detail = ?, version = version + 1, time_updated = ? WHERE id = ?",
@@ -1367,7 +1548,7 @@ export class Store {
   failAnswerDelivery(deliveryId: string, detail: string): boolean {
     return this.db.run(
       "UPDATE answer_delivery SET status = 'failed', failure_detail = ?, version = version + 1, time_updated = ? WHERE id = ? AND status IN ('pending','claimed')",
-      [boundDiagnostic(detail), Date.now(), deliveryId],
+      [boundDiagnostic(detail), this.clock.now(), deliveryId],
     ).changes > 0
   }
 
@@ -1381,7 +1562,7 @@ export class Store {
   cancelAnswerDelivery(deliveryId: string, reason: string): boolean {
     return this.db.run(
       "UPDATE answer_delivery SET status = 'cancelled', failure_detail = ?, version = version + 1, time_updated = ? WHERE id = ? AND status IN ('pending','claimed')",
-      [boundDiagnostic(reason), Date.now(), deliveryId],
+      [boundDiagnostic(reason), this.clock.now(), deliveryId],
     ).changes > 0
   }
 
@@ -1392,6 +1573,35 @@ export class Store {
     return rows.map(toAnswerDeliveryRecord)
   }
 
+  /**
+   * ACP D5/D7: the local write submitted successfully but is NOT yet
+   * confirmed delivered — open (non-reclaimable: a lease expiry must
+   * never resend it) until the matching turn response is observed.
+   * Guarded to `claimed` so only the current claimant can move it here.
+   */
+  markAnswerDeliverySubmitted(deliveryId: string): boolean {
+    return this.db.run(
+      "UPDATE answer_delivery SET status = 'submitted', claimed_at = NULL, lease_expires_at = NULL, version = version + 1, time_updated = ? WHERE id = ? AND status = 'claimed'",
+      [this.clock.now(), deliveryId],
+    ).changes > 0
+  }
+
+  /**
+   * ACP D5/D6: the delivery's outcome cannot be established (lost turn
+   * response, restart). Terminal for automatic handling — retains
+   * notes/question for audit, never replayed, never fails the step by
+   * itself (the caller separately fences the run via
+   * `fenceRunnerExecution`, which ALSO marks any open delivery unknown —
+   * this standalone method exists for a delivery-only path that has not
+   * yet gone through a full run fence, e.g. a restart recovery scan).
+   */
+  markAnswerDeliveryUnknown(deliveryId: string, detail: string): boolean {
+    return this.db.run(
+      "UPDATE answer_delivery SET status = 'unknown', failure_detail = ?, version = version + 1, time_updated = ? WHERE id = ? AND status IN ('pending','claimed','submitted')",
+      [boundDiagnostic(detail), this.clock.now(), deliveryId],
+    ).changes > 0
+  }
+
   insertRun(input: {
     featureId: string
     jobId: string
@@ -1400,6 +1610,7 @@ export class Store {
     attempt: number
     sessionId?: string
     metadata?: RunActionMetadata
+    binding?: Omit<Parameters<Store["bindRunnerTransport"]>[0], "runId">
   }): string {
     const id = randomUUID()
     this.db.transaction(() => {
@@ -1430,6 +1641,7 @@ export class Store {
           recoverNotes,
         ],
       )
+      if (input.binding) this.bindRunnerTransport({ ...input.binding, runId: id })
       this.db.run(
         "UPDATE recovery_dispatch SET notes_consumed = 1 WHERE feature_id = ? AND job_id = ? AND step_id = ? AND episode_closed = 0",
         [input.featureId, input.jobId, input.stepId],
@@ -1453,7 +1665,7 @@ export class Store {
         detail?.failure?.class ?? null,
         detail?.failure?.source ?? null,
         detail?.failure?.retryHintMs ?? null,
-        Date.now(),
+        this.clock.now(),
         runId,
       ],
     )
@@ -1531,6 +1743,8 @@ export class Store {
     event: PipelineEvent,
     transition: Transition,
     options?: {
+      /** Synchronous scoped authorization, inside the conclusion transaction. */
+      readonly authorize?: () => void
       readonly review?: AcceptedReview
       readonly persistDecisions?: readonly Decision[]
       readonly retrySchedule?: {
@@ -1553,6 +1767,7 @@ export class Store {
     let featureId: string | null = null
     let episode: RetryEpisodeRecord | null = null
     const claimed = this.db.transaction(() => {
+      options?.authorize?.()
       const result = this.db.run(
         `UPDATE run SET status = ?, outputs = ?, reason = ?, failure_class = ?, failure_source = ?, failure_retry_hint_ms = ?,
                         completion_event = ?, completion_decisions = ?, action_handled = 0, time_finished = ?
@@ -1566,11 +1781,14 @@ export class Store {
           detail?.failure?.retryHintMs ?? null,
           JSON.stringify(event),
           JSON.stringify(options?.persistDecisions ?? transition.decisions),
-          Date.now(),
+          this.clock.now(),
           runId,
         ],
       )
       if (result.changes === 0) return false
+      this.revokeCredentialsForRun(runId, "run_concluded")
+      this.db.run("UPDATE runner_binding SET phase = 'concluded', time_updated = ? WHERE run_id = ?", [this.clock.now(), runId])
+      this.db.run("UPDATE answer_delivery SET status = 'cancelled', time_updated = ? WHERE run_id = ? AND status IN ('pending','claimed','submitted')", [this.clock.now(), runId])
       const run = this.db.query("SELECT feature_id FROM run WHERE id = ?").get(runId) as { feature_id: string } | null
       if (!run) return false
       if (options?.review) {
@@ -1586,7 +1804,7 @@ export class Store {
                reviewed_head=excluded.reviewed_head, synced=0, time_updated=excluded.time_updated`,
             [`${run.feature_id}:${finding.id}`, run.feature_id, Number(finding.id.slice(1)), review.stepId,
               finding.path, finding.line, finding.severity, finding.body, finding.status, finding.resolution ?? null,
-              finding.blocking ? 1 : 0, JSON.stringify(finding.acceptanceTests), review.jobId, runId, review.head, Date.now(), Date.now()],
+              finding.blocking ? 1 : 0, JSON.stringify(finding.acceptanceTests), review.jobId, runId, review.head, this.clock.now(), this.clock.now()],
           )
         }
       }
@@ -1728,7 +1946,7 @@ export class Store {
     failure: FailureEnvelope
   }): RetryEpisodeRecord | null {
     const id = randomUUID()
-    const now = Date.now()
+    const now = this.clock.now()
     // The partial unique index on (feature_id, job_id, step_id) WHERE
     // status IN ('scheduled','claimed') enforces "one active attempt per
     // target" (design.md risk: "database uniqueness invariant for one
@@ -1813,7 +2031,7 @@ export class Store {
     return this.db.run(
       `UPDATE retry_episode SET status = 'closed', closed_reason = ?, time_updated = ?
        WHERE id = ? AND status IN ('scheduled','claimed')`,
-      [reason, Date.now(), episodeId],
+      [reason, this.clock.now(), episodeId],
     ).changes > 0
   }
 
@@ -1835,7 +2053,7 @@ export class Store {
     return this.db.transaction(() => {
       const prior = this.db.query("SELECT * FROM retry_episode WHERE id = ? AND version = ?").get(episodeId, expectedVersion) as RetryEpisodeRow | null
       if (!prior) return null
-      const now = Date.now()
+      const now = this.clock.now()
       if (prior.status !== "closed") {
         this.db.run(
           "UPDATE retry_episode SET status = 'closed', closed_reason = 'recovered', version = version + 1, time_updated = ? WHERE id = ?",
@@ -1902,7 +2120,7 @@ export class Store {
     diagnostic?: string
   }): ResourceWaitRecord {
     const id = randomUUID()
-    const now = Date.now()
+    const now = this.clock.now()
     const row = this.db.query(
       `INSERT INTO resource_wait (
          id, feature_id, job_id, step_id, status, reason,
@@ -1991,7 +2209,7 @@ export class Store {
     return this.db.run(
       `UPDATE resource_wait SET status = 'closed', closed_reason = ?, time_updated = ?
        WHERE id = ? AND status IN ('waiting','claimed')`,
-      [reason, Date.now(), waitId],
+      [reason, this.clock.now(), waitId],
     ).changes > 0
   }
 
@@ -2165,7 +2383,7 @@ export class Store {
     tags: readonly string[]
     body: string
   }>): string[] {
-    const now = Date.now()
+    const now = this.clock.now()
     const row = this.db.query("SELECT COALESCE(MAX(seq), 0) AS maxSeq FROM finding WHERE feature_id = ?").get(featureId) as { maxSeq: number }
     const ids: string[] = []
     this.db.transaction(() => {
@@ -2188,7 +2406,7 @@ export class Store {
     const result = this.db.run(
       `UPDATE finding SET status = ?, resolution = COALESCE(?, resolution), synced = 0, time_updated = ?
        WHERE id = ?`,
-      [status, resolution ?? null, Date.now(), `${featureId}:${shortId}`],
+      [status, resolution ?? null, this.clock.now(), `${featureId}:${shortId}`],
     )
     if (result.changes > 0) this.emit({ kind: "finding", featureId })
     return result.changes > 0
@@ -2206,6 +2424,377 @@ export class Store {
       decisions: JSON.parse(row.decisions) as Decision[],
       time: row.time_created,
     }))
+  }
+
+  // ------------------------------------------------------- runner safety (D5)
+
+  /**
+   * Persist the transport binding — the caller (`Engine.executeAgent`,
+   * task 2.4) MUST call this in the SAME transaction as `insertRun`
+   * (design.md D5: "Persist ACP binding at run insertion, BEFORE
+   * process/session awaits"). Idempotent: a duplicate call for a run
+   * that already has a binding returns the EXISTING row unchanged — the
+   * first bind wins, exactly like "existing native attempts record
+   * native transport so config changes cannot reroute them" (transport
+   * selection is immutable per run, never re-bound).
+   */
+  bindRunnerTransport(input: {
+    readonly runId: string
+    readonly transport: RunnerTransport
+    readonly profileId?: string
+    readonly configDigest?: string
+    readonly directory: string
+    readonly daemonGeneration: number
+  }): RunnerBindingRecord {
+    const now = this.clock.now()
+    const row = this.db.query(
+      `INSERT INTO runner_binding (run_id, transport, profile_id, config_digest, directory, daemon_generation, time_created, time_updated)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(run_id) DO UPDATE SET run_id = run_id
+       RETURNING *`,
+    ).get(
+      input.runId, input.transport, input.profileId ?? null, input.configDigest ?? null,
+      input.directory, input.daemonGeneration, now, now,
+    ) as RunnerBindingRow
+    return toRunnerBindingRecord(row)
+  }
+
+  getRunnerBinding(runId: string): RunnerBindingRecord | null {
+    const row = this.db.query("SELECT * FROM runner_binding WHERE run_id = ?").get(runId) as RunnerBindingRow | null
+    return row ? toRunnerBindingRecord(row) : null
+  }
+
+  /** Attach the adapter's opaque session/process identity once `session/new`
+   *  actually completes. False when the run has no binding at all (a
+   *  programming error upstream — `bindRunnerTransport` must always run
+   *  first) or the binding is no longer `active` (already fenced/concluded —
+   *  a late completion must not resurrect a fenced binding's session ref). */
+  setBindingSessionRef(runId: string, sessionRef: string, remoteSessionId?: string): boolean {
+    return this.db.run(
+      `UPDATE runner_binding SET session_ref = ?, remote_session_id = COALESCE(?, remote_session_id), time_updated = ?
+       WHERE run_id = ? AND phase = 'active'`,
+      [sessionRef, remoteSessionId ?? null, this.clock.now(), runId],
+    ).changes > 0
+  }
+
+  /**
+   * Claim a fresh operation row, or return an existing one for the SAME
+   * `(runId, kind, logicalKey)` whose payload digest matches (D5:
+   * "Duplicate logical keys with matching digest return existing state;
+   * differing payloads conflict"). A same-process concurrent duplicate
+   * call and a genuine restart-retry both land here and both get the
+   * SAME durable operation row — there is exactly one write attempt per
+   * logical operation, by construction of `UNIQUE(run_id, kind,
+   * logical_key)`.
+   */
+  claimOperation(input: {
+    readonly runId: string
+    readonly kind: RunnerOperationKind
+    readonly logicalKey: string
+    readonly payloadDigest: string
+    readonly ownerGeneration: number
+  }): RunnerOperationRecord {
+    const now = this.clock.now()
+    const existing = this.findOperation(input.runId, input.kind, input.logicalKey)
+    if (existing) {
+      if (existing.payloadDigest !== input.payloadDigest) {
+        throw new Error(
+          `operation conflict: run ${input.runId} kind ${input.kind} key ${input.logicalKey} already claimed with a different payload`,
+        )
+      }
+      return existing
+    }
+    const binding = this.getRunnerBinding(input.runId)
+    if (!binding || binding.phase !== "active" || binding.daemonGeneration !== input.ownerGeneration
+      || this.getRunById(input.runId)?.status !== "running") throw new Error("operation ownership lost")
+    if (input.kind !== "create" && this.listRunnerOperations(input.runId).some(op => op.kind !== "create" && ["prepared", "sending", "submitted", "unknown"].includes(op.phase))) throw new Error("unresolved runner turn")
+    const id = randomUUID()
+    const row = this.db.query(
+      `INSERT INTO runner_operation (id, run_id, kind, logical_key, payload_digest, phase, owner_generation, time_created, time_updated)
+       VALUES (?, ?, ?, ?, ?, 'prepared', ?, ?, ?)
+       ON CONFLICT(run_id, kind, logical_key) DO UPDATE SET run_id = run_id
+       RETURNING *`,
+    ).get(id, input.runId, input.kind, input.logicalKey, input.payloadDigest, input.ownerGeneration, now, now) as RunnerOperationRow
+    if (row.payload_digest !== input.payloadDigest) {
+      throw new Error(
+        `operation conflict: run ${input.runId} kind ${input.kind} key ${input.logicalKey} already claimed with a different payload`,
+      )
+    }
+    return toRunnerOperationRecord(row)
+  }
+
+  /**
+   * CAS phase transition. Rejects (false) once the row is no longer at
+   * `from` (a concurrent caller already moved it) OR is already
+   * terminal (`not_sent`/`unknown`) — a fence that races a report
+   * committing first must never be able to un-terminate an operation
+   * the report path already resolved, and vice versa.
+   */
+  transitionOperationPhase(
+    operationId: string,
+    from: RunnerOperationPhase,
+    to: RunnerOperationPhase,
+    detail?: { readonly stopReason?: string; readonly diagnosticCode?: string; readonly expectedVersion?: number; readonly ownerGeneration?: number },
+  ): boolean {
+    const allowed: Record<RunnerOperationPhase, readonly RunnerOperationPhase[]> = {
+      prepared: ["sending", "not_sent", "unknown"],
+      sending: ["submitted", "not_sent", "unknown"],
+      submitted: ["completed", "unknown"],
+      completed: [], not_sent: [], unknown: [],
+    }
+    if (!allowed[from].includes(to)) return false
+    const current = this.db.query("SELECT version, owner_generation FROM runner_operation WHERE id = ?").get(operationId) as { version: number; owner_generation: number } | null
+    if (!current || (detail?.expectedVersion !== undefined && detail.expectedVersion !== current.version)
+      || (detail?.ownerGeneration !== undefined && detail.ownerGeneration !== current.owner_generation)) return false
+    const result = this.db.run(
+      `UPDATE runner_operation SET version = version + 1, phase = ?, stop_reason = COALESCE(?, stop_reason), diagnostic_code = COALESCE(?, diagnostic_code), time_updated = ?
+       WHERE id = ? AND phase = ? AND phase NOT IN ('completed', 'not_sent', 'unknown')
+        AND EXISTS (SELECT 1 FROM runner_binding b JOIN run r ON r.id = b.run_id
+          WHERE b.run_id = runner_operation.run_id AND b.phase = 'active' AND r.status = 'running'
+          AND b.daemon_generation = runner_operation.owner_generation)`,
+      [to, detail?.stopReason ?? null, detail?.diagnosticCode ?? null, this.clock.now(), operationId, from],
+    )
+    return result.changes > 0
+  }
+
+  listRunnerOperations(runId: string): readonly RunnerOperationRecord[] {
+    return (this.db.query("SELECT * FROM runner_operation WHERE run_id = ? ORDER BY time_created").all(runId) as RunnerOperationRow[]).map(toRunnerOperationRecord)
+  }
+
+  getOperation(operationId: string): RunnerOperationRecord | null {
+    const row = this.db.query("SELECT * FROM runner_operation WHERE id = ?").get(operationId) as RunnerOperationRow | null
+    return row ? toRunnerOperationRecord(row) : null
+  }
+
+  findOperation(runId: string, kind: RunnerOperationKind, logicalKey: string): RunnerOperationRecord | null {
+    const row = this.db.query(
+      "SELECT * FROM runner_operation WHERE run_id = ? AND kind = ? AND logical_key = ?",
+    ).get(runId, kind, logicalKey) as RunnerOperationRow | null
+    return row ? toRunnerOperationRecord(row) : null
+  }
+
+  /** Startup recovery scan (D5/D10): every non-terminal operation whose
+   *  owner generation predates the current daemon generation — these
+   *  MUST be marked unknown (and their run fenced) before activation can
+   *  dispatch any new work. */
+  listStaleGenerationOperations(currentGeneration: number): readonly RunnerOperationRecord[] {
+    const rows = this.db.query(
+      `SELECT * FROM runner_operation WHERE owner_generation < ? AND phase IN ('prepared','sending','submitted')`,
+    ).all(currentGeneration) as RunnerOperationRow[]
+    return rows.map(toRunnerOperationRecord)
+  }
+
+  recordFence(input: FenceRequest & { readonly cleanupState: RunnerCleanupState }): RunnerFenceRecord {
+    const now = this.clock.now()
+    const row = this.db.query(
+      `INSERT INTO runner_fence (run_id, reason_code, operation_id, cleanup_state, created_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(run_id) DO UPDATE SET run_id = run_id
+       RETURNING *`,
+    ).get(input.runId, input.reasonCode, input.operationId ?? null, input.cleanupState, now) as RunnerFenceRow
+    return toRunnerFenceRecord(row)
+  }
+
+  hasUnresolvedRunnerFence(featureId: string, jobId?: string, stepId?: string): boolean {
+    return this.db.query(`SELECT 1 FROM runner_fence f JOIN run r ON r.id = f.run_id
+      WHERE r.feature_id = ? AND f.resolved_at IS NULL
+      AND (? IS NULL OR r.job_id = ?) AND (? IS NULL OR r.step_id = ?) LIMIT 1`).get(featureId, jobId ?? null, jobId ?? null, stepId ?? null, stepId ?? null) !== null
+  }
+
+  recordRunnerCleanup(runId: string, state: RunnerCleanupState): void {
+    this.db.run("UPDATE runner_fence SET cleanup_state = ? WHERE run_id = ? AND resolved_at IS NULL", [state, runId])
+  }
+
+  getFence(runId: string): RunnerFenceRecord | null {
+    const row = this.db.query("SELECT * FROM runner_fence WHERE run_id = ?").get(runId) as RunnerFenceRow | null
+    return row ? toRunnerFenceRecord(row) : null
+  }
+
+  resolveFence(runId: string, note: string): boolean {
+    return this.db.run(
+      "UPDATE runner_fence SET resolved_at = ?, resolution_note = ? WHERE run_id = ? AND resolved_at IS NULL",
+      [this.clock.now(), note, runId],
+    ).changes > 0
+  }
+
+  issueCredential(input: {
+    readonly runId: string
+    readonly attempt: number
+    readonly processGeneration: number
+    readonly tokenHash: string
+    readonly issuedAt: number
+    readonly expiresAt?: number
+  }): RunCredentialRecord {
+    const id = randomUUID()
+    this.db.run(
+      `INSERT INTO run_credential (id, run_id, attempt, process_generation, token_hash, issued_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [id, input.runId, input.attempt, input.processGeneration, input.tokenHash, input.issuedAt, input.expiresAt ?? null],
+    )
+    return {
+      id, runId: input.runId, attempt: input.attempt, processGeneration: input.processGeneration,
+      tokenHash: input.tokenHash, issuedAt: input.issuedAt, expiresAt: input.expiresAt ?? null,
+      revokedAt: null, revocationReason: null,
+    }
+  }
+
+  /** The ONLY lookup path for a credential — by hash, never by id from
+   *  an untrusted caller (D8: "no plaintext token in database/
+   *  projections"). */
+  findCredentialByHash(tokenHash: string): RunCredentialRecord | null {
+    const row = this.db.query("SELECT * FROM run_credential WHERE token_hash = ?").get(tokenHash) as RunCredentialRow | null
+    return row ? toRunCredentialRecord(row) : null
+  }
+
+  revokeCredential(id: string, reason: string): boolean {
+    return this.db.run(
+      "UPDATE run_credential SET revoked_at = ?, revocation_reason = ? WHERE id = ? AND revoked_at IS NULL",
+      [this.clock.now(), reason, id],
+    ).changes > 0
+  }
+
+  revokeCredentialsForRun(runId: string, reason: string): number {
+    return this.db.run(
+      "UPDATE run_credential SET revoked_at = ?, revocation_reason = ? WHERE run_id = ? AND revoked_at IS NULL",
+      [this.clock.now(), reason, runId],
+    ).changes
+  }
+
+  // ------------------------------------------------------- worker ask dedup
+
+  /** Audit lookup only. Writes belong to setRunQuestion's guarded transaction. */
+  findAskInvocation(runId: string, invocationId: string): { readonly questionGeneration: number } | null {
+    const row = this.db.query(
+      "SELECT question_generation FROM worker_request_dedup WHERE run_id = ? AND invocation_id = ?",
+    ).get(runId, invocationId) as { question_generation: number } | null
+    return row ? { questionGeneration: row.question_generation } : null
+  }
+
+  /**
+   * The atomic uncertainty transaction (D6): records run `uncertain`,
+   * marks the operation (if any) `unknown`, marks any open answer
+   * delivery `unknown` (retaining its notes/question for audit — never
+   * deleted), revokes every credential for the run, records the durable
+   * fence, applies the PURE `step.execution_unknown` transition (closing
+   * automatic retry scheduling for the target and escalating the
+   * feature) and persists the SAME durable completion-decisions outbox
+   * `concludeRun` already uses for every other conclusion path — a crash
+   * between "run marked uncertain" and "its escalation decisions acted
+   * on" replays through the EXACT same `getPendingRunAction`/
+   * `markRunActionHandled` outbox as any other run conclusion.
+   *
+   * Returns `null` when the run is not currently fenceable (already
+   * concluded some other way, or a fence already exists) — the caller
+   * must treat that as "someone else already resolved this", never
+   * retry blindly.
+   */
+  fenceRunnerExecution(
+    request: FenceRequest,
+    resolveWorkflow: (projectDir: string) => { readonly workflow: import("@conductor/core").WorkflowDef } | undefined,
+    cleanupState: RunnerCleanupState = "unconfirmed",
+  ): { readonly fenced: true; readonly fence: RunnerFenceRecord } | { readonly fenced: false; readonly reason: "already_fenced" | "run_not_active" | "unknown_feature" } {
+    const now = this.clock.now()
+    let result: { readonly fenced: true; readonly fence: RunnerFenceRecord } | { readonly fenced: false; readonly reason: "already_fenced" | "run_not_active" | "unknown_feature" } = {
+      fenced: false,
+      reason: "run_not_active",
+    }
+    let featureIdForEmit: string | null = null
+    this.db.transaction(() => {
+      const run = this.db.query("SELECT * FROM run WHERE id = ?").get(request.runId) as RunRow | undefined
+      if (!run) {
+        result = { fenced: false, reason: "run_not_active" }
+        return
+      }
+      // Report-versus-fence race: a report already committed (run no
+      // longer 'running') wins by transaction ordering — the fence loses
+      // cleanly, never overwrites a valid conclusion.
+      if (run.status !== "running") {
+        result = { fenced: false, reason: "run_not_active" }
+        return
+      }
+      const existingFence = this.db.query("SELECT 1 FROM runner_fence WHERE run_id = ?").get(request.runId)
+      if (existingFence) {
+        result = { fenced: false, reason: "already_fenced" }
+        return
+      }
+      const feature = this.db.query("SELECT * FROM feature WHERE id = ?").get(run.feature_id) as FeatureRow | undefined
+      if (!feature) {
+        result = { fenced: false, reason: "unknown_feature" }
+        return
+      }
+      // Execution uncertainty is state-only: workflow configuration must
+      // never be a prerequisite for revoking a lost owner's credential.
+      const snapshot = resolveWorkflow(feature.project_dir)
+
+      // 1. Run → uncertain (terminal for automatic execution, never
+      //    "failed" — D6: "not an assertion of failure or success").
+      this.db.run(
+        `UPDATE run SET status = 'uncertain', reason = ?, time_finished = ? WHERE id = ? AND status = 'running'`,
+        [request.diagnostic, now, request.runId],
+      )
+
+      this.db.run("UPDATE runner_binding SET phase = 'fenced', time_updated = ? WHERE run_id = ?", [now, request.runId])
+
+      // 2. The operation (if any) → unknown.
+      this.db.run(
+        `UPDATE runner_operation SET phase = 'unknown', time_updated = ?
+         WHERE run_id = ? AND phase IN ('prepared', 'sending', 'submitted')`,
+        [now, request.runId],
+      )
+
+      // 3. Any open (pending/claimed/submitted) answer delivery → unknown,
+      //    notes/question retained for audit — never deleted, never
+      //    replayed (no scheduleAnswerDeliveryRetry, no failAnswerDelivery
+      //    →step.failed for this case).
+      this.db.run(
+        `UPDATE answer_delivery SET status = 'unknown', time_updated = ?
+         WHERE run_id = ? AND status IN ('pending','claimed','submitted')`,
+        [now, request.runId],
+      )
+
+      // 4. Revoke every credential for the run.
+      this.db.run(
+        "UPDATE run_credential SET revoked_at = ?, revocation_reason = ? WHERE run_id = ? AND revoked_at IS NULL",
+        [now, `fenced: ${request.reasonCode}`, request.runId],
+      )
+
+      // 5. Durable fence record.
+      const fenceRow = this.db.query(
+        `INSERT INTO runner_fence (run_id, reason_code, operation_id, cleanup_state, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         RETURNING *`,
+      ).get(request.runId, request.reasonCode, request.operationId ?? null, cleanupState, now) as RunnerFenceRow
+
+      // 6. Pure workflow transition: escalate, mark the target
+      //    failed-for-recovery, NO retry/onFail/downstream dispatch.
+      //    Also closes any open retry episode for this exact target so
+      //    a stale due-schedule can never fire a replacement dispatch
+      //    later (the retry/outbox barrier D6 requires).
+      const state = toFeatureState(feature)
+      const event: PipelineEvent = { kind: "step.execution_unknown", jobId: request.jobId, stepId: request.stepId, reason: request.diagnostic }
+      const transition = interpret(snapshot?.workflow ?? { name: state.workflow ?? "unavailable", on: [], inputs: {}, roles: {}, jobs: {} }, state, event)
+      this.applyTransitionTx(run.feature_id, event, transition)
+      this.db.run("UPDATE run SET completion_event = ?, completion_decisions = ?, action_handled = 0 WHERE id = ?",
+        [JSON.stringify(event), JSON.stringify(transition.decisions), request.runId])
+      this.db.run(
+        `UPDATE retry_episode SET status = 'closed', closed_reason = 'fenced_uncertain', next_attempt_at = NULL, delay_ms = NULL, version = version + 1, time_updated = ?
+         WHERE feature_id = ? AND job_id = ? AND step_id = ? AND status IN ('scheduled','claimed')`,
+        [now, run.feature_id, request.jobId, request.stepId],
+      )
+      this.db.run(
+        `UPDATE resource_wait SET status = 'closed', closed_reason = 'fenced_uncertain', next_observation_at = NULL, version = version + 1, time_updated = ?
+         WHERE feature_id = ? AND job_id = ? AND step_id = ? AND status IN ('waiting','claimed')`,
+        [now, run.feature_id, request.jobId, request.stepId],
+      )
+
+      featureIdForEmit = run.feature_id
+      result = { fenced: true, fence: toRunnerFenceRecord(fenceRow) }
+    })()
+    if (result.fenced && featureIdForEmit !== null) {
+      this.emit({ kind: "run", featureId: featureIdForEmit })
+      this.emit({ kind: "transition", featureId: featureIdForEmit })
+    }
+    return result
   }
 }
 

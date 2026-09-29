@@ -609,7 +609,7 @@ type StepBase = Pick<StepDef, "id" | "if" | "outcomes" | "onFail" | "retry">
 function readAgentBody(node: Node | null, base: StepBase, where: string, reader: Reader): StepDef | undefined {
   const map = readMap(node, `${where}: agent`, reader)
   if (map === undefined) return undefined
-  const fields = readFields(map, `${where}: agent`, ["role", "prompt", "interactive", "ttlMs", "reviewHead", "fixFrom", "qualityFrom", "fixPrompt"], reader)
+  const fields = readFields(map, `${where}: agent`, ["role", "prompt", "interactive", "ttlMs", "idleSilenceNudgeMs", "busySilenceNudgeMs", "maxNudges", "reviewHead", "fixFrom", "qualityFrom", "fixPrompt"], reader)
   const roleNode = requireField(fields, "role", map, `${where}: agent`, reader)
   const promptNode = requireField(fields, "prompt", map, `${where}: agent`, reader)
   const role = roleNode === undefined ? undefined : readString(roleNode, `${where}: agent: role`, reader)
@@ -619,14 +619,16 @@ function readAgentBody(node: Node | null, base: StepBase, where: string, reader:
     interactive = readBoolean(fields.get("interactive")!.value, `${where}: agent: interactive`, reader)
     if (interactive === undefined) return undefined
   }
-  let ttlMs: number | undefined
-  if (fields.has("ttlMs")) {
-    ttlMs = readInteger(fields.get("ttlMs")!.value, `${where}: agent: ttlMs`, reader)
-    if (ttlMs === undefined) return undefined
-    if (ttlMs < 1) {
-      reader.error(fields.get("ttlMs")!.value, `${where}: agent: ttlMs must be ≥ 1 — omit it to use the engine default`)
+  const limits: Partial<Record<"ttlMs" | "idleSilenceNudgeMs" | "busySilenceNudgeMs" | "maxNudges", number>> = {}
+  for (const key of ["ttlMs", "idleSilenceNudgeMs", "busySilenceNudgeMs", "maxNudges"] as const) {
+    if (!fields.has(key)) continue
+    const value = readInteger(fields.get(key)!.value, `${where}: agent: ${key}`, reader)
+    if (value === undefined) return undefined
+    if (value < 1) {
+      reader.error(fields.get(key)!.value, `${where}: agent: ${key} must be ≥ 1 — omit it to use the engine default`)
       return undefined
     }
+    limits[key] = value
   }
   const structured: Partial<Record<"reviewHead" | "fixFrom" | "qualityFrom" | "fixPrompt", string>> = {}
   for (const key of ["reviewHead", "fixFrom", "qualityFrom", "fixPrompt"] as const) {
@@ -646,7 +648,7 @@ function readAgentBody(node: Node | null, base: StepBase, where: string, reader:
     role,
     prompt,
     ...(interactive !== undefined ? { interactive } : {}),
-    ...(ttlMs !== undefined ? { ttlMs } : {}),
+    ...limits,
   }
 }
 

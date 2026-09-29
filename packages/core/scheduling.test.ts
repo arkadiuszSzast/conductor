@@ -9,6 +9,7 @@ import {
   computeScheduledDelayMs,
   elapsedBudgetMs,
   nextAttemptAt,
+  parseIsoDurationMs,
 } from "./src/scheduling.ts"
 import type { Random } from "./src/scheduling.ts"
 import type { BackoffDef } from "./src/types.ts"
@@ -248,5 +249,40 @@ describe("checkRetryBudget", () => {
       candidateAttemptAtMs: 1000,
     })
     expect(result.ok).toBe(true)
+  })
+})
+
+describe("parseIsoDurationMs", () => {
+  it("parses the ISO-8601 durations a retry step may declare", () => {
+    expect(parseIsoDurationMs("PT0S")).toBe(0)
+    expect(parseIsoDurationMs("PT10M")).toBe(600_000)
+    expect(parseIsoDurationMs("PT6H")).toBe(21_600_000)
+    expect(parseIsoDurationMs("PT1H30M")).toBe(5_400_000)
+    expect(parseIsoDurationMs("P1DT2H")).toBe(93_600_000)
+    expect(parseIsoDurationMs("PT45S")).toBe(45_000)
+    expect(parseIsoDurationMs("PT0.5S")).toBe(500)
+    expect(parseIsoDurationMs("P2W")).toBe(1_209_600_000)
+  })
+
+  it("returns undefined for malformed input or a duration with no component", () => {
+    expect(parseIsoDurationMs("10m")).toBeUndefined()
+    expect(parseIsoDurationMs("P")).toBeUndefined()
+    expect(parseIsoDurationMs("PT")).toBeUndefined()
+    expect(parseIsoDurationMs("")).toBeUndefined()
+    // Syntactically plausible but not the grammar: lowercase, lone "T",
+    // a bare number, trailing garbage.
+    expect(parseIsoDurationMs("pt10m")).toBeUndefined()
+    expect(parseIsoDurationMs("PT10")).toBeUndefined()
+    expect(parseIsoDurationMs("P10")).toBeUndefined()
+    expect(parseIsoDurationMs("PT10Mx")).toBeUndefined()
+  })
+
+  it("returns undefined for a syntactically matching but non-finite total (component values so large the arithmetic overflows)", () => {
+    // `Number("9".repeat(400))` is `Infinity` — the grammar's `\d+`
+    // accepts arbitrarily long digit runs, so this cannot be rejected by
+    // the regex alone; the explicit `Number.isFinite` guard is load-
+    // bearing, not redundant with the regex.
+    expect(parseIsoDurationMs(`P${"9".repeat(400)}Y`)).toBeUndefined()
+    expect(parseIsoDurationMs(`PT${"9".repeat(400)}S`)).toBeUndefined()
   })
 })

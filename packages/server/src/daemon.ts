@@ -98,6 +98,7 @@ export const systemIntervalScheduler: IntervalScheduler = {
 // ----------------------------------------------------------- configuration
 
 export interface DaemonConfig {
+  readonly runners?: import("./acp/config.ts").RunnersConfig
   /** Explicit SQLite database path. Never inferred from a home directory. */
   readonly databasePath: string
   /** Create the database's parent directory if missing. */
@@ -106,7 +107,7 @@ export interface DaemonConfig {
   readonly projects: readonly string[]
   /** Reconciler heartbeat interval in milliseconds. */
   readonly heartbeatIntervalMs: number
-  /** Engine tuning (runTtlMs, nudgeIdleCycles, maxNudges). Defaults match the seed's operational values. */
+  /** Engine tuning: runTtlMs, nudgeIdleCycles, idleSilenceNudgeMs, busySilenceNudgeMs, maxNudges. */
   readonly engine?: EngineOptions
   /**
    * Local action registry search paths. `bundledPath` defaults to the
@@ -129,6 +130,13 @@ export interface Reconciler {
 export interface DaemonDeps {
   /** Session runner. Absent → the daemon starts and reports the runner unavailable. */
   readonly sessions?: SessionClient
+  readonly sessionFactory?: (store: Store, clock: Clock, observe: (operationId: string) => void) => {
+    sessions: SessionClient
+    generation: number
+    releaseReservation(id: string): Promise<void>
+    cleanupRun(runId: string, sessionId: string | null): Promise<"confirmed_terminated" | "unconfirmed">
+    stop(): Promise<void>
+  }
   /**
    * Dynamic runner availability for health reporting. A composition that
    * injects a routing session transport (e.g. the opencode runner hub,
@@ -221,6 +229,7 @@ function unavailableSessionClient(): SessionClient {
 
 export class Daemon {
   private phase: DaemonPhase = "created"
+  private managed: ReturnType<NonNullable<DaemonDeps["sessionFactory"]>> | undefined
   private connection: DatabaseConnection | null = null
   private storeInstance: Store | null = null
   private registryInstance: WorkflowRegistry | null = null
@@ -265,6 +274,11 @@ export class Daemon {
    * in place.
    */
   async start(): Promise<void> {
+    await this.initialize()
+    if (!this.stopPromise) await this.activate()
+  }
+
+  async initialize(): Promise<void> {
     if (this.phase !== "created") {
       throw new Error(`daemon cannot start from phase "${this.phase}"`)
     }
@@ -295,7 +309,7 @@ export class Daemon {
     this.connection = connection
     this.appliedNow = migrateDatabase(connection)
     for (const id of this.appliedNow) this.log("info", "migration applied", { migration: id })
-    this.storeInstance = new Store(connection.db)
+    this.storeInstance = new Store(connection.db, this.clock)
 
     const actionRegistry = this.deps.actionRegistry ?? (await this.loadActionRegistry())
     this.registryInstance = new WorkflowRegistry({
@@ -321,12 +335,22 @@ export class Daemon {
       }
     }
 
+    this.managed = this.deps.sessionFactory?.(this.storeInstance, this.clock, id => {
+      void this.engineInstance?.observeRunnerOperation(id).catch(() => this.log("error", "runner observation failed"))
+    })
     const processRunner = this.deps.process ?? realProcessRunner
     const engineLogger = { log: (text: string) => this.log("info", text, { component: "engine" }) }
     const actionHost = new ActionHost(bundledHandlers, { process: processRunner, log: engineLogger })
     this.engineInstance = new Engine(
       {
         store: this.storeInstance,
+        ...(this.config.runners ? { runners: this.config.runners } : {}),
+        ...(this.managed ? {
+          acpSessions: this.managed.sessions,
+          daemonGeneration: this.managed.generation,
+          releaseAcpReservation: (id: string) => this.managed!.releaseReservation(id),
+          cleanupAcpRun: (runId: string, sessionId: string | null) => this.managed!.cleanupRun(runId, sessionId),
+        } : {}),
         workflows: this.registryInstance.resolver,
         sessions: this.deps.sessions ?? unavailableSessionClient(),
         process: processRunner,
@@ -338,10 +362,33 @@ export class Daemon {
       },
       this.config.engine ?? {},
     )
+    // Persist ownership loss before exposing the engine to HTTP or reconciliation.
+    // This also applies when ACP has been disabled for new work.
+    if (!this.connection) return
+    for (const feature of this.storeInstance.listFeatures({})) {
+      for (const run of this.storeInstance.listRuns(feature.id)) {
+        if (run.status !== "running" || this.storeInstance.getRunnerBinding(run.id)?.transport !== "acp") continue
+        // Settle durable completed answer turns before loss-of-ownership
+        // fencing changes open deliveries to unknown. This is DB-only.
+        for (const delivery of this.storeInstance.listAnswerDeliveries(feature.id)) {
+          if (delivery.runId === run.id && this.storeInstance.findOperation(run.id, "answer", delivery.deliveryToken)?.phase === "completed") {
+            this.storeInstance.confirmAnswerDelivered(delivery.id)
+          }
+        }
+        this.storeInstance.fenceRunnerExecution({ runId: run.id, jobId: run.jobId, stepId: run.stepId,
+          reasonCode: "startup_recovery", diagnostic: "ACP ownership lost across daemon restart; independently verify orphan cleanup" },
+          dir => this.registryInstance!.resolver(dir) ?? undefined)
+      }
+    }
     this.reconciler = this.deps.reconciler ?? this.engineInstance
 
     if (!this.runnerAvailable()) this.log("warn", "no session runner registered — runner reported unavailable")
 
+  }
+
+  /** Called only after the reporting listener is bound. */
+  async activate(): Promise<void> {
+    if (this.phase !== "starting") throw new Error("daemon must initialize before activation")
     // Recovery pass before the first heartbeat: pending decisions from
     // the durable outbox are replayed by the same reconcile() the
     // heartbeat drives. Its failure is logged, not fatal — the daemon
@@ -440,6 +487,23 @@ export class Daemon {
    * calls share one promise. Active runs stay recoverable: everything
    * durable is already in SQLite before this returns.
    */
+  async drainWorkers(): Promise<void> {
+    this.phase = "stopping"
+    if (this.timerHandle !== null) { this.scheduler.clearInterval(this.timerHandle); this.timerHandle = null }
+    if (this.cycleInFlight) await this.cycleInFlight
+    if (this.connection && this.storeInstance) for (const feature of this.storeInstance.listFeatures({})) {
+      for (const run of this.storeInstance.listRuns(feature.id)) {
+        if (run.status !== "running" || this.storeInstance.getRunnerBinding(run.id)?.transport !== "acp") continue
+        this.storeInstance.fenceRunnerExecution({ runId: run.id, jobId: run.jobId, stepId: run.stepId,
+          reasonCode: "cancellation_during_uncertain_write", diagnostic: "Daemon shutting down with unreported ACP execution" }, dir => this.registryInstance!.resolver(dir) ?? undefined)
+        const evidence = await this.managed?.cleanupRun(run.id, run.sessionId) ?? "unconfirmed"
+        this.storeInstance.recordRunnerCleanup(run.id, evidence)
+      }
+    }
+    await this.managed?.stop()
+    await this.engineInstance?.drainRunnerCleanup()
+  }
+
   stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise
     this.stopPromise = (async () => {
@@ -454,6 +518,7 @@ export class Daemon {
       // Drain detached action executions before closing SQLite: their
       // conclusion writes must land while the connection is still open.
       await this.engineInstance?.settleActions()
+      await this.drainWorkers()
       this.connection?.close()
       this.connection = null
       this.phase = "stopped"

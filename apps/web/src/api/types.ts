@@ -106,7 +106,7 @@ export interface FeatureDetailResponse {
  *  answer-delivery task 3.1: additive, so a client that only reads
  *  `pendingQuestion` sees no shape change. */
 export interface RunAnswerDelivery {
-  readonly status: "pending" | "claimed"
+  readonly status: "pending" | "claimed" | "submitted" | "unknown"
   readonly acceptedAt: number
 }
 
@@ -117,7 +117,14 @@ export interface RunSummary {
   readonly stepId: string
   readonly stepType: "agent" | "command" | "action"
   readonly attempt: number
-  readonly status: "running" | "succeeded" | "failed" | "reaped"
+  readonly status: "running" | "succeeded" | "failed" | "reaped" | "uncertain"
+  readonly transport?: "native" | "acp"
+  readonly profileId?: string
+  readonly uncertain?: {
+    readonly reasonCode: string
+    readonly cleanupState: "confirmed_terminated" | "operator_attested" | "unconfirmed"
+    readonly recoveryRequiresCleanupAcknowledgement: boolean
+  }
   readonly sessionId: string | null
   readonly outputs: Readonly<Record<string, string>>
   readonly reason: string | null
