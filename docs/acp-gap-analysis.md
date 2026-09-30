@@ -1,1141 +1,1144 @@
-# ACP vs `runner-protocol` / `SessionClient` — analiza luk (gap analysis)
+# ACP vs `runner-protocol` / `SessionClient` — gap analysis
 
-> **Status: notatka doradcza (advisory), NIE zatwierdzony plan.** To jest
-> deliverable Etapu 1 ze `docs/development-roadmap.md` ("Ścieżka A —
-> Etap 1 — Przegląd projektowy (read-only)"). Nie zmienia kodu, nie
-> zawiera commitów, nie zastępuje `openspec/changes/runner-protocol/`.
-> Każda rekomendacja poniżej wymaga osobnej propozycji OpenSpec, zanim
-> stanie się wykonalna (`AGENTS.md`, `openspec/config.yaml`).
+> **Status: advisory note, NOT an approved plan.** This is
+> the Stage 1 deliverable from `docs/development-roadmap.md` ("Track A —
+> Stage 1 — Design review (read-only)"). It does not change code, does not
+> contain commits, and does not replace `openspec/changes/runner-protocol/`.
+> Every recommendation below requires a separate OpenSpec proposal before
+> it becomes actionable (`AGENTS.md`, `openspec/config.yaml`).
 
-Data analizy: 2026-09-25. Źródła ACP pobrane tego samego dnia (linki w
-sekcji [Źródła](#źródła)); wersje SDK/CLI **zaobserwowane** przez
-`registry.npmjs.org` tego samego dnia — to punkt-w-czasie, **nie**
-przypięcie/decyzja o wersji (przypięcie jest zadaniem Etapu 2) i nie
-gwarancja niezmienności (ACP v1 otrzymał ≥15 stabilizowanych RFD w ciągu
-ostatniego roku, patrz [`rfds/updates`](https://agentclientprotocol.com/rfds/updates.md)).
+Analysis date: 2026-09-25. ACP sources fetched the same day (links in the
+[Sources](#sources) section); SDK/CLI versions **observed** via
+`registry.npmjs.org` the same day — this is a point-in-time snapshot, **not**
+a version pin/decision (pinning is a Stage 2 task) and not a
+guarantee of immutability (ACP v1 received ≥15 stabilized RFDs over the
+past year, see [`rfds/updates`](https://agentclientprotocol.com/rfds/updates.md)).
 
-## 1. Cel i zakres
+## 1. Purpose and scope
 
-Porównać granicę `SessionClient` (`packages/server/src/ports.ts:112-141`)
-i niedokończony kontrakt `runner-protocol`
+Compare the `SessionClient` boundary (`packages/server/src/ports.ts:112-141`)
+and the unfinished `runner-protocol` contract
 (`openspec/changes/runner-protocol/{proposal,design,tasks}.md`, **0/20
-tasków ukończonych** — zweryfikowane `grep -c '\[x\]' tasks.md` = 0) z
-Agent Client Protocol (ACP) w wersji stabilnej v1 (major=1) oraz szkicu v2
-(draft, 2026-07-20). Cel: dla każdej decyzji projektowej i każdego
-requirementu trzech specs `runner-protocol` ustalić jawne **tak /
-częściowo / nie** pokrycie przez ACP, zidentyfikować granice
-architektoniczne i operacyjne, których ACP **nie** może przejąć bez
-zmiany fundamentów Conductora, i dać rekomendację "preserve/change/replace"
-— **nie** "zbuduj konkurencyjny protokół".
+tasks completed** — verified with `grep -c '\[x\]' tasks.md` = 0) against
+the Agent Client Protocol (ACP) in its stable v1 version (major=1) and the v2
+draft (draft, 2026-07-20). Goal: for every design decision and every
+requirement of the three `runner-protocol` specs, establish explicit **yes /
+partial / no** coverage by ACP, identify the architectural and
+operational boundaries that ACP **cannot** take over without
+changing Conductor's foundations, and give a "preserve/change/replace" recommendation
+— **not** "build a competing protocol".
 
-### Metodologia
+### Methodology
 
-- Kod: `packages/server/src/{ports,runner-transport,runner-registry,engine}.ts`,
+- Code: `packages/server/src/{ports,runner-transport,runner-registry,engine}.ts`,
   `packages/runner-opencode/src/{sessions,hub,plugin,tools}.ts`,
-  `packages/server/src/{migrations,store}.ts` (fragmenty `answer_delivery`).
+  `packages/server/src/{migrations,store}.ts` (the `answer_delivery` fragments).
 - Spec/design: `openspec/changes/runner-protocol/{proposal,design,tasks}.md`
-  i wszystkie trzy `specs/*/spec.md`; kontekst `openspec/config.yaml` i
-  `AGENTS.md`; status sąsiednich zmian `runner-liveness` (**8/8 shipped**)
-  i `retry-policy` (**25/25 shipped**) jako punkt odniesienia dla tego, co
-  `runner-protocol` ma zastąpić/rozszerzyć.
-- ACP: strony `protocol/v1/*` (stabilne), `protocol/v2/*` (draft),
-  `rfds/updates` (historia stabilizacji), `announcements/acp-v2-draft`.
-  Wersje pakietów **zaobserwowane** (nie przypięte — patrz niżej)
+  and all three `specs/*/spec.md`; context from `openspec/config.yaml` and
+  `AGENTS.md`; status of the neighbouring changes `runner-liveness` (**8/8 shipped**)
+  and `retry-policy` (**25/25 shipped**) as the reference point for what
+  `runner-protocol` is meant to replace/extend.
+- ACP: the `protocol/v1/*` pages (stable), `protocol/v2/*` (draft),
+  `rfds/updates` (stabilization history), `announcements/acp-v2-draft`.
+  Package versions **observed** (not pinned — see below) on
   `registry.npmjs.org` 2026-09-25: `@agentclientprotocol/sdk@1.5.0`,
   `opencode-ai@1.18.32`, `@agentclientprotocol/codex-acp@1.13.1`
-  (zależność `@openai/codex@^0.156.1`), `@google/gemini-cli@0.61.0`.
-- Nie uruchomiono żadnych testów kompatybilności SDK/runtime — to wymaga
-  Etapu 2 (spike). Żadna wersja pakietu w tej notatce nie jest
-  "przypięciem" ani decyzją — to punkty-w-czasie z rejestru npm,
-  do zweryfikowania/przypięcia dopiero w Etapie 2.
+  (dependency `@openai/codex@^0.156.1`), `@google/gemini-cli@0.61.0`.
+- No SDK/runtime compatibility tests were run — that requires
+  Stage 2 (spike). No package version in this note is a
+  "pin" or a decision — they are point-in-time snapshots from the npm registry,
+  to be verified/pinned only in Stage 2.
 
-**Numeracja SDK vs numeracja protokołu (nie mylić):** `protocolVersion`
-w `initialize` to pojedyncza liczba całkowita identyfikująca **główną
-wersję protokołu** (dziś `1`, [`initialization.md`](https://agentclientprotocol.com/protocol/v1/initialization.md):
-"a single integer that identifies a MAJOR protocol version"). SDK-y mają
-**własne, niezależne** numery wydań semver — `@agentclientprotocol/sdk`
-w wersji `1.5.0` implementuje `protocolVersion: 1` (stabilny) i,
-częściowo/eksperymentalnie, artefakty draft v2 (SDK dokumentuje osobne,
-niestabilne wejście dla v2 — traktować jako opt-in eksperyment, nie
-domyślną ścieżkę). Analogicznie Rust SDK `1.0.0`/Python SDK `0.12.1` czy
-`1.0rc2` to numeracje pakietu, nie protokołu — SDK w wersji `≥1.0.0` nie
-oznacza "obsługuje protokół v2", tylko "stabilne API pakietu dla
-protokołu v1". Ta notatka celowo **nie** analizuje Rust/Python SDK poza
-tą jedną uwagą — pozostaje to poza zakresem, żeby nie rozmywać fokusu na
-TypeScript/Bun (zgodnie ze stackiem Conductora).
+**SDK numbering vs protocol numbering (do not confuse):** `protocolVersion`
+in `initialize` is a single integer identifying the **major
+protocol version** (today `1`, [`initialization.md`](https://agentclientprotocol.com/protocol/v1/initialization.md):
+"a single integer that identifies a MAJOR protocol version"). The SDKs have
+their **own, independent** semver release numbers — `@agentclientprotocol/sdk`
+at version `1.5.0` implements `protocolVersion: 1` (stable) and,
+partially/experimentally, draft v2 artifacts (the SDK documents a separate,
+unstable entry point for v2 — treat it as an opt-in experiment, not
+the default path). Likewise Rust SDK `1.0.0`/Python SDK `0.12.1` or
+`1.0rc2` are package numbering, not protocol numbering — an SDK at version `≥1.0.0` does not
+mean "supports protocol v2", only "stable package API for
+protocol v1". This note deliberately does **not** analyse the Rust/Python SDKs beyond
+this single remark — that stays out of scope, so as not to dilute the focus on
+TypeScript/Bun (in line with Conductor's stack).
 
-**Rola Context7 w tej analizie:** zapytania Context7 (wykonane przed tą
-rewizją) posłużyły do **odkrycia** kandydatów bibliotek/dokumentacji
-(np. potwierdzenia istnienia i lokalizacji `@agentclientprotocol/sdk`,
-`opencode-ai`, dokumentacji OpenCode ACP) — **nie** jako źródło
-rozstrzygające dla żadnego twierdzenia w tej notatce. Wszystkie
-konkretne cytaty/wymogi protokołu opierają się na bezpośrednio pobranych
-stronach `agentclientprotocol.com` i tagowanych źródłach GitHub/npm
-(linki w tekście i w sekcji [Źródła](#źródła)) — Context7 był narzędziem
-nawigacyjnym, źródła oficjalne/tagowane są decydujące.
+**Role of Context7 in this analysis:** Context7 queries (run before this
+revision) were used to **discover** candidate libraries/documentation
+(e.g. confirming the existence and location of `@agentclientprotocol/sdk`,
+`opencode-ai`, the OpenCode ACP documentation) — **not** as the deciding
+source for any claim in this note. All
+concrete protocol quotes/requirements rely on directly fetched
+`agentclientprotocol.com` pages and tagged GitHub/npm sources
+(links in the text and in the [Sources](#sources) section) — Context7 was a navigation
+tool; the official/tagged sources are authoritative.
 
-### Uwaga o kontekście projektu (bez reopeningu)
+### Note on project context (no reopening)
 
-`AGENTS.md` deklaruje "Greenfield, no legacy obligations" — dowolna część
-`opencode-conductor` może być zastąpiona. `openspec/config.yaml` zawiera
-jednocześnie "The DB schema is adopted additively: in-flight conductor
-features survive the migration to the standalone daemon" oraz listę
-"Confirmed decisions (do not reopen without a proposal)" — w tym
+`AGENTS.md` declares "Greenfield, no legacy obligations" — any part of
+`opencode-conductor` may be replaced. `openspec/config.yaml` at the
+same time contains "The DB schema is adopted additively: in-flight conductor
+features survive the migration to the standalone daemon" and a list of
+"Confirmed decisions (do not reopen without a proposal)" — including
 "Agent report-back is the daemon's HTTP API plus a `conductor` CLI — a
-runner only needs createSession/prompt/status/note." To ostatnie zdanie
-**jest** dokładnie granicą `SessionClient`, którą ta notatka bada — samo
-istnienie tej "confirmed decision" nie przesądza wyniku Etapu 1, ale każda
-rekomendacja "replace" poniżej koliduje z nią i wymagałaby jawnego
-otwarcia tej decyzji w propozycji OpenSpec, nie cichego obejścia.
+runner only needs createSession/prompt/status/note." That last sentence
+**is** exactly the `SessionClient` boundary this note examines — the mere
+existence of that "confirmed decision" does not predetermine the outcome of Stage 1, but every
+"replace" recommendation below conflicts with it and would require explicitly
+reopening that decision in an OpenSpec proposal, not quietly working around it.
 
 ---
 
-## 2. Mapa: co jest zaimplementowane dziś
+## 2. Map: what is implemented today
 
-### 2.1 `SessionClient` — granica portu (zaimplementowana, w repo dziś — "produkcyjna" tu znaczy: kod na `main`, nie "wdrożona/eksploatowana")
+### 2.1 `SessionClient` — the port boundary (implemented, in the repo today — "production" here means: code on `main`, not "deployed/operated")
 
-`packages/server/src/ports.ts:112-141` definiuje **sześć** operacji:
+`packages/server/src/ports.ts:112-141` defines **six** operations:
 
-| Operacja | Sygnatura | Semantyka |
+| Operation | Signature | Semantics |
 |---|---|---|
-| `createSession` | `{title, directory, parentID?, runId?}` → `Promise<{id}>` | **Awaituje `id`** zanim silnik przejdzie dalej (`engine.ts:491-508`) — to NIE jest fire-and-forget: wywołujący czeka na odpowiedź HTTP z utworzonym `id`, tylko nie ma osobnej trwałej potwierdzonej-dostawy warstwy nad tym `await`. `runId` to opcjonalny hint do logowania (patrz 2.4). |
-| `prompt` | `{sessionID, text, agent?, model?}` → `Promise<void>` | Silnik **awaituje** wywołanie (`engine.ts:530`), ale zwrotka niesie tylko "żądanie HTTP się powiodło", nie "agent przetworzył/zakończył" — brak retry ani idempotency-key na poziomie portu. |
-| `sessionExists` | `sessionID` → `Promise<boolean>` | Konserwatywne: niepewność → `true`. |
-| `status` | `sessionID` → `Promise<"busy"\|"idle"\|"retry"\|"missing">` | `"retry"` = provider retrying (traktowane jak busy przez callerów); niepewność → `"busy"`. |
-| `note` | `{sessionID, text}` → `Promise<void>` | Append **bez wywoływania inferencji modelu** (`noReply`) — to NIE jest obietnica "zero tokenów zawsze"; to zależy od implementacji runnera po drugiej stronie portu (kontrakt portu gwarantuje tylko brak *jawnego* żądania odpowiedzi). |
-| `abort` | `sessionID` → `Promise<void>` | Best-effort; no-op na zakończonej/nieistniejącej sesji. |
+| `createSession` | `{title, directory, parentID?, runId?}` → `Promise<{id}>` | **Awaits the `id`** before the engine proceeds (`engine.ts:491-508`) — this is NOT fire-and-forget: the caller waits for the HTTP response with the created `id`; there is just no separate durable confirmed-delivery layer on top of that `await`. `runId` is an optional logging hint (see 2.4). |
+| `prompt` | `{sessionID, text, agent?, model?}` → `Promise<void>` | The engine **awaits** the call (`engine.ts:530`), but the return only carries "the HTTP request succeeded", not "the agent processed/finished" — no retry or idempotency key at the port level. |
+| `sessionExists` | `sessionID` → `Promise<boolean>` | Conservative: uncertainty → `true`. |
+| `status` | `sessionID` → `Promise<"busy"\|"idle"\|"retry"\|"missing">` | `"retry"` = provider retrying (treated as busy by callers); uncertainty → `"busy"`. |
+| `note` | `{sessionID, text}` → `Promise<void>` | Append **without invoking model inference** (`noReply`) — this is NOT a promise of "zero tokens, always"; it depends on the runner implementation on the other side of the port (the port contract only guarantees the absence of an *explicit* reply request). |
+| `abort` | `sessionID` → `Promise<void>` | Best-effort; no-op on a finished/nonexistent session. |
 
-Kluczowe: **`note` nie jest dziś wywoływane przez `engine.ts` w ogóle**
-(`grep -n "sessions\.\(note\|abort\|...\)" engine.ts` → brak trafienia dla
-`note`). Kontrakt portu deklaruje operację, silnik jej nie używa — to samo
-zauważa `design.md` runner-protocol ("Timeline notes do not trigger
-inference" — patrz sekcja 4, wymaganie nadal ważne mimo braku obecnego
-wywołania).
+Key point: **`note` is not called by `engine.ts` at all today**
+(`grep -n "sessions\.\(note\|abort\|...\)" engine.ts` → no hit for
+`note`). The port contract declares the operation, the engine does not use it — the same
+is observed by the runner-protocol `design.md` ("Timeline notes do not trigger
+inference" — see section 4; the requirement remains valid despite the absence of a current
+call).
 
-### 2.2 `runner-transport.ts` — implementacja portu nad HTTP (`packages/server/src/runner-transport.ts`)
+### 2.2 `runner-transport.ts` — the port implementation over HTTP (`packages/server/src/runner-transport.ts`)
 
-- `NoLiveRunnerError` (linie 11-16) — dedykowany typ dla "brak działającego
-  runnera"; łapany przez `engine.ts` do rozróżnienia resource-wait od
-  zwykłej awarii (patrz 2.4).
-- `probe()` (66-78): **health pre-probe** przed każdym zapisem —
-  `GET /v1/health`, timeout 10s (`AbortSignal.timeout(10_000)`, linia 57).
-  Tylko *definitywne* błędy pre-connect (`ECONNREFUSED`, `ENOTFOUND`,
+- `NoLiveRunnerError` (lines 11-16) — a dedicated type for "no live
+  runner"; caught by `engine.ts` to distinguish resource-wait from
+  an ordinary failure (see 2.4).
+- `probe()` (66-78): **health pre-probe** before every write —
+  `GET /v1/health`, 10s timeout (`AbortSignal.timeout(10_000)`, line 57).
+  Only *definitive* pre-connect errors (`ECONNREFUSED`, `ENOTFOUND`,
   `EAI_AGAIN`, `ConnectionRefused` — `isDefinitivePreConnectFailure`,
-  linie 18-22) pozwalają pominąć runnera; wszystko inne rzuca
-  `NoLiveRunnerError` **bez wysłania zapisu**.
-- `write()` (79-88) i `sessionWrite()` (89-103): **ambiguous POST failure
-  NIE jest replay'owany** na innego runnera — jeśli zapis już poszedł i
-  odpowiedź się zgubiła, transport nie zgaduje, tylko propaguje błąd.
-  Komentarz w `runner-liveness` spec to nazywa wprost: "Ambiguous POST
+  lines 18-22) allow skipping a runner; everything else throws
+  `NoLiveRunnerError` **without sending the write**.
+- `write()` (79-88) and `sessionWrite()` (89-103): **an ambiguous POST failure
+  is NOT replayed** against another runner — if the write already went out and
+  the response was lost, the transport does not guess, it just propagates the error.
+  The `runner-liveness` spec states this explicitly: "Ambiguous POST
   failures SHALL NOT be replayed against another endpoint by the
   transport."
-- `owners` (linia 41, LRU do 1024 wpisów, linia 45): **in-memory** mapa
-  sessionID→runnerID, nietrwała, nie przeżywa restartu daemona.
-- `read()` (104-124): dla `status`/`exists`, niepewność (brak znanego
-  właściciela, błąd, nieprawidłowa wartość) → `unknown→busy` /
-  `unknown→true` (safe direction), zgodnie z kontraktem portu.
-- `routeForDirectory()` (24-37): wybór runnera po najdłuższym prefiksie
-  ścieżki projektu — **nie** po capability matching (bo capabilities nie
-  istnieją w dzisiejszym rejestrze).
+- `owners` (line 41, LRU up to 1024 entries, line 45): an **in-memory**
+  sessionID→runnerID map, non-durable, does not survive a daemon restart.
+- `read()` (104-124): for `status`/`exists`, uncertainty (no known
+  owner, error, invalid value) → `unknown→busy` /
+  `unknown→true` (safe direction), in line with the port contract.
+- `routeForDirectory()` (24-37): runner selection by the longest project
+  path prefix — **not** by capability matching (because capabilities do not
+  exist in today's registry).
 
-### 2.3 `runner-registry.ts` — rejestr w pamięci (`packages/server/src/runner-registry.ts`)
+### 2.3 `runner-registry.ts` — in-memory registry (`packages/server/src/runner-registry.ts`)
 
-- Klucz rejestracji: **endpoint** (URL), nie stabilna tożsamość runnera
-  (linia `this.registrations.get(endpoint)`, ok. linii 44-52). Restart
-  runnera na innym porcie = nowa tożsamość.
-- Lease: **60 000 ms** (`leaseMs = 60_000`, konstruktor, linia 29),
-  odświeżany przez re-announce huba co **15 000 ms**
+- Registration key: the **endpoint** (URL), not a stable runner identity
+  (line `this.registrations.get(endpoint)`, around lines 44-52). A runner
+  restart on a different port = a new identity.
+- Lease: **60 000 ms** (`leaseMs = 60_000`, constructor, line 29),
+  refreshed by the hub re-announce every **15 000 ms**
   (`DEFAULT_REANNOUNCE_MS = 15_000`, `packages/runner-opencode/src/hub.ts:81`).
-- `list()` (linie ok. 82-86) usuwa wygasłe rejestracje przy każdym
-  odczycie (lazy expiry), nie przez osobny timer.
-- **Brak** capabilities, wersji protokołu, stabilnej tożsamości poza
-  endpointem — to dokładnie luka, którą `runner-protocol` design.md
-  nazywa "Alternative: retain endpoint-keyed in-memory identity. Rejected
+- `list()` (around lines 82-86) removes expired registrations on every
+  read (lazy expiry), not via a separate timer.
+- **No** capabilities, protocol version, or stable identity beyond the
+  endpoint — this is exactly the gap that the `runner-protocol` design.md
+  names "Alternative: retain endpoint-keyed in-memory identity. Rejected
   because ephemeral ports and daemon restarts create false identities and
   stale availability."
-- **Wszystko w pamięci procesu** — restart daemona = pusty rejestr
-  (healed tylko przez re-announce huba, nie przez trwały zapis).
+- **Everything is in process memory** — daemon restart = empty registry
+  (healed only by the hub re-announce, not by a durable record).
 
-### 2.4 `engine.ts` — orkiestracja wokół portu
+### 2.4 `engine.ts` — orchestration around the port
 
-- **Linie 418-435** (`executeAgent`): `this.deps.runnerAvailable?.() === false`
-  → **przed** utworzeniem runu wpisuje `resource_wait` z powodem
-  `"runner_unavailable"` przez `decideResourceWaitRoute` (czysta funkcja
-  interpretera) i **wraca bez tworzenia runu**. To jest ścieżka "no
-  runner at all" — zero-attempt.
-- **Linie 471-567**: gdy runner jest zarejestrowany, silnik **najpierw
-  wstawia run** (`store.insertRun`, linia 475 — *przed* jakimkolwiek
-  `await`, komentarz w kodzie tłumaczy to jako zamknięcie wyścigu z
-  równoległym reconcile), potem tworzy sesję rodzica/dziecka
-  (`createSession` ×2, linie 491-508) i dopiero potem `prompt` (linia
-  530). Jeśli `sessions.prompt` rzuci `NoLiveRunnerError` (linia 548),
-  run zostaje **cofnięty** do `resource_wait` przez
-  `concludeRunForResourceWait` (linie 556-561) — **bez konsumpcji
-  attemptu**. Jeśli rzuci **inny** błąd (np. ambiguous POST z
-  `runner-transport.ts`), run kończy się `"failed"` z klasyfikacją przez
-  `classifyThrownBoundary` (linia 565) — **to konsumuje attempt i może
-  prowadzić do duplikatów**, bo `createSession`/`prompt` mogły się
-  faktycznie wykonać po stronie runnera zanim błąd doleciał do silnika.
-  **To jest realna luka**, którą `runner-protocol` design.md wprost
-  adresuje ("Idempotent create and prompt state machine... Lost create
+- **Lines 418-435** (`executeAgent`): `this.deps.runnerAvailable?.() === false`
+  → **before** creating a run, records `resource_wait` with reason
+  `"runner_unavailable"` via `decideResourceWaitRoute` (a pure
+  interpreter function) and **returns without creating a run**. This is the "no
+  runner at all" path — zero-attempt.
+- **Lines 471-567**: when a runner is registered, the engine **first
+  inserts the run** (`store.insertRun`, line 475 — *before* any
+  `await`; a code comment explains this as closing a race with a
+  concurrent reconcile), then creates the parent/child session
+  (`createSession` ×2, lines 491-508) and only then `prompt` (line
+  530). If `sessions.prompt` throws `NoLiveRunnerError` (line 548),
+  the run is **rolled back** to `resource_wait` via
+  `concludeRunForResourceWait` (lines 556-561) — **without consuming
+  an attempt**. If it throws **any other** error (e.g. an ambiguous POST from
+  `runner-transport.ts`), the run ends as `"failed"` with classification via
+  `classifyThrownBoundary` (line 565) — **this consumes an attempt and can
+  lead to duplicates**, because `createSession`/`prompt` may have
+  actually executed on the runner side before the error reached the engine.
+  **This is a real gap**, which the `runner-protocol` design.md explicitly
+  addresses ("Idempotent create and prompt state machine... Lost create
   responses are redelivered with the same key... never blind fresh
   prompting").
-- **Linia 2279** (`classifyThrownBoundary`): klasyfikacja błędów przez
-  **regex na tekście komunikatu** (`/ECONNREFUSED|.../i`,
+- **Line 2279** (`classifyThrownBoundary`): error classification via
+  **regex on the message text** (`/ECONNREFUSED|.../i`,
   `/429|rate limit.../i`, `/502|503|504.../i`, `/timeout|timed out/i`,
-  fallback `"internal"`). To **wprost sprzeczne** z zasadą z
+  fallback `"internal"`). This **directly contradicts** the rule in
   `runner-contract/spec.md`: "The engine SHALL apply the generic policy
-  from `retry-policy` and SHALL NOT parse message text." Dzisiejszy kod
-  robi dokładnie to, czego planowany design zabrania — luka między stanem
-  bieżącym a projektowanym, nie luka ACP.
-- **Linie 1654-1664** (`pause`/`abandon`): obie metody wywołują **tylko**
+  from `retry-policy` and SHALL NOT parse message text." Today's code
+  does exactly what the planned design forbids — a gap between the current
+  and the designed state, not an ACP gap.
+- **Lines 1654-1664** (`pause`/`abandon`): both methods call **only**
   `this.dispatch(featureId, {kind: "human.paused"/"human.abandoned"})` —
-  **żadna nie wywołuje `sessions.abort`**. Stan durowalny (SQLite) zmienia
-  się natychmiast. `abort` **nie jest gwarantowany** w żadnym konkretnym
-  terminie po tym: `reconcileFeature` (linia 1693: `if (input.status ===
-  "paused") return`) **pomija** wszystkie kolejne kroki reconcile dla
-  wstrzymanej cechy — w tym `reconcileTtl`/`reap`, które są jedynym
-  miejscem wywołującym `abort` (patrz niżej). Dla `pause` runner może więc
-  pozostać nieabortowany na czas nieokreślony (dopóki cecha nie zostanie
-  wznowiona i dopiero wtedy ewentualnie zreapowana po TTL); dla `abandon`
-  (`feature.status === "abandoned"` sprawdzane na starcie `reconcileFeature`,
-  linia 1855) reconcile także wraca wcześnie. Żadna z dwóch ścieżek nie
-  gwarantuje odwołania sesji w żadnym oknie czasowym — to jest
-  best-effort bez terminu, nie "prędzej czy później reap i tak posprząta".
-- **Linie 2112-2135** (`reap`): jedyne miejsce, które wywołuje
-  `sessions.abort` (linia 2125), i to **best-effort w try/catch** —
-  błąd abortu jest logowany, nigdy nie blokuje konkluzji runu. Kolejność
-  jest zamierzona: abort **przed** conclude (komentarz w kodzie: gdyby
-  daemon padł między nimi, reconcile ponownie zreapuje wciąż-aktywny run;
-  odwrotna kolejność zostawiłaby sierocą sesję palącą tokeny).
-- Dopiero **wtedy**, gdy agent jawnie wywoła `report()` z `outcome`/
-  `verdict` (`engine.ts:1013`, patrz sekcja 5.5), silnik uznaje krok za
-  zakończony — nigdy na podstawie `status: idle` z portu. `ask` (ta sama
-  metoda `report()`, gałąź `input.ask !== undefined`, `engine.ts:1039-1062`)
-  **nie kończy** kroku — `store.setRunQuestion` zostawia run w stanie
-  `"running"` i **parkuje** go na pytaniu do człowieka; krok kończy się
-  dopiero późniejszym, osobnym wywołaniem `report()` z `outcome`/`verdict`.
+  **neither calls `sessions.abort`**. The durable state (SQLite) changes
+  immediately. `abort` is **not guaranteed** within any specific
+  time frame after that: `reconcileFeature` (line 1693: `if (input.status ===
+  "paused") return`) **skips** all subsequent reconcile steps for a
+  paused feature — including `reconcileTtl`/`reap`, which are the only
+  place that calls `abort` (see below). For `pause`, the runner may therefore
+  remain un-aborted indefinitely (until the feature is
+  resumed and only then possibly reaped after the TTL); for `abandon`
+  (`feature.status === "abandoned"` checked at the start of `reconcileFeature`,
+  line 1855) reconcile also returns early. Neither of the two paths
+  guarantees session cancellation within any time window — this is
+  best-effort without a deadline, not "sooner or later reap will clean up anyway".
+- **Lines 2112-2135** (`reap`): the only place that calls
+  `sessions.abort` (line 2125), and it is **best-effort in a try/catch** —
+  an abort error is logged and never blocks the run's conclusion. The ordering
+  is intentional: abort **before** conclude (code comment: if the
+  daemon died between them, reconcile would reap the still-active run again;
+  the reverse order would leave an orphaned session burning tokens).
+- Only **when** the agent explicitly calls `report()` with `outcome`/
+  `verdict` (`engine.ts:1013`, see section 5.5) does the engine consider the step
+  finished — never based on `status: idle` from the port. `ask` (the same
+  `report()` method, branch `input.ask !== undefined`, `engine.ts:1039-1062`)
+  **does not finish** the step — `store.setRunQuestion` leaves the run in the
+  `"running"` state and **parks** it on a question to the human; the step ends
+  only with a later, separate `report()` call with `outcome`/`verdict`.
 
-### 2.5 `packages/runner-opencode/` — jedyny dzisiejszy adapter
+### 2.5 `packages/runner-opencode/` — the only adapter today
 
-- `sessions.ts` (204 linii) implementuje `SessionClient` nad SDK
-  opencode. `status()` (linie 155-202) ma wielowarstwową logikę "safe
-  direction": `lookup unknown → busy` (161), timeline unreachable →
-  `busy` (193-197), brak wiadomości asystenta w oknie 5 → `busy` (189),
-  ostatnia wiadomość bez `completed` timestamp lub z pending/running tool
-  → `busy` (190-192). To jest dokładnie zachowanie, które
-  `runner-lifecycle/spec.md` chce ustandaryzować jako "Unknown status is
-  handled in the safe direction" — **dziś zaimplementowane
-  opencode-specyficznie, nie jako kontrakt**.
-- `hub.ts`: jeden proces opencode może obsługiwać wiele katalogów
-  projektów (linia routing po najdłuższym prefiksie, `isPathPrefix`,
-  linie 71-73); re-announce co 15s (linia 81); auth przez stały token
-  lub `CONDUCTOR_RUNNER_AUTH=none` (`authorized`, linie 66-70,
+- `sessions.ts` (204 lines) implements `SessionClient` over the opencode
+  SDK. `status()` (lines 155-202) has multi-layered "safe
+  direction" logic: `lookup unknown → busy` (161), timeline unreachable →
+  `busy` (193-197), no assistant message within a window of 5 → `busy` (189),
+  last message without a `completed` timestamp or with a pending/running tool
+  → `busy` (190-192). This is exactly the behaviour that
+  `runner-lifecycle/spec.md` wants to standardize as "Unknown status is
+  handled in the safe direction" — **implemented today
+  opencode-specifically, not as a contract**.
+- `hub.ts`: a single opencode process can serve many project
+  directories (routing by longest prefix, `isPathPrefix`,
+  lines 71-73); re-announce every 15s (line 81); auth via a fixed token
+  or `CONDUCTOR_RUNNER_AUTH=none` (`authorized`, lines 66-70,
   `timingSafeEqual`).
-- `plugin.ts`: rejestruje `conductor_start/report/ask/status/approve/
-  request_changes` jako **narzędzia pluginu opencode**
-  (`tool.schema.*` z `@opencode-ai/plugin`, linie 110-191) — **nie jako
-  MCP server run-scoped**. `tools.ts` implementuje je jako proste
-  wywołania HTTP do `ApiClient` (daemon REST API), nie do wewnętrznego
-  silnika. To znaczy: raportowanie idzie przez **CLI/HTTP API daemona**,
-  nie przez protokół agenta.
-- `note` port **istnieje** w `sessions.ts` (`noReply: true`,
-  `session.promptAsync`) ale — jak w 2.1 — silnik go nie wywołuje.
+- `plugin.ts`: registers `conductor_start/report/ask/status/approve/
+  request_changes` as **opencode plugin tools**
+  (`tool.schema.*` from `@opencode-ai/plugin`, lines 110-191) — **not as a
+  run-scoped MCP server**. `tools.ts` implements them as simple
+  HTTP calls to `ApiClient` (the daemon REST API), not to the internal
+  engine. That means: reporting goes through the **daemon's CLI/HTTP API**,
+  not through the agent protocol.
+- The `note` port **exists** in `sessions.ts` (`noReply: true`,
+  `session.promptAsync`) but — as in 2.1 — the engine does not call it.
 
-### 2.6 Dostarczanie odpowiedzi człowieka — `answer_delivery` (SQLite, at-least-once)
+### 2.6 Delivery of human answers — `answer_delivery` (SQLite, at-least-once)
 
-`packages/server/src/migrations.ts:456-531` (migracja `0014_answer_delivery`
-+ `0015_answer_delivery_retry_schedule`): tabela `answer_delivery` z
-`delivery_token` (linia 483, komentarz: "Conductor's own idempotency
+`packages/server/src/migrations.ts:456-531` (migration `0014_answer_delivery`
++ `0015_answer_delivery_retry_schedule`): an `answer_delivery` table with
+`delivery_token` (line 483, comment: "Conductor's own idempotency
 marker, carried into the prompt so an opencode-side dedup can [happen]"),
-unikalny indeks `idx_answer_delivery_open_run` na `(run_id) WHERE status
-IN ('pending','claimed')` (497-498) — **jeden otwarty delivery na run**.
-`store.ts:1168` sprawdza dedup przed insertem; `engine.ts:1214` osadza
-`[conductor delivery <token>]` w promptcie. To jest **at-least-once z
-tokenem po stronie Conductora** — **runtime (opencode) nie robi dedup
-sam z siebie**; token istnieje po to, żeby *agent* mógł go rozpoznać w
-treści, nie żeby protokół transportowy gwarantował dedup.
+a unique index `idx_answer_delivery_open_run` on `(run_id) WHERE status
+IN ('pending','claimed')` (497-498) — **one open delivery per run**.
+`store.ts:1168` checks dedup before insert; `engine.ts:1214` embeds
+`[conductor delivery <token>]` in the prompt. This is **at-least-once with a
+Conductor-side token** — **the runtime (opencode) does not dedup
+on its own**; the token exists so that the *agent* can recognize it in the
+content, not so that the transport protocol guarantees dedup.
 
-### 2.7 Status `runner-protocol` i sąsiednich zmian OpenSpec
+### 2.7 Status of `runner-protocol` and neighbouring OpenSpec changes
 
-| Zmiana | Tasks | Status |
+| Change | Tasks | Status |
 |---|---|---|
-| `runner-protocol` | 0/20 (`grep -c '\[x\]'` = 0) | **Nierozpoczęta implementacja.** `proposal.md`/`design.md`/`tasks.md` istnieją, kod nie. |
-| `runner-liveness` | 8/8 | **Shipped.** Dostarczyła 60s lease + 15s re-announce + health-probe + ambiguous-write semantics opisane w 2.2-2.3 — to jest **dzisiejszy stan**, nie plan. |
-| `retry-policy` | 25/25 | **Shipped.** Dostarczyła `FailureClass`, `resource_wait`, `recover()` z optimistic concurrency (`engine.ts:1490-1529`) — generalny mechanizm, na który `runner-protocol` design.md się powołuje jako właściciela retry/budget/escalation. |
+| `runner-protocol` | 0/20 (`grep -c '\[x\]'` = 0) | **Implementation not started.** `proposal.md`/`design.md`/`tasks.md` exist, the code does not. |
+| `runner-liveness` | 8/8 | **Shipped.** Delivered the 60s lease + 15s re-announce + health-probe + ambiguous-write semantics described in 2.2-2.3 — this is the **current state**, not a plan. |
+| `retry-policy` | 25/25 | **Shipped.** Delivered `FailureClass`, `resource_wait`, `recover()` with optimistic concurrency (`engine.ts:1490-1529`) — the general mechanism that the `runner-protocol` design.md cites as the owner of retry/budget/escalation. |
 
-**Uwaga o świeżości `design.md`:** `design.md` runner-protocol opisuje
-"Decisions" (identity/lease, offer przed attempt, idempotentny
-create/prompt) tak, jakby dzisiejszy stan był czysto in-memory bez leasy —
-ale `runner-liveness` (shipped) **już wprowadziła** 60s lease/15s
-re-announce/health-probe/ambiguous-write-no-replay, co częściowo
-pokrywa motywację `design.md` (choć nie durable identity, nie capability
-matching, nie idempotentne create/prompt). **`design.md` jest częściowo
-nieaktualny względem stanu repo** — kontekst do uwzględnienia przy
-ewentualnej rewizji `runner-protocol`, nie powód do jej zamknięcia.
+**Note on the freshness of `design.md`:** the runner-protocol `design.md` describes
+"Decisions" (identity/lease, offer before attempt, idempotent
+create/prompt) as if today's state were purely in-memory without a lease —
+but `runner-liveness` (shipped) **already introduced** the 60s lease/15s
+re-announce/health-probe/ambiguous-write-no-replay, which partially
+covers the motivation of `design.md` (though not durable identity, not capability
+matching, not idempotent create/prompt). **`design.md` is partially
+out of date relative to the repo state** — context to take into account in any
+revision of `runner-protocol`, not a reason to close it.
 
 ---
 
-## 3. Tabela pokrycia: 8 decyzji projektowych `design.md`
+## 3. Coverage table: the 8 design decisions of `design.md`
 
-Legenda: **Tak** = ACP v1 stabilne pokrywa intencję wprost; **Częściowo**
-= ACP daje prymityw, ale słabszy/opcjonalny/bez gwarancji, których
-`runner-protocol` wymaga; **Nie** = ACP nie ma odpowiednika **w warstwie
-protokołu** — nawet jeśli decyzja jest wewnętrzna dla Conductora (np.
-migracje SQLite), klasyfikujemy ją **Nie** (ACP nie może jej pokryć z
-definicji), nie jako "nie dotyczy" — każdy wiersz musi mieć jedną z
-trzech wartości, bez wyjątku.
+Legend: **Yes** = stable ACP v1 covers the intent directly; **Partial**
+= ACP provides a primitive, but weaker/optional/without the guarantees that
+`runner-protocol` requires; **No** = ACP has no counterpart **at the protocol
+layer** — even if the decision is internal to Conductor (e.g.
+SQLite migrations), we classify it as **No** (ACP cannot cover it by
+definition), not as "not applicable" — every row must have one of the
+three values, without exception.
 
-| # | Decyzja (`design.md`) | ACP | Uzasadnienie |
+| # | Decision (`design.md`) | ACP | Rationale |
 |---|---|---|---|
-| 1 | Durable stable identity + leased registration | **Nie** | ACP `initialize` ma `agentCapabilities`/`agentInfo`, ale `agentInfo` to **nie tożsamość** ([`initialization.md`](https://agentclientprotocol.com/protocol/v1/initialization.md): "Both take the following three fields... Intended for programmatic or logical use") — brak stabilnego ID przeżywającego restart procesu, brak leasy w ogóle. (Capability-negotiation jako osobna sprawa jest oceniona niżej, wiersz 4.3 — tu chodzi wyłącznie o identity+lease, których ACP nie ma.) ACP nie ma pojęcia "rejestr wielu agentów z heartbeatem" — to model 1:1 klient↔proces uruchamiany przez klienta (stdio transport), nie model N:1 (wiele projektów przez jeden zarejestrowany runner, jak `runner-opencode`). Stabilna tożsamość i lease pozostają w całości obowiązkiem Conductora. |
-| 2 | Daemon-initiated callback protocol (JSON HTTP, wersjonowany media type) | **Nie** | ACP jest **client-initiated na poziomie połączenia**: klient (Conductor jako client ACP) uruchamia agenta jako subprocess po stdio ([`transports.md`](https://agentclientprotocol.com/protocol/v1/transports.md): "The client launches the agent as a subprocess... All Agents MUST support stdio"). To NIE jest sprzeczne z dzisiejszym kierunkiem callbacku daemon→runner — przeciwnie, jest z nim **zgodne**: Conductor jako ACP-client już dziś inicjuje połączenie do runnera (dzisiejszy `runner-transport.ts` POST-uje do endpointu runnera, dokładnie tak jak klient ACP uruchamia/łączy się z agentem). Różnica leży gdzie indziej: (a) dzisiejszy callback to **własny wire format** (JSON HTTP ad-hoc), nie JSON-RPC-nad-stdio ACP — to jest do zastąpienia, nie kierunek; (b) **odwrotny** kierunek (runner→daemon) **już istnieje dziś**, nie tylko w planowanym `runner-protocol` — `hub.ts` już dziś POST-uje rejestrację+heartbeat do daemona (`announce()`, `hub.ts:204-212`, wywoływane z `registerProject`/re-announce timer, `hub.ts:138-158`, co 15s); to jest jednak **in-memory, endpoint-keyed** (sekcja 2.3), nie durable/stable-identity, jakiej żąda `runner-protocol`. Sam kierunek "runner ogłasza się do rejestru" więc **istnieje** w Conductorze — ACP go nie definiuje jako część protokołu agent↔klient (nie ma pojęcia "rejestr wielu agentów", patrz decyzja #1), ale to nie jest luka "czegoś nieistniejącego dziś", tylko luka "ACP nie standaryzuje tego wzorca, który Conductor już ma własnym mechanizmem". Po nawiązaniu połączenia ACP **jest** dwukierunkowe wewnątrz tej jednej sesji: agent może wysyłać żądania do klienta (`session/request_permission`, `fs/read_text_file`/`fs/write_text_file`, `terminal/*`, `elicitation/create`), nie tylko push `session/update` — ale to wciąż w obrębie połączenia, które klient zainicjował, nie nowe wychodzące połączenie inicjowane przez agenta. Zdalny transport HTTP dla samego ACP (nie mylić z MCP-over-HTTP, patrz 4.1/4.3) to osobny RFD "Streamable HTTP & WebSocket Transport" — stan **Active** (przeniesiony z Draft 2026-07-02, zweryfikowane [`rfds/updates`](https://agentclientprotocol.com/rfds/updates.md)), a więc bieżący fokus maintainerów, ale **nie stabilny/completed** — traktować jako niestabilną propozycję w ruchu, nie jako "wciąż Draft". |
-| 3 | Durable offer precedes executable run attempt (`wait_resource` przed utworzeniem attemptu) | **Nie** | ACP nie ma pojęcia "runner offline" jako stanu protokołu — połączenie albo istnieje (bo klient je otworzył), albo nie istnieje. Nie ma "durable assignment offer" czekającej na dostępność zdalnego agenta; to czysto orkiestracyjna koncepcja Conductora, zgodna z `retry-policy`'s `resource_wait`, bez odpowiednika w ACP. |
-| 4 | Idempotent create/prompt state machine (idempotency key, redelivery, no blind resend) | **Nie** | ACP nie ma **żadnego** pola idempotency-key na `session/new`/`session/prompt` w v1 ani v2. ACP v2 `prompt-lifecycle.md` wprost przyznaje brak gwarancji: "If the response is lost, the submission's outcome remains uncertain: replay may omit live-only or discarded messages, and a retry can create another submission." `messageId`/`toolCallId`/`_meta` służą **korelacji**, nie deduplikacji ([`extensibility.md`](https://agentclientprotocol.com/protocol/v1/extensibility.md): "JSON-RPC id correlation"). Osadzenie `run_id` w treści promptu i poleganie na `conductor_report` jako potwierdzeniu **nie czyni samego `create`/`prompt` idempotentnym** — to obchodzi problem przez zewnętrzny mechanizm (dokładnie taki, jaki Conductor już ma w `answer_delivery`, sekcja 2.6), nie rozwiązanie w warstwie protokołu. Stąd **Nie**, nie "Częściowo" — ACP nie dostarcza żadnego prymitywu w tym kierunku, tylko nazywa problem. |
-| 5 | Availability wake-up jako optymalizacja, heartbeat jako correctness | **Nie** | Bez modelu rejestru wieloagentowego (patrz #1) nie ma czego "obudzić" — ACP nie definiuje zdarzenia "nowy agent dostępny". |
-| 6 | Error ownership boundary (`compatible_runner_unavailable` jako resource reason, nie operation failure; reszta mapowana do `FailureClass`, bez parsowania tekstu) | **Częściowo** | ACP ma `StopReason` (`prompt-turn.md`: `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, `cancelled`) — zamknięty, mały zestaw **konkluzji turnu**, nie ogólna taksonomia błędów wykonania. Błędy transportowe to zwykłe błędy JSON-RPC (kod + `message` string) — bez ustandaryzowanej klasy `transient_upstream`/`capacity`/`timeout` w stylu `retry-policy`. Odwzorowanie na `FailureClass` Conductora nadal wymaga logiki po stronie adaptera (dziś: regex na tekście w `classifyThrownBoundary`, `engine.ts:2279` — a to jest już dziś złamanie własnej zasady "no message parsing", niezależnie od ACP). |
-| 7 | Safe status i cancellation (unknown→nie nudge/reap; cancel best-effort, audytowany) | **Częściowo** | Cancellation: `cancellation.md`/`prompt-turn.md` — `$/cancel_request` i `session/cancel` to **best-effort**, "MAY cancel", agent "SHOULD stop... as soon as possible" — zgodne kierunkowo z "best-effort" Conductora, ale **audyt (request+observed result) pozostaje w całości obowiązkiem Conductora** — ACP nie loguje ani nie gwarantuje żadnego trwałego zapisu wyniku anulowania. Status: ACP **nie ma metody `session/status`** w ogóle — jest tylko strumień `session/update` (push) i odpowiedź `session/prompt` na końcu turnu (`stopReason`, tylko w v1; w v2 przez `state_update`). Nie ma sposobu **odpytania** "czy sesja X jest busy/idle/retry/missing" poza obserwowaniem żywego strumienia — a wnioskowanie stanu z historii `session/update` **nie jest** bezpiecznym zamiennikiem: cisza w strumieniu jest równie niejednoznaczna jak dzisiejsza "niepewność" (nie odróżnia "long-running tool" od "utracone połączenie" od "nic nigdy nie miało nadejść"). To istotna luka względem `runner-lifecycle/spec.md` wymogu "Status SHALL distinguish busy, idle, provider-retrying and missing." |
-| 8 | Migracja (additive, no rollback destrukcyjny) | **Nie** | Czysto wewnętrzna decyzja Conductora (SQLite migrations) — ACP z definicji nie ma tu żadnej roli, więc pokrycie jest **Nie**, nie "nie dotyczy": ACP nie może pokryć tej decyzji, tak jak nie pokrywa 1/2/3/4/5. |
+| 1 | Durable stable identity + leased registration | **No** | ACP `initialize` has `agentCapabilities`/`agentInfo`, but `agentInfo` is **not an identity** ([`initialization.md`](https://agentclientprotocol.com/protocol/v1/initialization.md): "Both take the following three fields... Intended for programmatic or logical use") — there is no stable ID surviving a process restart, and no lease at all. (Capability negotiation as a separate matter is assessed below, row 4.3 — here it is solely about identity+lease, which ACP does not have.) ACP has no notion of "a registry of many agents with a heartbeat" — it is a 1:1 client↔process model where the process is launched by the client (stdio transport), not an N:1 model (many projects through one registered runner, like `runner-opencode`). Stable identity and lease remain entirely Conductor's responsibility. |
+| 2 | Daemon-initiated callback protocol (JSON HTTP, versioned media type) | **No** | ACP is **client-initiated at the connection level**: the client (Conductor as an ACP client) launches the agent as a subprocess over stdio ([`transports.md`](https://agentclientprotocol.com/protocol/v1/transports.md): "The client launches the agent as a subprocess... All Agents MUST support stdio"). This does NOT contradict today's daemon→runner callback direction — on the contrary, it is **consistent** with it: Conductor as an ACP client already initiates the connection to the runner today (today's `runner-transport.ts` POSTs to the runner's endpoint, exactly as an ACP client launches/connects to an agent). The difference lies elsewhere: (a) today's callback is a **custom wire format** (ad-hoc JSON HTTP), not ACP's JSON-RPC-over-stdio — that is what would be replaced, not the direction; (b) the **reverse** direction (runner→daemon) **already exists today**, not only in the planned `runner-protocol` — `hub.ts` already POSTs registration+heartbeat to the daemon today (`announce()`, `hub.ts:204-212`, called from `registerProject`/the re-announce timer, `hub.ts:138-158`, every 15s); however, this is **in-memory, endpoint-keyed** (section 2.3), not the durable/stable identity that `runner-protocol` demands. The "runner announces itself to a registry" direction itself therefore **exists** in Conductor — ACP does not define it as part of the agent↔client protocol (it has no notion of "a registry of many agents", see decision #1), but this is not a gap of "something that does not exist today", only a gap of "ACP does not standardize this pattern, which Conductor already has via its own mechanism". Once the connection is established, ACP **is** bidirectional within that one session: the agent can send requests to the client (`session/request_permission`, `fs/read_text_file`/`fs/write_text_file`, `terminal/*`, `elicitation/create`), not just push `session/update` — but this is still within the connection the client initiated, not a new outbound connection initiated by the agent. A remote HTTP transport for ACP itself (not to be confused with MCP-over-HTTP, see 4.1/4.3) is a separate RFD "Streamable HTTP & WebSocket Transport" — status **Active** (moved from Draft on 2026-07-02, verified via [`rfds/updates`](https://agentclientprotocol.com/rfds/updates.md)), and thus a current focus of the maintainers, but **not stable/completed** — treat it as an unstable proposal in motion, not as "still Draft". |
+| 3 | Durable offer precedes executable run attempt (`wait_resource` before an attempt is created) | **No** | ACP has no notion of "runner offline" as a protocol state — the connection either exists (because the client opened it) or does not. There is no "durable assignment offer" waiting for a remote agent to become available; this is a purely orchestration-level Conductor concept, consistent with `retry-policy`'s `resource_wait`, with no counterpart in ACP. |
+| 4 | Idempotent create/prompt state machine (idempotency key, redelivery, no blind resend) | **No** | ACP has **no** idempotency-key field on `session/new`/`session/prompt` in either v1 or v2. ACP v2 `prompt-lifecycle.md` explicitly admits the lack of a guarantee: "If the response is lost, the submission's outcome remains uncertain: replay may omit live-only or discarded messages, and a retry can create another submission." `messageId`/`toolCallId`/`_meta` serve **correlation**, not deduplication ([`extensibility.md`](https://agentclientprotocol.com/protocol/v1/extensibility.md): "JSON-RPC id correlation"). Embedding `run_id` in the prompt content and relying on `conductor_report` as confirmation **does not make `create`/`prompt` itself idempotent** — it works around the problem via an external mechanism (exactly the kind Conductor already has in `answer_delivery`, section 2.6), not a solution at the protocol layer. Hence **No**, not "Partial" — ACP provides no primitive in this direction, it only names the problem. |
+| 5 | Availability wake-up as an optimization, heartbeat as correctness | **No** | Without a multi-agent registry model (see #1) there is nothing to "wake up" — ACP does not define a "new agent available" event. |
+| 6 | Error ownership boundary (`compatible_runner_unavailable` as a resource reason, not an operation failure; the rest mapped to `FailureClass`, without text parsing) | **Partial** | ACP has `StopReason` (`prompt-turn.md`: `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, `cancelled`) — a closed, small set of **turn conclusions**, not a general taxonomy of execution errors. Transport errors are plain JSON-RPC errors (code + `message` string) — without a standardized `transient_upstream`/`capacity`/`timeout` class in the style of `retry-policy`. Mapping onto Conductor's `FailureClass` still requires adapter-side logic (today: regex on text in `classifyThrownBoundary`, `engine.ts:2279` — and that already violates Conductor's own "no message parsing" rule today, independently of ACP). |
+| 7 | Safe status and cancellation (unknown→no nudge/reap; cancel best-effort, audited) | **Partial** | Cancellation: `cancellation.md`/`prompt-turn.md` — `$/cancel_request` and `session/cancel` are **best-effort**, "MAY cancel", the agent "SHOULD stop... as soon as possible" — directionally consistent with Conductor's "best-effort", but **auditing (request+observed result) remains entirely Conductor's responsibility** — ACP neither logs nor guarantees any durable record of the cancellation result. Status: ACP **has no `session/status` method** at all — there is only the `session/update` stream (push) and the `session/prompt` response at the end of a turn (`stopReason`, v1 only; in v2 via `state_update`). There is no way to **query** "is session X busy/idle/retry/missing" other than by observing the live stream — and inferring state from the `session/update` history **is not** a safe replacement: silence in the stream is just as ambiguous as today's "uncertainty" (it does not distinguish "long-running tool" from "lost connection" from "nothing was ever going to arrive"). This is a significant gap relative to the `runner-lifecycle/spec.md` requirement "Status SHALL distinguish busy, idle, provider-retrying and missing." |
+| 8 | Migration (additive, no destructive rollback) | **No** | A purely internal Conductor decision (SQLite migrations) — ACP by definition has no role here, so coverage is **No**, not "not applicable": ACP cannot cover this decision, just as it does not cover 1/2/3/4/5. |
 
 ---
 
-## 4. Tabela pokrycia: requirements trzech specs
+## 4. Coverage table: requirements of the three specs
 
 ### 4.1 `agent-assignment/spec.md` (4 requirements)
 
-| Requirement | ACP | Uzasadnienie |
+| Requirement | ACP | Rationale |
 |---|---|---|
-| Every assignment is self-contained (run/attempt ID, cwd, role, prompt, capabilities, reporting instr., lease) | **Częściowo** | `session/new` niesie `cwd` (absolutny, `session-setup.md`: "MUST be an absolute path... MUST remain the base for relative-path resolution") i `mcpServers` — to pokrywa *routing katalogu* i *wstrzykiwanie narzędzi raportujących* (przez MCP server w `mcpServers`). Nie niesie roli/capabilities-wymagań ani leasy — to muszą dołożyć warstwy nad ACP (np. treść promptu, konfiguracja MCP per-run). |
-| Unassigned work is durable and visible (offer bez failed run, recoverowalny po restarcie) | **Nie** | Brak odpowiednika — patrz decyzja #3 w sekcji 3. |
-| Assignment acceptance is leased and atomic (jeden runner, race dwóch runnerów rozstrzygnięty atomowo) | **Nie** | ACP nie ma modelu wielu kandydujących runnerów per zadanie — klient wybiera *z góry*, którego agenta uruchomić (skonfigurowana komenda/binarka), zanim nawiąże połączenie. Brak "race" w warstwie protokołu. |
-| Timeline notes do not trigger inference (best-effort note, failure nie blokuje) | **Nie** | `rfds/session-notices` (Preview, 2026-09-24) wprowadza `notice` — ale jest **od agenta do klienta**, dokładnie odwrotny kierunek od `note()` Conductora (Conductor→sesja agenta). Kierunek jest tu rozstrzygający, nie tylko dojrzałość: nawet gdyby `notice` był stabilny, nie zaadresowałby wymogu "klient dopisuje coś do sesji agenta bez wywoływania inferencji", bo to nie ta strona protokołu. Jedyny kanał klient→agent w ACP to `session/prompt`, który zawsze jest wejściem do modelu. Stąd **Nie**, a nie "Częściowo" — `notice` jest nieistotny (irrelevant) dla tego konkretnego wymogu, nie słabszą wersją go. |
+| Every assignment is self-contained (run/attempt ID, cwd, role, prompt, capabilities, reporting instr., lease) | **Partial** | `session/new` carries `cwd` (absolute, `session-setup.md`: "MUST be an absolute path... MUST remain the base for relative-path resolution") and `mcpServers` — this covers *directory routing* and *injection of reporting tools* (via an MCP server in `mcpServers`). It does not carry role/capability requirements or a lease — these must be added by layers above ACP (e.g. prompt content, per-run MCP configuration). |
+| Unassigned work is durable and visible (offer without a failed run, recoverable after restart) | **No** | No counterpart — see decision #3 in section 3. |
+| Assignment acceptance is leased and atomic (one runner, a race between two runners resolved atomically) | **No** | ACP has no model of multiple candidate runners per task — the client chooses *up front* which agent to launch (a configured command/binary) before establishing the connection. No "race" at the protocol layer. |
+| Timeline notes do not trigger inference (best-effort note, failure does not block) | **No** | `rfds/session-notices` (Preview, 2026-09-24) introduces `notice` — but it goes **from the agent to the client**, exactly the opposite direction from Conductor's `note()` (Conductor→agent session). The direction is decisive here, not just maturity: even if `notice` were stable, it would not address the requirement "the client appends something to the agent's session without invoking inference", because it is on the wrong side of the protocol. The only client→agent channel in ACP is `session/prompt`, which is always model input. Hence **No**, rather than "Partial" — `notice` is irrelevant to this particular requirement, not a weaker version of it. |
 
 ### 4.2 `runner-lifecycle/spec.md` (5 requirements)
 
-| Requirement | ACP | Uzasadnienie |
+| Requirement | ACP | Rationale |
 |---|---|---|
-| Runner availability is leased, not assumed (heartbeat, expiry, brak usuwania tożsamości) | **Nie** | Patrz decyzja #1/#5 sekcja 3 — brak modelu rejestru z heartbeatem. |
-| Availability changes wake compatible waiting work | **Nie** | Jw. |
-| Session creation and prompting are idempotent (idempotency key, redelivery bez duplikatu) | **Nie** | Patrz decyzja #4 sekcja 3 — ACP nie ma żadnego pola idempotency-key; `messageId` koreluje **odpowiedzi agenta**, nie deduplikuje **żądania klienta**. Zero prymitywu w protokole w tym kierunku. |
-| Unknown status is handled in the safe direction (busy/idle/retry/missing rozróżnione; brak endpointu → transient error) | **Nie** | Brak metody `session/status` w ACP w ogóle (patrz decyzja #7 sekcja 3) — nie da się "zapytać o niepewność", bo nie da się zapytać wcale. Wnioskowanie z historii `session/update` (streaming) nie jest bezpiecznym zamiennikiem request/response `status()` (patrz sekcja 3, wiersz 7) — to inny model, nie słabsza wersja tego samego. |
-| Cancellation is best-effort and audited (request nie czeka na dostępność runnera; audyt request+result) | **Częściowo** | `session/cancel` (notification, nie blokuje na odpowiedzi) + `$/cancel_request` to dokładnie best-effort: "MAY cancel... The calling side MAY implement graceful cancellation processing by waiting for the response" — pasuje do "request nie czeka". Ale **audyt** (trwały zapis request+observed result) jest w całości obowiązkiem Conductora — ACP nie loguje ani nie przechowuje nic z tego; stąd **Częściowo**, nie **Tak**: protokół pokrywa tylko połowę requirementu (mechanikę żądania), nie audytowalność. |
+| Runner availability is leased, not assumed (heartbeat, expiry, no identity deletion) | **No** | See decisions #1/#5 in section 3 — no registry model with a heartbeat. |
+| Availability changes wake compatible waiting work | **No** | Same as above. |
+| Session creation and prompting are idempotent (idempotency key, redelivery without duplicates) | **No** | See decision #4 in section 3 — ACP has no idempotency-key field at all; `messageId` correlates **agent responses**, it does not deduplicate **client requests**. Zero protocol primitives in this direction. |
+| Unknown status is handled in the safe direction (busy/idle/retry/missing distinguished; missing endpoint → transient error) | **No** | No `session/status` method in ACP at all (see decision #7 in section 3) — you cannot "query for uncertainty", because you cannot query at all. Inferring from the `session/update` history (streaming) is not a safe replacement for a request/response `status()` (see section 3, row 7) — it is a different model, not a weaker version of the same one. |
+| Cancellation is best-effort and audited (request does not wait for runner availability; audit of request+result) | **Partial** | `session/cancel` (a notification, does not block on a response) + `$/cancel_request` are exactly best-effort: "MAY cancel... The calling side MAY implement graceful cancellation processing by waiting for the response" — matches "request does not wait". But the **audit** (durable record of request+observed result) is entirely Conductor's responsibility — ACP neither logs nor stores any of it; hence **Partial**, not **Yes**: the protocol covers only half of the requirement (the request mechanics), not auditability. |
 
 ### 4.3 `runner-contract/spec.md` (3 requirements)
 
-| Requirement | ACP | Uzasadnienie |
+| Requirement | ACP | Rationale |
 |---|---|---|
-| Runners implement a small versioned contract (version negotiation, capability reg/heartbeat, create/prompt/status/note/cancel) | **Częściowo** | Version negotiation: **częściowo pasuje**, nie w pełni — ACP faktycznie negocjuje wersję (`initialization.md`: "If the Agent supports the requested version, it MUST respond with the same version. Otherwise... the latest version it supports"), ale `runner-contract/spec.md` żąda diagnostyki "both supported **ranges**" przy niekompatybilności — ACP `protocolVersion` to **pojedyncza liczba całkowita głównej wersji** na stronę (dziś `1`), nie zakres wielu wspieranych wersji jednocześnie; diagnostyka "zakres po obu stronach" nie ma więc dokładnego odpowiednika — agent/klient zwraca jedną liczbę, nie listę/zakres, więc ten konkretny fragment requirementu jest tylko **częściowo** wykonalny (samą niekompatybilność da się zgłosić, "zakresy" nie w sensie dosłownym). Create/prompt/cancel: **Tak** jako prymitywy (`session/new`, `session/prompt`, `session/cancel`). Capability registration/heartbeat jako osobny **rejestr** (patrz #1/#5): **Nie**. Status: **Nie** (patrz wyżej). Note: **Nie** (patrz 4.1, kierunek odwrotny). Zbiorczo: rdzeń "sesyjny" (create/prompt/cancel) pokryty, version negotiation częściowo, rdzeń "rejestrowy" (capability/heartbeat/status/note-do-agenta) niepokryty. |
-| Capabilities are negotiated before assignment (required tool surface, opaque model binding, brak assignmentu bez kompatybilnego runnera) | **Częściowo** | `initialize` capabilities (`mcpCapabilities.http/sse`, `promptCapabilities.image/audio/embeddedContext`, `sessionCapabilities.{loadSession,resume,close,delete,additionalDirectories}`) negocjują **funkcje protokołu**, nie **zdolności wykonawcze specyficzne dla zadania** (np. "czy ten runner ma dostęp do worktree X"). Kilka rozróżnień doprecyzowujących: (a) **`parentID` NIE jest częścią stabilnego ACP v1** — `session/new` w ACP niesie tylko `cwd`/`mcpServers` ([`session-setup.md`](https://agentclientprotocol.com/protocol/v1/session-setup.md)); "parent session" to własny koncept portu Conductora (`SessionClient.createSession({parentID})`, dzisiejszy wzorzec przez SDK opencode, `engine.ts:491-508`), bez odpowiednika w samym ACP — nie mylić z `session/fork` (wciąż Draft), który jest **czymś innym** (rozgałęzienie historii istniejącej sesji), nie transportem dla `parentID`; adapter ACP musiałby zaimplementować hierarchię rodzic/dziecko poza protokołem (np. przez własną warstwę nad wieloma niezależnymi `session/new`). (b) Model/wariant/tryb **nie są uniwersalnymi identyfikatorami** — `configOptions` z `category: "model"` to *opcjonalny* mechanizm, każdy agent definiuje własne `value`/`id` bez wspólnego słownika między runtime'ami; walidacja jest jednak możliwa **po utworzeniu sesji, przed promptem**: `session/new` może zwrócić initial `configOptions` w odpowiedzi, i/albo `session/set_config_option` zwraca **pełną, aktualną** listę z `currentValue` — Conductor może odczytać ją i **odrzucić przed wysłaniem `session/prompt`**, jeśli żądany model nie figuruje wśród opcji; to nie jest "brak sposobu odrzucić przed próbą", tylko "walidacja jest możliwa dopiero po `session/new`, nie przed nim" — assignment-gating **przed utworzeniem sesji** (na etapie wyboru runnera) pozostaje niemożliwy, walidacja **po utworzeniu, przed promptem** jest możliwa. (c) "Required tool surface" (np. `conductor_report` przez MCP) zależy od tego, czy agent **faktycznie zaakceptował i podłączył** skonfigurowany serwer MCP — `session-setup.md`: "Agents **SHOULD** connect to all MCP servers specified by the Client" (SHOULD, nie MUST) — nie ma potwierdzenia w odpowiedzi `session/new`, że dany serwer MCP jest gotowy/narzędzia widoczne; gotowość trzeba zweryfikować empirycznie (patrz sekcja 7.1 ryzyko OpenCode), nie założyć z samej akceptacji `mcpServers` w żądaniu. Podsumowując: assignment-gating **przed** utworzeniem sesji, w oparciu o wymagane zdolności, pozostaje odpowiedzialnością Conductora — tylko część walidacji (model) da się przesunąć na "po utworzeniu, przed promptem". |
-| Runner errors use the shared failure model (stabilna klasa błędu, resource-unavailability ≠ operation failure) | **Częściowo** | Patrz decyzja #6 sekcja 3 — `StopReason` jest zamkniętym zbiorem konkluzji turnu, nie ogólną taksonomią; JSON-RPC error codes (`-32800` Cancelled, standardowe `-32601`/`-32602` itd.) dają strukturę, ale nie klasy w stylu `transient_upstream`/`capacity` — mapowanie nadal wymaga logiki adaptera. |
+| Runners implement a small versioned contract (version negotiation, capability reg/heartbeat, create/prompt/status/note/cancel) | **Partial** | Version negotiation: **a partial fit**, not a full one — ACP does negotiate the version (`initialization.md`: "If the Agent supports the requested version, it MUST respond with the same version. Otherwise... the latest version it supports"), but `runner-contract/spec.md` demands diagnostics of "both supported **ranges**" on incompatibility — ACP `protocolVersion` is a **single integer major version** per side (today `1`), not a range of multiple simultaneously supported versions; the "range on both sides" diagnostic therefore has no exact counterpart — the agent/client returns a single number, not a list/range, so this particular part of the requirement is only **partially** achievable (the incompatibility itself can be reported, "ranges" not in the literal sense). Create/prompt/cancel: **Yes** as primitives (`session/new`, `session/prompt`, `session/cancel`). Capability registration/heartbeat as a separate **registry** (see #1/#5): **No**. Status: **No** (see above). Note: **No** (see 4.1, opposite direction). Overall: the "session" core (create/prompt/cancel) is covered, version negotiation partially, the "registry" core (capability/heartbeat/status/note-to-agent) is not covered. |
+| Capabilities are negotiated before assignment (required tool surface, opaque model binding, no assignment without a compatible runner) | **Partial** | `initialize` capabilities (`mcpCapabilities.http/sse`, `promptCapabilities.image/audio/embeddedContext`, `sessionCapabilities.{loadSession,resume,close,delete,additionalDirectories}`) negotiate **protocol features**, not **task-specific execution capabilities** (e.g. "does this runner have access to worktree X"). A few clarifying distinctions: (a) **`parentID` is NOT part of stable ACP v1** — `session/new` in ACP carries only `cwd`/`mcpServers` ([`session-setup.md`](https://agentclientprotocol.com/protocol/v1/session-setup.md)); "parent session" is a concept of Conductor's own port (`SessionClient.createSession({parentID})`, today's pattern via the opencode SDK, `engine.ts:491-508`), with no counterpart in ACP itself — not to be confused with `session/fork` (still Draft), which is **something else** (branching the history of an existing session), not a transport for `parentID`; an ACP adapter would have to implement the parent/child hierarchy outside the protocol (e.g. via its own layer on top of multiple independent `session/new` calls). (b) Model/variant/mode are **not universal identifiers** — `configOptions` with `category: "model"` is an *optional* mechanism, each agent defines its own `value`/`id` with no shared vocabulary across runtimes; validation is, however, possible **after session creation, before the prompt**: `session/new` may return initial `configOptions` in its response, and/or `session/set_config_option` returns the **full, current** list with `currentValue` — Conductor can read it and **reject before sending `session/prompt`** if the requested model is not among the options; this is not "no way to reject before an attempt", but "validation is possible only after `session/new`, not before it" — assignment-gating **before session creation** (at the runner selection stage) remains impossible, validation **after creation, before the prompt** is possible. (c) The "required tool surface" (e.g. `conductor_report` via MCP) depends on whether the agent **actually accepted and connected** the configured MCP server — `session-setup.md`: "Agents **SHOULD** connect to all MCP servers specified by the Client" (SHOULD, not MUST) — there is no confirmation in the `session/new` response that a given MCP server is ready/its tools visible; readiness has to be verified empirically (see section 7.1, OpenCode risk), not assumed from the mere acceptance of `mcpServers` in the request. In summary: assignment-gating **before** session creation, based on required capabilities, remains Conductor's responsibility — only part of the validation (model) can be moved to "after creation, before the prompt". |
+| Runner errors use the shared failure model (stable error class, resource-unavailability ≠ operation failure) | **Partial** | See decision #6 in section 3 — `StopReason` is a closed set of turn conclusions, not a general taxonomy; JSON-RPC error codes (`-32800` Cancelled, the standard `-32601`/`-32602` etc.) provide structure, but not classes in the style of `transient_upstream`/`capacity` — mapping still requires adapter logic. |
 
-**Uwaga o liczeniu:** ta notatka celowo **nie** agreguje wierszy sekcji 3
-i 4 w jedną liczbę "X/Y pokrycia". Decyzje projektowe (sekcja 3) i
-requirementy specs (sekcja 4) nie są jednostkami porównywalnej wagi —
-sumowanie ich sugerowałoby precyzję pomiaru, której ta jakościowa
-analiza nie ma. Wniosek ilościowy jest prostszy i solidniejszy: **żaden
-wiersz w żadnej z dwóch tabel nie jest "Tak" poza cancellation-mechanics
-(sekcja 4, częściowo) i version-negotiation/create/prompt/cancel jako
-pojedyncze prymitywy sesji (sekcja 4.3, w ramach wiersza ocenionego
-całościowo jako Częściowo)** — dominują "Nie" i "Częściowo", co
-wystarcza do wniosku w sekcji 10 bez potrzeby sumy liczbowej.
+**Note on counting:** this note deliberately does **not** aggregate the rows of sections 3
+and 4 into a single "X/Y coverage" number. Design decisions (section 3) and
+spec requirements (section 4) are not units of comparable weight —
+summing them would suggest a measurement precision that this qualitative
+analysis does not have. The quantitative conclusion is simpler and more robust: **no
+row in either of the two tables is "Yes" except cancellation mechanics
+(section 4, partial) and version-negotiation/create/prompt/cancel as
+individual session primitives (section 4.3, within a row assessed
+as Partial overall)** — "No" and "Partial" dominate, which
+suffices for the conclusion in section 10 without the need for a numerical sum.
 
 ---
 
-## 5. Analizy granic: sześć architektonicznych + uprawnienia/auth/izolacja
+## 5. Boundary analyses: six architectural + permissions/auth/isolation
 
-Poniższe granice są fundamentalne dla architektury Conductora
-(`AGENTS.md`, `openspec/config.yaml`) i **żadna z nich nie jest tym,
-czym jest ACP** — mylenie ich prowadzi do architektury, w której ACP
-po cichu przejmuje odpowiedzialność, której nie powinien mieć. Sekcje
-5.1-5.6 to sześć granic architektonicznych (source-of-truth, czystość
-interpretera, własność retry, własność review/gates, end_turn-vs-sukces,
-recovery-konwersacji-vs-wykonania). Sekcje 5.7-5.8 dodają dwie granice
-operacyjne — uprawnienia/autoryzacja/izolacja oraz tożsamość/lease/nadzór
-procesów — które recenzja tej notatki wskazała jako brakujące i które
-**nie są zastępowane** przez pozostałe sześć: dotyczą innego pytania
-("kto/co wolno agentowi zrobić pod jaką tożsamością, i kto nadzoruje sam
-proces", nie "gdzie żyje prawda stanu/efekty/retry/gates").
+The boundaries below are fundamental to Conductor's architecture
+(`AGENTS.md`, `openspec/config.yaml`) and **none of them is what ACP
+is** — confusing them leads to an architecture in which ACP silently
+takes on responsibility it should not have. Sections
+5.1-5.6 are the six architectural boundaries (source-of-truth, interpreter
+purity, retry ownership, review/gates ownership, end_turn-vs-success,
+conversation-recovery-vs-execution-recovery). Sections 5.7-5.8 add two
+operational boundaries — permissions/authorization/isolation and
+process identity/lease/supervision — which the review of this note
+identified as missing and which **are not covered** by the other six:
+they address a different question ("what is the agent allowed to do,
+under what identity, and who supervises the process itself", not "where
+does the truth of state/effects/retry/gates live").
 
-### 5.1 Prawda stanu: SQLite vs sesja ACP
+### 5.1 State truth: SQLite vs the ACP session
 
 `AGENTS.md`: "SQLite is the source of truth. Sessions are disposable
-executors." ACP nie ma pojęcia trwałości poza opcjonalnym
-`session/load` (replay historii) i `session/resume` (bez replay) —
-**obie zależą od tego, czy agent sam trzyma trwały stan** (capability
-`loadSession`/`sessionCapabilities.resume`, oba opcjonalne, oba mogą być
-`false`). ACP **nie gwarantuje**, że jakikolwiek stan przeżyje restart
-agenta — to decyzja implementacji agenta, nie protokołu. Conductor już
-dziś nie polega na trwałości sesji (`state.sessionId` jest odtwarzane
-przez `sessionExists` + rekreację, `engine.ts:484-497`) — to jest zgodne
-z ACP, ale **z innego powodu**: Conductor projektuje sesje jako
-jednorazowe z założenia, ACP po prostu nie obiecuje trwałości.
-**Wniosek: SQLite jako source of truth pozostaje niezmienione; ACP nie
-może i nie powinien tego zastąpić — to nie jest jego rola.**
+executors." ACP has no notion of durability beyond the optional
+`session/load` (history replay) and `session/resume` (no replay) —
+**both depend on whether the agent itself keeps durable state**
+(capability `loadSession`/`sessionCapabilities.resume`, both optional,
+both may be `false`). ACP **does not guarantee** that any state survives
+an agent restart — that is a decision of the agent implementation, not
+of the protocol. Conductor already today does not rely on session
+durability (`state.sessionId` is re-established via `sessionExists` +
+re-creation, `engine.ts:484-497`) — this is consistent with ACP, but
+**for a different reason**: Conductor designs sessions as disposable by
+intent, whereas ACP simply does not promise durability.
+**Conclusion: SQLite as the source of truth remains unchanged; ACP
+cannot and should not replace it — that is not its role.**
 
-### 5.2 Czystość interpretera: gdzie żyją efekty uboczne
+### 5.2 Interpreter purity: where side effects live
 
 `AGENTS.md`: "Interpreter pure, engine owns I/O. Routing decisions live
 in a pure function; all side effects live in the engine/reconciler."
-ACP z natury **jest** protokołem efektów ubocznych — `session/prompt`
-wywołuje model, agent wykonuje narzędzia i **raportuje** je przez
-`tool_call`/`tool_call_update` (obserwacja stanu, nie żądanie wykonania
-przez klienta), a `session/request_permission` to żądanie **decyzji**
-klienta (allow/deny), nie samo wykonanie akcji — efekt uboczny (np.
-zapis pliku) wykonuje agent, dopiero **po** ewentualnym pozwoleniu.
-Niezależnie od tego rozróżnienia, ACP jako całość pozostaje protokołem
-niosącym efekty uboczne, których interpreter nie powinien dotykać
-bezpośrednio. Gdyby interpreter Conductora (funkcja
-czysta, decydująca o routingu grafu) zyskał bezpośredni dostęp do
-klienta ACP, złamałoby to podział. **Granica pozostaje: interpreter
-dalej tylko decyduje "co dalej" (np. `decideResourceWaitRoute`,
-`engine.ts:422`), a wywołanie ACP (analog dzisiejszego `sessions.prompt`)
-zostaje w `engine.ts`/warstwie I/O, tak jak dziś `SessionClient` jest
-wstrzykiwany do silnika, nie do interpretera.** Adapter ACP zastąpiłby
-`runner-opencode`/`runner-transport.ts` jako **implementację portu**,
-nie zmienił architektury warstw.
+ACP is by nature **a** side-effect protocol — `session/prompt`
+invokes the model, the agent executes tools and **reports** them via
+`tool_call`/`tool_call_update` (observation of state, not a request for
+the client to execute), and `session/request_permission` is a request
+for a client **decision** (allow/deny), not the execution of the action
+itself — the side effect (e.g. writing a file) is performed by the
+agent, only **after** permission, if any, is granted.
+Regardless of this distinction, ACP as a whole remains a protocol
+carrying side effects that the interpreter should not touch
+directly. If Conductor's interpreter (a
+pure function deciding graph routing) gained direct access to the
+ACP client, that would break the split. **The boundary stays: the
+interpreter still only decides "what next" (e.g. `decideResourceWaitRoute`,
+`engine.ts:422`), and the ACP call (the analogue of today's `sessions.prompt`)
+stays in `engine.ts`/the I/O layer, just as today `SessionClient` is
+injected into the engine, not into the interpreter.** An ACP adapter would
+replace `runner-opencode`/`runner-transport.ts` as a **port implementation**,
+not change the layered architecture.
 
-### 5.3 Własność retry / failure-classification: `retry-policy` vs ACP
+### 5.3 Retry / failure-classification ownership: `retry-policy` vs ACP
 
 `runner-contract/spec.md`: "The engine SHALL apply the generic policy
 from `retry-policy` and SHALL NOT parse message text." `retry-policy`
-(**shipped**, 25/25) już dostarcza `FailureClass`, budżety
-tries-and-elapsed, `resource_wait`, `recover()` z optimistic concurrency
-(`engine.ts:1490-1529`). ACP `StopReason` (5 wartości) i JSON-RPC error
-codes **nie są** i nie mogą być taksonomią retry — nie niosą hintów
-retry (`retry hint` z `runner-contract` requirement "Provider outage is
-classified" nie ma odpowiednika w ACP poza swobodnym tekstem błędu).
-**Każdy adapter ACP musi tłumaczyć swoje błędy na `FailureClass` po
-stronie Conductora — dokładnie tak, jak dziś robi to (źle, przez regex)
-`classifyThrownBoundary`.** ACP nie przejmuje i nie powinien przejąć
-własności retry.
+(**shipped**, 25/25) already provides `FailureClass`, tries-and-elapsed
+budgets, `resource_wait`, and `recover()` with optimistic concurrency
+(`engine.ts:1490-1529`). ACP `StopReason` (5 values) and JSON-RPC error
+codes **are not** and cannot be a retry taxonomy — they carry no retry
+hints (the `retry hint` from the `runner-contract` requirement "Provider outage is
+classified" has no ACP counterpart other than free-form error text).
+**Every ACP adapter must translate its errors into `FailureClass` on
+Conductor's side — exactly as `classifyThrownBoundary` does today (badly,
+via regex).** ACP does not take over, and should not take over,
+retry ownership.
 
-### 5.4 Własność review/findings lifecycle i human gates
+### 5.4 Ownership of the review/findings lifecycle and human gates
 
-Structured review (`conductor report --review`, findings z ID/severity/
-blocking/acceptanceTests — `tools.ts` `createReportTool`, pełny schemat
-w `plugin.ts:40-78`) oraz human gates (`approve`/`requestChanges`,
-`conductor_approve`/`conductor_request_changes`, `plugin.ts:164-190`) są
-**w pełni własnością Conductora** — stan żyje w SQLite (`findings` table,
-`store.listFindings`), przejścia idą przez `dispatch()` interpretera
-(`human.paused`/`human.abandoned`/analogiczne dla approve). ACP nie ma
-pojęcia "finding", "review verdict" ani "approval gate" jako pierwszej
-klasy — to co ACP ma najbliższego to `session/request_permission`
-(pojedyncze tool-call, per-akcja, nie per-run gate) i **elicitation**
-(`elicitation/create`, stabilne od 2026-07-24). Elicitation jest jednak
-**UI-interaction**, nie durable gate: żądanie jest scoped do żywego
-połączenia agent↔klient (`elicitation.md`: "Agents MUST bind each
+Structured review (`conductor report --review`, findings with ID/severity/
+blocking/acceptanceTests — `tools.ts` `createReportTool`, full schema
+in `plugin.ts:40-78`) and human gates (`approve`/`requestChanges`,
+`conductor_approve`/`conductor_request_changes`, `plugin.ts:164-190`) are
+**fully owned by Conductor** — the state lives in SQLite (`findings` table,
+`store.listFindings`), transitions go through the interpreter's `dispatch()`
+(`human.paused`/`human.abandoned`/analogous ones for approve). ACP has no
+notion of a "finding", "review verdict" or "approval gate" as a first-class
+concept — the closest thing ACP has is `session/request_permission`
+(a single tool call, per action, not a per-run gate) and **elicitation**
+(`elicitation/create`, stable since 2026-07-24). Elicitation, however, is
+**UI interaction**, not a durable gate: the request is scoped to the live
+agent↔client connection (`elicitation.md`: "Agents MUST bind each
 elicitation and related state to the receiving Client connection"),
-**nie przeżywa restartu**, nie ma budżetu/audytu w stylu findings, i
-explicite nie jest execution-authority ("An accept response means the
+**does not survive a restart**, has no findings-style budget/audit, and
+is explicitly not an execution authority ("An accept response means the
 user consented to open the URL. It does not mean the external
-interaction completed"). **Human gates i findings lifecycle pozostają w
-100% po stronie Conductora; ACP elicitation nie jest ich substytutem —
-to inna warstwa (per-tool-call UI prompt vs per-run durable approval
+interaction completed"). **Human gates and the findings lifecycle remain
+100% on Conductor's side; ACP elicitation is not a substitute for them —
+it is a different layer (per-tool-call UI prompt vs per-run durable approval
 state machine).**
 
-### 5.5 `end_turn` (StopReason) ≠ sukces zadania
+### 5.5 `end_turn` (StopReason) ≠ task success
 
-To jest **najbardziej niebezpieczna** potencjalna pomyłka projektowa.
-ACP v1 `prompt-turn.md`: `stopReason: "end_turn"` oznacza wyłącznie "The
+This is the **most dangerous** potential design mistake.
+ACP v1 `prompt-turn.md`: `stopReason: "end_turn"` means only "The
 language model finishes responding without requesting more tools" —
-**nic o tym, czy zadanie zostało wykonane poprawnie, czy w ogóle
-zaraportowane**. ACP v2 `prompt-lifecycle.md` to samo, plus explicite:
-"A successful prompt response is not an `idle` signal" (dla `session/
-prompt` samego w sobie) i osobno definiuje `idle` `state_update` jako
-koniec foreground-worku — ale **żaden z tych sygnałów nie jest
-Conductorowym `run.status = "succeeded"`**. Conductor już dziś **celowo
-nie** wnioskuje sukcesu z `status: idle` (`sessions.status()`) — najbliższy
-autorytatywny sygnał to jawne wywołanie `report()` (`engine.ts:1013`,
+**nothing about whether the task was completed correctly, or even
+reported at all**. ACP v2 `prompt-lifecycle.md` says the same, plus explicitly:
+"A successful prompt response is not an `idle` signal" (for `session/
+prompt` itself) and separately defines the `idle` `state_update` as
+the end of foreground work — but **none of these signals is
+Conductor's `run.status = "succeeded"`**. Conductor already today
+**deliberately does not** infer success from `status: idle` (`sessions.status()`) — the closest
+authoritative signal is an explicit `report()` call (`engine.ts:1013`,
 guard `if (run.status !== "running") return alreadyConcludedText(...)`)
-przez agenta z `outcome`/`verdict`. Ale nawet to trzeba doprecyzować, nie
-upraszczać do "report/ask = zakończone":
+by the agent with an `outcome`/`verdict`. But even this needs to be made
+precise rather than simplified to "report/ask = finished":
 
-- `report(..., ask: question)` **NIE kończy runu** — wprost przeciwnie,
-  **zawiesza** go: `store.setRunQuestion` (`engine.ts:1050`) zostawia
-  run w stanie `running` i czeka na odpowiedź człowieka jako nowy prompt;
-  to jest "koniec turnu, nie koniec zadania" (patrz niżej, uzupełnienie
-  sekcji 6), nie sukces ani porażka.
-- Run **może zakończyć się bez żadnego `report()` od agenta w ogóle** —
-  `reap()` (`engine.ts:2112-2135`) konkluduje run jako `"reaped"` po
-  przekroczeniu TTL ciszy, niezależnie od tego, czy agent kiedykolwiek
-  zawoła `conductor_report`. Autorytatywność `report()` jest więc
-  warunkowa: jest jedynym **pozytywnym** sygnałem sukcesu, ale **nie**
-  jedynym sposobem, w jaki run się kończy — reap i inne ścieżki
-  `concludeAndDispatch` (błąd promptu, `step.failed`) kończą run bez
-  udziału agenta.
+- `report(..., ask: question)` **DOES NOT end the run** — quite the opposite,
+  it **suspends** it: `store.setRunQuestion` (`engine.ts:1050`) leaves the
+  run in the `running` state and waits for the human's answer as a new prompt;
+  this is "end of turn, not end of task" (see below, the supplement to
+  section 6), neither success nor failure.
+- A run **can conclude without any `report()` from the agent at all** —
+  `reap()` (`engine.ts:2112-2135`) concludes the run as `"reaped"` after
+  the silence TTL is exceeded, regardless of whether the agent ever
+  calls `conductor_report`. The authority of `report()` is therefore
+  conditional: it is the only **positive** success signal, but **not**
+  the only way a run ends — reap and other
+  `concludeAndDispatch` paths (prompt error, `step.failed`) end the run without
+  the agent's involvement.
 
-Gdyby adapter ACP zaczął traktować `stopReason: "end_turn"` samo w sobie
-jako sygnał zakończenia **kroku** (sukcesu), złamałby to dokładnie tę
-zasadę — end_turn to **zdarzenie modelu językowego** (koniec turnu
-promptu), `report()` to **zdarzenie protokołu biznesowego Conductora**
-(koniec zadania), a nieotrzymanie żadnego z nich prowadzi do reap, nie do
-domyślnego sukcesu. **Wniosek: adapter ACP musi nadal czekać na jawny,
-pozytywny `report()` (przez MCP tool run-scoped, patrz sekcja 6) dla
-sukcesu, i pozostawić TTL/reap jako jedyną ścieżkę dla ciszy — nigdy nie
-inferować sukcesu z samego `stopReason`.**
+If an ACP adapter started treating `stopReason: "end_turn"` by itself
+as a signal that the **step** has completed (successfully), it would break
+exactly this principle — end_turn is a **language-model event** (end of a
+prompt turn), `report()` is a **Conductor business-protocol event**
+(end of the task), and receiving neither of them leads to reap, not to
+default success. **Conclusion: the ACP adapter must still wait for an explicit,
+positive `report()` (via a run-scoped MCP tool, see section 6) for
+success, and leave TTL/reap as the only path for silence — never
+infer success from `stopReason` alone.**
 
-### 5.6 Recovery konwersacji ≠ recovery wykonania
+### 5.6 Conversation recovery ≠ execution recovery
 
-`session/load` (replay pełnej historii przed odpowiedzią) i `session/
-resume` (bez replay, "MUST NOT replay... restores the session context...
-returns once ready") to **recovery połączenia/kontekstu konwersacji** —
-odpowiadają na pytanie "jak wrócić do rozmowy z tym samym agentem". To
-**nie jest** to samo co "recovery wykonania kroku workflow" — czyli
-pytanie, które zadaje `retry-policy`: czy dany `run`/`attempt` zakończył
-się, czy trzeba go ponowić, z jakim budżetem, z jaką klasą błędu.
-Dowód wprost z ACP v2: "If the response [do `session/prompt`] is lost,
+`session/load` (replay of the full history before responding) and `session/
+resume` (no replay, "MUST NOT replay... restores the session context...
+returns once ready") are **connection/conversation-context recovery** —
+they answer the question "how do I get back to the conversation with the same agent". That
+**is not** the same as "recovery of a workflow step's execution" — i.e. the
+question that `retry-policy` asks: whether a given `run`/`attempt` has
+concluded, whether it needs to be retried, with what budget, with what failure class.
+Direct evidence from ACP v2: "If the response [to `session/prompt`] is lost,
 the submission's outcome remains uncertain: **replay may omit live-only
 or discarded messages, and a retry can create another submission**." —
-ACP **przyznaje**, że nawet mając `session/load`, nie da się bezpiecznie
-odtworzyć "czy dany prompt doszedł" bez dodatkowego mechanizmu poza
-protokołem. Doprecyzowanie roli `messageId`/`load`, żeby nie
-uogólniać ponad to, co spec faktycznie mówi:
+ACP **admits** that even with `session/load`, it is not possible to safely
+reconstruct "whether a given prompt arrived" without an additional mechanism outside
+the protocol. Clarifying the role of `messageId`/`load`, so as not to
+generalise beyond what the spec actually says:
 
-- `messageId`/`toolCallId`/`_meta` służą **korelacji żądanie↔odpowiedź**
-  — to nie jest ograniczone tylko do jednego, wciąż-żywego połączenia:
-  jeśli agent retencjonuje i replayuje wiadomość (przy `session/load`),
-  MUSI użyć **tego samego** `messageId` co przy oryginalnym wysłaniu
+- `messageId`/`toolCallId`/`_meta` serve **request↔response correlation**
+  — this is not limited to a single, still-live connection:
+  if the agent retains and replays a message (on `session/load`),
+  it MUST use **the same** `messageId` as on the original send
   (`session-setup.md`/`prompt-lifecycle.md`: "If the message is retained
-  and replayed, the Agent MUST use the same ID") — więc identyfikator
-  *może* przetrwać między połączeniami, o ile agent zdecyduje się
-  przechowywać historię. To, czego brakuje, to **deduplikacja żądania
-  klienta** (idempotency-key po stronie `session/prompt`), nie
-  korelacja odpowiedzi jako taka — te dwie rzeczy nie są tożsame.
-- `session/load`, tam gdzie agent **wspiera** `loadSession` (capability
-  opcjonalna), **faktycznie dostarcza trwałą historię konwersacji** —
-  to nie jest "ACP nigdy nie gwarantuje trwałości" w sposób blankietowy;
-  to jest "trwałość jest opcjonalną capability, zależną od
-  implementacji agenta", co jest różnicą ważną dla oceny per-agent w
-  sekcji 7 (który z trzech kandydatów faktycznie ją wspiera i jak
-  długo). To, czego `session/load`/`session/resume` **nie** gwarantują,
-  to nie sama trwałość kontekstu (którą, gdy wspierana, dostarczają), a
-  **potwierdzenie, że efekty uboczne zgłoszone w tej historii faktycznie
-  wystąpiły dokładnie raz** — replay/resume odtwarza **kontekst
-  rozmowy**, nie audytuje **skutki w świecie zewnętrznym** (pliki,
-  commity, wywołania narzędzi). To rozróżnienie — kontekst vs efekty —
-  jest sednem tej granicy, nie brak trwałości per se.
+  and replayed, the Agent MUST use the same ID") — so the identifier
+  *may* survive across connections, provided the agent chooses to
+  store history. What is missing is **deduplication of client
+  requests** (an idempotency key on the `session/prompt` side), not
+  response correlation as such — these two things are not the same.
+- `session/load`, where the agent **supports** `loadSession` (an optional
+  capability), **does actually deliver durable conversation history** —
+  this is not "ACP never guarantees durability" in a blanket sense;
+  it is "durability is an optional capability, dependent on the
+  agent implementation", a distinction that matters for the per-agent
+  assessment in section 7 (which of the three candidates actually supports it and for how
+  long). What `session/load`/`session/resume` **do not** guarantee
+  is not context durability itself (which, when supported, they deliver), but
+  **confirmation that the side effects reported in that history actually
+  occurred exactly once** — replay/resume restores the **conversation
+  context**, it does not audit **effects in the external world** (files,
+  commits, tool invocations). This distinction — context vs effects —
+  is the crux of this boundary, not a lack of durability per se.
 
-**Wniosek: `session/resume`/`session/load`, tam gdzie wspierane, mogą
-faktycznie pomóc wznowić rozmowę i kontekst z agentem po utracie
-połączenia transportowego, ale to nie rozwiązuje wykonania. Conductor
-nadal potrzebuje własnego mechanizmu (idempotency key/delivery_token w
-stylu dzisiejszego `answer_delivery`, sekcja 2.6) — ale nawet ten
-mechanizm **koreluje próby dostawy**, ale bez deduplikacji i dowodu po
-stronie odbiorcy nie potwierdza nawet dostarczenia dokładnie raz.
-**Nie dowodzi też sam z siebie**, że efekt uboczny w świecie
-zewnętrznym wystąpił dokładnie raz: token bez efekt-specyficznego dowodu
-(np. sprawdzenia stanu repo/PR) zostawia crash-po-efekcie-przed-raportem
-w stanie **nieznanym** (patrz sekcja 6, "Krytyczne zastrzeżenie") — ACP
-dostarcza (opcjonalnie) recovery kontekstu/konwersacji; ani ACP, ani sam
-token korelacyjny nie dostarczają audytu wykonania i jego efektów.**
+**Conclusion: `session/resume`/`session/load`, where supported, can
+genuinely help resume the conversation and context with the agent after loss
+of the transport connection, but that does not solve execution. Conductor
+still needs its own mechanism (an idempotency key/delivery_token in
+the style of today's `answer_delivery`, section 2.6) — but even that
+mechanism **correlates delivery attempts**, and without deduplication and
+receiver-side proof it does not even confirm exactly-once delivery.
+**Nor does it prove on its own** that a side effect in the external
+world occurred exactly once: a token without effect-specific proof
+(e.g. checking repo/PR state) leaves a crash-after-effect-before-report
+in an **unknown** state (see section 6, "Critical caveat") — ACP
+provides (optionally) context/conversation recovery; neither ACP nor the
+correlation token alone provides an audit of execution and its effects.**
 
-### 5.7 Uprawnienia, autoryzacja, izolacja (headless daemon, deny-default)
+### 5.7 Permissions, authorization, isolation (headless daemon, deny-default)
 
-Conductor uruchamia agentów **bez interaktywnego człowieka przy
-klawiaturze** — to jest headless orchestrator, nie IDE. ACP zakłada w
-wielu miejscach obecność klienta z UI (Zed, edytor) i **nie** definiuje
-sam z siebie bezpiecznej postawy dla headless-hosta. Ta granica jest
-osobna od 5.1-5.6: dotyczy tego, **co wolno agentowi zrobić i pod jaką
-tożsamością**, nie tego, gdzie żyje prawda stanu.
+Conductor runs agents **without an interactive human at the
+keyboard** — it is a headless orchestrator, not an IDE. ACP assumes in
+many places the presence of a client with a UI (Zed, an editor) and does **not**
+by itself define a safe posture for a headless host. This boundary is
+separate from 5.1-5.6: it concerns **what the agent is allowed to do and under what
+identity**, not where the truth of state lives.
 
-- **`cwd` to granica konwencji, nie sandbox.** `session-setup.md`:
+- **`cwd` is a convention boundary, not a sandbox.** `session-setup.md`:
   "This root set **SHOULD** serve as a boundary for tool operations on
-  the file system" — `SHOULD`, nie `MUST`, i "boundary for tool
-  operations" nie jest równoznaczne z hermetyczną izolacją procesu.
-  ACP nie sandboxuje niczego samo z siebie — `cwd`/`additionalDirectories`
-  to instrukcja dla *grzecznego* agenta, nie wymuszenie na poziomie OS.
-  Rzeczywista izolacja (namespace/chroot/kontener/uprawnienia
-  systemowe) musi pochodzić z **hosta uruchamiającego proces agenta**
-  (dzisiejszy `PluginProcessSpawner`, `ports.ts:101-103, w kontekście
-  długo-żyjących procesów), nie z ACP.
-- **`session/request_permission` jest opcjonalne po stronie agenta, nie
-  uniwersalne wymuszenie.** `tool-calls.md`: "The Agent **MAY** request
-  permission from the user before executing a tool call" — `MAY`, nie
-  `MUST`. Agent, który uzna, że dane narzędzie nie wymaga potwierdzenia
-  (albo jest źle zaimplementowany), po prostu je wykona bez pytania.
-  Conductor **nie może polegać** na `request_permission` jako jedynej
-  linii obrony dla headless-runu — potrzebuje własnej, deny-default
-  polityki (np. sandboxing procesu, allowlist katalogów, brak dostępu
-  do sieci poza tym co jawnie dozwolone) **niezależnej** od tego, czy
-  konkretny agent zapyta.
-- **Autoryzacja providera ≠ autoryzacja uruchomienia (run authorization).**
-  `authentication.md` reguluje wyłącznie to, czy agent ma ważne
-  poświadczenia do swojego modelu/API (`authenticate`, `authMethods`,
-  `logout`) — to pytanie "czy ten agent może w ogóle rozmawiać z
-  providerem", zupełnie osobne od pytania Conductora "czy **temu
-  runowi/temu workflow** wolno tu wykonać to zadanie w tym repo".
-  ACP nie ma pojęcia autoryzacji na poziomie run/attempt — to musi
-  pozostać wyłącznie po stronie Conductora (np. dzisiejszy
-  `CONDUCTOR_RUNNER_TOKEN`/`timingSafeEqual` w `hub.ts:66-70`, albo
-  jego odpowiednik w warstwie MCP-report, patrz sekcja 6).
-- **Deny-default, bounded, headless czekanie na potwierdzenie.** Skoro
-  `request_permission` jest opcjonalne i UI-owe z natury (klient
-  "prezentuje" opcje użytkownikowi), headless-hosting Conductora musi
-  **sam** odpowiadać na te żądania (albo automatyczną polityką
-  allow/deny, albo eskalacją do człowieka przez istniejący mechanizm
-  `conductor_ask`/human-gate, nie przez czekanie w nieskończoność na
-  UI, którego nie ma) — z jawnym, ograniczonym w czasie timeoutem, nie
-  nieskończonym blokowaniem połączenia ACP.
-- **Ograniczenia OS/proces/env/sieć pozostają poza ACP w całości.**
-  Protokół nie ma pojęcia limitów zasobów, ograniczeń sieciowych,
-  ograniczeń zmiennych środowiskowych przekazywanych do subprocessu,
-  ani nadzoru nad drzewem procesów. Wszystko to jest — i pozostaje —
-  odpowiedzialnością warstwy hostującej Conductora (uruchamiającej
-  proces agenta/adaptera), analogicznie do dzisiejszego
+  the file system" — `SHOULD`, not `MUST`, and "boundary for tool
+  operations" is not equivalent to hermetic process isolation.
+  ACP sandboxes nothing by itself — `cwd`/`additionalDirectories`
+  are an instruction to a *well-behaved* agent, not OS-level enforcement.
+  Real isolation (namespace/chroot/container/system
+  permissions) must come from the **host launching the agent process**
+  (today's `PluginProcessSpawner`, `ports.ts:101-103, in the context of
+  long-lived processes), not from ACP.
+- **`session/request_permission` is optional on the agent side, not
+  universal enforcement.** `tool-calls.md`: "The Agent **MAY** request
+  permission from the user before executing a tool call" — `MAY`, not
+  `MUST`. An agent that decides a given tool does not require confirmation
+  (or is badly implemented) will simply execute it without asking.
+  Conductor **cannot rely** on `request_permission` as the only
+  line of defence for a headless run — it needs its own deny-default
+  policy (e.g. process sandboxing, a directory allowlist, no network
+  access beyond what is explicitly permitted) **independent** of whether
+  a particular agent asks.
+- **Provider authorization ≠ run authorization.**
+  `authentication.md` governs only whether the agent has valid
+  credentials for its model/API (`authenticate`, `authMethods`,
+  `logout`) — that is the question "can this agent talk to the
+  provider at all", entirely separate from Conductor's question "is **this
+  run/this workflow** allowed to perform this task here in this repo".
+  ACP has no notion of authorization at the run/attempt level — this must
+  remain exclusively on Conductor's side (e.g. today's
+  `CONDUCTOR_RUNNER_TOKEN`/`timingSafeEqual` in `hub.ts:66-70`, or
+  its counterpart in the MCP-report layer, see section 6).
+- **Deny-default, bounded, headless waiting for confirmation.** Since
+  `request_permission` is optional and UI-oriented by nature (the client
+  "presents" options to the user), Conductor's headless hosting must
+  answer these requests **itself** (either via an automatic
+  allow/deny policy, or via escalation to a human through the existing
+  `conductor_ask`/human-gate mechanism, not by waiting forever for a
+  UI that does not exist) — with an explicit, time-bounded timeout, not
+  indefinite blocking of the ACP connection.
+- **OS/process/env/network restrictions remain entirely outside ACP.**
+  The protocol has no notion of resource limits, network restrictions,
+  restrictions on environment variables passed to the subprocess,
+  or supervision of the process tree. All of this is — and remains —
+  the responsibility of Conductor's hosting layer (the one launching
+  the agent/adapter process), analogous to today's
   `PluginProcessSpawner`/`ProcessRunner`.
 
-**Wniosek: ACP nie dostarcza ani sandboxu, ani wymuszonej autoryzacji
-uruchomienia, ani polityki OS/sieć/proces. Deny-default nie jest dziś w
-pełni zaimplementowane nawet dla `runner-opencode` — token-auth na
-callbacku istnieje (`hub.ts:66-70`), ale katalog-routing (`hub.ts:247-258`,
-`sessionsForDirectory`) **spada na pierwszy zarejestrowany projekt w
-kolejności sortowania**, gdy żądany katalog leży poza wszystkimi
-zarejestrowanymi rootami, zamiast odrzucić żądanie — to jest
-permisywny fallback, nie enforced allowlist. Adapter ACP musi więc nie
-tylko "importować" istniejące założenia, ale **faktycznie domknąć** tę
-lukę (odrzucać, nie fallbackować, poza zadeklarowanym `cwd`/rootami) —
-ACP samo tego nie zastępuje ani nie osłabia wymogu, ale też nie
-rozwiązuje go za Conductora.**
+**Conclusion: ACP provides neither a sandbox, nor enforced run
+authorization, nor an OS/network/process policy. Deny-default is not
+fully implemented today even for `runner-opencode` — token auth on the
+callback exists (`hub.ts:66-70`), but directory routing (`hub.ts:247-258`,
+`sessionsForDirectory`) **falls back to the first registered project in
+sort order** when the requested directory lies outside all
+registered roots, instead of rejecting the request — this is a
+permissive fallback, not an enforced allowlist. The ACP adapter therefore must
+not only "import" the existing assumptions, but **actually close** this
+gap (reject, not fall back, outside the declared `cwd`/roots) —
+ACP by itself neither replaces nor weakens this requirement, but it also does not
+solve it for Conductor.**
 
-### 5.8 Tożsamość, lease i nadzór procesów — trwałość pozostaje po stronie Conductora
+### 5.8 Identity, lease and process supervision — durability stays on Conductor's side
 
-Uzupełnienie 5.1/5.7 skupione konkretnie na **procesie**, nie tylko na
-danych: ACP identyfikuje **połączenie i sesję** (`sessionId` zwrócony z
-`session/new`), nie **proces systemu operacyjnego**. Kilka konsekwencji:
+A supplement to 5.1/5.7 focused specifically on the **process**, not just on
+data: ACP identifies the **connection and session** (`sessionId` returned from
+`session/new`), not the **operating-system process**. Several consequences:
 
-- **Brak identity opartej o PID.** Subprocess uruchomiony przez klienta
-  po stdio nie ma stabilnego identyfikatora przeżywającego restart —
-  `sessionId` jest własnością ACP (opcjonalnie trwałą, jeśli agent
-  wspiera `loadSession`/`resume`), ale **proces**, który go obsługiwał,
-  ginie i jest zastępowany nowym przy każdym restarcie klienta. Fencing
-  (zapobieganie temu, by dwa procesy dla tej samej logicznej pracy
-  działały równocześnie i kolidowały) nie jest częścią ACP — musi być
-  zbudowany przez hosta (Conductor). Dzisiejszy `RunnerRegistry`
-  (sekcja 2.3) **nie jest** przykładem gotowego rozwiązania tego
-  problemu — jest keyed po endpoincie, **w pamięci procesu**, nie
-  durowały ani stabilny poza restartem (luka #1 w sekcji 3); to raczej
-  ilustracja, że nawet dzisiejszy, nie-ACP-owy mechanizm jeszcze nie
-  rozwiązał fencing/stabilnej tożsamości — punkt, który adapter ACP
-  odziedziczyłby jako otwarty problem, nie jako coś, co Conductor już
-  ma gotowe i tylko trzeba podłączyć.
-- **Nadzór drzewa procesów jest zadaniem hosta, nie ACP.** Gdy klient
-  anuluje (`session/cancel`) albo terminuje połączenie, ACP nie
-  gwarantuje, że **cały** proces potomny (i jego własne pod-procesy,
-  np. narzędzia uruchomione przez agenta) rzeczywiście zginął —
-  protokół mówi tylko o stanie sesji/turnu (`cancelled` stop reason),
-  nie o stanie procesu OS. Weryfikacja drzewa procesów pozostaje
-  obowiązkiem hosta (patrz scenariusz spike'a 8.3 punkt 9).
-- **Żadna trwałość nie jest automatyczna.** Nawet gdy agent wspiera
-  `loadSession`/`resume`, to *jego* wybór implementacyjny, czy i jak
-  długo trzyma stan — ACP nie narzuca ani nie gwarantuje okresu
-  retencji. Conductor nie może założyć, że "skoro agent zadeklarował
-  `resume`, to stan przetrwa restart" — to zależy wyłącznie od
-  implementacji agenta, weryfikowalne tylko empirycznie (spike,
-  scenariusz 8.3 punkt 5/6).
+- **No PID-based identity.** A subprocess launched by the client
+  over stdio has no stable identifier that survives a restart —
+  `sessionId` belongs to ACP (optionally durable, if the agent
+  supports `loadSession`/`resume`), but the **process** that served it
+  dies and is replaced by a new one on every client restart. Fencing
+  (preventing two processes for the same logical work from
+  running concurrently and colliding) is not part of ACP — it must be
+  built by the host (Conductor). Today's `RunnerRegistry`
+  (section 2.3) **is not** an example of a ready solution to this
+  problem — it is keyed by endpoint, **in process memory**, neither
+  durable nor stable across a restart (gap #1 in section 3); it is rather
+  an illustration that even today's non-ACP mechanism has not yet
+  solved fencing/stable identity — a point that an ACP adapter
+  would inherit as an open problem, not as something Conductor already
+  has ready and only needs to plug in.
+- **Process-tree supervision is the host's job, not ACP's.** When the client
+  cancels (`session/cancel`) or terminates the connection, ACP does not
+  guarantee that the **entire** child process (and its own sub-processes,
+  e.g. tools launched by the agent) has actually died —
+  the protocol speaks only of session/turn state (`cancelled` stop reason),
+  not of OS process state. Verifying the process tree remains
+  the host's obligation (see spike scenario 8.3 item 9).
+- **No durability is automatic.** Even when the agent supports
+  `loadSession`/`resume`, it is *its* implementation choice whether and for how
+  long it keeps state — ACP neither imposes nor guarantees a retention
+  period. Conductor cannot assume that "since the agent declared
+  `resume`, the state will survive a restart" — that depends solely on the
+  agent implementation, verifiable only empirically (spike,
+  scenario 8.3 items 5/6).
 
-**Wniosek: durowała tożsamość, fencing i nadzór procesu pozostają w
-100% odpowiedzialnością Conductora (hosta) — ACP identyfikuje
-połączenia/sesje, nie procesy systemowe, i nie obiecuje trwałości poza
-tym, co dany agent sam zdecyduje się zaimplementować.**
+**Conclusion: durable identity, fencing and process supervision remain
+100% the responsibility of Conductor (the host) — ACP identifies
+connections/sessions, not system processes, and promises no durability beyond
+what a given agent chooses to implement on its own.**
 
 ---
 
-## 6. Rekomendacja: adapter, nie konkurencyjny protokół
+## 6. Recommendation: an adapter, not a competing protocol
 
-**Nie budować** drugiego wire protocol równoległego do `SessionClient`/
-`runner-protocol`. Zamiast tego, jeśli Etap 2 (spike) wypadnie pozytywnie:
+**Do not build** a second wire protocol parallel to `SessionClient`/
+`runner-protocol`. Instead, if Stage 2 (spike) turns out positive:
 
-- **Preserve (bez zmian):** SQLite jako source of truth (5.1); interpreter
-  pure / engine owns I/O (5.2); `retry-policy` jako jedyny właściciel
-  `FailureClass`/budżetów/`resource_wait` (5.3); findings lifecycle i
-  human gates jako stan Conductora, nie ACP (5.4); `conductor_report` jako
-  jedyny autorytatywny sygnał sukcesu, nie `stopReason` (5.5); furtka
-  natywnej integracji (`SessionClient` bezpośrednio nad SDK runtime'u, jak
-  dziś `runner-opencode`) pozostaje dostępna — ACP jej nie zastępuje
-  siłowo dla runtime'ów, które mają lepszą natywną integrację.
-- **Change (adapter implementuje port, port się nie zmienia radykalnie):**
-  Punktem odniesienia dla ewentualnego adaptera powinno być **stabilne
-  v1**, nie draft v2 — v2 jest w Draft (od 2026-07-20) i jego semantyka
+- **Preserve (unchanged):** SQLite as the source of truth (5.1); interpreter
+  pure / engine owns I/O (5.2); `retry-policy` as the sole owner of
+  `FailureClass`/budgets/`resource_wait` (5.3); findings lifecycle and
+  human gates as Conductor state, not ACP state (5.4); `conductor_report` as
+  the only authoritative success signal, not `stopReason` (5.5); the door to
+  native integration (`SessionClient` directly over a runtime's SDK, as
+  `runner-opencode` does today) remains open — ACP does not forcibly replace it
+  for runtimes that have a better native integration.
+- **Change (the adapter implements the port, the port does not change radically):**
+  The reference point for any adapter should be the **stable
+  v1**, not the v2 draft — v2 is in Draft (since 2026-07-20) and its semantics
   ("acceptance means insertion, not completion", `prompt-lifecycle.md`)
-  **nie jest** tym, co v1 gwarantuje. W v1 `session/prompt` **jest
-  długo-żyjącym żądaniem** ([`prompt-turn.md`](https://agentclientprotocol.com/protocol/v1/prompt-turn.md):
-  odpowiedź z `stopReason` przychodzi dopiero **na końcu turnu**, po
-  wszystkich `session/update`) — adapter nie może traktować lokalnego
-  wysłania żądania jako równoważnego trwałemu potwierdzeniu przyjęcia;
-  jedyne, co v1 gwarantuje od razu, to że żądanie zostało wysłane, nie że
-  zostało "zaakceptowane" w sensie v2. `runner-opencode`-style adapter dla
-  ACP implementowałby **ten sam** `SessionClient` (ew. rozszerzony
-  `runner-protocol` port, gdy ten powstanie) nad połączeniem ACP zamiast
-  nad SDK opencode: `createSession` → `session/new`; `prompt` →
-  `session/prompt` (długo-żyjące w v1, nie fire-and-forget); `abort` →
-  `session/cancel`. Osobne, nie pojedyncze 10s (jak dzisiejszy
-  `runner-transport.ts:57`), budżety czasowe są konieczne per operację:
-  **startup** (uruchomienie/połączenie z procesem agenta), **write**
-  (dostarczenie pojedynczego żądania JSON-RPC), **turn** (cały
-  `session/prompt` do `stopReason` — może trwać minuty), **cancel**
-  (oczekiwanie na potwierdzone `cancelled` po `session/cancel`) — jeden
-  wspólny timeout myliłby "agent long-running" z "połączenie martwe".
-  `status`/`sessionExists` → **nie mają portable, wspólnego dla wszystkich
-  agentów odpowiednika** (luka potwierdzona sekcja 3 wiersz 7, sekcja 4.2)
-  — jedyna droga to (a) wnioskowanie z historii `session/update`
-  utrzymywanej w adapterze, co **nie jest bezpiecznym zamiennikiem**
-  (cisza w strumieniu nie odróżnia "agent liczy" od "połączenie zerwane"
-  — nie inferować "idle"/"missing" z samej ciszy transkryptu), albo (b)
-  rozszerzenie przez `_`-prefiksowaną metodę custom (`extensibility.md`),
-  co jest z definicji **nieportable** między agentami, które jej nie
-  implementują — każdy z trzech kandydatów w sekcji 7 musiałby być
-  weryfikowany osobno, nie założony. Raportowanie
-  (`conductor_report`/`conductor_ask`) przechodzi przez **MCP server
-  run-scoped**, wstrzyknięty przez `mcpServers` w
-  `session/new`/`session/load`/`session/resume` po stdio (baseline, MUST
-  wspierane przez każdego agenta ACP — `session-setup.md`; HTTP nagłówki
-  auth są dostępne jako opcja transportu MCP, ale same MCP-HTTP/SSE
-  capabilities są opcjonalne po stronie agenta, nie MUST) — **nie** przez
-  dzisiejszy model "narzędzia pluginu opencode wołające HTTP API" (2.5),
-  bo to jest opencode-specyficzne, nie ACP. MCP-tool-surface eksponowany
-  agentowi powinien ograniczać się do `report`/`ask` (i odczytu statusu
-  własnego runu) — **nie** do `approve`/`request_changes`/admin-owych
-  operacji: broad admin-scope przez narzędzie wywoływane przez sam
-  wykonywany agent byłby odwróceniem granicy z 5.7 (agent przyznający
-  sobie uprawnienia). Same wywołania MCP powinny trafiać do **tego
-  samego** istniejącego API daemona/SQLite (`ApiClient`/`store`), nie do
-  równoległej ścieżki prawdy — MCP-server jest tu transportem, nie nowym
-  źródłem stanu.
-- **Replace (jedyny kandydat na wymianę):** transport `runner-opencode`
-  (dzisiejszy `hub.ts`/`sessions.ts`, callback HTTP daemon→runner) **dla
-  runtime'ów, które mają maintained adapter ACP** — ale to decyzja per
-  runtime (patrz sekcja 7), nie blanket replacement, i wymaga rekoncyliacji
-  z `runner-protocol` (ten sam kontrakt wersji/capabilities/lease, albo
-  jawne zamknięcie wybranych jego decyzji jako zastąpionych przez granicę
-  ACP+MCP-report — **nigdy cichej duplikacji**).
+  **are not** what v1 guarantees. In v1, `session/prompt` **is a
+  long-lived request** ([`prompt-turn.md`](https://agentclientprotocol.com/protocol/v1/prompt-turn.md):
+  the response with `stopReason` arrives only **at the end of the turn**, after
+  all `session/update`s) — the adapter must not treat the local
+  sending of the request as equivalent to a durable confirmation of acceptance;
+  the only thing v1 guarantees immediately is that the request was sent, not that
+  it was "accepted" in the v2 sense. A `runner-opencode`-style adapter for
+  ACP would implement **the same** `SessionClient` (or an extended
+  `runner-protocol` port, once that exists) over an ACP connection instead of
+  over the opencode SDK: `createSession` → `session/new`; `prompt` →
+  `session/prompt` (long-lived in v1, not fire-and-forget); `abort` →
+  `session/cancel`. Separate time budgets per operation, rather than a single 10s one (like today's
+  `runner-transport.ts:57`), are necessary:
+  **startup** (launching/connecting to the agent process), **write**
+  (delivering a single JSON-RPC request), **turn** (the whole
+  `session/prompt` until `stopReason` — may take minutes), **cancel**
+  (waiting for a confirmed `cancelled` after `session/cancel`) — a single
+  shared timeout would confuse "long-running agent" with "dead connection".
+  `status`/`sessionExists` → **have no portable counterpart common to all
+  agents** (gap confirmed in section 3 row 7, section 4.2)
+  — the only options are (a) inference from the `session/update` history
+  kept in the adapter, which **is not a safe replacement**
+  (silence in the stream does not distinguish "agent is computing" from "connection dropped"
+  — do not infer "idle"/"missing" from transcript silence alone), or (b)
+  an extension via a `_`-prefixed custom method (`extensibility.md`),
+  which is by definition **non-portable** across agents that do not
+  implement it — each of the three candidates in section 7 would have to be
+  verified separately, not assumed. Reporting
+  (`conductor_report`/`conductor_ask`) goes through a **run-scoped MCP
+  server**, injected via `mcpServers` in
+  `session/new`/`session/load`/`session/resume` over stdio (baseline, MUST
+  be supported by every ACP agent — `session-setup.md`; HTTP auth headers
+  are available as an MCP transport option, but the MCP-HTTP/SSE
+  capabilities themselves are optional on the agent side, not MUST) — **not** via
+  today's model of "opencode plugin tools calling the HTTP API" (2.5),
+  because that is opencode-specific, not ACP. The MCP tool surface exposed
+  to the agent should be limited to `report`/`ask` (and reading the status of
+  its own run) — **not** `approve`/`request_changes`/admin
+  operations: a broad admin scope via a tool invoked by the very agent
+  being executed would invert the boundary from 5.7 (an agent granting
+  itself permissions). The MCP calls themselves should hit **the
+  same** existing daemon/SQLite API (`ApiClient`/`store`), not a
+  parallel path of truth — the MCP server is a transport here, not a new
+  source of state.
+- **Replace (the only candidate for replacement):** the `runner-opencode` transport
+  (today's `hub.ts`/`sessions.ts`, HTTP callback daemon→runner) **for
+  runtimes that have a maintained ACP adapter** — but this is a per-runtime
+  decision (see section 7), not a blanket replacement, and it requires reconciliation
+  with `runner-protocol` (the same version/capabilities/lease contract, or
+  an explicit closing of selected decisions of it as superseded by the
+  ACP+MCP-report boundary — **never silent duplication**).
 
-### Uzupełnienie: zakres poświadczeń MCP-report i higiena logów stdio
+### Supplement: MCP-report credential scope and stdio log hygiene
 
-Jeśli raportowanie przechodzi przez MCP server run-scoped (wyżej), kilka
-dodatkowych warunków musi być spełnionych, niezależnie od ACP:
+If reporting goes through a run-scoped MCP server (above), several
+additional conditions must be met, independently of ACP:
 
-- **Poświadczenie scoped do pojedynczego attemptu**, nie do sesji/agenta
-  ogólnie — token/klucz wstrzyknięty do konfiguracji MCP powinien
-  identyfikować dokładnie `run_id`/`attempt`, analogicznie do dzisiejszego
-  `delivery_token` (sekcja 2.6), żeby duplikat/nieaktualne wywołanie dało
-  się jednoznacznie odrzucić po stronie daemona (walidacja stale/duplicate
-  musi żyć w Conductorze — MCP transport tego nie daje za darmo).
-- **`session-setup.md` MCP stdio niesie `env`** (zmienne środowiskowe
-  przekazywane do procesu serwera MCP) — jeśli poświadczenie trafia tą
-  drogą, musi być traktowane jak sekret: nigdy nie logować argumentów/env
-  procesu MCP wprost (ten sam wymóg redakcji, jaki dzisiejszy
-  `boundDiagnostic` już stosuje do komunikatów błędów, `engine.ts:537-546`).
-- **Rozróżnić `mcpCapabilities.http` (ACP, opcjonalne dla agenta) od
-  "ACP przez HTTP" (transport samego ACP, wciąż RFD w stanie Active, nie
-  stabilny)** — to dwie różne rzeczy: pierwsze to zdolność agenta do
-  łączenia się z serwerami MCP po HTTP (część stabilnego ACP v1), drugie
-  to hipotetyczny zdalny transport dla samego połączenia klient↔agent
-  (patrz sekcja 3, wiersz 2) — nie mylić dojrzałości jednego z drugim.
+- **A credential scoped to a single attempt**, not to the session/agent
+  in general — the token/key injected into the MCP configuration should
+  identify exactly `run_id`/`attempt`, analogously to today's
+  `delivery_token` (section 2.6), so that a duplicate/stale call can
+  be unambiguously rejected on the daemon side (stale/duplicate validation
+  must live in Conductor — the MCP transport does not provide it for free).
+- **`session-setup.md` MCP stdio carries `env`** (environment variables
+  passed to the MCP server process) — if the credential travels this
+  way, it must be treated as a secret: never log the MCP process
+  arguments/env verbatim (the same redaction requirement that today's
+  `boundDiagnostic` already applies to error messages, `engine.ts:537-546`).
+- **Distinguish `mcpCapabilities.http` (ACP, optional for the agent) from
+  "ACP over HTTP" (the transport of ACP itself, still an RFD in Active state, not
+  stable)** — these are two different things: the first is the agent's ability to
+  connect to MCP servers over HTTP (part of stable ACP v1), the second
+  is a hypothetical remote transport for the client↔agent connection itself
+  (see section 3, row 2) — do not confuse the maturity of one with the other.
 
-### Krytyczne zastrzeżenie: durowałość MCP-report ≠ automatyczna idempotencja
+### Critical caveat: MCP-report durability ≠ automatic idempotency
 
-Durable MCP report (agent wywołuje `conductor_report` przez run-scoped MCP
-tool) **commituje wynik** do SQLite z tym samym rygorem co dziś
-(`WHERE status = 'running'` guard, `run_already_concluded` na duplikat —
-`tools.ts` `describeError`/`ApiError` obsługa). To rozwiązuje "czy wynik
-dotarł", **nie** rozwiązuje "czy efekt uboczny (np. `git commit`, `gh pr
-create` wykonany przez agenta) wystąpił dokładnie raz". Crash **po**
-zdalnym efekcie, **przed** zapisem raportu, zostawia stan **UNKNOWN** —
-wymaga dowodu (np. sprawdzenia repo/PR), fencing tokena, albo eskalacji do
-człowieka — **nie** ślepego retry. To jest dokładnie ten sam problem,
-który `retry-policy`/`runner-protocol` już projektują generalnie
-(`resource_wait`, `recover()` z operator-selected target) — ACP niczego
-tu nie zmienia i nie upraszcza.
+A durable MCP report (the agent calls `conductor_report` via a run-scoped MCP
+tool) **commits the result** to SQLite with the same rigour as today
+(`WHERE status = 'running'` guard, `run_already_concluded` on a duplicate —
+`tools.ts` `describeError`/`ApiError` handling). This solves "did the result
+arrive", it does **not** solve "did the side effect (e.g. `git commit`, `gh pr
+create` performed by the agent) occur exactly once". A crash **after**
+the remote effect, **before** the report is written, leaves the state **UNKNOWN** —
+it requires proof (e.g. checking the repo/PR), a fencing token, or escalation to
+a human — **not** a blind retry. This is exactly the same problem
+that `retry-policy`/`runner-protocol` already design for in general
+(`resource_wait`, `recover()` with an operator-selected target) — ACP changes
+nothing here and simplifies nothing.
 
-### `conductor_ask` / human gates: koniec turnu ≠ koniec zadania (uzupełnienie 5.5)
+### `conductor_ask` / human gates: end of turn ≠ end of task (supplement to 5.5)
 
-`conductor_ask` (`plugin.ts:135-154`) kończy prompt turn (agent kończy
-turn, sesja zostaje żywa, odpowiedź człowieka przychodzi jako **nowy**
-prompt) — to jest wzorzec, który **pasuje** do ACP: `end_turn` faktycznie
-kończy turn, a odpowiedź to nowy `session/prompt`. To jest jedyne miejsce,
-gdzie `end_turn` i "task paused pending human" są zgodne z zamiarem — ale
-**tylko dlatego, że Conductor explicite differencjuje "koniec turnu" od
-"koniec zadania"** (durable `answer_delivery`, sekcja 2.6, nie polega na
-tym, że sesja "pamięta", że czeka). Elicitation ACP (5.4) **nie** powinna
-zastąpić tego mechanizmu — elicitation jest scoped do żywego połączenia i
-nie ma delivery-token/retry-schedule w stylu `answer_delivery`.
+`conductor_ask` (`plugin.ts:135-154`) ends the prompt turn (the agent ends the
+turn, the session stays alive, the human's answer arrives as a **new**
+prompt) — this is a pattern that **fits** ACP: `end_turn` does indeed
+end the turn, and the answer is a new `session/prompt`. This is the only place
+where `end_turn` and "task paused pending human" align with intent — but
+**only because Conductor explicitly differentiates "end of turn" from
+"end of task"** (durable `answer_delivery`, section 2.6, does not rely on
+the session "remembering" that it is waiting). ACP elicitation (5.4) should **not**
+replace this mechanism — elicitation is scoped to the live connection and
+has no delivery-token/retry-schedule in the style of `answer_delivery`.
 
 ---
 
-## 7. Per-agent go/no-go + spike na tym samym zadaniu
+## 7. Per-agent go/no-go + spike on the same task
 
-### 7.1 OpenCode — natywny ACP
+### 7.1 OpenCode — native ACP
 
-- **Wersja:** `opencode-ai@1.18.32` (npm, zweryfikowane 2026-09-25).
-  Komenda: `opencode acp --cwd <ABS>` (natywna, wbudowana w binarkę
-  `opencode`, brak zewnętrznego adaptera pośredniczącego). Dokumentacja: <https://opencode.ai/docs/acp/>,
-  <https://opencode.ai/docs/cli/>. Źródło (tag `v1.18.32`):
+- **Version:** `opencode-ai@1.18.32` (npm, verified 2026-09-25).
+  Command: `opencode acp --cwd <ABS>` (native, built into the `opencode`
+  binary, no external intermediary adapter). Documentation: <https://opencode.ai/docs/acp/>,
+  <https://opencode.ai/docs/cli/>. Source (tag `v1.18.32`):
   <https://github.com/anomalyco/opencode/blob/v1.18.32/packages/opencode/src/acp/service.ts>.
-- **Capabilities zaobserwowane:** `load`/`list`/`resume`/`close`/`fork`
-  advertised — ale `fork` jest **wciąż draft** w samym ACP (`rfds/updates`:
-  "session/fork RFD moves to Draft stage", 2025-11-20, brak stabilizacji
-  do 2026-09-25) — advertising draft-capability jest ryzykiem
-  interoperacyjności, nie powodem do odrzucenia natywnego OpenCode.
-  MCP HTTP/SSE: wspierane.
-- **Ryzyko:** rejestracja MCP servera jest **directory-scoped, nie
-  session-scoped** w źródle serwisu, i **ignoruje niektóre błędy** przy
-  łączeniu — to podważa gwarancję "readiness narzędzia raportującego
-  przed pierwszym promptem" (`agent-assignment` requirement "Required
-  tool surface unavailable"). Wymaga jawnego testu w spike'u: czy
-  `conductor_report`-MCP jest gotowy, zanim agent może go wywołać, czy
-  trzeba pollować/czekać.
-- **Auth:** `opencode-login` zwraca sukces, ale **zewnętrzny provider
-  auth nadal wymagany** osobno (nie jest to "magic" auth via ACP).
-- **Abort:** błędy abortu są **połykane** (swallowed) w źródle — trzeba
-  obserwować faktyczny `cancelled` stop reason / stan procesu, nie ufać
-  samemu wywołaniu `session/cancel` jako dowodowi.
-- **Go/No-Go: GO** (natywny, aktywnie rozwijany, najniższe ryzyko
-  dodatkowego procesu-pośrednika) — **warunek:** spike musi zweryfikować
-  MCP-readiness i faktyczny efekt `session/cancel` (nie tylko brak błędu).
+- **Observed capabilities:** `load`/`list`/`resume`/`close`/`fork`
+  advertised — but `fork` is **still a draft** in ACP itself (`rfds/updates`:
+  "session/fork RFD moves to Draft stage", 2025-11-20, not stabilized
+  as of 2026-09-25) — advertising a draft capability is an
+  interoperability risk, not a reason to reject native OpenCode.
+  MCP HTTP/SSE: supported.
+- **Risk:** MCP server registration is **directory-scoped, not
+  session-scoped** in the service source, and **ignores some errors** when
+  connecting — this undermines the guarantee of "reporting tool readiness
+  before the first prompt" (`agent-assignment` requirement "Required
+  tool surface unavailable"). Requires an explicit test in the spike: whether
+  the `conductor_report` MCP is ready before the agent can call it, or
+  whether polling/waiting is needed.
+- **Auth:** `opencode-login` returns success, but **external provider
+  auth is still required** separately (this is not "magic" auth via ACP).
+- **Abort:** abort errors are **swallowed** in the source — the actual
+  `cancelled` stop reason / process state must be observed; do not trust
+  the `session/cancel` call alone as proof.
+- **Go/No-Go: GO** (native, actively developed, lowest risk of an
+  additional intermediary process) — **condition:** the spike must verify
+  MCP readiness and the actual effect of `session/cancel` (not just the absence of an error).
 
-### 7.2 Codex — warunkowy GO (maintained adapter, nie natywny)
+### 7.2 Codex — conditional GO (maintained adapter, not native)
 
-- **Codex CLI natywnie NIE jest ACP** — `codex app-server`
-  (<https://developers.openai.com/codex/cli/reference/>, CLI 0.157.0) to
-  osobny protokół, nie ACP. Stary `zed-industries/codex-acp` **przekierowuje**
-  na maintained `agentclientprotocol/codex-acp`.
-- **Wersja adaptera:** `@agentclientprotocol/codex-acp@1.13.1` (npm,
-  zweryfikowane 2026-09-25) deklaruje zależność `@openai/codex@^0.156.1` w
-  swoim `package.json` — dla wersji `0.x`, semver caret zamyka zakres na
-  poziomie patch (`^0.156.1` = `>=0.156.1 <0.157.0`), więc ten
-  zadeklarowany zakres **wyklucza** `0.157.0` — zaobserwowaną w tej
-  notatce wydaną wersję Codex CLI (sekcja 7.2 pierwsza pozycja). Adapter
-  i aktualnie wydany Codex CLI mogą więc **nie być deklarowanie
-  kompatybilne** — to nie jest potwierdzona niezgodność (adapter mógł
-  faktycznie działać mimo węższej deklaracji, albo autorzy jeszcze nie
-  zaktualizowali zakresu), ale jest to sygnał do zweryfikowania w
-  spike'u, nie do zignorowania. **Dwa pinowania wymagane w spike'u**:
-  wersja adaptera ORAZ faktycznie zweryfikowana, kompatybilna wersja
-  binarki Codex (`CODEX_PATH`, prawdopodobnie `0.156.x`, do potwierdzenia
-  empirycznie, nie z założenia) — nie zakładać zgodności z żadnej strony
-  bez testu. Źródło (commit `b1b8490cd165c18626dc3fe83836cdacdef94cd3`):
+- **Codex CLI is NOT natively ACP** — `codex app-server`
+  (<https://developers.openai.com/codex/cli/reference/>, CLI 0.157.0) is
+  a separate protocol, not ACP. The old `zed-industries/codex-acp` **redirects**
+  to the maintained `agentclientprotocol/codex-acp`.
+- **Adapter version:** `@agentclientprotocol/codex-acp@1.13.1` (npm,
+  verified 2026-09-25) declares a dependency on `@openai/codex@^0.156.1` in
+  its `package.json` — for `0.x` versions, the semver caret locks the range at
+  the patch level (`^0.156.1` = `>=0.156.1 <0.157.0`), so this
+  declared range **excludes** `0.157.0` — the released Codex CLI version
+  observed in this note (section 7.2, first item). The adapter
+  and the currently released Codex CLI may therefore **not be declared
+  compatible** — this is not a confirmed incompatibility (the adapter may
+  actually work despite the narrower declaration, or the authors have not yet
+  updated the range), but it is a signal to verify in the
+  spike, not to ignore. **Two pins required in the spike**:
+  the adapter version AND an actually verified, compatible version of the
+  Codex binary (`CODEX_PATH`, probably `0.156.x`, to be confirmed
+  empirically, not by assumption) — do not assume compatibility in either direction
+  without a test. Source (commit `b1b8490cd165c18626dc3fe83836cdacdef94cd3`):
   <https://github.com/agentclientprotocol/codex-acp/blob/b1b8490cd165c18626dc3fe83836cdacdef94cd3/src/CodexAcpServer.ts>.
 - **Capabilities:** `load`/`resume`/`list`/`close`/`fork`/`delete`
   advertised; MCP HTTP **true**, SSE **false**.
-- **Uruchomienie:** przyszła komenda pinowana (binarka jawnie
-  zainstalowana) lub `npx -y @agentclientprotocol/codex-acp@1.13.1` —
-  **nie wykonane w tej notatce** (poza zakresem Etapu 1, read-only).
-- **Auth:** ChatGPT-login **lub** `CODEX_API_KEY` z pierwszeństwem nad
-  `OPENAI_API_KEY` — wymaga **jawnego wyboru metody** przed spikem;
-  `NO_BROWSER` ukrywa login, nie zastępuje autoryzacji ("no auth magic").
-- **Ryzyko:** proces pośredniczący (adapter) to **dodatkowa warstwa
-  awarii** poza samym Codex CLI — crash adaptera ≠ crash Codex, wymaga
-  osobnej obserwacji w spike'u (proces-tree, nie tylko połączenie ACP).
-  Nie generalizować z tego adaptera na "background tasks"/rozszerzenia
-  Codex — poza zakresem tej notatki.
-- **Go/No-Go: WARUNKOWY GO** — warunek: przypięcie **obu** wersji
-  (adapter + `CODEX_PATH`), jawny wybór metody auth, test restartu procesu
-  potomnego Codex niezależnie od procesu adaptera ACP.
+- **Launch:** a future pinned command (binary explicitly
+  installed) or `npx -y @agentclientprotocol/codex-acp@1.13.1` —
+  **not executed in this note** (outside the scope of Stage 1, read-only).
+- **Auth:** ChatGPT login **or** `CODEX_API_KEY`, which takes precedence over
+  `OPENAI_API_KEY` — requires an **explicit choice of method** before the spike;
+  `NO_BROWSER` hides the login, it does not replace authorization ("no auth magic").
+- **Risk:** the intermediary process (adapter) is an **additional failure
+  layer** beyond the Codex CLI itself — an adapter crash ≠ a Codex crash, requiring
+  separate observation in the spike (process tree, not just the ACP connection).
+  Do not generalize from this adapter to Codex "background tasks"/extensions
+  — out of scope for this note.
+- **Go/No-Go: CONDITIONAL GO** — condition: pinning **both** versions
+  (adapter + `CODEX_PATH`), an explicit choice of auth method, a restart test of the Codex
+  child process independently of the ACP adapter process.
 
-### 7.3 Gemini — warunkowy GO (natywna flaga)
+### 7.3 Gemini — conditional GO (native flag)
 
-- **Wersja:** `@google/gemini-cli@0.61.0` (npm, zweryfikowane
-  2026-09-25), wymaga Node ≥20. Komenda: `gemini --acp` (natywna flaga;
-  `--experimental-acp` **deprecated** wg
+- **Version:** `@google/gemini-cli@0.61.0` (npm, verified
+  2026-09-25), requires Node ≥20. Command: `gemini --acp` (native flag;
+  `--experimental-acp` is **deprecated** per
   <https://github.com/google-gemini/gemini-cli/blob/v0.61.0/packages/cli/src/config/config.ts>).
-- **Rozbieżność dokumentacja vs kod:** przewodnik
+- **Documentation vs code discrepancy:** the guide
   (<https://github.com/google-gemini/gemini-cli/blob/v0.61.0/docs/cli/acp-mode.md>)
-  opisuje "MCP initialize", ale kod dispatchera
+  describes "MCP initialize", but the dispatcher code
   (<https://github.com/google-gemini/gemini-cli/blob/v0.61.0/packages/cli/src/acp/acpRpcDispatcher.ts>)
-  pokazuje `session new`/`session load` — **dokumentacja nie odzwierciedla
-  dokładnie ścieżki kodu**, wymaga weryfikacji w spike'u, nie ufania
-  samemu przewodnikowi.
-- **Capabilities zaobserwowane w dispatcherze:** `load` **true**, MCP
-  HTTP/SSE **true**. (`session/new` nie jest osobną negocjowaną
-  capability — to część bazowego zestawu metod, które **każdy** agent ACP
-  MUST wspierać: `initialization.md`, "As a baseline, all Agents MUST
+  shows `session new`/`session load` — **the documentation does not accurately
+  reflect the code path**; this requires verification in the spike, not trusting
+  the guide alone.
+- **Capabilities observed in the dispatcher:** `load` **true**, MCP
+  HTTP/SSE **true**. (`session/new` is not a separately negotiated
+  capability — it is part of the baseline method set that **every** ACP agent
+  MUST support: `initialization.md`, "As a baseline, all Agents MUST
   support `session/new`, `session/prompt`, `session/cancel`, and
-  `session/update`" — nie wymaga potwierdzenia w dispatcherze.) `list`/
-  `resume`/`close` **nie są explicite advertised** w dispatcherze —
-  traktować jako niewspierane do potwierdzenia w spike'u: zgodnie z ACP
-  ("Clients MUST NOT attempt to call" nieadvertised opcjonalną metodę)
-  brak advertised capability oznacza **brak fallbacku** — nie zakładać,
-  że operacja "może zadziałać mimo wszystko", tylko że jest niedostępna,
-  dopóki spike nie potwierdzi inaczej.
-- **Model API:** legacy unstable model API (poprzedzająca usunięty
-  `session/set_model`, ACP `rfds/updates` 2026-06-01) — **nie portable**,
-  wymaga adapter-specyficznej obsługi wyboru modelu, nie ogólnego
+  `session/update`" — it does not need confirmation in the dispatcher.) `list`/
+  `resume`/`close` are **not explicitly advertised** in the dispatcher —
+  treat them as unsupported until confirmed in the spike: per ACP
+  ("Clients MUST NOT attempt to call" a non-advertised optional method),
+  the absence of an advertised capability means **no fallback** — do not assume
+  that the operation "might work anyway", but rather that it is unavailable
+  until the spike confirms otherwise.
+- **Model API:** legacy unstable model API (preceding the removed
+  `session/set_model`, ACP `rfds/updates` 2026-06-01) — **not portable**,
+  requires adapter-specific handling of model selection, not generic
   `configOptions`.
-- **Ryzyko odtworzenia (nie zweryfikowany bug, wymaga testu):**
+- **Reproduction risk (unverified bug, requires a test):**
   <https://github.com/google-gemini/gemini-cli/blob/v0.61.0/packages/cli/src/acp/acpSessionManager.ts>
-  — replay historii przy `load` **nie jest awaitowany** w pozornej ścieżce
-  kodu — to może (nie potwierdzone) prowadzić do race'a w kolejności
-  zdarzeń przy `session/load`. **Wymaga jawnego testu w spike'u**, nie
-  założenia ani w jedną, ani w drugą stronę.
-- **Auth:** API key **lub** Vertex/cached login — izolować ustawienia
-  (<https://geminicli.com/docs/get-started/authentication/>), jawnie wybrać
-  metodę **przed** spikem, bo `load` może wymagać zapisanej wcześniej
-  metody.
-- **Nie testowano:** żadnych płatnych wywołań modelu w ramach tej
-  notatki.
-- **Go/No-Go: WARUNKOWY GO** — warunek: zweryfikować w spike'u (a) czy
-  `acp-mode.md` faktycznie opisuje realną ścieżkę kodu czy jest
-  nieaktualny, (b) kolejność zdarzeń przy `session/load` (race czy nie),
-  (c) które capabilities są faktycznie advertised na żywo (nie tylko w
-  źródle na dany tag).
+  — history replay on `load` is **not awaited** in the apparent code
+  path — this may (unconfirmed) lead to a race in the ordering of
+  events on `session/load`. **Requires an explicit test in the spike**, not
+  an assumption in either direction.
+- **Auth:** API key **or** Vertex/cached login — isolate settings
+  (<https://geminicli.com/docs/get-started/authentication/>), explicitly choose
+  the method **before** the spike, because `load` may require a previously saved
+  method.
+- **Not tested:** no paid model calls were made as part of this
+  note.
+- **Go/No-Go: CONDITIONAL GO** — condition: verify in the spike (a) whether
+  `acp-mode.md` actually describes the real code path or is
+  outdated, (b) the event ordering on `session/load` (race or not),
+  (c) which capabilities are actually advertised live (not just in
+  the source at a given tag).
 
-### 7.4 Podsumowanie: ten sam mały spike na wszystkich trzech
+### 7.4 Summary: the same small spike on all three
 
-Warunek Etapu 2 z `docs/development-roadmap.md` — "ten sam mały zadaniowy
-task na OpenCode/Codex/Gemini przez ACP" — patrz sekcja 8 dla pełnej
-specyfikacji środowiska, scenariuszy i kryteriów sukcesu. Żaden z trzech
-agentów nie jest dyskwalifikujący sam z siebie; OpenCode ma najniższe
-ryzyko (natywny, brak pośrednika), Codex i Gemini wymagają dodatkowych
-warunków przed uruchomieniem spike'a, nie po jego rozpoczęciu.
-
----
-
-## 8. Specyfikacja spike'a (Etap 2 — nie wykonane w tej notatce)
-
-### 8.1 Środowisko
-
-- **Osobny, jednorazowy (disposable) worktree**, poza `main`, nieintegrowany
-  z żadnym pakietem workspace. Nie modyfikować `packages/*`.
-- **Jeden proces/attempt** — izolacja profilu na runtime (żaden agent nie
-  dzieli katalogu/profilu z innym w trakcie testu, poza jawnym scenariuszem
-  8.3 "izolacja tego samego `cwd`").
-- **Tymczasowa baza SQLite** (nie produkcyjna, nie `gloam-idle`), zgodna
-  ze schematem `answer_delivery`/`runs` jeśli spike odtwarza tę część, albo
-  minimalny log efektu, jeśli spike jest czysto protokolarny.
-- **Zamockowany MCP-report jako pierwszy krok** — dopiero po zweryfikowaniu
-  mechaniki na mocku, przejść do prawdziwych agentów; **prawdziwe wywołania
-  modeli wymagają osobnego, jawnego budżetu/zgody** (koszt), i traktować
-  jako **osobny, oddzielnie zatwierdzony etap** spike'a, nie domyślną
-  kontynuację mocka.
-- **Stack:** Bun + TypeScript (zgodnie ze stackiem Conductora,
-  `AGENTS.md`), plus przypięty SDK ACP (`@agentclientprotocol/sdk`, patrz
-  sekcja 9 dla wersji do potwierdzenia w samym spike'u — Node ≥20 dla
-  Gemini CLI wymusza, że środowisko uruchamiające musi spełniać ten sam
-  minimalny runtime niezależnie od Bun-a).
-- **Egress zablokowany domyślnie (offline-first).** Faza mockowa (patrz
-  wyżej) działa **bez wyjścia sieciowego** — dopiero faza z prawdziwymi
-  agentami, po osobnej zgodzie na budżet, otwiera dostęp do sieci
-  providera modelu, i to jawnie, nie jako efekt uboczny domyślnej
-  konfiguracji.
-- **Ramy czasowe: dwa dni robocze** na całość Etapu 2 (środowisko + 15
-  scenariuszy × 3 runtime'y + raport) — przekroczenie tego okna jest
-  sygnałem do przerwania i zredukowania zakresu (np. do 2 z 3
-  runtime'ów), nie do rozszerzania spike'a w nieskończoność (zgodnie z
-  zasadą z sekcji 8.4: to ma pozostać mały, ograniczony eksperyment).
-- Wersje-kandydaci jak w sekcji 7 (`opencode-ai@1.18.32`,
-  `@agentclientprotocol/codex-acp@1.13.1` + `CODEX_PATH` do zweryfikowania
-  względem faktycznie zainstalowanego `@openai/codex`, `@google/gemini-cli@0.61.0`)
-  — **przypięcie następuje w samym spike'u** po weryfikacji, nie jest tu
-  z góry ustalone jako pewnik.
-
-### 8.2 Zadanie (identyczne na wszystkich trzech)
-
-Mały, deterministyczny task z efektem ubocznym markowalnym po `run-id`:
-np. "dopisz linię `spike-marker-<run_id>` do pliku `MARKER.md` w danym
-worktree i zgłoś wynik przez `conductor_report`-ekwiwalent (MCP tool
-run-scoped)". Wymaga: log efektu (czy plik faktycznie zmieniony),
-raport (czy MCP-wywołanie doszło), `ask` (jedno wymagane pytanie do
-człowieka w trakcie), potem `cancel` na osobnym powtórzeniu.
-
-### 8.3 Scenariusze (wszystkie trzy runtime'y, ten sam zestaw)
-
-1. Utracona odpowiedź na `session/new` (create) — proces klienta udaje
-   utratę odpowiedzi po tym, jak żądanie faktycznie dotarło.
-2. Utracony `session/prompt` **przed** wystąpieniem efektu ubocznego.
-3. Utracony `session/prompt` **po** wystąpieniu efektu ubocznego (agent
-   zdążył napisać do pliku, zanim odpowiedź/potwierdzenie zaginęło).
-4. Utracone ACK raportu MCP (`conductor_report`-ekwiwalent wywołany,
-   odpowiedź nie dotarła) → duplikat raportu.
-5. Śmierć i restart procesu agenta/klienta (dla Codex: **osobno** proces
-   potomny Codex vs proces adaptera `codex-acp`).
-6. Raport zapisany trwale **przed** crashem (baseline pozytywny —
-   sprawdzić, że to *działa* zanim testować negatywy).
-7. Cancel w trakcie generowania modelu.
-8. Cancel w trakcie oczekiwania na `session/request_permission`.
-9. Cancel w trakcie wolno-działającego narzędzia + weryfikacja drzewa
-   procesów (czy proces potomny faktycznie ginie, nie tylko połączenie
-   ACP raportuje `cancelled`).
-10. Stare/nieaktualne **scoped credentials** (poświadczenia MCP scoped
-    do attemptu, sekcja 6, nie "delivery ID" — to inna warstwa: delivery
-    ID koreluje wiadomość, credential autoryzuje wywołanie) po stronie
-    mocka — upewnić się, że nieaktualny/unieważniony credential jest
-    jawnie odrzucony, nie cicho zaakceptowany ani niedeterministycznie
-    obsłużony.
-11. Izolacja worktree — oraz **osobno**, dla OpenCode: wiele **faktycznych
-    rejestracji ACP** (nie analogia do `hub.ts`) na tym samym `cwd` —
-    zweryfikować **rzeczywiste** zachowanie natywnego `opencode acp` przy
-    kolizji katalogu, nie zakładać, że dzisiejszy routing
-    `runner-opencode`/`hub.ts` (który jest specyficzny dla dzisiejszego
-    callback-protokołu, nie ACP) przenosi się wprost.
-12. `session/load` transkryptu **vs** przerwane zadanie — nie robić
-    ślepego "resend" po `load`; potwierdzić, że Conductor-side logika nie
-    zakłada, że `load` = "zadanie się nie wykonało".
-13. Niewspierane capabilities (np. `resume` nie advertised) — musi
-    **fail closed** (jawny błąd/odmowa), nie cicho udawać wznowienia.
-14. Brak poprawnych credentiali — testować **na wszystkich trzech**,
-    włącznie z OpenCode (nie tylko Codex/Gemini): OpenCode wymaga
-    osobnej autoryzacji providera niezależnie od `opencode-login` (patrz
-    sekcja 7.1) — musi dać jawny, rozróżnialny błąd auth, nie mylić się
-    z "runner unavailable".
-15. MCP server nie zdążył się połączyć przed pierwszym promptem (dla
-    OpenCode w szczególności, patrz 7.1 ryzyko) — zweryfikować readiness.
-16. **Pozytywny baseline sukcesu** (`end_turn` + poprawny `report()`) —
-    zweryfikować **najpierw**, że szczęśliwa ścieżka działa na wszystkich
-    trzech, zanim testuje się negatywy; bez tego punktu odniesienia
-    wynik scenariuszy negatywnych nie da się poprawnie zinterpretować.
-17. **Negatyw: `end_turn` bez żadnego `report()`** — zweryfikować, że
-    Conductor-side logika (reap po TTL, sekcja 5.5) faktycznie się
-    uruchamia i **nie** myli samego `end_turn` z sukcesem zadania —
-    bezpośredni test granicy z sekcji 5.5.
-18. **Polityka uprawnień allow/deny** (`session/request_permission`) —
-    zweryfikować zarówno automatyczne `allow` jak i `deny` z poziomu
-    klienta/mocka, i potwierdzić że odrzucenie uprawnienia nie jest
-    mylone z błędem transportowym ani nie blokuje bezterminowo runu
-    (patrz sekcja 5.7).
-19. **Bounded cancellation z twardym limitem** — po `session/cancel`,
-    jeśli `cancelled` stop reason/`state_update` nie nadejdzie w
-    ustalonym oknie (np. 5 s), klient spike'a **zabija drzewo procesów**
-    i **rejestruje** to zdarzenie jako fakt obserwowany (nie ukrywa go w
-    logu) — dokładnie ta granica, którą sekcja 5.8 nazywa "ACP nie
-    gwarantuje nadzoru drzewa procesów".
-20. **Redakcja logów** — potwierdzić, że żaden surowy log JSON-RPC
-    zapisany przez spike nie zawiera w czystym tekście
-    poświadczeń/tokenów/kluczy API przekazanych przez `env` w
-    konfiguracji MCP stdio (sekcja 6) ani w treści błędów providera.
-
-### 8.4 Kryteria sukcesu
-
-- Wszystkie **3** runtime'y przetestowane na **tym samym** zadaniu i
-  **tym samym** zestawie scenariuszy (8.3), z odtwarzalnym raportem
-  (kroki + surowe logi JSON-RPC, nie tylko podsumowanie).
-- **≥2 z 3** runtime'y wykazują spójne zachowanie: MCP-report doszedł
-  dokładnie raz (albo jawnie wykryty duplikat, nigdy cichy), `cancel`
-  zaobserwowany jako faktyczne zatrzymanie (nie tylko brak błędu), i
-  bezpieczny recovery (żaden scenariusz nie kończy się ślepym retry ani
-  fałszywym sukcesem) — **przed** przejściem do Etapu 3.
-- Scenariusz "niewspierane capabilities" (13) musi zakończyć się fail
-  closed na **każdym** z trzech, nie tylko na większości — to jest
-  twardy warunek bezpieczeństwa, nie statystyczny.
-- To jest **mały, ograniczony eksperyment**, nie budowa infrastruktury
-  produkcyjnej — spike, który sam zaczyna wyglądać jak `runner-protocol`
-  w miniaturze, oznacza przekroczenie zakresu Etapu 2.
+The Stage 2 condition from `docs/development-roadmap.md` — "the same small
+task on OpenCode/Codex/Gemini via ACP" — see section 8 for the full
+specification of the environment, scenarios, and success criteria. None of the three
+agents is disqualifying on its own; OpenCode has the lowest
+risk (native, no intermediary), Codex and Gemini require additional
+conditions before the spike is launched, not after it has started.
 
 ---
 
-## 9. Ryzyka i niewiadome
+## 8. Spike specification (Stage 2 — not executed in this note)
 
-- **ACP jako protokół wciąż aktywnie ewoluuje** (≥15 RFD stabilizowanych
-  w ~roku, v2 w Draft od 2026-07-20 z otwartymi RFD jak Session Notices
-  wciąż w Preview 2026-09-24) — każda decyzja "pin do v1" wymaga
-  monitoringu `rfds/updates`, nie założenia stabilności ad infinitum.
-- **Brak zmierzonej zgodności runtime↔SDK** — nie uruchomiono żadnego
-  testu w tej notatce; wersje są punktem-w-czasie z registry.npmjs.org,
-  nie dowodem działania razem.
-- **Rozbieżność dokumentacja/kod w Gemini CLI** (7.3) — nieznana skala,
-  wymaga weryfikacji w spike'u.
-- **Nieznana kolejność zdarzeń przy `session/load`** w Gemini
-  (`acpSessionManager.ts`, replay niepewny co do await) — potencjalny
-  bug, nie potwierdzony w tej notatce (read-only).
-- **Adapter jako dodatkowa warstwa awarii** dla Codex (osobny proces
-  `codex-acp` + osobny proces potomny `codex`) — podwaja powierzchnię
-  do monitorowania restartu względem dzisiejszego jednowarstwowego
+### 8.1 Environment
+
+- **A separate, disposable worktree**, outside `main`, not integrated
+  with any workspace package. Do not modify `packages/*`.
+- **One process/attempt** — per-runtime profile isolation (no agent
+  shares a directory/profile with another during the test, except for the explicit scenario
+  8.3 "isolation of the same `cwd`").
+- **A temporary SQLite database** (not production, not `gloam-idle`), consistent
+  with the `answer_delivery`/`runs` schema if the spike reproduces that part, or
+  a minimal effect log if the spike is purely protocol-level.
+- **A mocked MCP report as the first step** — only after verifying the
+  mechanics on the mock, move on to real agents; **real model
+  calls require a separate, explicit budget/approval** (cost), and should be treated
+  as a **separate, separately approved stage** of the spike, not the default
+  continuation of the mock.
+- **Stack:** Bun + TypeScript (consistent with Conductor's stack,
+  `AGENTS.md`), plus a pinned ACP SDK (`@agentclientprotocol/sdk`, see
+  section 9 for the version to be confirmed in the spike itself — Node ≥20 for
+  Gemini CLI means the execution environment must meet that same
+  minimum runtime regardless of Bun).
+- **Egress blocked by default (offline-first).** The mock phase (see
+  above) runs **without network egress** — only the phase with real
+  agents, after separate budget approval, opens access to the model
+  provider's network, and does so explicitly, not as a side effect of the default
+  configuration.
+- **Timebox: two working days** for the whole of Stage 2 (environment + 15
+  scenarios × 3 runtimes + report) — exceeding this window is a
+  signal to stop and reduce scope (e.g., to 2 of 3
+  runtimes), not to extend the spike indefinitely (in line with
+  the principle from section 8.4: this must remain a small, bounded experiment).
+- Candidate versions as in section 7 (`opencode-ai@1.18.32`,
+  `@agentclientprotocol/codex-acp@1.13.1` + `CODEX_PATH` to be verified
+  against the actually installed `@openai/codex`, `@google/gemini-cli@0.61.0`)
+  — **pinning happens in the spike itself** after verification; it is not
+  fixed here in advance as a certainty.
+
+### 8.2 Task (identical on all three)
+
+A small, deterministic task with a side effect markable by `run-id`:
+e.g., "append the line `spike-marker-<run_id>` to the file `MARKER.md` in the given
+worktree and report the result via a `conductor_report` equivalent (run-scoped
+MCP tool)". Requires: an effect log (whether the file was actually changed),
+a report (whether the MCP call arrived), `ask` (one required question to
+a human along the way), then `cancel` on a separate repetition.
+
+### 8.3 Scenarios (all three runtimes, the same set)
+
+1. Lost response to `session/new` (create) — the client process simulates
+   losing the response after the request actually arrived.
+2. Lost `session/prompt` **before** the side effect occurs.
+3. Lost `session/prompt` **after** the side effect occurs (the agent
+   managed to write to the file before the response/acknowledgement was lost).
+4. Lost MCP report ACK (`conductor_report` equivalent called,
+   response did not arrive) → duplicate report.
+5. Death and restart of the agent/client process (for Codex: **separately** the Codex child
+   process vs the `codex-acp` adapter process).
+6. Report durably persisted **before** the crash (positive baseline —
+   check that it *works* before testing the negatives).
+7. Cancel during model generation.
+8. Cancel while waiting on `session/request_permission`.
+9. Cancel during a slow-running tool + verification of the process
+   tree (whether the child process actually dies, not just that the
+   ACP connection reports `cancelled`).
+10. Stale/outdated **scoped credentials** (MCP credentials scoped
+    to the attempt, section 6, not a "delivery ID" — that is a different layer: the delivery
+    ID correlates a message, the credential authorizes a call) on the
+    mock side — make sure that a stale/revoked credential is
+    explicitly rejected, not silently accepted or non-deterministically
+    handled.
+11. Worktree isolation — and **separately**, for OpenCode: multiple **actual
+    ACP registrations** (not an analogy to `hub.ts`) on the same `cwd` —
+    verify the **real** behavior of native `opencode acp` on a
+    directory collision; do not assume that today's
+    `runner-opencode`/`hub.ts` routing (which is specific to today's
+    callback protocol, not ACP) carries over directly.
+12. `session/load` of the transcript **vs** an interrupted task — do not perform
+    a blind "resend" after `load`; confirm that the Conductor-side logic does not
+    assume that `load` = "the task did not execute".
+13. Unsupported capabilities (e.g., `resume` not advertised) — must
+    **fail closed** (explicit error/refusal), not silently pretend to resume.
+14. Missing valid credentials — test **on all three**,
+    including OpenCode (not just Codex/Gemini): OpenCode requires
+    separate provider authorization independent of `opencode-login` (see
+    section 7.1) — it must produce an explicit, distinguishable auth error, not be confused
+    with "runner unavailable".
+15. MCP server did not manage to connect before the first prompt (for
+    OpenCode in particular, see the 7.1 risk) — verify readiness.
+16. **Positive success baseline** (`end_turn` + a correct `report()`) —
+    verify **first** that the happy path works on all
+    three before testing negatives; without this reference
+    point the results of the negative scenarios cannot be correctly interpreted.
+17. **Negative: `end_turn` without any `report()`** — verify that
+    the Conductor-side logic (reap after TTL, section 5.5) actually
+    triggers and does **not** confuse a bare `end_turn` with task success —
+    a direct test of the boundary from section 5.5.
+18. **Allow/deny permission policy** (`session/request_permission`) —
+    verify both automatic `allow` and `deny` at the
+    client/mock level, and confirm that a permission denial is not
+    confused with a transport error and does not block the run indefinitely
+    (see section 5.7).
+19. **Bounded cancellation with a hard limit** — after `session/cancel`,
+    if the `cancelled` stop reason/`state_update` does not arrive within
+    a fixed window (e.g., 5 s), the spike client **kills the process tree**
+    and **records** this event as an observed fact (does not hide it in
+    the log) — exactly the boundary that section 5.8 calls "ACP does not
+    guarantee process-tree supervision".
+20. **Log redaction** — confirm that no raw JSON-RPC log
+    written by the spike contains, in plain text,
+    credentials/tokens/API keys passed via `env` in the
+    MCP stdio configuration (section 6) or in the content of provider errors.
+
+### 8.4 Success criteria
+
+- All **3** runtimes tested on **the same** task and
+  **the same** set of scenarios (8.3), with a reproducible report
+  (steps + raw JSON-RPC logs, not just a summary).
+- **≥2 of 3** runtimes show consistent behavior: the MCP report arrived
+  exactly once (or a duplicate was explicitly detected, never silently), `cancel`
+  observed as an actual stop (not just the absence of an error), and
+  safe recovery (no scenario ends in a blind retry or a
+  false success) — **before** moving on to Stage 3.
+- The "unsupported capabilities" scenario (13) must end in fail
+  closed on **each** of the three, not just on the majority — this is
+  a hard safety condition, not a statistical one.
+- This is a **small, bounded experiment**, not the construction of production
+  infrastructure — a spike that itself starts to look like a miniature `runner-protocol`
+  means the scope of Stage 2 has been exceeded.
+
+---
+
+## 9. Risks and unknowns
+
+- **ACP as a protocol is still actively evolving** (≥15 RFDs stabilized
+  in ~a year, v2 in Draft since 2026-07-20 with open RFDs such as Session Notices
+  still in Preview as of 2026-09-24) — any "pin to v1" decision requires
+  monitoring `rfds/updates`, not assuming stability ad infinitum.
+- **No measured runtime↔SDK compatibility** — no test was run
+  in this note; the versions are a point-in-time snapshot from registry.npmjs.org,
+  not proof that they work together.
+- **Documentation/code discrepancy in Gemini CLI** (7.3) — unknown extent,
+  requires verification in the spike.
+- **Unknown event ordering on `session/load`** in Gemini
+  (`acpSessionManager.ts`, replay uncertain with respect to await) — a potential
+  bug, not confirmed in this note (read-only).
+- **Adapter as an additional failure layer** for Codex (a separate
+  `codex-acp` process + a separate `codex` child process) — doubles the surface
+  to monitor for restarts compared to today's single-layer
   `runner-opencode`.
-- **Fork (`session/fork`) jest draft w samym ACP** — jeśli którykolwiek
-  runtime reklamuje `fork` jako gotowe, to reklama wyprzedza stabilizację
-  protokołu; nie budować na tym żadnej ścieżki krytycznej.
-- **`design.md` runner-protocol częściowo nieaktualny** (sekcja 2.7) —
-  jeśli Etap 3 w ogóle nastąpi, wymaga rewizji `design.md` względem
-  tego, co `runner-liveness`/`retry-policy` już dostarczyły, zanim
-  dopisze się warstwę ACP na wierzchu.
-- **Elicitation/session-notices to funkcje UI-warstwy klienta ACP**
-  (Conductor jako headless orchestrator nie ma "użytkownika w oknie
-  dialogowym" w tym samym sensie co Zed) — ich przydatność dla
-  headless-daemon jest niejasna i wymaga osobnej oceny w spike'u, nie
-  założenia, że "istnieją w spec więc się nadają".
-- **Sprzeczność konfiguracji** (patrz sekcja 1, "Uwaga o kontekście
-  projektu") między "greenfield, no legacy obligations" a "confirmed
-  decisions" listującymi dzisiejszy kontrakt `createSession/prompt/
-  status/note` — nierozstrzygnięta w tej notatce, do jawnego adresowania
-  w ewentualnej przyszłej propozycji, nie do cichego obejścia.
-- **Mapowanie ryzyk `design.md` runner-protocol na konkretne decyzje ACP
-  (żeby przyszła rewizja `design.md` nie musiała szukać ponownie):**
+- **Fork (`session/fork`) is a draft in ACP itself** — if any
+  runtime advertises `fork` as ready, the advertisement is ahead of the protocol's
+  stabilization; do not build any critical path on it.
+- **runner-protocol `design.md` partially outdated** (section 2.7) —
+  if Stage 3 happens at all, it requires a revision of `design.md` against
+  what `runner-liveness`/`retry-policy` have already delivered, before
+  an ACP layer is added on top.
+- **Elicitation/session-notices are UI-layer features of the ACP client**
+  (Conductor as a headless orchestrator has no "user in a dialog
+  window" in the same sense as Zed) — their usefulness for a
+  headless daemon is unclear and requires a separate assessment in the spike, not
+  the assumption that "they exist in the spec, so they are suitable".
+- **Configuration contradiction** (see section 1, "Note on project
+  context") between "greenfield, no legacy obligations" and "confirmed
+  decisions" listing today's `createSession/prompt/
+  status/note` contract — unresolved in this note, to be explicitly addressed
+  in any future proposal, not silently worked around.
+- **Mapping of runner-protocol `design.md` risks to concrete ACP decisions
+  (so that a future revision of `design.md` does not have to search again):**
   - *Idempotency storage retention* (`design.md` "Risks/Trade-offs":
     "Idempotency storage grows... finite retention after attempts become
-    terminal") — bezpośrednio dotyczy luki z sekcji 3 wiersz 4: ACP nie
-    ma pola idempotency-key w ogóle, więc retencja tego rodzaju wpisów
-    pozostaje w całości po stronie Conductora, niezależnie od tego, czy
-    transport to dzisiejszy HTTP callback czy przyszły ACP.
+    terminal") — directly concerns the gap from section 3 row 4: ACP has
+    no idempotency-key field at all, so retention of such entries
+    remains entirely on the Conductor side, regardless of whether
+    the transport is today's HTTP callback or a future ACP.
   - *Stable local identity configuration / cloning rules* (`design.md`:
     "reference adapter persists/generated identity outside ephemeral
-    process state and documents cloning rules") — bezpośrednio dotyczy
-    luki z sekcji 3 wiersz 1 (brak stabilnej tożsamości w ACP) i sekcji
-    5.8 (brak identity opartej o PID) — jeśli adapter ACP kiedyś
-    powstanie, musi rozwiązać identity/cloning **dokładnie tym samym
-    mechanizmem**, jaki `design.md` już projektuje dla dzisiejszego
-    transportu, nie osobnym dla ACP.
+    process state and documents cloning rules") — directly concerns the
+    gap from section 3 row 1 (no stable identity in ACP) and section
+    5.8 (no PID-based identity) — if an ACP adapter is ever
+    built, it must solve identity/cloning **with exactly the same
+    mechanism** that `design.md` already designs for today's
+    transport, not a separate one for ACP.
   - *Conformance suite* (`runner-protocol` task 1.3: "transport-independent
     conformance suite for versioning, capabilities, idempotency, safe
-    status and cancellation") — jeśli adapter ACP ma zastąpić
-    `runner-opencode` dla danego runtime'u (sekcja 6, "Replace"), musi
-    przejść **ten sam** conformance suite, gdy ten powstanie — nie
-    osobny, ACP-specyficzny zestaw testów, żeby uniknąć dokładnie tego,
-    przed czym `design.md` ostrzega w "Protocol surface precedes second
+    status and cancellation") — if an ACP adapter is to replace
+    `runner-opencode` for a given runtime (section 6, "Replace"), it must
+    pass **the same** conformance suite once it exists — not a
+    separate, ACP-specific test set, to avoid exactly what
+    `design.md` warns against in "Protocol surface precedes second
     adapter": "conformance suite and mock runner prevent
-    opencode-specific leakage" — analogicznie, zapobiec ACP-specific
+    opencode-specific leakage" — analogously, prevent ACP-specific
     leakage.
 
 ---
 
-## 10. Bramka decyzyjna i gotowy prompt na kolejne zadanie
+## 10. Decision gate and a ready-to-paste prompt for the next task
 
-**Bramka Etapu 1 → Etap 2** (z `docs/development-roadmap.md`): czy ACP
-pokrywa wystarczająco dużo, by uzasadnić spike? **Wynik tej notatki: TAK,
-warunkowo.** ACP dostarcza wspólne prymitywy sesji, promptów, zdarzeń,
-anulowania i konfiguracji MCP. Tabele w sekcjach 3-4 pokazują zarazem,
-że złożone wymagania trwałego wykonania pozostają pokryte tylko częściowo
-albo wcale. Wartość wspólnej integracji sesyjnej wystarcza, by uzasadnić
-spike **testujący konkretne luki**
-(idempotencja, status-bez-query, end_turn-vs-success, capability-gating)
-— nie uzasadnia przejścia od razu do Etapu 3. Osiem granic z sekcji 5
-(5.1-5.8: sześć architektonicznych + uprawnienia/auth/izolacja +
-tożsamość/lease/nadzór procesów) pozostaje nienaruszalnych niezależnie
-od wyniku spike'a.
+**Stage 1 → Stage 2 gate** (from `docs/development-roadmap.md`): does ACP
+cover enough to justify a spike? **Result of this note: YES,
+conditionally.** ACP provides shared primitives for sessions, prompts, events,
+cancellation, and MCP configuration. At the same time, the tables in sections 3-4 show
+that the complex durable-execution requirements remain covered only partially
+or not at all. The value of a shared session integration is enough to justify
+a spike **testing the specific gaps**
+(idempotency, status-without-query, end_turn-vs-success, capability-gating)
+— it does not justify moving straight to Stage 3. The eight boundaries from section 5
+(5.1-5.8: six architectural + permissions/auth/isolation +
+identity/lease/process supervision) remain inviolable regardless
+of the spike's outcome.
 
-### Gotowy prompt (do wklejenia jako kolejne zadanie — Etap 2)
+### Ready-to-paste prompt (to paste as the next task — Stage 2)
 
-> Przeprowadź Etap 2 (spike kompatybilności, disposable, poza `main`) z
-> `docs/development-roadmap.md`, na podstawie
-> `docs/acp-gap-analysis.md` (ta notatka — w szczególności sekcja 7
-> per-agent go/no-go i sekcja 8 specyfikacja środowiska/scenariuszy/
-> kryteriów sukcesu). Zbuduj ten sam mały zadaniowy task (sekcja 8.2) na
-> OpenCode (`opencode-ai@1.18.32`, natywny `opencode acp`), Codex
-> (`@agentclientprotocol/codex-acp@1.13.1` — **zweryfikuj i przypnij**
-> kompatybilną wersję `@openai/codex`/`CODEX_PATH` w samym spike'u, nie
-> zakładaj `^0.156.1` z `package.json` bez testu, patrz sekcja 7.2) i
-> Gemini (`@google/gemini-cli@0.61.0`, `gemini --acp`) przez ACP, w
-> osobnym worktree, nieintegrowany z `packages/*`. Zacznij od mocka
-> MCP-report (bez prawdziwych wywołań modelu), potem — **tylko po
-> osobnej, jawnej zgodzie na budżet** — prawdziwe agenty. Przetestuj
-> **wszystkie** scenariusze z sekcji 8.3 na wszystkich trzech
-> runtime'ach; **bez ślepych retry** przy żadnej
-> niepewności (zgodnie z "safe unknown status" z
-> `runner-lifecycle/spec.md`). Dostarcz: kod spike'a (nieintegrowany),
-> raport z macierzą capability × runtime, listę przypadków utraty
-> połączenia i zaobserwowane zachowanie recovery (surowe logi JSON-RPC),
-> rekomendację wersji ACP do przypięcia. Kryteria sukcesu: sekcja 8.4 tej
-> notatki (≥2/3 runtime'y spójne na MCP-report + cancel + bezpieczny
-> recovery; scenariusz "niewspierane capabilities" musi fail-closed na
-> wszystkich trzech). Zakończ jawną bramką go/no-go dla Etapu 3
-> (właściwy adapter ACP + rekoncyliacja z `runner-protocol` —
-> **wymaga osobnej propozycji OpenSpec**, nie realizuj Etapu 3 w tym
-> zadaniu).
+> Carry out Stage 2 (compatibility spike, disposable, outside `main`) from
+> `docs/development-roadmap.md`, based on
+> `docs/acp-gap-analysis.md` (this note — in particular section 7
+> per-agent go/no-go and section 8 specification of the environment/scenarios/
+> success criteria). Build the same small task (section 8.2) on
+> OpenCode (`opencode-ai@1.18.32`, native `opencode acp`), Codex
+> (`@agentclientprotocol/codex-acp@1.13.1` — **verify and pin**
+> a compatible `@openai/codex`/`CODEX_PATH` version in the spike itself; do not
+> assume `^0.156.1` from `package.json` without a test, see section 7.2) and
+> Gemini (`@google/gemini-cli@0.61.0`, `gemini --acp`) via ACP, in a
+> separate worktree, not integrated with `packages/*`. Start with a mock
+> MCP report (no real model calls), then — **only after
+> separate, explicit budget approval** — real agents. Test
+> **all** scenarios from section 8.3 on all three
+> runtimes; **no blind retries** under any
+> uncertainty (in line with "safe unknown status" from
+> `runner-lifecycle/spec.md`). Deliver: the spike code (not integrated),
+> a report with a capability × runtime matrix, a list of connection-loss
+> cases and the observed recovery behavior (raw JSON-RPC logs),
+> a recommendation of the ACP version to pin. Success criteria: section 8.4 of this
+> note (≥2/3 runtimes consistent on MCP report + cancel + safe
+> recovery; the "unsupported capabilities" scenario must fail closed on
+> all three). Finish with an explicit go/no-go gate for Stage 3
+> (the actual ACP adapter + reconciliation with `runner-protocol` —
+> **requires a separate OpenSpec proposal**; do not carry out Stage 3 in this
+> task).
 
 ---
 
-## Źródła
+## Sources
 
-Skróty w formacie `` `nazwa.md` `` użyte w tekście odnoszą się do
-poniższych stron ACP (wszystkie pobrane 2026-09-25):
+The abbreviations in the form `` `name.md` `` used in the text refer to
+the following ACP pages (all retrieved 2026-09-25):
 
 - `initialization.md` — <https://agentclientprotocol.com/protocol/v1/initialization.md>
 - `session-setup.md` — <https://agentclientprotocol.com/protocol/v1/session-setup.md>
@@ -1149,14 +1152,14 @@ poniższych stron ACP (wszystkie pobrane 2026-09-25):
 - `session-config-options.md` — <https://agentclientprotocol.com/protocol/v1/session-config-options.md>
 - `prompt-lifecycle.md` (v2) — <https://agentclientprotocol.com/protocol/v2/prompt-lifecycle.md>
 - `rfds/updates` — <https://agentclientprotocol.com/rfds/updates.md>
-- `rfds` (proces RFD, definicje Draft/Active/Preview/Completed) — <https://agentclientprotocol.com/rfds>
+- `rfds` (RFD process, definitions of Draft/Active/Preview/Completed) — <https://agentclientprotocol.com/rfds>
 - `rfds/session-notices` — <https://agentclientprotocol.com/rfds/session-notices.md>
 - `rfds/streamable-http-websocket-transport` — <https://agentclientprotocol.com/rfds/streamable-http-websocket-transport.md>
 - `announcements/acp-v2-draft` — <https://agentclientprotocol.com/announcements/acp-v2-draft.md>
 
-SDK/CLI (wersje zaobserwowane `registry.npmjs.org` 2026-09-25):
+SDK/CLI (versions observed on `registry.npmjs.org` 2026-09-25):
 
-- `@agentclientprotocol/sdk@1.5.0` — <https://registry.npmjs.org/@agentclientprotocol/sdk/latest>, dokumentacja SDK: <https://agentclientprotocol.github.io/typescript-sdk/>
-- `opencode-ai@1.18.32` — <https://registry.npmjs.org/opencode-ai/latest>; docs: <https://opencode.ai/docs/acp/>, <https://opencode.ai/docs/cli/>; źródło (tag): <https://github.com/anomalyco/opencode/blob/v1.18.32/packages/opencode/src/acp/service.ts>
-- `@agentclientprotocol/codex-acp@1.13.1` — <https://registry.npmjs.org/@agentclientprotocol/codex-acp/latest>; źródło (commit `b1b8490cd165c18626dc3fe83836cdacdef94cd3`): <https://github.com/agentclientprotocol/codex-acp/blob/b1b8490cd165c18626dc3fe83836cdacdef94cd3/src/CodexAcpServer.ts>; upstream Codex CLI docs: <https://developers.openai.com/codex/cli/reference/>
-- `@google/gemini-cli@0.61.0` — <https://registry.npmjs.org/@google/gemini-cli/latest>; docs (guide): <https://github.com/google-gemini/gemini-cli/blob/v0.61.0/docs/cli/acp-mode.md>; źródło dispatchera: <https://github.com/google-gemini/gemini-cli/blob/v0.61.0/packages/cli/src/acp/acpRpcDispatcher.ts>; auth: <https://geminicli.com/docs/get-started/authentication/>
+- `@agentclientprotocol/sdk@1.5.0` — <https://registry.npmjs.org/@agentclientprotocol/sdk/latest>, SDK documentation: <https://agentclientprotocol.github.io/typescript-sdk/>
+- `opencode-ai@1.18.32` — <https://registry.npmjs.org/opencode-ai/latest>; docs: <https://opencode.ai/docs/acp/>, <https://opencode.ai/docs/cli/>; source (tag): <https://github.com/anomalyco/opencode/blob/v1.18.32/packages/opencode/src/acp/service.ts>
+- `@agentclientprotocol/codex-acp@1.13.1` — <https://registry.npmjs.org/@agentclientprotocol/codex-acp/latest>; source (commit `b1b8490cd165c18626dc3fe83836cdacdef94cd3`): <https://github.com/agentclientprotocol/codex-acp/blob/b1b8490cd165c18626dc3fe83836cdacdef94cd3/src/CodexAcpServer.ts>; upstream Codex CLI docs: <https://developers.openai.com/codex/cli/reference/>
+- `@google/gemini-cli@0.61.0` — <https://registry.npmjs.org/@google/gemini-cli/latest>; docs (guide): <https://github.com/google-gemini/gemini-cli/blob/v0.61.0/docs/cli/acp-mode.md>; dispatcher source: <https://github.com/google-gemini/gemini-cli/blob/v0.61.0/packages/cli/src/acp/acpRpcDispatcher.ts>; auth: <https://geminicli.com/docs/get-started/authentication/>

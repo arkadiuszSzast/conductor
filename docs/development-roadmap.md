@@ -1,119 +1,124 @@
-# Mapa drogowa: ACP i graf zadań (roadmap, nie plan wdrożenia)
+# Roadmap: ACP and the task graph (roadmap, not an implementation plan)
 
-Status: **roadmap do delegacji**, nie zatwierdzony plan OpenSpec. Każdy etap
-oznaczony `[impl]` wymaga osobnej propozycji w `openspec/changes/` (zgodnie z
-`AGENTS.md`) — dla ACP: uzgodnienia/rekoncyliacji z `runner-protocol`
-(`openspec/changes/runner-protocol/{proposal,design,tasks}.md`), bo oba
-opisują tę samą granicę `SessionClient` (`packages/server/src/ports.ts:112`).
-Nie duplikować `runner-protocol` — rozszerzyć go lub jawnie zamknąć jako
-zastąpiony.
+Status: **roadmap for delegation**, not an approved OpenSpec plan. Every stage
+marked `[impl]` requires a separate proposal in `openspec/changes/` (per
+`AGENTS.md`) — for ACP: agreement/reconciliation with `runner-protocol`
+(`openspec/changes/runner-protocol/{proposal,design,tasks}.md`), because both
+describe the same `SessionClient` boundary (`packages/server/src/ports.ts:112`).
+Do not duplicate `runner-protocol` — extend it or explicitly close it as
+superseded.
 
-Kontekst: prace z sesji już scommitowane (`03e50dd`, `025ce83`) — nie
-powtarzać. Ten dokument dotyczy kolejnych, niezależnie zlecalnych kroków.
+Context: the work from earlier sessions is already committed (`03e50dd`,
+`025ce83`) — do not repeat it. This document covers the next, independently
+delegable steps.
 
-## Ścieżka A — ACP (Agent Client Protocol): ACP-first, nie ACP-only
+## Track A — ACP (Agent Client Protocol): ACP-first, not ACP-only
 
-### Etap 1 — Przegląd projektowy (read-only)
-- **Zakres:** porównać ACP z `SessionClient` (`ports.ts`) i niedokończonym
-  `runner-protocol` (kontrakt wersji/capabilities, leased registration,
-  idempotentne create/prompt — patrz `design.md` sekcja "Decisions").
-  Zidentyfikować luki i pokrycie.
-- **Zależności:** brak (czysto analityczny).
-- **Deliverable:** notatka gap-analysis (markdown, w `openspec/changes/` jako
-  draft `design.md` fragment lub osobny research note) mapująca każdą
-  capability `runner-protocol` na odpowiednik/brak w ACP.
-- **Kryteria akceptacji:** każda decyzja projektowa `runner-protocol` ma
-  jawne "ACP: tak/nie/częściowo + dlaczego"; brak nieuzasadnionych założeń.
-- **Bramka decyzyjna:** czy ACP pokrywa wystarczająco dużo, by uzasadnić
-  spike (Etap 2)? Jeśli nie — udokumentować i zamknąć wątek.
+### Stage 1 — Design review (read-only)
+- **Scope:** compare ACP with `SessionClient` (`ports.ts`) and the unfinished
+  `runner-protocol` (version/capabilities contract, leased registration,
+  idempotent create/prompt — see `design.md`, section "Decisions").
+  Identify gaps and coverage.
+- **Dependencies:** none (purely analytical).
+- **Deliverable:** a gap-analysis note (markdown, in `openspec/changes/` as a
+  draft `design.md` fragment or a separate research note) mapping every
+  `runner-protocol` capability to its ACP counterpart or absence.
+- **Acceptance criteria:** every `runner-protocol` design decision has an
+  explicit "ACP: yes/no/partial + why"; no unjustified assumptions.
+- **Decision gate:** does ACP cover enough to justify a spike (Stage 2)? If
+  not — document it and close the thread.
 
-### Etap 2 — Spike kompatybilności (disposable, poza main)
-- **Zakres:** ten sam mały zadaniowy task na OpenCode/Codex/Gemini przez ACP:
-  run-scoped MCP report, permission/cancel, utrata połączenia + restart,
-  recovery sesji — **bez ślepych retry** (zgodnie z zasadą "safe unknown
-  status" z `design.md`). Zbudować macierz capability: natywne vs adaptery.
-  Zweryfikować negocjację stabilnej wersji protokołu i to, że obecna
-  dokumentacja (`docs/*.md`, `runner-protocol/specs/`) nie zakłada sztywno
-  niewspieranej wersji ACP.
-- **Zależności:** Etap 1 (gap-analysis jako punkt wyjścia).
-- **Deliverable:** kod spike'a (osobny branch/worktree, nieintegrowany),
-  raport: macierz capability × runtime, lista przypadków utraty połączenia i
-  zachowanie recovery, rekomendacja wersji ACP do zablokowania.
-- **Kryteria akceptacji:** wszystkie trzy runtime'y przetestowane na tym
-  samym zadaniu; brak retry bez potwierdzenia stanu; raport jest
-  odtwarzalny (kroki + logi).
-- **Bramka decyzyjna:** go/no-go dla Etapu 3, na podstawie: czy MCP
-  reporting + cancel + recovery działają spójnie na ≥2 runtime'ach.
+### Stage 2 — Compatibility spike (disposable, off main)
+- **Scope:** the same small task on OpenCode/Codex/Gemini through ACP:
+  run-scoped MCP report, permission/cancel, connection loss + restart,
+  session recovery — **without blind retries** (per the "safe unknown
+  status" principle in `design.md`). Build a capability matrix: native vs
+  adapters. Verify negotiation of a stable protocol version and that current
+  documentation (`docs/*.md`, `runner-protocol/specs/`) does not hard-code an
+  unsupported ACP version.
+- **Dependencies:** Stage 1 (the gap analysis as the starting point).
+- **Deliverable:** spike code (separate branch/worktree, not integrated),
+  a report: capability × runtime matrix, list of connection-loss cases and
+  recovery behaviour, a recommended ACP version to pin.
+- **Acceptance criteria:** all three runtimes tested on the same task; no
+  retry without state confirmation; the report is reproducible (steps + logs).
+- **Decision gate:** go/no-go for Stage 3, based on whether MCP reporting +
+  cancel + recovery work consistently on ≥2 runtimes.
 
-### Etap 3 — Decyzja + plan produkcyjny `[impl]` (wymaga propozycji OpenSpec)
-- **Zakres:** jeśli go — właściwy ACP runner + wspólny raportujący MCP,
-  zachowując: Conductor SQLite jako właściciel wyniku run/retry/review/gate
-  (supervizja workera ACP po stdio **nie jest automatycznie trwała** — to
-  proces, nie stan). Testy, dokumentacja, bramka jakości (typecheck/lint/
-  test/build jak w `runner-protocol` task 5.5). Zachować furtkę ucieczki:
-  natywna integracja pozostaje dostępna, ACP jej nie zastępuje siłowo.
-- **Zależności:** Etap 2 (wynik pozytywny), rekoncyliacja z
-  `runner-protocol` (ten sam kontrakt wersji/capabilities/lease albo jawne
-  zastąpienie wybranych decyzji).
-- **Deliverable:** propozycja OpenSpec (`proposal.md`/`design.md`/`tasks.md`
-  w nowym `openspec/changes/<nazwa>/`), potem implementacja wg zwykłego
-  procesu tasków.
-- **Kryteria akceptacji:** zgodność z `AGENTS.md` (SQLite = source of truth,
-  sesje disposable, interpreter pure/engine I/O); przechodzi
-  conformance suite równoważny temu z `runner-protocol` 1.3.
+### Stage 3 — Decision + production plan `[impl]` (requires an OpenSpec proposal)
+- **Scope:** if go — a proper ACP runner + shared reporting MCP, preserving:
+  Conductor SQLite as the owner of run/retry/review/gate results (supervising
+  an ACP worker over stdio **is not automatically durable** — it is a process,
+  not state). Tests, documentation, quality gate (typecheck/lint/test/build as
+  in `runner-protocol` task 5.5). Keep an escape hatch: the native integration
+  remains available; ACP does not forcibly replace it.
+- **Dependencies:** Stage 2 (positive result), reconciliation with
+  `runner-protocol` (the same version/capabilities/lease contract, or an
+  explicit replacement of selected decisions).
+- **Deliverable:** an OpenSpec proposal (`proposal.md`/`design.md`/`tasks.md`
+  in a new `openspec/changes/<name>/`), then implementation through the usual
+  task process.
+- **Acceptance criteria:** consistent with `AGENTS.md` (SQLite = source of
+  truth, disposable sessions, pure interpreter/engine I/O); passes a
+  conformance suite equivalent to the one in `runner-protocol` 1.3.
 
-## Ścieżka B — dekompozycja zadań / graf pracy (task graph)
+## Track B — task decomposition / task graph
 
-### Etap 4 — Kontrakt małego zadania + bramka planowania/oceny rozmiaru
-- **Zakres:** OpenSpec pozostaje właścicielem intencji/spec/design (nie tylko
-  "biznesowej" części). Rozróżnić **backlog DAG** (zależności między małymi
-  zadaniami w obrębie zmiany, opcjonalnie między zmianami) od **workflow DAG** (`needs:` w `conductor.yaml`,
-  wykonanie). Obecny plugin OpenSpec parsuje tekst/status checkboxów i
-  startuje **całą zmianę na raz** (`plugins/openspec/serve.ts`,
-  `handleStartWork`, linie ok. 200–420) — nie ma schedulera zadań. Zdefiniować
-  minimalny kontrakt zadania: zakres akceptacji, zależności, dowód
-  wykonania (evidence), granica "done", nowo odkryty zakres (follow-up), oraz
-  wymóg finalnej walidacji **całej zmiany** mimo podziału na taski.
-- **Zależności:** brak twardej zależności od Ścieżki A; może iść równolegle.
-- **Deliverable:** krótka notatka projektowa (design note) z kontraktem
-  zadania + diagramem backlog DAG vs workflow DAG.
-- **Kryteria akceptacji:** kontrakt jest wystarczający, by opisać istniejące
-  `tasks.md` bez utraty informacji; jasno oddziela planowanie (backlog) od
-  wykonania (workflow).
-- **Bramka decyzyjna:** czy przykładowa duża zmiana została rozbita na małe,
-  niezależnie weryfikowalne zadania z pełnym kontekstem dla nowej sesji?
-  Jeśli nie — poprawić dekompozycję przed wyborem magazynu zadań.
+### Stage 4 — Small-task contract + planning/size gate
+- **Status:** done — see [`task-contract-design.md`](task-contract-design.md).
+- **Scope:** OpenSpec remains the owner of intent/spec/design (not only the
+  "business" part). Distinguish the **backlog DAG** (dependencies between
+  small tasks within a change, optionally across changes) from the
+  **workflow DAG** (`needs:` in `conductor.yaml`, execution). The current
+  OpenSpec plugin parses checkbox text/status and starts **the whole change at
+  once** (`plugins/openspec/serve.ts`, `handleStartWork`, around lines
+  200–420) — there is no task scheduler. Define a minimal task contract:
+  acceptance scope, dependencies, evidence of completion, the "done"
+  boundary, newly discovered scope (follow-up), and the requirement for final
+  validation of the **whole change** despite the split into tasks.
+- **Dependencies:** no hard dependency on Track A; can run in parallel.
+- **Deliverable:** a short design note with the task contract + a diagram of
+  backlog DAG vs workflow DAG.
+- **Acceptance criteria:** the contract is sufficient to describe existing
+  `tasks.md` files without losing information; it clearly separates planning
+  (backlog) from execution (workflow).
+- **Decision gate:** was the example large change split into small,
+  independently verifiable tasks with full context for a fresh session? If
+  not — fix the decomposition before choosing a task store.
 
-### Etap 5 — Ewaluacja Beads vs natywne SQLite vs interfejs providera
-- **Zakres:** ocena z realnego przypadku użycia (Etap 4), nie z góry.
-  Uwaga: Beads **nie dzieli zadań automatycznie** — to tylko śledzenie/graf.
-  Architektura oparta o Dolt wymaga weryfikacji aktualności w momencie
-  decyzji (nie zakładać z dokumentacji). Unikać podwójnej prawdy z
-  `tasks.md` — jeśli wybrane rozwiązanie zewnętrzne, zdefiniować jawnie:
-  claims, mapowanie run↔task, rekoncyliację, kto ma "completion authority".
-- **Zależności:** Etap 4 (kontrakt zadania jako kryterium oceny).
-- **Deliverable:** krótkie porównanie (tabela) + ew. pilotaż na jednym
-  realnym backlogu, **bez** narzucania Dolta i **bez** budowania pełnego
-  klonu Beads.
-- **Kryteria akceptacji:** decyzja ma jawne uzasadnienie względem kontraktu
-  z Etapu 4; nie wprowadza drugiego źródła prawdy równoległego do SQLite.
-- **Bramka decyzyjna:** wybór spośród (a) natywne SQLite, (b) Beads, (c)
-  interfejs providera pluggable — dopiero po porównaniu/pilotażu.
+### Stage 5 — Evaluation: Beads vs native SQLite vs a provider interface
+- **Scope:** evaluation from a real use case (Stage 4), not up front.
+  Note: Beads **does not split tasks automatically** — it is only
+  tracking/a graph. The Dolt-based architecture must be verified as current
+  at decision time (do not assume it from documentation). Avoid a double
+  truth with `tasks.md` — if an external solution is chosen, explicitly
+  define: claims, run↔task mapping, reconciliation, and who has "completion
+  authority".
+- **Dependencies:** Stage 4 (the task contract as the evaluation criterion).
+- **Deliverable:** a short comparison (table) + possibly a pilot on one real
+  backlog, **without** imposing Dolt and **without** building a full Beads
+  clone.
+- **Acceptance criteria:** the decision is explicitly justified against the
+  Stage 4 contract; it introduces no second source of truth parallel to
+  SQLite.
+- **Decision gate:** choose among (a) native SQLite, (b) Beads, (c) a
+  pluggable provider interface — only after the comparison/pilot.
 
-### Etap 6 — Implementacja `[impl]` (wymaga propozycji OpenSpec)
-- **Zakres:** `conductor.yaml` pozostaje **jedynym** formatem wykonania
-  (workflow-as-data) — żadnych duplikatów bramek/gate'ów przez formuły
-  Beads ani inny silnik reguł.
-- **Zależności:** Etap 5 (decyzja), zgodność z `workflow-format` i
-  `retry-policy`.
-- **Deliverable:** propozycja OpenSpec + implementacja wg zwykłego procesu.
+### Stage 6 — Implementation `[impl]` (requires an OpenSpec proposal)
+- **Scope:** `conductor.yaml` remains the **only** execution format
+  (workflow-as-data) — no duplicated gates via Beads formulas or any other
+  rule engine.
+- **Dependencies:** Stage 5 (decision), consistency with `workflow-format`
+  and `retry-policy`.
+- **Deliverable:** an OpenSpec proposal + implementation through the usual
+  process.
 
-## Następne zadanie gotowe do wklejenia
+## Next task, ready to paste
 
-> Przeprowadź Etap 1 (przegląd projektowy ACP): porównaj ACP z
-> `SessionClient` (`packages/server/src/ports.ts:112`) i decyzjami z
-> `openspec/changes/runner-protocol/design.md` (identity/lease, offer przed
-> attempt, idempotentny create/prompt, safe unknown status, error ownership
-> boundary). Wynik: gap-analysis notatka mapująca każdą decyzję na
-> pokrycie ACP (tak/nie/częściowo + uzasadnienie), bez zmian w kodzie, bez
-> commitów. Zakończ rekomendacją go/no-go dla spike'a (Etap 2).
+> Run Stage 1 (ACP design review): compare ACP with `SessionClient`
+> (`packages/server/src/ports.ts:112`) and the decisions in
+> `openspec/changes/runner-protocol/design.md` (identity/lease, offer before
+> attempt, idempotent create/prompt, safe unknown status, error ownership
+> boundary). Result: a gap-analysis note mapping every decision to ACP
+> coverage (yes/no/partial + justification), no code changes, no commits.
+> Conclude with a go/no-go recommendation for the spike (Stage 2).

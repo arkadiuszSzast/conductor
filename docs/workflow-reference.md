@@ -297,7 +297,7 @@ Performs LLM work.
   agent:
     role: architect                 # required — key into `roles`
     prompt: |                       # required — the IR is self-describing
-      Zaproponuj architekturę dla {{ inputs.feature }}.
+      Propose an architecture for {{ inputs.feature }}.
 ```
 
 | Field | Required | Description |
@@ -753,14 +753,14 @@ jobs:
         agent:
           role: architect
           prompt: |
-            Zaproponuj architekturę dla {{ inputs.feature }}.
+            Propose an architecture for {{ inputs.feature }}.
 
-            Twoja poprzednia propozycja (pusta w rundzie 1):
+            Your previous proposal (empty in round 1):
             {{ feedback.jobs["architect-a"]["design"]["report"] }}
-            Propozycja drugiego architekta:
+            The other architect's proposal:
             {{ feedback.jobs["architect-b"]["design"]["report"] }}
-            Uwagi sędziego: {{ feedback.jobs["consensus"]["agree"]["report"] }}
-            Powód zwrotki: {{ feedback.message }}
+            Judge's notes: {{ feedback.jobs["consensus"]["agree"]["report"] }}
+            Reason for sending back: {{ feedback.message }}
 
   architect-b:
     outputs:
@@ -770,13 +770,13 @@ jobs:
         agent:
           role: architect
           prompt: |
-            Zaproponuj niezależną architekturę dla {{ inputs.feature }}.
+            Propose an independent architecture for {{ inputs.feature }}.
 
-            Twoja poprzednia propozycja (pusta w rundzie 1):
+            Your previous proposal (empty in round 1):
             {{ feedback.jobs["architect-b"]["design"]["report"] }}
-            Propozycja drugiego architekta:
+            The other architect's proposal:
             {{ feedback.jobs["architect-a"]["design"]["report"] }}
-            Uwagi sędziego: {{ feedback.jobs["consensus"]["agree"]["report"] }}
+            Judge's notes: {{ feedback.jobs["consensus"]["agree"]["report"] }}
 
   consensus:
     needs: [architect-a, architect-b]
@@ -787,8 +787,8 @@ jobs:
         agent:
           role: judge
           prompt: |
-            Porównaj architektury; odpowiedz outcome'em approved albo
-            changes_requested. Rozumowanie ZAWSZE w raporcie.
+            Compare the architectures; answer with outcome approved or
+            changes_requested. ALWAYS put the reasoning in the report.
 
             A: {{ needs["architect-a"].outputs.design }}
             B: {{ needs["architect-b"].outputs.design }}
@@ -813,25 +813,25 @@ jobs:
         agent:
           role: implementer
           prompt: |
-            Napisz zmianę OpenSpec. Pracuj w {{ steps.worktree.outputs.path }}.
-            Uzgodniona architektura: {{ needs["consensus"].outputs.decision }}
+            Write an OpenSpec change. Work in {{ steps.worktree.outputs.path }}.
+            Agreed architecture: {{ needs["consensus"].outputs.decision }}
 
       - id: implement
         agent:
           role: implementer
           prompt: |
-            Zaimplementuj {{ inputs.feature }} według
+            Implement {{ inputs.feature }} according to
             {{ steps.openspec.outputs.report }}.
 
-            Poprzednia iteracja: {{ feedback.jobs["deliver"]["implement"]["report"] }}
-            Uwagi quality: {{ feedback.jobs["deliver"]["quality"]["report"] }}
-            Uwagi review: {{ feedback.jobs["deliver"]["internal-review"]["report"] }}
-            Uwagi z PR: {{ feedback.jobs["deliver"]["pr-review"]["notes"] }}
+            Previous iteration: {{ feedback.jobs["deliver"]["implement"]["report"] }}
+            Quality notes: {{ feedback.jobs["deliver"]["quality"]["report"] }}
+            Review notes: {{ feedback.jobs["deliver"]["internal-review"]["report"] }}
+            PR notes: {{ feedback.jobs["deliver"]["pr-review"]["notes"] }}
 
       - id: quality
         agent:
           role: quality
-          prompt: "Build, testy, lint. Odpowiedz approved albo issues; problemy w raporcie."
+          prompt: "Build, tests, lint. Answer approved or issues; problems go in the report."
         outcomes:
           approved: next
           issues:
@@ -840,7 +840,7 @@ jobs:
       - id: internal-review
         agent:
           role: reviewer
-          prompt: "Zreviewuj diff. approved albo changes_requested; uwagi w raporcie."
+          prompt: "Review the diff. approved or changes_requested; notes go in the report."
         outcomes:
           approved: next
           changes_requested:
