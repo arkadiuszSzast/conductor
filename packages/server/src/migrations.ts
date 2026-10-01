@@ -923,6 +923,54 @@ export const migrations: readonly Migration[] = [
       db.run("ALTER TABLE worker_request_dedup ADD COLUMN disposition TEXT")
     },
   },
+  {
+    id: "0025_change_queue",
+    up(db) {
+      db.run(`
+        CREATE TABLE change_queue (
+          project_dir   TEXT PRIMARY KEY,
+          paused        INTEGER NOT NULL DEFAULT 0,
+          parallelism   INTEGER NOT NULL DEFAULT 1 CHECK(parallelism >= 1),
+          time_updated  INTEGER NOT NULL
+        )
+      `)
+      db.run(`
+        CREATE TABLE change_queue_entry (
+          id            TEXT PRIMARY KEY,
+          project_dir   TEXT NOT NULL,
+          change        TEXT NOT NULL,
+          position      INTEGER NOT NULL,
+          status        TEXT NOT NULL
+                          CHECK(status IN ('waiting','blocked','invalid','starting','running','escalated','merged','removed')),
+          reason        TEXT,
+          state         TEXT,
+          feature_id    TEXT,
+          claim_token   TEXT,
+          claimed_at    INTEGER,
+          time_created  INTEGER NOT NULL,
+          time_updated  INTEGER NOT NULL
+        )
+      `)
+      // One live entry per change; merged/removed entries are history and
+      // never block queueing the same change again.
+      db.run(
+        `CREATE UNIQUE INDEX idx_change_queue_entry_live ON change_queue_entry(project_dir, change)
+         WHERE status NOT IN ('merged','removed')`,
+      )
+      db.run("CREATE INDEX idx_change_queue_entry_position ON change_queue_entry(project_dir, position)")
+      db.run(`
+        CREATE TABLE change_queue_transition (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          entry_id      TEXT NOT NULL,
+          from_status   TEXT,
+          to_status     TEXT NOT NULL,
+          reason        TEXT,
+          time          INTEGER NOT NULL
+        )
+      `)
+      db.run("CREATE INDEX idx_change_queue_transition_entry ON change_queue_transition(entry_id, id)")
+    },
+  },
 ]
 
 function validateMigrations(ordered: readonly Migration[]): void {

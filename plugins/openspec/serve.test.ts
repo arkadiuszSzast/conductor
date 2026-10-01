@@ -87,11 +87,11 @@ describe("GET /changes", () => {
       expect(response.status).toBe(200)
       const body = (await response.json()) as {
         openspec: boolean
-        active: Array<{ name: string; taskProgress: { done: number; total: number } | null }>
+        active: Array<{ name: string; taskProgress: { done: number; total: number } | null; dependsOn: string[] }>
         archived: string[]
       }
       expect(body.openspec).toBe(true)
-      expect(body.active).toEqual([{ name: "add-feature", taskProgress: { done: 2, total: 3 } }])
+      expect(body.active).toEqual([{ name: "add-feature", taskProgress: { done: 2, total: 3 }, dependsOn: [] }])
       expect(body.archived).toEqual(["old-change"])
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -111,8 +111,8 @@ describe("GET /changes", () => {
       })
 
       const response = await handleRequest(new Request("http://x/changes"), realFsDeps(dir, { exec }))
-      const body = (await response.json()) as { active: Array<{ name: string; taskProgress: unknown }> }
-      expect(body.active).toEqual([{ name: "no-counts", taskProgress: { done: 1, total: 3 } }])
+      const body = (await response.json()) as { active: Array<{ name: string; taskProgress: unknown; dependsOn: string[] }> }
+      expect(body.active).toEqual([{ name: "no-counts", taskProgress: { done: 1, total: 3 }, dependsOn: [] }])
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -145,11 +145,11 @@ describe("GET /changes", () => {
       const response = await handleRequest(new Request("http://x/changes"), realFsDeps(dir, { exec }))
       const body = (await response.json()) as {
         openspec: boolean
-        active: Array<{ name: string; taskProgress: { done: number; total: number } | null }>
+        active: Array<{ name: string; taskProgress: { done: number; total: number } | null; dependsOn: string[] }>
         archived: string[]
       }
       expect(body.openspec).toBe(true)
-      expect(body.active).toEqual([{ name: "sample-change", taskProgress: { done: 1, total: 2 } }])
+      expect(body.active).toEqual([{ name: "sample-change", taskProgress: { done: 1, total: 2 }, dependsOn: [] }])
       expect(body.archived).toEqual(["old-change"])
     } finally {
       rmSync(dir, { recursive: true, force: true })

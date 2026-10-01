@@ -72,6 +72,17 @@ export type {
   PluginManifestBackend,
   PluginManifestPanel,
 } from "./plugin-manifest.ts"
+export { planQueue, validateQueueEntry } from "./change-queue.ts"
+export type {
+  PlanQueueInput,
+  PlanQueueResult,
+  QueueDiagnostic,
+  QueueEntry,
+  QueueEntryId,
+  QueueEntryState,
+  QueueEntryStatus,
+  StuckFeatureStatus,
+} from "./change-queue.ts"
 export type * from "./types.ts"
 export type { RenderResult } from "./template.ts"
 export type { ValidationResult } from "./validate.ts"

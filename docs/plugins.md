@@ -265,8 +265,8 @@ Known residual risks, accepted under the trust model above:
 ## Installing the bundled OpenSpec plugin
 
 The repository ships a reference plugin at `plugins/openspec/` — it reads
-a project's `openspec/` tree and offers a "start work" action, and it is
-installed exactly the way a third-party plugin would be, with no
+a project's `openspec/` tree and offers "start work" and change-queue
+actions, and it is installed exactly the way a third-party plugin would be, with no
 special-casing.
 
 `conductor init` does **not** install it automatically. Copy it into the
@@ -291,7 +291,10 @@ rail whenever that project is the active scope. Opening it shows:
 - active changes with task progress (done/total, parsed from
   `tasks.md` checkboxes),
 - archived changes,
-- a "Start work" button per active change.
+- a "Start work" button per active change,
+- each active change's declared dependencies, and — when queued — its queue
+  state and reason, with "Queue"/"Dequeue" actions and the project's queue
+  controls ([below](#queueing-changes-from-the-panel)).
 
 Clicking "Start work" calls the plugin's `/start-work` route, which reads
 the change's `proposal.md` (its "Why" section becomes the feature
@@ -300,3 +303,48 @@ description) and creates a Conductor feature through the public
 then the panel navigates the Control Room to the new feature via the
 bridge's `navigate` message. A project with no `openspec/` root gets an
 explanatory empty state, never an error.
+
+### Queueing changes from the panel
+
+Next to "Start work", every active change has a **Queue** button. Start work
+still runs the change immediately and outside the queue; Queue hands it to
+the daemon's [change queue](install.md#running-unattended-change-queue), which
+starts it by itself once its dependencies have merged. Neither action hides
+the other.
+
+- **Dependencies.** Each active change shows `Depends on` followed by the
+  names from `depends_on` in its `.openspec.yaml`, or "No dependencies
+  declared". A `.openspec.yaml` that cannot be parsed shows no dependencies
+  and a warning (`ignored .openspec.yaml depends_on: …`; also for a file over 64 KiB or one with YAML anchors/aliases); the listing never
+  fails because of it. Declared dependencies are shown for every change, so a
+  missing declaration is visible before queueing.
+- **Queue state.** A queued change shows a state badge and the daemon's reason,
+  for example `waiting` — "waiting for `unify-content-gates`",
+  `blocked` — "blocked: `quest-outcomes` escalated", `waiting` — "queue paused"
+  or "parallelism limit reached (1)", `running` once its feature started,
+  `invalid` with the diagnostic. States and reasons are exactly those of the
+  [HTTP API](http-api.md#entry-payload); the panel does not compute any of
+  them. A change whose entry is `merged` is shown as not queued.
+- **Dequeue.** A queued change that has not started (`waiting`, `blocked` or
+  `invalid`) offers **Dequeue** instead of Queue. Once its feature has
+  started (`starting`, `running`, `escalated`) there is no dequeue action —
+  abandon the feature instead. (The daemon API itself also allows removing
+  an entry whose feature is terminal — `done` without a merge, or
+  `abandoned`; the panel does not offer that.)
+- **Queue controls.** At the top of the panel: a **Pause**/**Resume** button
+  (a "paused" badge while paused; pausing stops new starts only) and a
+  **Parallelism** field (a whole number of at least 1, changed on commit).
+- **Errors.** A refusal is shown inline with the daemon's message, and the
+  change is not shown as queued: a dependency cycle or an unknown dependency
+  on the change, an invalid parallelism on the controls. If the queue API is
+  unavailable (for example the project is not registered), the panel shows
+  "Queue unavailable: …" and degrades to Start work only.
+
+The plugin reaches the queue only through the daemon's public API with its own
+token, via the backend routes `GET /queue`, `POST /queue/entries`
+(`{change}`), `DELETE /queue/entries/:id` and `PATCH /queue`
+(`{paused?, parallelism?}`; the project directory is always the plugin's own,
+and order is not exposed). The panel reads the queue when it loads and after
+each action; use Refresh to see the scheduler's latest decisions, which
+arrive on its own interval (see `changeQueueIntervalMs` in
+[Install](install.md)). The plugin declares no new capabilities for this.

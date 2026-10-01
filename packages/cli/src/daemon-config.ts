@@ -14,6 +14,7 @@
 
 import { isAbsolute } from "node:path"
 import { parseYamlObject, stringifyYamlObject } from "@conductor/core"
+import { DEFAULT_CHANGE_QUEUE_INTERVAL_MS } from "@conductor/server"
 import type { ApiAuth, ApiConfig, DaemonConfig } from "@conductor/server"
 import type { EngineOptions } from "@conductor/server"
 import { UsageError } from "./errors.ts"
@@ -42,6 +43,7 @@ const TOP_LEVEL_FIELDS = new Set([
   "bind",
   "auth",
   "heartbeatIntervalMs",
+  "changeQueueIntervalMs",
   "engine",
   "actions",
   "plugins",
@@ -131,6 +133,11 @@ export function assembleDaemonConfig(raw: unknown): DaemonFileConfig {
     throw new UsageError('"heartbeatIntervalMs" must be a positive number')
   }
 
+  const changeQueueIntervalMs = raw["changeQueueIntervalMs"] === undefined ? DEFAULT_CHANGE_QUEUE_INTERVAL_MS : raw["changeQueueIntervalMs"]
+  if (typeof changeQueueIntervalMs !== "number" || !Number.isFinite(changeQueueIntervalMs) || changeQueueIntervalMs <= 0) {
+    throw new UsageError('"changeQueueIntervalMs" must be a positive number')
+  }
+
   const engine = raw["engine"]
   let engineTuning: EngineOptions | undefined
   if (engine !== undefined) {
@@ -217,6 +224,7 @@ export function assembleDaemonConfig(raw: unknown): DaemonFileConfig {
       databasePath,
       projects: projects as string[],
       heartbeatIntervalMs,
+      changeQueueIntervalMs,
       createDatabaseDirectory: createDatabaseDirectory ?? true,
       ...(engineTuning !== undefined ? { engine: engineTuning } : {}),
       ...(actionsConfig !== undefined ? { actions: actionsConfig } : {}),

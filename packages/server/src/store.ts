@@ -13,6 +13,8 @@ import type {
   FeatureStatus,
   JobRuntime,
   PipelineEvent,
+  QueueEntryState,
+  QueueEntryStatus,
   ResourceReason,
   Transition,
 } from "@conductor/core"
@@ -758,6 +760,110 @@ function toRunCredentialRecord(row: RunCredentialRow): RunCredentialRecord {
     revokedAt: row.revoked_at,
     revocationReason: row.revocation_reason,
   }
+}
+
+export interface QueueSettings {
+  readonly projectDir: string
+  readonly paused: boolean
+  readonly parallelism: number
+  /** Null until the first settings write; the defaults apply until then. */
+  readonly timeUpdated: number | null
+}
+
+export interface QueueEntryRecord {
+  readonly id: string
+  readonly projectDir: string
+  readonly change: string
+  readonly position: number
+  readonly status: QueueEntryStatus
+  readonly reason: string | null
+  /** The last `QueueEntryState` the planner produced, as persisted. */
+  readonly state: QueueEntryState | null
+  readonly featureId: string | null
+  readonly claimToken: string | null
+  readonly claimedAt: number | null
+  readonly timeCreated: number
+  readonly timeUpdated: number
+}
+
+export interface QueueSnapshot {
+  readonly settings: QueueSettings
+  /** Live and final (merged/removed) entries, in position order. */
+  readonly entries: readonly QueueEntryRecord[]
+}
+
+export interface QueueTransitionRecord {
+  readonly id: number
+  readonly entryId: string
+  readonly fromStatus: QueueEntryStatus | null
+  readonly toStatus: QueueEntryStatus
+  readonly reason: string | null
+  readonly time: number
+}
+
+export type ChangeQueueErrorCode = "duplicate_entry" | "invalid_order" | "invalid_settings"
+
+export class ChangeQueueError extends Error {
+  constructor(
+    readonly code: ChangeQueueErrorCode,
+    message: string,
+    /** The offending entry, when one is known (the live duplicate, an unmovable entry). */
+    readonly entryId?: string,
+  ) {
+    super(message)
+    this.name = "ChangeQueueError"
+  }
+}
+
+export type RemoveQueueEntryResult =
+  | { readonly removed: true; readonly entry: QueueEntryRecord }
+  | { readonly removed: false; readonly refusal: "not_found" }
+  | { readonly removed: false; readonly refusal: "started" | "final"; readonly entry: QueueEntryRecord }
+
+export interface QueueStatusChange {
+  readonly entryId: string
+  readonly from: QueueEntryStatus
+  readonly to: QueueEntryStatus
+}
+
+interface QueueEntryRow {
+  id: string
+  project_dir: string
+  change: string
+  position: number
+  status: QueueEntryStatus
+  reason: string | null
+  state: string | null
+  feature_id: string | null
+  claim_token: string | null
+  claimed_at: number | null
+  time_created: number
+  time_updated: number
+}
+
+function toQueueEntryRecord(row: QueueEntryRow): QueueEntryRecord {
+  return {
+    id: row.id,
+    projectDir: row.project_dir,
+    change: row.change,
+    position: row.position,
+    status: row.status,
+    reason: row.reason,
+    state: row.state === null ? null : (JSON.parse(row.state) as QueueEntryState),
+    featureId: row.feature_id,
+    claimToken: row.claim_token,
+    claimedAt: row.claimed_at,
+    timeCreated: row.time_created,
+    timeUpdated: row.time_updated,
+  }
+}
+
+const QUEUE_FINAL_STATUSES: ReadonlySet<QueueEntryStatus> = new Set(["merged", "removed"])
+/** Entries that have not started: the only ones the operator may reorder or remove without abandoning a feature. */
+const QUEUE_UNSTARTED_STATUSES: ReadonlySet<QueueEntryStatus> = new Set(["waiting", "blocked", "invalid"])
+
+function stateReason(state: QueueEntryState): string | null {
+  return "reason" in state ? state.reason : null
 }
 
 export class WorkerInvocationConflict extends Error {
@@ -2795,6 +2901,310 @@ export class Store implements RunnerSafetyStore {
       this.emit({ kind: "transition", featureId: featureIdForEmit })
     }
     return result
+  }
+
+  // ---- change queue (design D4) ----
+
+  getQueueSettings(projectDir: string): QueueSettings {
+    const row = this.db.query("SELECT paused, parallelism, time_updated FROM change_queue WHERE project_dir = ?").get(projectDir) as
+      | { paused: number; parallelism: number; time_updated: number }
+      | null
+    return row
+      ? { projectDir, paused: row.paused !== 0, parallelism: row.parallelism, timeUpdated: row.time_updated }
+      : { projectDir, paused: false, parallelism: 1, timeUpdated: null }
+  }
+
+  getQueue(projectDir: string): QueueSnapshot {
+    const rows = this.db
+      .query("SELECT * FROM change_queue_entry WHERE project_dir = ? ORDER BY position, rowid")
+      .all(projectDir) as QueueEntryRow[]
+    return { settings: this.getQueueSettings(projectDir), entries: rows.map(toQueueEntryRecord) }
+  }
+
+  getQueueEntry(id: string): QueueEntryRecord | null {
+    const row = this.db.query("SELECT * FROM change_queue_entry WHERE id = ?").get(id) as QueueEntryRow | null
+    return row ? toQueueEntryRecord(row) : null
+  }
+
+  /** Projects with at least one entry that is not `merged`/`removed`. */
+  listQueuedProjects(): string[] {
+    return (
+      this.db
+        .query("SELECT DISTINCT project_dir FROM change_queue_entry WHERE status NOT IN ('merged','removed') ORDER BY project_dir")
+        .all() as Array<{ project_dir: string }>
+    ).map(row => row.project_dir)
+  }
+
+  listStartingEntries(): QueueEntryRecord[] {
+    return (
+      this.db.query("SELECT * FROM change_queue_entry WHERE status = 'starting' ORDER BY claimed_at, rowid").all() as QueueEntryRow[]
+    ).map(toQueueEntryRecord)
+  }
+
+  getQueueTransitions(entryId: string): QueueTransitionRecord[] {
+    return (
+      this.db.query("SELECT * FROM change_queue_transition WHERE entry_id = ? ORDER BY id").all(entryId) as Array<{
+        id: number
+        entry_id: string
+        from_status: QueueEntryStatus | null
+        to_status: QueueEntryStatus
+        reason: string | null
+        time: number
+      }>
+    ).map(row => ({
+      id: row.id,
+      entryId: row.entry_id,
+      fromStatus: row.from_status,
+      toStatus: row.to_status,
+      reason: row.reason,
+      time: row.time,
+    }))
+  }
+
+  private logQueueTransition(entryId: string, from: QueueEntryStatus | null, to: QueueEntryStatus, reason: string | null, time: number): void {
+    this.db.run(
+      "INSERT INTO change_queue_transition (entry_id, from_status, to_status, reason, time) VALUES (?, ?, ?, ?, ?)",
+      [entryId, from, to, reason, time],
+    )
+  }
+
+  /**
+   * Appends an entry at the end of the project's queue, `waiting` with the
+   * given initial state (default: "not yet evaluated") or `blocked`. A second
+   * live entry for the same change throws `ChangeQueueError("duplicate_entry")`;
+   * `merged`/`removed` entries never conflict.
+   */
+  addEntry(projectDir: string, change: string, initial?: QueueEntryState): QueueEntryRecord {
+    const now = this.clock.now()
+    const id = randomUUID()
+    if (initial !== undefined && initial.kind !== "waiting" && initial.kind !== "blocked") {
+      throw new Error(`a new queue entry starts waiting or blocked, not ${initial.kind}`)
+    }
+    const state: QueueEntryState = initial ?? {
+      kind: "waiting",
+      why: "dependencies",
+      waitingOn: [],
+      reason: "queued; not yet evaluated",
+    }
+    const status = state.kind
+    this.db.transaction(() => {
+      const live = this.db
+        .query("SELECT id FROM change_queue_entry WHERE project_dir = ? AND change = ? AND status NOT IN ('merged','removed')")
+        .get(projectDir, change) as { id: string } | null
+      if (live) throw new ChangeQueueError("duplicate_entry", `change "${change}" is already in the queue`, live.id)
+      const last = this.db.query("SELECT MAX(position) AS position FROM change_queue_entry WHERE project_dir = ?").get(projectDir) as {
+        position: number | null
+      }
+      this.db.run(
+        `INSERT INTO change_queue_entry (id, project_dir, change, position, status, reason, state, time_created, time_updated)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [id, projectDir, change, (last.position ?? -1) + 1, status, state.reason, JSON.stringify(state), now, now],
+      )
+      this.logQueueTransition(id, null, status, state.reason, now)
+    }).immediate()
+    return this.getQueueEntry(id)!
+  }
+
+  /**
+   * Marks an entry `removed`. Refused (typed result, nothing written) while
+   * it is `starting`, or `running`/`escalated` with a linked feature that is
+   * not terminal (`done`/`abandoned`; a feature row that cannot be found
+   * counts as non-terminal): the operator must abandon the feature first.
+   * The feature status is read in the same transaction as the write.
+   */
+  removeEntry(id: string): RemoveQueueEntryResult {
+    const now = this.clock.now()
+    return this.db.transaction((): RemoveQueueEntryResult => {
+      const entry = this.getQueueEntry(id)
+      if (!entry) return { removed: false, refusal: "not_found" }
+      if (QUEUE_FINAL_STATUSES.has(entry.status)) return { removed: false, refusal: "final", entry }
+      if (entry.status === "starting") return { removed: false, refusal: "started", entry }
+      if (entry.status === "running" || entry.status === "escalated") {
+        const feature =
+          entry.featureId === null
+            ? null
+            : (this.db.query("SELECT status FROM feature WHERE id = ?").get(entry.featureId) as { status: FeatureStatus } | null)
+        if (feature === null || (feature.status !== "done" && feature.status !== "abandoned")) {
+          return { removed: false, refusal: "started", entry }
+        }
+      }
+      this.db.run(
+        `UPDATE change_queue_entry SET status = 'removed', reason = NULL, state = ?, claim_token = NULL, time_updated = ? WHERE id = ?`,
+        [JSON.stringify({ kind: "removed" } satisfies QueueEntryState), now, id],
+      )
+      this.logQueueTransition(id, entry.status, "removed", "removed by operator", now)
+      return { removed: true, entry: this.getQueueEntry(id)! }
+    }).immediate()
+  }
+
+  /**
+   * Reorders entries that have not started. `orderedIds` must be distinct
+   * `waiting`/`blocked`/`invalid` entries of this project; they take the
+   * positions they collectively occupy in the new order, everything else
+   * (started and final entries, unlisted entries) keeps its position.
+   * Anything else throws `ChangeQueueError("invalid_order")` and writes nothing.
+   */
+  reorder(projectDir: string, orderedIds: readonly string[]): void {
+    const now = this.clock.now()
+    this.db.transaction(() => {
+      if (new Set(orderedIds).size !== orderedIds.length) {
+        throw new ChangeQueueError("invalid_order", "order lists the same entry more than once")
+      }
+      const entries = orderedIds.map(id => {
+        const entry = this.getQueueEntry(id)
+        if (!entry || entry.projectDir !== projectDir) {
+          throw new ChangeQueueError("invalid_order", `entry ${id} is not in this project's queue`, id)
+        }
+        if (!QUEUE_UNSTARTED_STATUSES.has(entry.status)) {
+          throw new ChangeQueueError("invalid_order", `entry ${id} ("${entry.change}") is ${entry.status} and cannot be reordered`, id)
+        }
+        return entry
+      })
+      const positions = entries.map(entry => entry.position).sort((a, b) => a - b)
+      for (const [index, id] of orderedIds.entries()) {
+        this.db.run("UPDATE change_queue_entry SET position = ?, time_updated = ? WHERE id = ?", [positions[index]!, now, id])
+      }
+    }).immediate()
+  }
+
+  setQueueSettings(projectDir: string, patch: { paused?: boolean; parallelism?: number }): QueueSettings {
+    if (patch.parallelism !== undefined && (!Number.isInteger(patch.parallelism) || patch.parallelism < 1)) {
+      throw new ChangeQueueError("invalid_settings", "parallelism must be an integer of at least 1")
+    }
+    if (patch.paused !== undefined && typeof patch.paused !== "boolean") {
+      throw new ChangeQueueError("invalid_settings", "paused must be a boolean")
+    }
+    if (patch.paused === undefined && patch.parallelism === undefined) return this.getQueueSettings(projectDir)
+    const now = this.clock.now()
+    this.db.transaction(() => {
+      const current = this.getQueueSettings(projectDir)
+      this.db.run(
+        `INSERT INTO change_queue (project_dir, paused, parallelism, time_updated) VALUES (?, ?, ?, ?)
+         ON CONFLICT(project_dir) DO UPDATE SET paused = excluded.paused, parallelism = excluded.parallelism, time_updated = excluded.time_updated`,
+        [projectDir, (patch.paused ?? current.paused) ? 1 : 0, patch.parallelism ?? current.parallelism, now],
+      )
+    }).immediate()
+    return this.getQueueSettings(projectDir)
+  }
+
+  /**
+   * Persists the planner's next state (status, reason, state JSON) for each
+   * entry of the project in one transaction, with one audit row per actual
+   * status change. The planner's `starting` for an entry that is not yet
+   * claimed is skipped — only `claimEntry` moves an entry into `starting` —
+   * and entries that are `starting` or final are never moved by a plan, so a
+   * claim or an operator action that landed after the plan was computed is
+   * not overwritten. Unknown ids are ignored.
+   */
+  applyPlannedStates(projectDir: string, states: ReadonlyMap<string, QueueEntryState>): QueueStatusChange[] {
+    const now = this.clock.now()
+    const changes: QueueStatusChange[] = []
+    this.db.transaction(() => {
+      for (const [id, state] of states) {
+        const entry = this.getQueueEntry(id)
+        if (!entry || entry.projectDir !== projectDir) continue
+        if (QUEUE_FINAL_STATUSES.has(entry.status)) continue
+        if (state.kind === "starting" && entry.status !== "starting") continue
+        if (entry.status === "starting" && state.kind !== "starting") continue
+        const reason = stateReason(state)
+        const serialized = JSON.stringify(state)
+        if (state.kind === entry.status && reason === entry.reason && serialized === JSON.stringify(entry.state)) continue
+        this.db.run("UPDATE change_queue_entry SET status = ?, reason = ?, state = ?, time_updated = ? WHERE id = ?", [
+          state.kind,
+          reason,
+          serialized,
+          now,
+          id,
+        ])
+        if (state.kind !== entry.status) {
+          this.logQueueTransition(id, entry.status, state.kind, reason, now)
+          changes.push({ entryId: id, from: entry.status, to: state.kind })
+        }
+      }
+    }).immediate()
+    return changes
+  }
+
+  /** `waiting → starting`, only while the entry is currently `waiting`; false when it is not (or was claimed first). */
+  claimEntry(id: string, token: string, now: number = this.clock.now()): boolean {
+    const state: QueueEntryState = { kind: "starting", reason: "starting: claimed, feature not created yet" }
+    return this.db.transaction(() => {
+      const result = this.db.run(
+        `UPDATE change_queue_entry SET status = 'starting', reason = ?, state = ?, claim_token = ?, claimed_at = ?, time_updated = ?
+         WHERE id = ? AND status = 'waiting'`,
+        [state.reason, JSON.stringify(state), token, now, now, id],
+      )
+      if (result.changes === 0) return false
+      this.logQueueTransition(id, "waiting", "starting", state.reason, now)
+      return true
+    }).immediate()
+  }
+
+  /** `starting → running`, only while the claim token matches. */
+  linkEntry(id: string, token: string, featureId: string, now: number = this.clock.now()): boolean {
+    const state: QueueEntryState = { kind: "running", reason: "feature running" }
+    return this.db.transaction(() => {
+      const result = this.db.run(
+        `UPDATE change_queue_entry SET status = 'running', reason = ?, state = ?, feature_id = ?, claim_token = NULL, time_updated = ?
+         WHERE id = ? AND status = 'starting' AND claim_token = ?`,
+        [state.reason, JSON.stringify(state), featureId, now, id, token],
+      )
+      if (result.changes === 0) return false
+      this.logQueueTransition(id, "starting", "running", `linked to feature ${featureId}`, now)
+      return true
+    }).immediate()
+  }
+
+  /**
+   * `starting → invalid`, only while the claim token matches: parks a failed
+   * start with its state/reason in one transaction (status, state JSON, cleared
+   * claim and audit row together), so a crash can never leave a released but
+   * not-yet-invalid entry that would be started again.
+   */
+  failClaim(id: string, token: string, state: QueueEntryState & { kind: "invalid" }, now: number = this.clock.now()): boolean {
+    return this.db.transaction(() => {
+      const result = this.db.run(
+        `UPDATE change_queue_entry SET status = 'invalid', reason = ?, state = ?, claim_token = NULL, claimed_at = NULL, time_updated = ?
+         WHERE id = ? AND status = 'starting' AND claim_token = ?`,
+        [state.reason, JSON.stringify(state), now, id, token],
+      )
+      if (result.changes === 0) return false
+      this.logQueueTransition(id, "starting", "invalid", state.reason, now)
+      return true
+    }).immediate()
+  }
+
+  /** `starting → waiting`, only while the claim token matches; the next plan re-evaluates the entry. */
+  releaseClaim(id: string, token: string, now: number = this.clock.now()): boolean {
+    return this.db.transaction(() => {
+      const result = this.db.run(
+        `UPDATE change_queue_entry SET status = 'waiting', reason = 'claim released', state = NULL, claim_token = NULL, claimed_at = NULL, time_updated = ?
+         WHERE id = ? AND status = 'starting' AND claim_token = ?`,
+        [now, id, token],
+      )
+      if (result.changes === 0) return false
+      this.logQueueTransition(id, "starting", "waiting", "claim released", now)
+      return true
+    }).immediate()
+  }
+
+  /**
+   * The earliest feature in `projectDir` created at/after `since` whose
+   * start input names `change` (`change_slug` or `change`) and that no queue
+   * entry is already linked to — how restart reconciliation finds the feature
+   * a crashed start created.
+   */
+  findFeatureCreatedForChange(projectDir: string, change: string, since: number): string | null {
+    const row = this.db
+      .query(
+        `SELECT id FROM feature
+         WHERE project_dir = ? AND time_created >= ?
+           AND (json_extract(state, '$.input.change_slug') = ? OR json_extract(state, '$.input.change') = ?)
+           AND NOT EXISTS (SELECT 1 FROM change_queue_entry WHERE change_queue_entry.feature_id = feature.id)
+         ORDER BY time_created, rowid LIMIT 1`,
+      )
+      .get(projectDir, since, change, change) as { id: string } | null
+    return row ? row.id : null
   }
 }
 

@@ -26,7 +26,17 @@
 
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { resolve } from "node:path"
-import type { FeatureState, FeatureStatus, InputDef, StepRuntime, WorkflowInputDiagnostic } from "@conductor/core"
+import { planQueue } from "@conductor/core"
+import type {
+  FeatureState,
+  FeatureStatus,
+  InputDef,
+  QueueEntry,
+  QueueEntryState,
+  StepRuntime,
+  WorkflowDef,
+  WorkflowInputDiagnostic,
+} from "@conductor/core"
 import type { RunLogEntryInput, RunSummary, Store, StoreChange } from "./store.ts"
 import type { DaemonHealth, DaemonLogger } from "./daemon.ts"
 import type { LoadResult, WorkflowResolver, WorkflowStatus } from "./workflow-registry.ts"
@@ -36,6 +46,14 @@ import type { PluginControl } from "./plugin-proxy.ts"
 import { pickStaticFile, serveStaticFile } from "./static-files.ts"
 import { isAlreadyConcludedMessage, parseReportBody } from "./run-reporting.ts"
 import { createWorkerRoutes, type WorkerRoutesDeps } from "./worker-routes.ts"
+import { ChangeQueueError, type QueueEntryRecord } from "./store.ts"
+import {
+  API_READ_MERGED_BUDGET_MS,
+  diagnoseChange,
+  knownChanges,
+  type ChangeQueueReadPort,
+  type LocalChanges,
+} from "./change-queue-sources.ts"
 
 // ------------------------------------------------------------ configuration
 
@@ -148,6 +166,11 @@ export interface ApiDeps {
   readonly runners?: RunnerRegistry
   /** Plugin listing + proxy resolution (`/v1/plugins`). Absent → those routes 404. */
   readonly plugins?: PluginControl
+  /**
+   * Change-queue readers (`.openspec.yaml` graph, merged names) behind
+   * `/v1/projects/queue…`. Absent → those routes 404.
+   */
+  readonly changeQueue?: ChangeQueueReadPort
   readonly logger?: DaemonLogger
   /**
    * The restricted `/v1/worker/{report,status,ready}` namespace (D8,
@@ -169,6 +192,8 @@ export type ApiErrorCode =
   | "project_not_configured"
   | "unknown_workflow"
   | "invalid_input"
+  | "invalid_queue_entry"
+  | "invalid_queue_settings"
   | "conflict"
   | "stale_version"
   | "run_already_concluded"
@@ -189,6 +214,8 @@ const ERROR_STATUS: Record<ApiErrorCode, number> = {
   project_not_configured: 422,
   unknown_workflow: 422,
   invalid_input: 422,
+  invalid_queue_entry: 422,
+  invalid_queue_settings: 422,
   conflict: 409,
   stale_version: 409,
   run_already_concluded: 409,
@@ -223,6 +250,9 @@ export interface ConductorApi {
   /** Open SSE subscriber count (observability + shutdown tests). */
   readonly sseClientCount: number
 }
+
+/** `GET /v1/projects/queue` lists every live entry plus at most this many `merged` entries, newest first. */
+const MAX_FINAL_QUEUE_ENTRIES = 20
 
 const encoder = new TextEncoder()
 
@@ -348,7 +378,7 @@ function parseStatusFilter(raw: string): FeatureStatus[] | null {
 type SseChangeFrame = StoreChange | { readonly kind: "plugins" }
 
 export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
-  const { store, engine, health, resolveWorkflow, workflowStatus, registerProject, runners, plugins, logger } = deps
+  const { store, engine, health, resolveWorkflow, workflowStatus, registerProject, runners, plugins, logger, changeQueue } = deps
   const staticRoot = config.ui !== undefined ? resolve(config.ui.staticDir) : null
   const sseClients = new Set<SseClient>()
   const inFlight = new Set<Promise<void>>()
@@ -702,6 +732,22 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       return projectWorkflow(url, requestId)
     }
 
+    if (changeQueue !== undefined) {
+      if (path === "/v1/projects/queue" && method === "GET") return getQueue(url, changeQueue, requestId)
+      if (path === "/v1/projects/queue" && method === "PATCH") return patchQueue(request, changeQueue, requestId)
+      if (path === "/v1/projects/queue/entries" && method === "POST") return addQueueEntry(request, changeQueue, requestId)
+      const queueEntryMatch = path.match(/^\/v1\/projects\/queue\/entries\/([^/]+)$/)
+      if (queueEntryMatch && method === "DELETE") {
+        let entryId: string
+        try {
+          entryId = decodeURIComponent(queueEntryMatch[1]!)
+        } catch {
+          return error(requestId, "invalid_request", "queue entry id is not valid percent-encoding")
+        }
+        return removeQueueEntry(entryId, requestId)
+      }
+    }
+
     if (path === "/v1/projects" && method === "POST" && registerProject !== undefined) {
       const parsed = await readJsonBody(request)
       if (!parsed.ok) return error(requestId, "invalid_json", "request body must be a JSON object")
@@ -814,6 +860,215 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     }
 
     return error(requestId, "not_found", `no route for ${method} ${path}`)
+  }
+
+  // ------------------------------------------------------- change queue
+
+  /** The canonical project directory the queue is keyed by, or an error response. */
+  function queueProject(
+    dir: unknown,
+    requestId: string,
+  ): { ok: true; dir: string; workflow: WorkflowDef } | { ok: false; response: Response } {
+    if (typeof dir !== "string" || dir.trim() === "") {
+      return { ok: false, response: error(requestId, "invalid_request", "\"dir\" (project directory) is required") }
+    }
+    const snapshot = resolveWorkflow(dir)
+    if (snapshot === null) {
+      return { ok: false, response: error(requestId, "project_not_configured", `no valid conductor.yaml registered for "${dir}"`) }
+    }
+    return { ok: true, dir: snapshot.projectDir, workflow: snapshot.workflow }
+  }
+
+  function queueEntryPayload(entry: QueueEntryRecord, local: LocalChanges): unknown {
+    return {
+      id: entry.id,
+      change: entry.change,
+      position: entry.position,
+      status: entry.status,
+      reason: entry.reason,
+      state: entry.state,
+      dependsOn: local.graph.get(entry.change) ?? [],
+      featureId: entry.featureId,
+    }
+  }
+
+  async function queuePayload(projectDir: string, source: ChangeQueueReadPort): Promise<unknown> {
+    const local = await source.readLocal(projectDir)
+    const snapshot = store.getQueue(projectDir)
+    // Live entries in queue order, then at most MAX_FINAL_QUEUE_ENTRIES merged
+    // entries, newest first. Removed entries are never listed.
+    const live = snapshot.entries.filter(entry => entry.status !== "removed" && entry.status !== "merged")
+    const merged = snapshot.entries
+      .filter(entry => entry.status === "merged")
+      .sort((a, b) => b.timeUpdated - a.timeUpdated || b.position - a.position)
+      .slice(0, MAX_FINAL_QUEUE_ENTRIES)
+    return {
+      settings: { paused: snapshot.settings.paused, parallelism: snapshot.settings.parallelism },
+      entries: [...live, ...merged].map(entry => queueEntryPayload(entry, local)),
+    }
+  }
+
+  async function getQueue(url: URL, source: ChangeQueueReadPort, requestId: string): Promise<Response> {
+    const project = queueProject(url.searchParams.get("dir"), requestId)
+    if (!project.ok) return project.response
+    return json(200, await queuePayload(project.dir, source), requestId)
+  }
+
+  async function addQueueEntry(request: Request, source: ChangeQueueReadPort, requestId: string): Promise<Response> {
+    const parsed = await readJsonBody(request)
+    if (!parsed.ok) return error(requestId, "invalid_json", "request body must be a JSON object")
+    const project = queueProject(parsed.body["dir"], requestId)
+    if (!project.ok) return project.response
+    const change = parsed.body["change"]
+    if (typeof change !== "string" || change.trim() === "") {
+      return error(requestId, "invalid_request", "\"change\" (OpenSpec change name) is required")
+    }
+
+    const local = await source.readLocal(project.dir)
+    let merged = source.lastKnownMerged(project.dir)
+    let diagnostics = diagnoseChange(change, local, merged ?? new Set(), project.workflow)
+    if (diagnostics.some(diagnostic => diagnostic.kind === "unknown-dependency")) {
+      // A dependency archived on the remote but not yet in this checkout is
+      // known only after a fetch: do it once, only when it could matter, and
+      // with a short budget — the caller is waiting on this response.
+      const fetched = await source.readMerged(project.dir, { budgetMs: API_READ_MERGED_BUDGET_MS })
+      if (fetched.kind === "known") {
+        merged = fetched.names
+        diagnostics = diagnoseChange(change, local, merged, project.workflow)
+      }
+    }
+    if (diagnostics.length > 0) {
+      return json(
+        422,
+        {
+          error: {
+            code: "invalid_queue_entry",
+            message: `cannot queue "${change}": ${diagnostics.map(diagnostic => diagnostic.message).join("; ")}`,
+            requestId,
+          },
+          diagnostics,
+        },
+        requestId,
+      )
+    }
+
+    try {
+      const entry = store.addEntry(project.dir, change, initialQueueState(project.dir, change, local, merged))
+      return json(201, queueEntryPayload(entry, local), requestId)
+    } catch (err) {
+      if (err instanceof ChangeQueueError && err.code === "duplicate_entry") {
+        return error(requestId, "conflict", err.message)
+      }
+      throw err
+    }
+  }
+
+  /**
+   * The state a new entry reads with: what the scheduler would compute now
+   * (same graph, last known merged set and current features, via `planQueue`),
+   * so "waiting for `base`" shows immediately. Without a known merged set
+   * the dependencies cannot be judged, so the reason says that. Undefined
+   * (the store's default) when the plan has nothing useful to say.
+   */
+  function initialQueueState(
+    projectDir: string,
+    change: string,
+    local: LocalChanges,
+    merged: ReadonlySet<string> | null,
+  ): QueueEntryState | undefined {
+    if (merged === null) {
+      return {
+        kind: "waiting",
+        why: "dependencies",
+        waitingOn: [],
+        reason: "queued; merged set not yet known, evaluated on the next scheduler pass",
+      }
+    }
+    const snapshot = store.getQueue(projectDir)
+    const newId = "\0new-entry"
+    const features = new Map<string, FeatureStatus>()
+    const entries: QueueEntry[] = snapshot.entries.map(record => {
+      if (record.featureId !== null) {
+        const feature = store.getFeature(record.featureId)
+        if (feature) features.set(record.featureId, feature.status)
+      }
+      return {
+        id: record.id,
+        change: record.change,
+        status: record.status,
+        ...(record.featureId !== null ? { featureId: record.featureId } : {}),
+      }
+    })
+    entries.push({ id: newId, change, status: "waiting" })
+    const plan = planQueue({
+      entries,
+      graph: local.graph,
+      known: knownChanges(local, merged),
+      merged,
+      features,
+      limit: snapshot.settings.parallelism,
+      paused: snapshot.settings.paused,
+    })
+    const state = plan.states.get(newId)
+    if (state === undefined) return undefined
+    if (state.kind === "waiting" || state.kind === "blocked") return state
+    if (state.kind === "starting") {
+      return { kind: "waiting", why: "dependencies", waitingOn: [], reason: "ready: all dependencies merged" }
+    }
+    return undefined
+  }
+
+  function removeQueueEntry(entryId: string, requestId: string): Response {
+    const result = store.removeEntry(entryId)
+    if (result.removed) {
+      return json(200, { entry: { id: result.entry.id, change: result.entry.change, status: "removed" } }, requestId)
+    }
+    if (result.refusal === "not_found") return error(requestId, "not_found", `unknown queue entry "${entryId}"`)
+    if (result.refusal === "started") {
+      const feature = result.entry.featureId !== null ? ` (feature ${result.entry.featureId})` : ""
+      return error(
+        requestId,
+        "conflict",
+        `queue entry for "${result.entry.change}" has started${feature}; abandon the feature instead of removing the entry`,
+      )
+    }
+    return error(requestId, "conflict", `queue entry for "${result.entry.change}" is already ${result.entry.status}`)
+  }
+
+  async function patchQueue(request: Request, source: ChangeQueueReadPort, requestId: string): Promise<Response> {
+    const parsed = await readJsonBody(request)
+    if (!parsed.ok) return error(requestId, "invalid_json", "request body must be a JSON object")
+    const project = queueProject(parsed.body["dir"], requestId)
+    if (!project.ok) return project.response
+    const { paused, parallelism, order } = parsed.body
+    if (paused === undefined && parallelism === undefined && order === undefined) {
+      return error(requestId, "invalid_request", "at least one of \"paused\", \"parallelism\", \"order\" is required")
+    }
+    const invalid = (message: string): Response => error(requestId, "invalid_queue_settings", message)
+    if (paused !== undefined && typeof paused !== "boolean") return invalid("\"paused\" must be a boolean")
+    if (parallelism !== undefined && (typeof parallelism !== "number" || !Number.isInteger(parallelism) || parallelism < 1)) {
+      return invalid("\"parallelism\" must be an integer of at least 1")
+    }
+    if (order !== undefined && (!Array.isArray(order) || !order.every(id => typeof id === "string"))) {
+      return invalid("\"order\" must be an array of queue entry ids")
+    }
+    try {
+      // Reorder first: it is the only write that can still fail on store
+      // state; the settings were fully validated above.
+      if (order !== undefined) store.reorder(project.dir, order as string[])
+      if (paused !== undefined || parallelism !== undefined) {
+        store.setQueueSettings(project.dir, {
+          ...(paused !== undefined ? { paused } : {}),
+          ...(parallelism !== undefined ? { parallelism } : {}),
+        })
+      }
+    } catch (err) {
+      if (err instanceof ChangeQueueError && (err.code === "invalid_order" || err.code === "invalid_settings")) {
+        return invalid(err.message)
+      }
+      throw err
+    }
+    return json(200, await queuePayload(project.dir, source), requestId)
   }
 
   function projectWorkflow(url: URL, requestId: string): Response {

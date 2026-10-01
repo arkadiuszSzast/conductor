@@ -28,6 +28,10 @@ Authentication is explicit (`auth.mode: "none"` or `"bearer"`); only
 | `POST /v1/runs/:id/report` | Agent/runner report-back (`outcome`/`verdict`), or a mid-step `ask`. |
 | `POST /v1/runs/:id/answer` | Human answers a run's pending question; the notes flow into the live session. |
 | `GET /v1/projects/workflow?dir=<projectDir>` | Structure-only workflow projection (below). |
+| `GET /v1/projects/queue?dir=<projectDir>` | Change queue: settings (`paused`, `parallelism`) and entries with state, reason, declared dependencies and feature id ([Change queue](#change-queue)). |
+| `POST /v1/projects/queue/entries` | Queue a change (`{dir, change}` → 201). Refused with `422 invalid_queue_entry` (cycle, unknown dependency, unstartable change) or `409 conflict` (already queued). |
+| `DELETE /v1/projects/queue/entries/:id` | Remove an entry that has not started, or whose linked feature is terminal (`done`/`abandoned`). A `starting` entry, or a `running`/`escalated` one whose feature is not terminal → `409 conflict`: abandon the feature first; unknown id → 404; malformed id → `400 invalid_request`. |
+| `PATCH /v1/projects/queue` | Pause/resume, set the parallelism limit, reorder unstarted entries: `{dir, paused?, parallelism?, order?}` (bad values → `422 invalid_queue_settings`). |
 | `GET/POST /v1/runners`, `DELETE /v1/runners/:id` | Runner endpoint registration (when a registry is configured). |
 | `POST /v1/worker/report`, `GET /v1/worker/status`, `POST /v1/worker/ready` | Restricted, run-scoped namespace for the opt-in ACP integration's MCP reporting bridge (below; only reachable when `runners` is configured). |
 | `GET /v1/plugins`, `POST /v1/plugins/session`, `ANY /v1/plugins/:id/*` | Plugin listing, session cookie exchange, and per-plugin reverse proxy (below; when a plugin control is configured). |
@@ -619,6 +623,201 @@ loaded validly is 409 with the load diagnostics (same messages, joined
 into the error's `message`). Workflow structure belongs to the project,
 not the feature — the graph view fetches here, not from the feature
 payload.
+
+## Change queue
+
+The change queue lets the daemon pull OpenSpec changes by itself: it starts
+every queued change whose dependencies have merged, up to a per-project
+parallelism limit. These four routes read and edit the queue; the scheduler
+that acts on it runs inside the daemon (see
+[Running unattended](install.md#running-unattended-change-queue)). Each start
+creates an ordinary feature, so everything in
+[Starting a feature](#starting-a-feature) applies to it afterwards.
+
+The routes need the daemon's change-queue readers, which the standard daemon
+always wires; without them (`ApiDeps.changeQueue` unset) they are absent
+(404, `not_found`), the same "absent optional dependency → 404" convention as
+`/v1/runners`. Auth is the same as for every other `/v1/*` route.
+
+In every route `dir` is the project directory; it must resolve to a project
+with a valid registered `conductor.yaml` (the entry is keyed by the
+registry's canonical directory). A missing or blank `dir` is `400
+invalid_request`; an unregistered project is `422 project_not_configured`.
+A body that is not a JSON object is `400 invalid_json`.
+
+### Entry payload
+
+Every route returns entries in this shape:
+
+```json
+{
+  "id": "6f1c…",
+  "change": "dialogue-node-atomic-commit",
+  "position": 1,
+  "status": "waiting",
+  "reason": "waiting for `unify-content-gates`",
+  "state": { "kind": "waiting", "why": "dependencies", "waitingOn": ["unify-content-gates"], "reason": "waiting for `unify-content-gates`" },
+  "dependsOn": ["unify-content-gates"],
+  "featureId": null
+}
+```
+
+| Field | Description |
+|---|---|
+| `id` | Entry id (use it for `DELETE` and `order`). |
+| `change` | The OpenSpec change name. |
+| `position` | Queue order, ascending; the scheduler considers entries in this order. |
+| `status` | One of the entry states below. |
+| `reason` | Human-readable reason for the state; `null` for `merged` and `removed`. |
+| `state` | The scheduler's last decision as persisted: an object whose `kind` equals `status`, plus kind-specific fields (`waiting`: `why` = `dependencies` \| `limit` \| `paused` and `waitingOn`; `blocked`: `by` and `stuck`; `invalid`: `diagnostics`; `running`/`escalated`: `featureStatus` when known). May be `null` right after a released claim. Treat `status` and `reason` as the stable surface. |
+| `dependsOn` | The change's `depends_on`, read from its `.openspec.yaml` **at request time** (not stored); `[]` when it declares none, or when the change no longer exists on disk. |
+| `featureId` | The feature started for this entry; `null` until it is linked. |
+
+`status` and `state` are written by the scheduler, so after a queue edit they
+catch up on the next pass (by default within a minute, see
+`changeQueueIntervalMs` in [Install](install.md)). A newly queued entry
+already carries the state the scheduler would compute right now (same
+dependency graph, last known merged set and current features), so the
+`POST` response and the next `GET` read e.g. `` waiting for `base` ``,
+`queue paused` or `parallelism limit reached (1)` immediately. Only when the
+daemon has not yet learned the project's merged set (no pass or fetch has
+succeeded since it started) does it read `queued; merged set not yet known,
+evaluated on the next scheduler pass`.
+
+Entry states:
+
+| `status` | Meaning | Typical `reason` |
+|---|---|---|
+| `waiting` | Not started yet. `state.why` says what holds it. | `` waiting for `a`, `b` `` (only the dependencies that have not merged) · `queue paused` · `parallelism limit reached (1)` |
+| `blocked` | A change it depends on, directly or transitively, has a feature that is `escalated`, `paused` or `abandoned`. | `` blocked: `a` escalated `` |
+| `invalid` | Cannot be started: the dependency graph has a cycle or an unknown dependency, the change or its `proposal.md` is gone, a `.openspec.yaml` on its dependency path is unreadable, or starting the feature failed. Re-evaluated every pass, except a failed start, which is kept until the entry is removed and queued again. | `` invalid: dependency cycle: `a` → `b` → `a` `` |
+| `starting` | Transient: claimed by the scheduler, feature not linked yet (the exactly-once start protocol). | `starting: claimed, feature not created yet` |
+| `running` | Linked to a live feature (running, waiting for a human, or paused), or to a `done` feature whose change has not reached the default branch yet. | `feature running` · `feature waiting for a human` · `feature paused` |
+| `escalated` | Linked to a feature that is `escalated` or `abandoned`. | `feature escalated` · `feature abandoned; remove the entry or drop the dependency to unblock dependants` |
+| `merged` | The change's archive directory is on the default branch. Final. | — |
+| `removed` | Removed by the operator. Final; never listed by `GET`. | — |
+
+`GET` lists every live entry in queue order, followed by at most the **20
+most recent `merged` entries, newest first**; older merged entries stay in the
+database but are not listed. `removed` entries are never listed.
+
+Every state except `merged` and `removed` carries a reason. A change counts
+as merged when `origin/<default branch>` contains
+`openspec/changes/archive/<date>-<name>/` — see
+[Running unattended](install.md#running-unattended-change-queue).
+
+### `GET /v1/projects/queue?dir=<projectDir>`
+
+```json
+{
+  "settings": { "paused": false, "parallelism": 1 },
+  "entries": [ /* entry payloads, in queue order */ ]
+}
+```
+
+A project that never used the queue returns the defaults (`paused: false`,
+`parallelism: 1`) and no entries. `merged` entries stay in the list as
+history; `removed` ones do not.
+
+### `POST /v1/projects/queue/entries`
+
+Body: `{ "dir": "/path/to/project", "change": "quest-outcomes" }`. Both are
+required strings (a missing or blank `change` is `400 invalid_request`).
+
+Success is **`201`** with the entry payload (`status: "waiting"` or
+`"blocked"`, with the reason the scheduler would give right now), appended at
+the end of the queue. The change is validated against the project's working
+tree before anything is written; a refusal queues nothing:
+
+- **`422 invalid_queue_entry`** — the response carries the usual envelope plus
+  a `diagnostics` array naming every problem, the same way
+  [`invalid_input`](#starting-a-feature) does:
+
+  ```json
+  {
+    "error": {
+      "code": "invalid_queue_entry",
+      "message": "cannot queue \"a\": dependency cycle: `a` → `b` → `a`",
+      "requestId": "..."
+    },
+    "diagnostics": [
+      { "kind": "cycle", "changes": ["a", "b"], "message": "dependency cycle: `a` → `b` → `a`" }
+    ]
+  }
+  ```
+
+  `diagnostics[].kind` is one of:
+
+  | `kind` | `changes` | Meaning |
+  |---|---|---|
+  | `cycle` | the cycle members in dependency order, starting at the lexicographically smallest name | `depends_on` of active changes loops back |
+  | `unknown-dependency` | `[declaring change, unknown dependency]` | a dependency is neither active, archived in the working tree, nor archived on the remote default branch |
+  | `invalid-depends-on` | `[change]` | the `.openspec.yaml` of the change, or of a not-yet-merged dependency reachable from it, cannot be read or parsed (not a mapping, `depends_on` not a list, an item not a non-empty string) |
+  | `not-startable` | `[change]` | the change has no directory under `openspec/changes/`, no `proposal.md`, or the project's workflow declares no `change_slug`/`change` string input (the message is "the workflow declares no `change_slug`/`change` string input") |
+
+  `error.message` is `cannot queue "<change>": ` followed by the diagnostics'
+  messages joined with `; `. When a dependency looks unknown, the daemon does
+  one bounded `git fetch` of the default branch (10 s total budget) before refusing, because a
+  dependency archived on the remote but not yet in this checkout is valid.
+- **`409 conflict`** — the change already has a live (not `merged`/`removed`)
+  entry in this project. A merged or removed change can be queued again.
+- `400 invalid_request`, `400 invalid_json`, `422 project_not_configured` as
+  described above.
+
+### `DELETE /v1/projects/queue/entries/:id`
+
+No body. Removes an entry and answers **`200`**:
+
+```json
+{ "entry": { "id": "6f1c…", "change": "quest-outcomes", "status": "removed" } }
+```
+
+Errors:
+
+- **`404 not_found`** — no entry with that id (`unknown queue entry "<id>"`).
+- **`400 invalid_request`** — the id is not valid percent-encoding.
+- **`409 conflict`** — the entry is `starting`, or `running`/`escalated` with a
+  linked feature that is not terminal (`done` or `abandoned`); the message says
+  to abandon the feature instead, e.g. `queue entry for "quest-outcomes" has
+  started (feature <id>); abandon the feature instead of removing the entry`.
+  Also `409` when the entry is already final: `queue entry for "<change>" is
+  already merged` (or `removed`).
+
+An entry whose linked feature is terminal — `done` without a merge, or
+`abandoned` — can be removed; an `escalated` or `paused` feature must be
+abandoned first. Removing only removes the queue entry and never touches the
+feature. Removing the entry of an *abandoned* change does not unblock its
+dependants: they stay `blocked` until their `depends_on` stops naming it, they
+are removed, or the change is queued again and finishes. Removing a `done`
+change's entry leaves its dependants waiting for the merge. A removed entry
+whose feature is still non-terminal (it can only get there by the feature
+being resumed after the removal) keeps counting against the parallelism limit
+until the feature is terminal.
+
+### `PATCH /v1/projects/queue`
+
+Body: `{ "dir": "...", "paused"?: boolean, "parallelism"?: integer, "order"?: string[] }`.
+At least one of the three is required (none → `400 invalid_request`). Responds
+**`200`** with the whole queue, in the same shape as `GET`.
+
+- `paused` — a boolean. Pausing stops *new* starts only; running features
+  continue. Ready entries read `queue paused` on the next pass.
+- `parallelism` — an integer ≥ 1 (default 1): the most queue-started features
+  that may be non-terminal at once.
+- `order` — an array of entry ids. Each must be a distinct entry of this
+  project that has not started (`waiting`, `blocked` or `invalid`). The listed
+  entries take, in the new order, the positions they collectively occupied;
+  every other entry keeps its position.
+
+Invalid values answer **`422 invalid_queue_settings`**, with nothing written,
+including the settings given in the same request: `"paused" must be a
+boolean`, `"parallelism" must be an integer of at least 1`, `"order" must be an
+array of queue entry ids`, or the store's message for an order that repeats an
+entry, names an entry that is not in this project's queue, or includes one
+that has started.
+
+Queue, dequeue and pause/parallelism are also what the bundled OpenSpec panel
+drives through its own backend; see [Plugins](plugins.md#queueing-changes-from-the-panel).
 
 ## Plugins
 
