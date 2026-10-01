@@ -87,6 +87,14 @@ delegable steps.
   not — fix the decomposition before choosing a task store.
 
 ### Stage 5 — Evaluation: Beads vs native SQLite vs a provider interface
+- **Status:** superseded **at the change level** by the
+  [`change-queue`](../openspec/changes/change-queue/proposal.md) OpenSpec change:
+  the decision is native SQLite (queue tables in the Conductor database, no
+  Beads, no Dolt), with dependencies declared as data in each change's own
+  `.openspec.yaml` (`depends_on`). Per-**task** decomposition and execution
+  inside a change are **not** covered and remain deferred (see
+  [`task-contract-design.md`](task-contract-design.md)); the text below is kept
+  as written for that case.
 - **Scope:** evaluation from a real use case (Stage 4), not up front.
   Note: Beads **does not split tasks automatically** — it is only
   tracking/a graph. The Dolt-based architecture must be verified as current
@@ -105,6 +113,12 @@ delegable steps.
   pluggable provider interface — only after the comparison/pilot.
 
 ### Stage 6 — Implementation `[impl]` (requires an OpenSpec proposal)
+- **Status:** superseded **at the change level** by `change-queue`
+  (implemented there: the pure scheduler in `@conductor/core`, the queue
+  store and scheduler in `@conductor/server`, the queue API and the OpenSpec
+  panel actions; see [Running unattended](install.md#running-unattended-change-queue)).
+  `conductor.yaml` stays the only execution format. Per-task execution
+  remains deferred; the text below is kept as written for that case.
 - **Scope:** `conductor.yaml` remains the **only** execution format
   (workflow-as-data) — no duplicated gates via Beads formulas or any other
   rule engine.

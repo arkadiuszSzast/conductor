@@ -97,6 +97,7 @@ auth:
   mode: bearer
   token: "change-me"           # or mode: none — logged as an explicit warning
 heartbeatIntervalMs: 5000
+# changeQueueIntervalMs: 60000   # how often the change queue is evaluated (default 60000)
 # actions:
 #   bundledPath: /path/to/conductor/packages/server/actions   # needed for the compiled binary
 # plugins:
@@ -161,6 +162,20 @@ busySilenceNudgeMs: 1200000
 maxNudges: 3
 ttlMs: 10800000
 ```
+
+### Change queue interval
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `changeQueueIntervalMs` | positive number (ms) | `60000` | How often the change-queue scheduler runs. It has its own timer, separate from `heartbeatIntervalMs`, because a pass runs `git fetch` once per project that has queued changes. Omit it for the default. |
+
+A value that is not a positive finite number (zero, negative, `NaN`,
+`Infinity`, a string, `null`) fails config loading with
+`"changeQueueIntervalMs" must be a positive number`. The scheduler only
+does work for projects whose queue holds entries that are not yet
+`merged`/`removed`, so an idle queue costs nothing. A merge, a resume or a
+queue edit is therefore picked up within one interval (plus the fetch).
+See [Running unattended](#running-unattended-change-queue).
 
 ### Plugins
 
@@ -497,6 +512,190 @@ conductor approve <feature-id> --notes "ship it"   # when waiting_human
 conductor logs <feature-id>          # transition timeline
 ```
 
+## Running unattended (change queue)
+
+The change queue lets Conductor pull OpenSpec changes by itself instead of
+waiting for a human to start each one: it starts every queued change whose
+dependencies have **merged**, up to a per-project parallelism limit, and a
+stuck change blocks only the changes that depend on it. A queued change
+starts an ordinary feature, through the same path as "Start work" in the
+OpenSpec panel, with the project's own `conductor.yaml`; the workflow is
+untouched and the workflow engine does not know the queue exists. The
+queue is inert until you queue something.
+
+### Declaring dependencies
+
+A change lists the changes it depends on in its own
+`openspec/changes/<name>/.openspec.yaml` as `depends_on`:
+
+```yaml
+schema: spec-driven
+created: 2026-03-02
+depends_on:
+  - unify-content-gates
+  - dialogue-node-atomic-commit
+```
+
+- `depends_on` is a list of change names. Absent, or empty, means "no
+  dependencies": the change is ready as soon as it is queued. The OpenSpec
+  CLI keeps the key untouched.
+- Each name must be a change that exists in the project: active
+  (`openspec/changes/<name>/`) or archived
+  (`openspec/changes/archive/<date>-<name>/`, in the checkout or on the
+  remote default branch). Conductor never derives dependencies from
+  `proposal.md` prose; a dependency mentioned only in prose is not scheduled.
+- A `.openspec.yaml` that is not a mapping, whose `depends_on` is not a list
+  or has a non-string item, is reported on the entry (`invalid`), never a
+  crash. The panel shows such a change with no dependencies and a warning. A
+`.openspec.yaml` larger than 64 KiB, or one that uses YAML anchors or aliases
+(`&`/`*`), is refused the same way, before it is parsed.
+- The scheduler re-reads these files on every pass, so editing `depends_on`
+  is enough to change the graph; it travels through review with the change.
+
+Queueing is refused up front (`422 invalid_queue_entry`, see
+[HTTP API](http-api.md#change-queue)) when the dependencies contain a cycle
+or name an unknown change; the same checks run on every pass, so an edit
+that later introduces a cycle turns the entry `invalid` instead of starting
+it.
+
+Dependency declarations, proposals and the change directory are read from
+the **project's checkout on disk**, not from the remote: a change must exist
+in the checkout to be startable (otherwise the entry is `invalid`, "has no
+directory"). Keep the checkout current — the pipeline's cleanup step
+fast-forwards it after a merge. Only the *merged* test below looks at the
+remote.
+
+### What "merged" means
+
+A dependency counts as merged when the project's **default branch on the
+remote** contains its archive directory: `openspec/changes/archive/<YYYY-MM-DD>-<name>/`.
+On each pass, for each project with live queue entries, the daemon:
+
+1. finds the default branch (`git symbolic-ref refs/remotes/origin/HEAD`,
+   falling back to `main`);
+2. runs one bounded `git fetch --quiet origin <default branch>` (30 s limit,
+   never a credential prompt);
+3. lists `openspec/changes/archive/` on `origin/<default branch>`.
+
+This is exactly what a merged PR produces when the workflow archives the
+change on the feature branch, and it does not depend on Conductor having
+watched the merge — a human may merge by hand. A feature that finished
+`done` without the archive on the default branch does **not** count (a
+workflow without a merge step also ends `done`): its entry stays `running`
+with the reason "feature done; waiting for its change to merge on the
+default branch", and its dependants keep waiting. "Merged" is final: once an
+entry is `merged` it never leaves that state.
+
+If the fetch fails (offline, auth), the failure is logged and the project's
+last known merged set from an earlier pass is used — merged only ever grows,
+so this can delay a start but never cause a wrong one. With no earlier
+result (for example right after a daemon restart) nothing is started for
+that project until a fetch succeeds.
+
+### States and what blocks what
+
+Each entry is in exactly one state and carries a reason (full table in the
+[HTTP API](http-api.md#entry-payload)):
+
+| State | Why |
+|---|---|
+| `waiting` | Not started: waiting for named unmerged dependencies, the queue is paused, or the parallelism limit is reached. |
+| `blocked` | A change it depends on, directly or transitively, has a feature that is `escalated`, `paused` or `abandoned`; the reason names the nearest stuck change. |
+| `invalid` | Cannot be started (cycle, unknown dependency, unreadable `.openspec.yaml`, missing change or `proposal.md`, or a failed start). |
+| `starting` / `running` / `escalated` | Claimed / linked to a live feature / linked to an escalated or abandoned feature. |
+| `merged` / `removed` | Final. |
+
+When several reasons apply, the entry shows the first that matches, in this
+order: invalid, blocked, unmerged dependencies, queue paused, parallelism
+limit. So a paused queue says "queue paused" only for changes that are
+otherwise ready.
+
+A stuck change blocks **only its dependants**. Independent changes keep
+starting, so an escalation at 3 a.m. does not stall unrelated work. When the
+stuck feature is resumed or recovered, its dependants return to `waiting`
+on the next pass. Abandoning a feature is permanent: removing the queue
+entry of an abandoned change leaves its dependants `blocked` until their
+`depends_on` no longer names it or you remove them.
+
+An entry can be removed while it has not started, or once its feature is
+terminal (`done` without a merge, or `abandoned`). It cannot be removed while
+`starting` or while its feature is running, paused or escalated: abandon the
+feature first (the API answers `409`). A paused feature keeps its entry
+`running`, keeps its parallelism slot and blocks its dependants until it
+resumes. A removed entry whose feature is still non-terminal keeps counting
+against the parallelism limit.
+
+### Parallelism and pause
+
+- **Parallelism** (default `1`, any integer ≥ 1, per project): the number of
+  the queue's started features that may be non-terminal at once. Ready
+  entries start in queue order until the limit is reached; the rest wait with
+  "parallelism limit reached". A feature waiting at a human gate still holds
+  its slot. The default of 1 keeps the blast radius to one change at a time;
+  independent changes can still conflict when merged, so raise it knowingly.
+- **Pause** stops *new* starts only; running features carry on. Resume
+  to continue. Both are set from the OpenSpec panel or `PATCH /v1/projects/queue`.
+- **Order** — entries that have not started can be reordered; queue order is
+  the start order among ready entries.
+
+### When starting a change fails
+
+For each ready entry the scheduler claims it, creates the feature, then links
+it, so a change starts at most once, also across daemon restarts and a second
+daemon on the same database. At the start of every pass, a claimed entry left
+behind is linked to the feature that was created for it, or its claim is
+released. The feature is found by its `change_slug`/`change` input, so a
+project whose workflow declares neither as a string input is not startable:
+its entries are `invalid` ("the workflow declares no `change_slug`/`change`
+string input") and never claimed.
+
+If creating the feature is refused — for example the workflow declares a
+required input other than `change_slug`/`change`, which the queue cannot
+supply, or the change lost its `proposal.md` — the entry becomes `invalid`
+with the error as its reason and **is not retried** on later passes (a
+retry would fail forever and loop). Fix the cause, remove the entry, and
+queue the change again. (If the project was unregistered mid-pass, the claim
+is simply released and the next pass tries again.)
+
+The derived start is the same as "Start work": the title comes from the
+change name, the description from the proposal's *Why*, and the workflow's
+`change_slug` (or `change`) string input is filled with the change name.
+
+### Auto-merge is the project's choice
+
+Conductor's queue **never merges anything**. Merge policy stays in the
+project's `conductor.yaml`. A project that keeps its human merge gate (for
+example a `human` step before a `git/pr-merge@v1` action) gets a queue that
+starts the next change when a person approves and the PR merges — unattended
+between those points. A project that wants fully unattended runs opts in
+explicitly by removing that human gate from its own `conductor.yaml`
+(see [Workflow reference](workflow-reference.md#human)), and accepts that
+merged work is no longer reviewed by a person. Nothing in the daemon config
+turns auto-merge on or off.
+
+A dependant starts from whatever the project's workflow checks out, so make
+sure it syncs the default branch before creating the worktree (the gloam
+workflow does in `prepare/sync_main`); the readiness test only guarantees the
+dependency is on `origin/<default branch>`.
+
+### Operating it
+
+```sh
+# Queue from the OpenSpec panel ("Queue" next to "Start work"), or:
+curl -X POST http://127.0.0.1:4400/v1/projects/queue/entries \
+  -H "authorization: Bearer $CONDUCTOR_TOKEN" -H 'content-type: application/json' \
+  -d '{"dir": "/path/to/my-project", "change": "quest-outcomes"}'
+
+curl "http://127.0.0.1:4400/v1/projects/queue?dir=/path/to/my-project" \
+  -H "authorization: Bearer $CONDUCTOR_TOKEN"
+```
+
+The panel ([Plugins](plugins.md#queueing-changes-from-the-panel)) shows
+each change's dependencies, queue state and reason, and the pause and
+parallelism controls. Daemon logs mention the queue as `change-queue: …`
+(starts, failed starts, fetch failures, restart recovery). To roll back,
+pause the queue and stop queueing; the queue tables can stay.
+
 ## Troubleshooting
 
 - **Port already in use** — `conductor daemon` fails at startup with a
@@ -538,3 +737,13 @@ conductor logs <feature-id>          # transition timeline
   for the required `--acknowledge-uncertain --expected-version
   --idempotency-key` (and, after independently confirming orphan
   cleanup, `--cleanup-attested`) recovery flow.
+- **A queued change never starts** — read its `reason` (panel or
+  `GET /v1/projects/queue`). `` waiting for `x` `` means `x` is not archived on
+  `origin/<default branch>` yet (a `done` feature is not enough);
+  `blocked: …` names the escalated/paused/abandoned change to resolve; `invalid: …`
+  says what to fix (a failed start stays `invalid` until you remove the entry
+  and queue the change again; a project whose workflow declares no
+  `change_slug`/`change` string input has every entry `invalid` until the
+  workflow declares one). If every entry waits and the daemon log shows
+  `git fetch … failed … starting nothing for this project`, fix the remote
+  access; the scheduler needs one successful fetch.

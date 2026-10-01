@@ -82,7 +82,7 @@ On every reconcile pass, for each project with a running (not paused) queue, Con
 
 ### Requirement: A stuck change blocks only its dependants
 
-When a queue-started feature is escalated, paused or abandoned, its queue entry SHALL be marked accordingly, and every queued change that depends on it, directly or transitively, SHALL be `blocked` with a reason naming the stuck change. Changes that do not depend on it SHALL keep being scheduled. When the stuck feature resumes or is recovered, its dependants SHALL return to waiting. Removing an abandoned change's entry SHALL leave its dependants blocked until their `depends_on` no longer names it or the operator removes them.
+When a queue-started feature is escalated, paused or abandoned, its queue entry SHALL be marked accordingly (a paused feature keeps its entry `running`, still holds its parallelism slot, and blocks its dependants until it resumes), and every queued change that depends on it, directly or transitively, SHALL be `blocked` with a reason naming the stuck change. Changes that do not depend on it SHALL keep being scheduled. When the stuck feature resumes or is recovered, its dependants SHALL return to waiting. Removing an abandoned change's entry SHALL leave its dependants blocked until their `depends_on` no longer names it or the operator removes them.
 
 #### Scenario: Unrelated work continues
 
@@ -110,7 +110,7 @@ Each queue entry SHALL be in exactly one state: `waiting` (with a reason: unmerg
 
 ### Requirement: The operator controls the queue
 
-The operator SHALL be able to add a change to a project's queue, remove an entry that has not started, pause and resume a project's queue, set the project's parallelism limit (an integer of at least 1), and reorder entries that have not started. Pausing SHALL stop new starts only; running features SHALL continue. These operations SHALL be available through the HTTP API, and the queue with each entry's state, dependencies and reason SHALL be readable through it.
+The operator SHALL be able to add a change to a project's queue, remove an entry that has not started or whose linked feature is terminal (`done` or `abandoned`), pause and resume a project's queue, set the project's parallelism limit (an integer of at least 1), and reorder entries that have not started. Pausing SHALL stop new starts only; running features SHALL continue. These operations SHALL be available through the HTTP API, and the queue with each entry's state, dependencies and reason SHALL be readable through it.
 
 #### Scenario: Pause stops new starts only
 
@@ -119,5 +119,10 @@ The operator SHALL be able to add a change to a project's queue, remove an entry
 
 #### Scenario: Removing a running entry is refused
 
-- **WHEN** the operator tries to remove an entry whose feature is running
+- **WHEN** the operator tries to remove an entry that is `starting`, or whose linked feature is not terminal (running, waiting for a human, paused or escalated)
 - **THEN** the request is refused, and the operator is told to abandon the feature instead
+
+#### Scenario: Removing an entry whose feature ended is allowed
+
+- **WHEN** the operator removes an entry whose linked feature is `done` without a merge, or `abandoned`
+- **THEN** the entry is removed

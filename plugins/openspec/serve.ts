@@ -5,8 +5,13 @@
  * stripped:
  *
  *   GET  /changes     -> { openspec: false } | { openspec: true, active, archived }
- *   GET  /change      -> per-change detail (proposal sections, delta specs, tasks) | { error }
+ *                        (each active change carries its declared `dependsOn`)
+ *   GET  /change      -> per-change detail (proposal sections, delta specs, tasks, dependsOn) | { error }
  *   POST /start-work  -> { featureId } | { error }
+ *   GET    /queue                -> the daemon's change queue for this project | { error }
+ *   POST   /queue/entries        -> queue a change ({ change }) | { error }
+ *   DELETE /queue/entries/:id    -> dequeue an entry that has not started | { error }
+ *   PATCH  /queue                -> update { paused?, parallelism? } | { error }
  *   GET  /ui/...      -> static panel files
  *
  * `handleRequest` is pure I/O-via-injected-deps so it is testable
@@ -19,6 +24,7 @@
 import { spawn } from "node:child_process"
 import { readdir, readFile as fsReadFile, stat } from "node:fs/promises"
 import { extname, join, resolve, sep } from "node:path"
+import { deriveChangeStart, extractSection, parseDependsOn, type ParseYaml } from "./change-start.ts"
 
 export interface ExecResult {
   readonly code: number
@@ -43,7 +49,12 @@ interface TaskProgress {
   readonly total: number
 }
 
-interface ActiveChange {
+interface DeclaredDependencies {
+  readonly dependsOn: readonly string[]
+  readonly dependsOnWarning?: string
+}
+
+interface ActiveChange extends DeclaredDependencies {
   readonly name: string
   readonly taskProgress: TaskProgress | null
 }
@@ -100,7 +111,30 @@ async function toActiveChange(raw: RawListedChange, deps: OpenSpecServeDeps): Pr
     total = counted?.total
   }
   const taskProgress = done !== undefined && total !== undefined && total > 0 ? { done, total } : null
-  return { name: raw.name, taskProgress }
+  return { name: raw.name, taskProgress, ...(await readDeclaredDependencies(deps, raw.name)) }
+}
+
+/** The plugin cannot import a YAML dependency, so it uses the runtime's
+ *  own parser (`Bun.YAML`, the runtime `plugin.yaml` already requires). */
+const parseYaml: ParseYaml = source => {
+  const runtime = (Bun as { YAML?: { parse(text: string): unknown } }).YAML
+  if (runtime === undefined) throw new Error("this Bun version has no YAML parser (Bun 1.2.21 or newer is required)")
+  return { ok: true, value: runtime.parse(source) }
+}
+
+/** A missing `.openspec.yaml` declares nothing; a malformed one shows no
+ *  dependencies plus a warning — never an error for the whole listing. */
+async function readDeclaredDependencies(deps: OpenSpecServeDeps, name: string): Promise<DeclaredDependencies> {
+  if (!isSafeChangeName(name)) return { dependsOn: [] }
+  let source: string
+  try {
+    source = await deps.readFile(join(deps.projectDir, "openspec", "changes", name, ".openspec.yaml"))
+  } catch {
+    return { dependsOn: [] }
+  }
+  const parsed = parseDependsOn(source, parseYaml)
+  if (parsed.ok) return { dependsOn: parsed.dependsOn }
+  return { dependsOn: [], dependsOnWarning: `ignored .openspec.yaml depends_on: ${parsed.error.message}` }
 }
 
 async function listArchived(deps: OpenSpecServeDeps): Promise<readonly string[]> {
@@ -152,29 +186,6 @@ async function handleChanges(deps: OpenSpecServeDeps): Promise<Response> {
     .filter((change): change is ActiveChange => change !== null)
   const archived = await listArchived(deps)
   return jsonResponse(200, { openspec: true, active, archived })
-}
-
-function titleFromChangeName(name: string): string {
-  return name
-    .split(/[-_]+/)
-    .filter(word => word !== "")
-    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(" ")
-}
-
-function extractSection(markdown: string, heading: string): string | null {
-  const lines = markdown.split("\n")
-  const headingPattern = new RegExp(`^##\\s+${heading}\\s*$`, "i")
-  const startIndex = lines.findIndex(line => headingPattern.test(line.trim()))
-  if (startIndex === -1) return null
-  const rest = lines.slice(startIndex + 1)
-  const endIndex = rest.findIndex(line => /^##\s+/.test(line))
-  const section = (endIndex === -1 ? rest : rest.slice(0, endIndex)).join("\n").trim()
-  return section === "" ? null : section
-}
-
-function extractWhySection(markdown: string): string | null {
-  return extractSection(markdown, "why")
 }
 
 interface ChangeRequirement {
@@ -281,6 +292,7 @@ async function handleChangeDetail(request: Request, deps: OpenSpecServeDeps): Pr
   return jsonResponse(200, {
     name,
     archived: resolved.archived,
+    ...(resolved.archived ? {} : await readDeclaredDependencies(deps, name)),
     why: proposalText !== null ? (extractSection(proposalText, "why") ?? undefined) : undefined,
     whatChanges: proposalText !== null ? (extractSection(proposalText, "what changes") ?? undefined) : undefined,
     specs: await readSpecs(deps, resolved.dir),
@@ -288,18 +300,9 @@ async function handleChangeDetail(request: Request, deps: OpenSpecServeDeps): Pr
   })
 }
 
-/** Workflows commonly declare which OpenSpec change a feature delivers
- *  as a required string input (the dogfood workflow calls it
- *  `change_slug`). The plugin knows the change being started, so it
- *  fills that input automatically instead of failing the creation.
- *  Projection failures degrade to "no inputs" — daemon validation
+/** Projection failures degrade to "no inputs" — daemon validation
  *  still applies and its message is relayed as usual. */
-const CHANGE_INPUT_NAMES = ["change_slug", "change"] as const
-
-async function resolveChangeInput(
-  change: string,
-  deps: OpenSpecServeDeps,
-): Promise<Record<string, string> | null> {
+async function fetchWorkflowInputs(deps: OpenSpecServeDeps): Promise<unknown> {
   try {
     const response = await deps.fetchFn(
       `${deps.conductorUrl}/v1/projects/workflow?dir=${encodeURIComponent(deps.projectDir)}`,
@@ -307,16 +310,11 @@ async function resolveChangeInput(
         headers: deps.conductorToken !== undefined ? { authorization: `Bearer ${deps.conductorToken}` } : {},
       },
     )
-    if (!response.ok) return null
+    if (!response.ok) return undefined
     const payload: unknown = await response.json()
-    if (!isRecord(payload) || !isRecord(payload.inputs)) return null
-    for (const name of CHANGE_INPUT_NAMES) {
-      const input = payload.inputs[name]
-      if (isRecord(input) && input.type === "string") return { [name]: change }
-    }
-    return null
+    return isRecord(payload) ? payload.inputs : undefined
   } catch {
-    return null
+    return undefined
   }
 }
 
@@ -338,22 +336,44 @@ async function handleStartWork(request: Request, deps: OpenSpecServeDeps): Promi
     return jsonResponse(404, { error: `no proposal found for change "${change}"` })
   }
 
-  const title = titleFromChangeName(change)
-  const description = extractWhySection(proposalText) ?? proposalText.trim()
-  const inputs = await resolveChangeInput(change, deps)
+  const { title, description, inputs } = deriveChangeStart(change, proposalText, await fetchWorkflowInputs(deps))
 
+  const call = await callDaemon(deps, "POST", "/v1/features", {
+    title,
+    project: deps.projectDir,
+    description,
+    ...(inputs !== undefined ? { inputs } : {}),
+  })
+  if (!call.ok) return call.response
+
+  const payload = call.payload
+  const featureId =
+    isRecord(payload) && isRecord(payload.feature) && typeof payload.feature.id === "string" ? payload.feature.id : null
+  if (featureId === null) return jsonResponse(502, { error: "daemon response did not include a feature id" })
+
+  return jsonResponse(200, { featureId })
+}
+
+type DaemonCall =
+  | { readonly ok: true; readonly status: number; readonly payload: unknown }
+  | { readonly ok: false; readonly response: Response }
+
+/** One call to the daemon's public API with the plugin's own token. A
+ *  failure becomes the plugin's `{ error }` response carrying the
+ *  daemon's envelope message and status. */
+async function callDaemon(deps: OpenSpecServeDeps, method: string, path: string, body?: unknown): Promise<DaemonCall> {
   let response: Response
   try {
-    response = await deps.fetchFn(`${deps.conductorUrl}/v1/features`, {
-      method: "POST",
+    response = await deps.fetchFn(`${deps.conductorUrl}${path}`, {
+      method,
       headers: {
-        "content-type": "application/json",
+        ...(body !== undefined ? { "content-type": "application/json" } : {}),
         ...(deps.conductorToken !== undefined ? { authorization: `Bearer ${deps.conductorToken}` } : {}),
       },
-      body: JSON.stringify({ title, project: deps.projectDir, description, ...(inputs !== null ? { inputs } : {}) }),
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     })
   } catch (error) {
-    return jsonResponse(502, { error: `could not reach the daemon: ${errorMessage(error)}` })
+    return { ok: false, response: jsonResponse(502, { error: `could not reach the daemon: ${errorMessage(error)}` }) }
   }
 
   let payload: unknown = null
@@ -368,14 +388,53 @@ async function handleStartWork(request: Request, deps: OpenSpecServeDeps): Promi
       isRecord(payload) && isRecord(payload.error) && typeof payload.error.message === "string"
         ? payload.error.message
         : `daemon responded ${response.status}`
-    return jsonResponse(response.status, { error: message })
+    return { ok: false, response: jsonResponse(response.status, { error: message }) }
   }
+  return { ok: true, status: response.status, payload }
+}
 
-  const featureId =
-    isRecord(payload) && isRecord(payload.feature) && typeof payload.feature.id === "string" ? payload.feature.id : null
-  if (featureId === null) return jsonResponse(502, { error: "daemon response did not include a feature id" })
+async function readJsonObject(request: Request): Promise<Record<string, unknown> | Response> {
+  let body: unknown
+  try {
+    body = await request.json()
+  } catch {
+    return jsonResponse(400, { error: "request body must be JSON" })
+  }
+  return isRecord(body) ? body : jsonResponse(400, { error: "request body must be a JSON object" })
+}
 
-  return jsonResponse(200, { featureId })
+async function handleQueueRead(deps: OpenSpecServeDeps): Promise<Response> {
+  const call = await callDaemon(deps, "GET", `/v1/projects/queue?dir=${encodeURIComponent(deps.projectDir)}`)
+  return call.ok ? jsonResponse(call.status, call.payload) : call.response
+}
+
+async function handleQueueAdd(request: Request, deps: OpenSpecServeDeps): Promise<Response> {
+  const body = await readJsonObject(request)
+  if (body instanceof Response) return body
+  const change = typeof body.change === "string" ? body.change.trim() : ""
+  if (change === "") return jsonResponse(400, { error: '"change" (non-empty string) is required' })
+  if (!isSafeChangeName(change)) return jsonResponse(400, { error: `invalid change name "${change}"` })
+  const call = await callDaemon(deps, "POST", "/v1/projects/queue/entries", { dir: deps.projectDir, change })
+  return call.ok ? jsonResponse(call.status, call.payload) : call.response
+}
+
+async function handleQueueRemove(entryId: string, deps: OpenSpecServeDeps): Promise<Response> {
+  const call = await callDaemon(deps, "DELETE", `/v1/projects/queue/entries/${encodeURIComponent(entryId)}`)
+  return call.ok ? jsonResponse(call.status, call.payload) : call.response
+}
+
+/** Only the pause flag and the parallelism limit are exposed; their
+ *  values are validated by the daemon and its message is relayed. */
+async function handleQueueSettings(request: Request, deps: OpenSpecServeDeps): Promise<Response> {
+  const body = await readJsonObject(request)
+  if (body instanceof Response) return body
+  const settings = {
+    ...(body.paused !== undefined ? { paused: body.paused } : {}),
+    ...(body.parallelism !== undefined ? { parallelism: body.parallelism } : {}),
+  }
+  if (Object.keys(settings).length === 0) return jsonResponse(400, { error: 'at least one of "paused", "parallelism" is required' })
+  const call = await callDaemon(deps, "PATCH", "/v1/projects/queue", { dir: deps.projectDir, ...settings })
+  return call.ok ? jsonResponse(call.status, call.payload) : call.response
 }
 
 function safeDecode(path: string): string | null {
@@ -417,6 +476,14 @@ export async function handleRequest(request: Request, deps: OpenSpecServeDeps): 
   if (request.method === "GET" && path === "/changes") return handleChanges(deps)
   if (request.method === "GET" && path === "/change") return handleChangeDetail(request, deps)
   if (request.method === "POST" && path === "/start-work") return handleStartWork(request, deps)
+  if (path === "/queue" && request.method === "GET") return handleQueueRead(deps)
+  if (path === "/queue" && request.method === "PATCH") return handleQueueSettings(request, deps)
+  if (path === "/queue/entries" && request.method === "POST") return handleQueueAdd(request, deps)
+  if (request.method === "DELETE" && path.startsWith("/queue/entries/")) {
+    const entryId = safeDecode(path.slice("/queue/entries/".length))
+    if (entryId === null || entryId === "" || entryId.includes("/")) return jsonResponse(400, { error: "invalid queue entry id" })
+    return handleQueueRemove(entryId, deps)
+  }
   if (request.method === "GET" && (path === "/ui" || path.startsWith("/ui/"))) return handleStatic(path, deps)
 
   return jsonResponse(404, { error: `no route for ${request.method} ${path}` })

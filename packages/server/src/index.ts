@@ -10,8 +10,42 @@ export {
 export type { Database, DatabaseConfig, DatabaseConnection } from "./database.ts"
 export { migrations, runMigrations } from "./migrations.ts"
 export type { Migration } from "./migrations.ts"
-export { Store } from "./store.ts"
+export { ChangeQueueError, Store } from "./store.ts"
+export { reconcileStartingEntries } from "./change-queue-reconcile.ts"
+export { ChangeQueueScheduler } from "./change-queue-scheduler.ts"
 export type {
+  ChangeQueueSchedulerDeps,
+  ChangeQueueTickResult,
+  QueueEngine,
+  QueueProjectResult,
+  QueueStartFailure,
+  QueueStartRecord,
+} from "./change-queue-scheduler.ts"
+export {
+  archivedChangeName,
+  ChangeQueueSources,
+  diagnoseChange,
+  diagnoseUnstartable,
+  knownChanges,
+  nodeOpenSpecFiles,
+} from "./change-queue-sources.ts"
+export type {
+  ChangeQueueReadPort,
+  ChangeQueueSourcePort,
+  ChangeQueueSourcesDeps,
+  LocalChanges,
+  MergedChanges,
+  OpenSpecFiles,
+} from "./change-queue-sources.ts"
+export type { ReconcileStartingResult, FindStartedFeature } from "./change-queue-reconcile.ts"
+export type {
+  ChangeQueueErrorCode,
+  QueueEntryRecord,
+  QueueSettings,
+  QueueSnapshot,
+  QueueStatusChange,
+  QueueTransitionRecord,
+  RemoveQueueEntryResult,
   AcceptAnswerResult,
   AnswerDeliveryRecord,
   AnswerDeliveryStatus,
@@ -189,7 +223,7 @@ export type {
   PermissionDecisionRecord,
 } from "./acp/permissions.ts"
 
-export { Daemon, jsonLineLogger, systemIntervalScheduler } from "./daemon.ts"
+export { DEFAULT_CHANGE_QUEUE_INTERVAL_MS, Daemon, jsonLineLogger, systemIntervalScheduler } from "./daemon.ts"
 export type {
   DaemonConfig,
   DaemonDeps,

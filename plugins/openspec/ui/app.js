@@ -121,24 +121,114 @@
     })
   }
 
-  function renderChanges(data) {
-    const active = data.active || []
-    const archived = data.archived || []
+  // The listing and the queue are loaded separately so a daemon that
+  // cannot serve the queue (e.g. project not configured) degrades the
+  // panel to start-work only, with the reason shown, instead of hiding
+  // the changes.
+  let listing = null
+  let queue = null
+  let queueError = null
+
+  const LIVE_STARTED = ["starting", "running", "escalated"]
+
+  /** The entry that represents a change in the queue: a live one wins
+   *  over a final (`merged`) one. */
+  function entryFor(name) {
+    if (queue === null) return null
+    let found = null
+    for (const entry of queue.entries) {
+      if (entry.change !== name) continue
+      if (entry.status !== "merged") return entry
+      found = entry
+    }
+    return found
+  }
+
+  function isQueued(entry) {
+    return entry !== null && entry.status !== "merged"
+  }
+
+  function canDequeue(entry) {
+    return isQueued(entry) && !LIVE_STARTED.includes(entry.status)
+  }
+
+  function stateKind(entry) {
+    return entry.status || (entry.state && entry.state.kind)
+  }
+
+  function renderDependencies(change) {
+    const deps = Array.isArray(change.dependsOn) ? change.dependsOn : []
+    let html = '<div class="change-deps">'
+    if (deps.length === 0) {
+      html += '<span class="muted">No dependencies declared</span>'
+    } else {
+      html += '<span class="muted">Depends on</span> ' + deps.map(dep => "<code>" + escapeHtml(dep) + "</code>").join(", ")
+    }
+    html += "</div>"
+    if (typeof change.dependsOnWarning === "string") {
+      html += '<div class="change-warning">' + escapeHtml(change.dependsOnWarning) + "</div>"
+    }
+    return html
+  }
+
+  function renderQueueState(entry) {
+    if (entry === null) return ""
+    const kind = stateKind(entry)
+    let html = '<div class="queue-state"><span class="badge badge-' + escapeHtml(kind) + '">' + escapeHtml(kind) + "</span>"
+    if (typeof entry.reason === "string" && entry.reason !== "") {
+      html += '<span class="queue-reason">' + escapeHtml(entry.reason) + "</span>"
+    }
+    return html + "</div>"
+  }
+
+  function renderQueueControls() {
+    if (queue === null) {
+      if (queueError === null) return ""
+      return '<div class="queue-controls"><div class="queue-warning">Queue unavailable: ' + escapeHtml(queueError) + "</div></div>"
+    }
+    const paused = queue.settings.paused
+    return (
+      '<div class="queue-controls">' +
+      '<span class="queue-title">Queue</span>' +
+      (paused ? '<span class="badge badge-paused">paused</span>' : "") +
+      '<button type="button" id="queue-pause">' + (paused ? "Resume" : "Pause") + "</button>" +
+      '<label class="queue-limit">Parallelism ' +
+      '<input type="number" id="queue-parallelism" min="1" step="1" value="' + escapeHtml(queue.settings.parallelism) + '" />' +
+      "</label>" +
+      '<div class="error-message" id="queue-error" hidden></div>' +
+      "</div>"
+    )
+  }
+
+  function renderChanges() {
+    const active = listing.active || []
+    const archived = listing.archived || []
 
     expandedTile = null
     expandedContainer = null
 
-    let html = '<div class="toolbar"><h1>OpenSpec</h1><button type="button" id="refresh">Refresh</button></div>'
+    let html =
+      '<div class="toolbar"><h1>OpenSpec</h1><button type="button" id="refresh">Refresh</button></div>' +
+      renderQueueControls()
 
     if (active.length === 0) {
       html += '<p class="empty">No active changes.</p>'
     } else {
       for (const change of active) {
+        const entry = entryFor(change.name)
+        let actions = '<button type="button" class="start-work">Start work</button>'
+        if (queue !== null && canDequeue(entry)) {
+          actions = '<button type="button" class="dequeue" data-entry="' + escapeHtml(entry.id) + '">Dequeue</button>' + actions
+        } else if (queue !== null && !isQueued(entry)) {
+          actions = '<button type="button" class="enqueue">Queue</button>' + actions
+        }
         html +=
           '<div class="change" data-name="' + escapeHtml(change.name) + '">' +
           '<div class="change-name">' + escapeHtml(change.name) + "</div>" +
+          renderDependencies(change) +
+          renderQueueState(entry) +
           renderProgress(change.taskProgress) +
-          '<div class="change-actions"><button type="button" class="start-work">Start work</button></div>' +
+          '<div class="change-actions">' + actions + "</div>" +
           '<div class="error-message" hidden></div>' +
           "</div>"
       }
@@ -164,8 +254,115 @@
       })
     }
 
+    for (const button of root.querySelectorAll(".enqueue")) {
+      button.addEventListener("click", event => {
+        event.stopPropagation()
+        enqueue(button)
+      })
+    }
+
+    for (const button of root.querySelectorAll(".dequeue")) {
+      button.addEventListener("click", event => {
+        event.stopPropagation()
+        dequeue(button)
+      })
+    }
+
+    const pauseButton = document.getElementById("queue-pause")
+    if (pauseButton) pauseButton.addEventListener("click", () => updateQueueSettings({ paused: !queue.settings.paused }))
+    const parallelismInput = document.getElementById("queue-parallelism")
+    if (parallelismInput) {
+      parallelismInput.addEventListener("change", () => {
+        const value = Number(parallelismInput.value)
+        if (parallelismInput.value.trim() === "" || !Number.isFinite(value)) {
+          showQueueError("parallelism must be a whole number of at least 1")
+          return
+        }
+        updateQueueSettings({ parallelism: value })
+      })
+    }
+
     for (const changeEl of root.querySelectorAll(".change")) attachExpansion(changeEl)
     for (const item of root.querySelectorAll(".archived-item")) attachExpansion(item)
+  }
+
+  function showError(errorEl, message) {
+    errorEl.textContent = message
+    errorEl.hidden = false
+  }
+
+  function showQueueError(message) {
+    const errorEl = document.getElementById("queue-error")
+    if (errorEl) showError(errorEl, message)
+  }
+
+  /** A request to the plugin backend; an API refusal resolves to
+   *  `{ ok: false, message }` carrying the daemon's message verbatim. */
+  async function request(method, path, body) {
+    try {
+      const response = await fetch(withQuery(path), {
+        method,
+        ...(body !== undefined ? { headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : {}),
+      })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok) {
+        return { ok: false, message: payload && payload.error ? String(payload.error) : "request failed (" + response.status + ")" }
+      }
+      return { ok: true, payload }
+    } catch (error) {
+      return { ok: false, message: String(error) }
+    }
+  }
+
+  async function reloadQueue() {
+    const result = await request("GET", "../queue")
+    if (result.ok && result.payload && result.payload.settings && Array.isArray(result.payload.entries)) {
+      queue = result.payload
+      queueError = null
+    } else {
+      queue = null
+      queueError = result.ok ? "unexpected response" : result.message
+    }
+  }
+
+  async function enqueue(button) {
+    const changeEl = button.closest(".change")
+    const errorEl = changeEl.querySelector(".error-message")
+    errorEl.hidden = true
+    button.disabled = true
+    const result = await request("POST", "../queue/entries", { change: changeEl.dataset.name })
+    if (!result.ok) {
+      showError(errorEl, result.message)
+      button.disabled = false
+      return
+    }
+    await reloadQueue()
+    renderChanges()
+  }
+
+  async function dequeue(button) {
+    const changeEl = button.closest(".change")
+    const errorEl = changeEl.querySelector(".error-message")
+    errorEl.hidden = true
+    button.disabled = true
+    const result = await request("DELETE", "../queue/entries/" + encodeURIComponent(button.dataset.entry))
+    if (!result.ok) {
+      showError(errorEl, result.message)
+      button.disabled = false
+      return
+    }
+    await reloadQueue()
+    renderChanges()
+  }
+
+  async function updateQueueSettings(settings) {
+    const result = await request("PATCH", "../queue", settings)
+    if (!result.ok) {
+      showQueueError(result.message)
+      return
+    }
+    await reloadQueue()
+    renderChanges()
   }
 
   async function runStartWork(name, button, errorEl) {
@@ -206,13 +403,14 @@
   async function load() {
     root.innerHTML = '<p class="loading">Loading…</p>'
     try {
-      const response = await fetch(withQuery("../changes"))
+      const [response] = await Promise.all([fetch(withQuery("../changes")), reloadQueue()])
       const data = await response.json()
       if (!data.openspec) {
         renderEmptyState()
         return
       }
-      renderChanges(data)
+      listing = data
+      renderChanges()
     } catch (error) {
       root.innerHTML = '<p class="error-message">' + escapeHtml(String(error)) + "</p>"
     }

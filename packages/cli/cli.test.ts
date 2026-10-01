@@ -13,7 +13,7 @@ import { afterEach, describe, expect, it } from "bun:test"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import { Daemon, createApi, type ConductorApi, type ApiConfig } from "@conductor/server"
+import { DEFAULT_CHANGE_QUEUE_INTERVAL_MS, Daemon, createApi, type ConductorApi, type ApiConfig } from "@conductor/server"
 import type { SessionClient } from "@conductor/server"
 import { validateWorkflow, parseWorkflow } from "@conductor/core"
 import { runCli, EXIT, type CliDeps, type DaemonStartInput } from "./src/cli.ts"
@@ -972,6 +972,7 @@ auth:
     expect(input.daemon.databasePath).toBe("/var/lib/conductor/state.db")
     expect(input.daemon.projects).toEqual(["/work/project"])
     expect(input.daemon.heartbeatIntervalMs).toBe(DEFAULT_HEARTBEAT_INTERVAL_MS)
+    expect(input.daemon.changeQueueIntervalMs).toBe(DEFAULT_CHANGE_QUEUE_INTERVAL_MS)
     expect(input.api.bind).toEqual({ host: "127.0.0.1", port: 4400 })
     expect(input.api.auth).toEqual({ mode: "none" })
   })
@@ -1068,6 +1069,7 @@ describe("CLI: daemon config parsing", () => {
       ...base,
       auth: { mode: "bearer", token: "t" },
       heartbeatIntervalMs: 250,
+      changeQueueIntervalMs: 90_000,
       createDatabaseDirectory: false,
       engine: { runTtlMs: 1000, busySilenceNudgeMs: 500, nudgeIdleCycles: 2, maxNudges: 3 },
       actions: { bundledPath: "/actions", localPaths: ["/more"] },
@@ -1077,6 +1079,7 @@ describe("CLI: daemon config parsing", () => {
       databasePath: "/db/state.db",
       projects: ["/p1"],
       heartbeatIntervalMs: 250,
+      changeQueueIntervalMs: 90_000,
       createDatabaseDirectory: false,
       engine: { runTtlMs: 1000, busySilenceNudgeMs: 500, nudgeIdleCycles: 2, maxNudges: 3 },
       actions: { bundledPath: "/actions", localPaths: ["/more"] },
@@ -1111,6 +1114,7 @@ describe("CLI: daemon config parsing", () => {
     ["unknown top-level field", { ...base, portt: 1 }, "portt"],
     ["unknown engine field", { ...base, engine: { ttl: 5 } }, "engine.ttl"],
     ["negative heartbeat", { ...base, heartbeatIntervalMs: -5 }, "heartbeatIntervalMs"],
+    ...[0, -1, Infinity, NaN, "60000", null].map(value => ["invalid changeQueueIntervalMs", { ...base, changeQueueIntervalMs: value }, "changeQueueIntervalMs"] as const),
     ["removed ui field", { ...base, ui: { staticDir: "/x" } }, "ui"],
     ["bad localPaths", { ...base, actions: { localPaths: [""] } }, "actions.localPaths"],
     ["fractional nudgeIdleCycles", { ...base, engine: { nudgeIdleCycles: 2.5 } }, "positive integer"],

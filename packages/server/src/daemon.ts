@@ -35,6 +35,8 @@ import { Store } from "./store.ts"
 import { WorkflowRegistry, type WorkflowDiagnostic, type WorkflowStatus } from "./workflow-registry.ts"
 import { loadActionRegistry, type ActionRegistryLoadDiagnostic, type LoadedActionRegistry } from "./action-registry.ts"
 import { Engine, type EngineOptions } from "./engine.ts"
+import { ChangeQueueScheduler } from "./change-queue-scheduler.ts"
+import { ChangeQueueSources } from "./change-queue-sources.ts"
 import { ActionHost } from "./action-host.ts"
 import { bundledHandlers } from "./actions/bundled.ts"
 import { realProcessRunner } from "./process.ts"
@@ -97,6 +99,9 @@ export const systemIntervalScheduler: IntervalScheduler = {
 
 // ----------------------------------------------------------- configuration
 
+/** How often the change-queue scheduler runs when `changeQueueIntervalMs` is not configured. */
+export const DEFAULT_CHANGE_QUEUE_INTERVAL_MS = 60_000
+
 export interface DaemonConfig {
   readonly runners?: import("./acp/config.ts").RunnersConfig
   /** Explicit SQLite database path. Never inferred from a home directory. */
@@ -107,6 +112,12 @@ export interface DaemonConfig {
   readonly projects: readonly string[]
   /** Reconciler heartbeat interval in milliseconds. */
   readonly heartbeatIntervalMs: number
+  /**
+   * Change-queue scheduler interval in milliseconds. Its own timer, separate
+   * from the reconciler heartbeat (a pass fetches from the remote once per
+   * queued project). Default `DEFAULT_CHANGE_QUEUE_INTERVAL_MS` (60 s).
+   */
+  readonly changeQueueIntervalMs?: number
   /** Engine tuning: runTtlMs, nudgeIdleCycles, idleSilenceNudgeMs, busySilenceNudgeMs, maxNudges. */
   readonly engine?: EngineOptions
   /**
@@ -150,6 +161,12 @@ export interface DaemonDeps {
   readonly clock?: Clock
   readonly logger?: DaemonLogger
   readonly scheduler?: IntervalScheduler
+  /**
+   * Timer for the change-queue scheduler, separate from `scheduler` (the
+   * reconciler heartbeat) because it runs on its own interval. Defaults to
+   * the system interval scheduler; tests inject a manual one.
+   */
+  readonly changeQueueTimer?: IntervalScheduler
   readonly notify?: (title: string, message: string) => void
   /** Loaded action registry for resolving workflow `action` steps. Absent → any workflow using `action` steps is invalid. */
   readonly actionRegistry?: LoadedActionRegistry
@@ -236,7 +253,11 @@ export class Daemon {
   private engineInstance: Engine | null = null
   private reconciler: Reconciler | null = null
   private timerHandle: unknown = null
+  private queueTimerHandle: unknown = null
+  private queueScheduler: ChangeQueueScheduler | null = null
+  private queueSourcesInstance: ChangeQueueSources | null = null
   private cycleInFlight: Promise<void> | null = null
+  private queueInFlight: Promise<void> | null = null
   private stopPromise: Promise<void> | null = null
   private appliedNow: readonly string[] = []
   private lastCycleStartedAt: number | null = null
@@ -246,6 +267,7 @@ export class Daemon {
 
   private readonly logger: DaemonLogger
   private readonly scheduler: IntervalScheduler
+  private readonly queueTimer: IntervalScheduler
   private readonly clock: Clock
   private readonly runnerAvailable: () => boolean
 
@@ -256,9 +278,16 @@ export class Daemon {
     if (!Number.isFinite(config.heartbeatIntervalMs) || config.heartbeatIntervalMs <= 0) {
       throw new Error("heartbeatIntervalMs must be a positive number")
     }
+    if (
+      config.changeQueueIntervalMs !== undefined &&
+      (!Number.isFinite(config.changeQueueIntervalMs) || config.changeQueueIntervalMs <= 0)
+    ) {
+      throw new Error("changeQueueIntervalMs must be a positive number")
+    }
     resolveDatabasePath({ path: config.databasePath })
     this.logger = deps.logger ?? jsonLineLogger
     this.scheduler = deps.scheduler ?? systemIntervalScheduler
+    this.queueTimer = deps.changeQueueTimer ?? systemIntervalScheduler
     this.clock = deps.clock ?? systemClock
     this.runnerAvailable = deps.runnerAvailability ?? (() => deps.sessions !== undefined)
   }
@@ -382,6 +411,17 @@ export class Daemon {
     }
     this.reconciler = this.deps.reconciler ?? this.engineInstance
 
+    const queueLog = { log: (text: string) => this.log("info", text, { component: "change-queue" }) }
+    this.queueSourcesInstance = new ChangeQueueSources({ process: processRunner, log: queueLog })
+    this.queueScheduler = new ChangeQueueScheduler({
+      store: this.storeInstance,
+      engine: this.engineInstance,
+      sources: this.queueSourcesInstance,
+      workflows: this.registryInstance.resolver,
+      clock: this.clock,
+      log: queueLog,
+    })
+
     if (!this.runnerAvailable()) this.log("warn", "no session runner registered — runner reported unavailable")
 
   }
@@ -402,11 +442,19 @@ export class Daemon {
       return
     }
 
+    // Settle `starting` queue claims left by a crash before anything else
+    // can start a change (DB-only; the passes themselves run on the timer).
+    this.queueScheduler?.recover()
+
     this.timerHandle = this.scheduler.setInterval(() => {
       void this.beat()
     }, this.config.heartbeatIntervalMs)
+    const changeQueueIntervalMs = this.config.changeQueueIntervalMs ?? DEFAULT_CHANGE_QUEUE_INTERVAL_MS
+    this.queueTimerHandle = this.queueTimer.setInterval(() => {
+      void this.queueBeat()
+    }, changeQueueIntervalMs)
     this.phase = "ready"
-    this.log("info", "daemon ready", { heartbeatIntervalMs: this.config.heartbeatIntervalMs })
+    this.log("info", "daemon ready", { heartbeatIntervalMs: this.config.heartbeatIntervalMs, changeQueueIntervalMs })
   }
 
   /**
@@ -458,6 +506,28 @@ export class Daemon {
     return this.runCycle("heartbeat")
   }
 
+  /**
+   * One change-queue pass. Shares an in-flight pass instead of overlapping,
+   * never throws (a failed pass is logged; the next interval retries), and
+   * is a no-op unless the daemon is ready. Public for deterministic tests.
+   */
+  queueBeat(): Promise<void> {
+    const scheduler = this.queueScheduler
+    if (this.phase !== "ready" || !scheduler) return Promise.resolve()
+    if (this.queueInFlight) return this.queueInFlight
+    const pass = (async () => {
+      try {
+        await scheduler.tick()
+      } catch (error) {
+        this.log("error", `change-queue pass failed: ${message(error)}`)
+      } finally {
+        this.queueInFlight = null
+      }
+    })()
+    this.queueInFlight = pass
+    return pass
+  }
+
   private runCycle(kind: "recovery" | "heartbeat"): Promise<void> {
     const reconciler = this.reconciler
     if (!reconciler) return Promise.resolve()
@@ -490,7 +560,9 @@ export class Daemon {
   async drainWorkers(): Promise<void> {
     this.phase = "stopping"
     if (this.timerHandle !== null) { this.scheduler.clearInterval(this.timerHandle); this.timerHandle = null }
+    if (this.queueTimerHandle !== null) { this.queueTimer.clearInterval(this.queueTimerHandle); this.queueTimerHandle = null }
     if (this.cycleInFlight) await this.cycleInFlight
+    if (this.queueInFlight) await this.queueInFlight
     if (this.connection && this.storeInstance) for (const feature of this.storeInstance.listFeatures({})) {
       for (const run of this.storeInstance.listRuns(feature.id)) {
         if (run.status !== "running" || this.storeInstance.getRunnerBinding(run.id)?.transport !== "acp") continue
@@ -514,7 +586,12 @@ export class Daemon {
         this.scheduler.clearInterval(this.timerHandle)
         this.timerHandle = null
       }
+      if (this.queueTimerHandle !== null) {
+        this.queueTimer.clearInterval(this.queueTimerHandle)
+        this.queueTimerHandle = null
+      }
       if (this.cycleInFlight) await this.cycleInFlight
+      if (this.queueInFlight) await this.queueInFlight
       // Drain detached action executions before closing SQLite: their
       // conclusion writes must land while the connection is still open.
       await this.engineInstance?.settleActions()
@@ -571,6 +648,18 @@ export class Daemon {
   get engine(): Engine {
     if (!this.engineInstance) throw new Error("daemon has not started")
     return this.engineInstance
+  }
+
+  /** The change-queue scheduler — available once `start()` has constructed it. */
+  get changeQueue(): ChangeQueueScheduler {
+    if (!this.queueScheduler) throw new Error("daemon has not started")
+    return this.queueScheduler
+  }
+
+  /** The change-queue file/git readers (shared with the HTTP API) — available once `start()` has constructed them. */
+  get changeQueueSources(): ChangeQueueSources {
+    if (!this.queueSourcesInstance) throw new Error("daemon has not started")
+    return this.queueSourcesInstance
   }
 
   /** The daemon's workflow registry — available once `start()` has constructed it. */

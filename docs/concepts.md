@@ -471,6 +471,36 @@ become common in day-to-day operation.
 
 **Abandoning** ends the feature permanently.
 
+## The change queue: a backlog next to the workflow
+
+Two different graphs are easy to confuse:
+
+- The **workflow DAG** (`needs:` between jobs in `conductor.yaml`) is
+  *execution*: how one feature is carried out, step by step, with gates and
+  loops. Everything above is about it.
+- The **change queue** is a *backlog*: which OpenSpec changes should be
+  started, in what order, because other changes must have merged first. Its
+  edges are `depends_on` entries in each change's `.openspec.yaml`, and its
+  nodes are changes, not jobs.
+
+The queue sits **in front of** features, not inside a workflow. Each queue
+entry that starts becomes one ordinary feature — created through the same
+path as `POST /v1/features` — and from that point the workflow runs exactly
+as it would have if a human had started it. The engine and the interpreter
+are unaware of the queue: no event, no job and no state in the workflow
+refers to it. A small scheduler in the daemon, on its own timer, reads the
+feature statuses and the git remote, and decides which entries to start
+next. That is also why the queue never merges anything: merge policy is a
+step in the workflow, and removing a human merge gate is a change to the
+project's `conductor.yaml`, not to the queue.
+
+A feature that the queue started is stuck when it is `escalated`, `paused`
+or `abandoned`; only the queued changes that depend on it wait, and the rest
+of the queue keeps going. See [Running unattended](install.md#running-unattended-change-queue)
+for the operator's view and the [HTTP API](http-api.md#change-queue) for the
+states. Splitting a change into per-task steps is a different, still
+deferred idea (see the [task contract design](task-contract-design.md)).
+
 ## Determinism and durability
 
 - The interpreter is deterministic: same IR + state + event → same decisions.

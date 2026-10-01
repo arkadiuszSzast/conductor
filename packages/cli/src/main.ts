@@ -191,6 +191,7 @@ function startDaemon(input: DaemonStartInput): DaemonProcessHandle {
       resolveWorkflow: daemon.registry.resolver,
       workflowStatus: dir => daemon.registry.getStatus(dir),
       registerProject: dir => daemon.registry.register(dir),
+      changeQueue: daemon.changeQueueSources,
       runners,
       plugins: plugins.control,
       logger,

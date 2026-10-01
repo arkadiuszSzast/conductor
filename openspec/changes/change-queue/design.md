@@ -72,12 +72,14 @@ The function validates (cycles via DFS over active changes, unknown names), prop
 - **Hook:** the daemon's timer calls a new `ChangeQueueScheduler.tick()` on its own interval. It gathers inputs (store, files via the existing process port, git per D2), calls `planQueue`, persists the states, then starts the selected entries.
 - **Exactly-once start:** for each selected entry, in one SQLite transaction, move it `waiting → starting` with a fresh claim token; then call `Engine.startFeature` with the change's title/description/inputs computed the same way the plugin does today; then, in a second transaction, link `feature_id` and move to `running`. On restart, a `starting` entry is reconciled by looking up a feature whose `inputs` carry the change slug and was created after the claim; if found it is linked, otherwise the claim is released. A unique partial index guarantees one live entry per change.
 - **Start inputs:** the scheduler reuses the plugin's derivation (title from the change name, description from the proposal's *Why*, the `change_slug`/`change` input from the workflow projection). That logic moves from `plugins/openspec/serve.ts` into a small shared module the plugin and the server both import.
+- **Accepted coupling (server → plugin import):** the shared module is `plugins/openspec/change-start.ts`, and the server imports it by relative path (`../../../plugins/openspec/change-start.ts`). It lives in the plugin directory because an installed plugin is a verbatim copy of `plugins/openspec/` — it cannot import workspace packages, so the module must be self-contained and sit next to `serve.ts`. The server depending on a plugin file is deliberate and accepted: it keeps one derivation of start inputs and `depends_on` for the panel and the scheduler; the module has no dependencies, so the coupling is one file.
+- **Startability requires the change input:** restart recovery finds a crashed start's feature by its `change_slug`/`change` input, so a project whose workflow declares neither as a string input is not startable: its entries are `invalid` ("the workflow declares no `change_slug`/`change` string input") before any claim, both when queueing and on every pass.
 
 ### D5 — HTTP API
 
 - `GET /v1/projects/queue?dir=` → queue settings and entries (state, reason, dependencies, feature id).
 - `POST /v1/projects/queue/entries` `{dir, change}` → add (validated, D3).
-- `DELETE /v1/projects/queue/entries/:id` → remove (refused while `starting`/`running`).
+- `DELETE /v1/projects/queue/entries/:id` → remove (refused while `starting`, or while the linked feature is not terminal; allowed once it is `done` or `abandoned`).
 - `PATCH /v1/projects/queue` `{dir, paused?, parallelism?, order?}`.
 - Errors use the existing envelope; validation failures return `422` with the diagnostic naming the offending changes.
 

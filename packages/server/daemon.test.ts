@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import { Daemon, type DaemonDeps, type DaemonLogEntry, type IntervalScheduler } from "./src/daemon.ts"
+import { DEFAULT_CHANGE_QUEUE_INTERVAL_MS, Daemon, type DaemonDeps, type DaemonLogEntry, type IntervalScheduler } from "./src/daemon.ts"
 import { openMigratedDatabase } from "./src/database.ts"
 import { migrations } from "./src/migrations.ts"
 import { Store } from "./src/store.ts"
@@ -663,5 +663,117 @@ describe("Daemon: structured logs", () => {
     const engineEntry = logger.entries.find(e => e.fields?.component === "engine")
     expect(engineEntry).toBeDefined()
     expect(engineEntry!.message).toContain(`feature=${result.feature.slug}`)
+  })
+})
+
+describe("Daemon: change-queue timer", () => {
+  function makeQueueDaemon(config: { changeQueueIntervalMs?: number } = {}) {
+    const project = writeProject()
+    const heartbeat = new ManualScheduler()
+    const queueTimer = new ManualScheduler()
+    const logger = new CollectingLogger()
+    const daemon = new Daemon(
+      {
+        databasePath: join(tempDir("conductor-daemon-db-"), "state.db"),
+        projects: [project],
+        heartbeatIntervalMs: 1000,
+        ...config,
+      },
+      { scheduler: heartbeat, changeQueueTimer: queueTimer, logger, sessions: new FakeSessions() },
+    )
+    daemonsToStop.push(daemon)
+    return { daemon, project, heartbeat, queueTimer, logger }
+  }
+
+  function queueChange(project: string, name: string): void {
+    const dir = join(project, "openspec", "changes", name)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, "proposal.md"), `## Why\nBecause ${name}.\n`)
+  }
+
+  it("arms its own timer at the 60 s default, separate from the heartbeat", async () => {
+    const { daemon, heartbeat, queueTimer } = makeQueueDaemon()
+    await daemon.start()
+    expect(DEFAULT_CHANGE_QUEUE_INTERVAL_MS).toBe(60_000)
+    expect(queueTimer.intervalMs).toBe(60_000)
+    expect(heartbeat.intervalMs).toBe(1000)
+  })
+
+  it("uses the configured interval", async () => {
+    const { daemon, queueTimer } = makeQueueDaemon({ changeQueueIntervalMs: 2500 })
+    await daemon.start()
+    expect(queueTimer.intervalMs).toBe(2500)
+  })
+
+  it.each([0, -5, Number.NaN, Number.POSITIVE_INFINITY])("rejects an invalid interval (%p)", value => {
+    expect(
+      () =>
+        new Daemon(
+          { databasePath: join(tempDir("conductor-daemon-db-"), "state.db"), projects: [], heartbeatIntervalMs: 1000, changeQueueIntervalMs: value },
+          {},
+        ),
+    ).toThrow("changeQueueIntervalMs must be a positive number")
+  })
+
+  it("a timer tick runs a scheduler pass; with no reachable remote nothing starts and nothing throws, and the reconcile heartbeat never starts queue entries", async () => {
+    const { daemon, project, heartbeat, queueTimer } = makeQueueDaemon()
+    await daemon.start()
+    queueChange(project, "a")
+    const canonical = daemon.registry.resolve(project)!.projectDir
+    daemon.store.addEntry(canonical, "a")
+    // The temp project has no git remote, so the real fetch fails and the merged set is unknown.
+    queueTimer.tick()
+    await daemon.queueBeat()
+    expect(daemon.store.listFeatures({})).toHaveLength(0)
+    expect(daemon.store.getQueue(canonical).entries[0]!.status).toBe("waiting")
+    heartbeat.tick()
+    await daemon.beat()
+    expect(daemon.store.listFeatures({})).toHaveLength(0)
+  })
+
+  it("queue passes never overlap and a failing pass never throws out of the timer", async () => {
+    const { daemon, queueTimer, logger } = makeQueueDaemon()
+    await daemon.start()
+    let calls = 0
+    const gate = deferred<void>()
+    ;(daemon.changeQueue as unknown as { tick: () => Promise<unknown> }).tick = async () => {
+      calls++
+      await gate.promise
+      throw new Error("pass exploded")
+    }
+    const first = daemon.queueBeat()
+    const second = daemon.queueBeat()
+    expect(second).toBe(first)
+    queueTimer.tick()
+    gate.resolve()
+    await first
+    expect(calls).toBe(1)
+    expect(logger.messages().some(m => m.includes("change-queue pass failed: pass exploded"))).toBe(true)
+  })
+
+  it("stop() clears the queue timer and waits for an in-flight pass", async () => {
+    const { daemon, queueTimer } = makeQueueDaemon()
+    await daemon.start()
+    const gate = deferred<void>()
+    let finished = false
+    ;(daemon.changeQueue as unknown as { tick: () => Promise<unknown> }).tick = async () => {
+      await gate.promise
+      finished = true
+      return { projects: [] }
+    }
+    void daemon.queueBeat()
+    const stopping = daemon.stop()
+    gate.resolve()
+    await stopping
+    expect(finished).toBe(true)
+    expect(queueTimer.cleared).toBe(1)
+  })
+
+  it("queueBeat is a no-op before the daemon is ready", async () => {
+    const { daemon } = makeQueueDaemon()
+    await daemon.queueBeat()
+    await daemon.initialize()
+    await daemon.queueBeat()
+    expect(daemon.health().ready).toBe(false)
   })
 })
