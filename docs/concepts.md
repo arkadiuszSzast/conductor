@@ -401,7 +401,15 @@ existing failure classes, retry budgets and resource waits above are
 unchanged for native runs, and an ACP run that completes with an
 explicit `conductor_report` behaves exactly like a native completion.
 
-Recovering an `uncertain` run uses the same `recover` action as an
+Once cleanup evidence is in, the fence is classified. A fence that is
+provably harmless to replay — no session was ever created and the process is
+confirmed dead (`no_effect`), or the step declares `replaySafe: true` and the
+process is confirmed dead (`replay_safe`) — heals automatically with patient,
+unbounded backoff, and the feature shows `attention` if it keeps failing
+([Self-healing](install.md#self-healing-of-uncertain-runs)). Only `unsafe`
+fences escalate.
+
+Recovering an escalated `uncertain` run uses the same `recover` action as an
 exhausted retry/resource-wait escalation, but requires stronger operator
 attestation: acknowledgment that the effects are unproven (not confirmed
 absent), the usual optimistic-concurrency/idempotency fields, and — only

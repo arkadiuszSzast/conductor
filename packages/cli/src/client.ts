@@ -31,9 +31,31 @@ export interface ApiConnection {
  * more than one), a per-job status summary and the escalation reason
  * (kept outside the core state shape).
  */
+export interface AttentionView {
+  readonly since: number
+  readonly targets: readonly {
+    readonly jobId: string
+    readonly stepId: string
+    readonly source: string
+    readonly consecutiveFailures: number
+    readonly lastDiagnostic: string | null
+    readonly nextAttemptAt: number | null
+  }[]
+}
+
+export interface ActivityView {
+  readonly state: string
+  readonly reason: string | null
+  readonly nextAt: number | null
+  readonly message: string
+}
+
 export interface FeatureView extends Omit<FeatureState, "jobs"> {
   readonly currentStep: string | null
   readonly escalation: string | null
+  /** Persistent per-target trouble while retries continue — null/absent when none. */
+  readonly attention?: AttentionView | null
+  readonly activity?: ActivityView
   /** The list projection carries `{status, currentStep}` per job; the
    *  detail projection adds full step runtimes (with the rendered gate
    *  `prompt` while a step waits for a human). */
@@ -276,6 +298,10 @@ export class ApiClient {
 
   health(): Promise<Record<string, unknown>> {
     return this.request("GET", "/v1/health")
+  }
+
+  testNotifications(): Promise<{ channels: { channel: string; ok: boolean; error?: string }[]; ok: boolean }> {
+    return this.request("POST", "/v1/notifications/test")
   }
 
   registerProject(dir: string): Promise<{ project: string; workflow: string }> {

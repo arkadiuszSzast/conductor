@@ -32,6 +32,7 @@ Authentication is explicit (`auth.mode: "none"` or `"bearer"`); only
 | `POST /v1/projects/queue/entries` | Queue a change (`{dir, change}` → 201). Refused with `422 invalid_queue_entry` (cycle, unknown dependency, unstartable change) or `409 conflict` (already queued). |
 | `DELETE /v1/projects/queue/entries/:id` | Remove an entry that has not started, or whose linked feature is terminal (`done`/`abandoned`). A `starting` entry, or a `running`/`escalated` one whose feature is not terminal → `409 conflict`: abandon the feature first; unknown id → 404; malformed id → `400 invalid_request`. |
 | `PATCH /v1/projects/queue` | Pause/resume, set the parallelism limit, reorder unstarted entries: `{dir, paused?, parallelism?, order?}` (bad values → `422 invalid_queue_settings`). |
+| `POST /v1/notifications/test` | Send a test message through every configured notification channel synchronously; returns `{channels: [{channel, ok, error?}], ok}` (when notifications are configured). |
 | `GET/POST /v1/runners`, `DELETE /v1/runners/:id` | Runner endpoint registration (when a registry is configured). |
 | `POST /v1/worker/report`, `GET /v1/worker/status`, `POST /v1/worker/ready` | Restricted, run-scoped namespace for the opt-in ACP integration's MCP reporting bridge (below; only reachable when `runners` is configured). |
 | `GET /v1/plugins`, `POST /v1/plugins/session`, `ANY /v1/plugins/:id/*` | Plugin listing, session cookie exchange, and per-plugin reverse proxy (below; when a plugin control is configured). |
@@ -125,10 +126,16 @@ a configured ACP profile additionally carries:
 
 - `transport: "native" | "acp"` and, when known, `profileId` (the
   configured ACP profile id) — never the executable path, env or token.
-- `uncertain: {reasonCode, cleanupState, recoveryRequiresCleanupAcknowledgement}`
+- `uncertain: {reasonCode, cleanupState, recoveryRequiresCleanupAcknowledgement, classification, autoHealing}`
   while an unresolved execution fence is open (see
   [Install § Restart, shutdown and unknown execution](install.md#restart-shutdown-and-unknown-execution)) —
-  absent once the fence is resolved by a recover. `reasonCode` is one of
+  absent once the fence is resolved by a recover or a heal. `classification`
+  is `null` while cleanup evidence is being gathered, then `no_effect`,
+  `replay_safe` or `unsafe`; `autoHealing: true` means a healing attempt is
+  scheduled and no operator action is needed
+  ([Self-healing](install.md#self-healing-of-uncertain-runs)).
+- `healed: {classification, resolvedAt, note}` on a fenced run that
+  self-healing resolved (the run itself stays `uncertain` in history). `reasonCode` is one of
   `lost_create_response`, `lost_prompt_response`, `lost_answer_response`,
   `process_or_daemon_restart`, `turn_deadline_exceeded`, `no_report_timeout`,
   `cancellation_during_uncertain_write`, or `startup_recovery`.
@@ -164,11 +171,21 @@ happening" from raw job/run state:
 ```
 
 `state` is one of `active` | `waiting_retry` | `blocked` | `waiting_human`
-| `paused` | `escalated` | `terminal`:
+| `paused` | `escalated` | `terminal` | `attention`:
+
+- `attention` — the feature is `running` (status unchanged) but at least
+  one target keeps failing while retries/healing continue. The feature
+  payload's `attention: {since, targets: [{jobId, stepId, source:
+  "healing"|"retry", consecutiveFailures, lastDiagnostic, nextAttemptAt}]}`
+  lists them (`null` otherwise; present on list items too). It clears on
+  the first successful run of the target.
 
 - `blocked` — a durable resource wait is open (no compatible runner /
   binding yet); `target`/`reason`/`diagnostic` describe it, `nextAt` is
   the next observation time, `deadlineAt` is the wait's finite deadline.
+- `waiting_retry` with `reason: "healing:<classification>"` — an uncertain
+  run is being healed automatically; `nextAt` is the healing attempt time
+  and `deadlineAt` is `null` (healing has no budget).
 - `waiting_retry` — a durable retry episode is scheduled; `reason` is the
   classified failure class, `diagnostic` its bounded message, `nextAt` the
   scheduled attempt time, and `deadlineAt` the retry's elapsed budget

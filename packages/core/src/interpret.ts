@@ -48,7 +48,8 @@ export function interpret(
     case "step.completed":    return onCompleted(workflow, state, event.jobId, event.stepId, event.outcome ?? DEFAULT_OUTCOME, event.outputs)
     case "step.failed":       return onFailed(workflow, state, event.jobId, event.stepId, event.reason)
     case "step.budget_exhausted": return onBudgetExhausted(workflow, state, event.jobId, event.stepId, event.reason)
-    case "step.execution_unknown": return onExecutionUnknown(state, event.jobId, event.stepId, event.reason)
+    case "step.execution_unknown": return onExecutionUnknown(state, event.jobId, event.stepId)
+    case "step.fence_classified": return onFenceClassified(state, event.jobId, event.stepId, event.classification, event.reason)
     case "human.paused":      return buildTransition([{ kind: "pause" }], { status: "paused" })
     case "human.resumed":     return onResumed(workflow, state)
     case "human.abandoned":   return buildTransition([{ kind: "abandon" }], { status: "abandoned" })
@@ -606,27 +607,38 @@ function onBudgetExhausted(
 
 /**
  * A potentially-delivered runner effect whose outcome cannot be
- * established (acp-runner design.md D6: "durable escalation, never
- * ordinary failed routing"). Unlike `onFailed`/`onBudgetExhausted`, this
- * NEVER applies the step's `onFail` route and NEVER cascades to sibling
- * or dependent jobs — an unknown external effect must not spend the
- * step's retry budget, and jobs that never touched the uncertain target
- * keep their exact current state ("parallel job state preserved"). The
- * targeted job/step is marked failed (the SAME shape
- * `Engine.recoveryCandidates`'s durable frontier already scans for, so
- * operator recovery already finds it) and the feature escalates
- * directly — there is no route left to evaluate, only an operator
- * decision (`acknowledgeUncertain` recovery, D6) to make.
+ * established. The target stays armed (job running, same current step)
+ * while the engine gathers cleanup evidence and classifies the fence —
+ * routing waits for `step.fence_classified`. Never touches the retry
+ * budget, `onFail` or sibling/dependent jobs.
  */
-function onExecutionUnknown(
+function onExecutionUnknown(state: FeatureState, jobId: string, stepId: string): Transition {
+  const jobRuntime = state.jobs[jobId]
+  if (!jobRuntime || jobRuntime.currentStep !== stepId) {
+    return noopTransition(`stale execution-unknown for "${jobId}/${stepId}"`)
+  }
+  return noopTransition(`"${jobId}/${stepId}" fenced — awaiting classification`)
+}
+
+/**
+ * `unsafe`: escalate exactly as an unrecoverable uncertainty (acp-runner
+ * D6) — the target is marked failed (the frontier operator recovery
+ * scans) and nothing cascades. Healable: the target stays armed; the
+ * engine owns the healing schedule, so routing has nothing to do.
+ */
+function onFenceClassified(
   state: FeatureState,
   jobId: string,
   stepId: string,
+  classification: "no_effect" | "replay_safe" | "unsafe",
   reason: string,
 ): Transition {
   const jobRuntime = state.jobs[jobId]
   if (!jobRuntime || jobRuntime.currentStep !== stepId) {
-    return noopTransition(`stale execution-unknown for "${jobId}/${stepId}"`)
+    return noopTransition(`stale fence classification for "${jobId}/${stepId}"`)
+  }
+  if (classification !== "unsafe") {
+    return noopTransition(`"${jobId}/${stepId}" fence is ${classification} — healing scheduled`)
   }
   return buildTransition(
     [{ kind: "escalate", reason }],

@@ -45,13 +45,13 @@ export function JobFrontierCard({ card }: JobFrontierCardProps): React.ReactNode
   const progressPercent = card.jobsTotal > 0 ? Math.min(100, Math.max(0, (card.jobsDone / card.jobsTotal) * 100)) : 0
 
   return (
-    <div className={`${styles.card} ${styles[cls]} ${attention ? styles.attention : ""}`} data-card-id={card.cardId}>
+    <div className={`${styles.card} ${styles[cls]} ${attention ? styles.attention : ""} ${card.troubled !== null ? styles.troubledCard : ""}`} data-card-id={card.cardId}>
       <Link href={baseHref} className={styles.cardLink}>
         <div className={styles.head}>
           <span className={`${styles.glyph} ${styles[cls]}`} aria-hidden="true">
             {statusGlyph(card.status)}
           </span>
-          <span className={styles.statusLabel}>{STATUS_LABEL[card.status]}</span>
+          <span className={styles.statusLabel}>{card.troubled !== null ? "attention" : STATUS_LABEL[card.status]}</span>
           {card.parallelCount > 1 ? (
             <span className={styles.parallel} title={`Active at ${card.parallelCount} jobs in parallel`}>
               ⑂ ×{card.parallelCount}
@@ -75,6 +75,11 @@ export function JobFrontierCard({ card }: JobFrontierCardProps): React.ReactNode
         {card.escalation !== null ? (
           <div className={styles.escalation} title={card.escalation}>
             {card.escalation}
+          </div>
+        ) : null}
+        {card.troubled !== null ? (
+          <div className={styles.troubled} title={card.troubled.diagnostic ?? card.troubled.summary}>
+            ⚠ {card.troubled.summary}
           </div>
         ) : null}
         {card.findingsNew > 0 ? <div className={styles.findings}>⚑ {card.findingsNew} new</div> : null}

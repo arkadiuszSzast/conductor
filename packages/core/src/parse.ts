@@ -609,7 +609,7 @@ type StepBase = Pick<StepDef, "id" | "if" | "outcomes" | "onFail" | "retry">
 function readAgentBody(node: Node | null, base: StepBase, where: string, reader: Reader): StepDef | undefined {
   const map = readMap(node, `${where}: agent`, reader)
   if (map === undefined) return undefined
-  const fields = readFields(map, `${where}: agent`, ["role", "prompt", "interactive", "ttlMs", "idleSilenceNudgeMs", "busySilenceNudgeMs", "maxNudges", "reviewHead", "fixFrom", "qualityFrom", "fixPrompt"], reader)
+  const fields = readFields(map, `${where}: agent`, ["role", "prompt", "interactive", "replaySafe", "ttlMs", "idleSilenceNudgeMs", "busySilenceNudgeMs", "maxNudges", "reviewHead", "fixFrom", "qualityFrom", "fixPrompt"], reader)
   const roleNode = requireField(fields, "role", map, `${where}: agent`, reader)
   const promptNode = requireField(fields, "prompt", map, `${where}: agent`, reader)
   const role = roleNode === undefined ? undefined : readString(roleNode, `${where}: agent: role`, reader)
@@ -618,6 +618,15 @@ function readAgentBody(node: Node | null, base: StepBase, where: string, reader:
   if (fields.has("interactive")) {
     interactive = readBoolean(fields.get("interactive")!.value, `${where}: agent: interactive`, reader)
     if (interactive === undefined) return undefined
+  }
+  let replaySafe: boolean | undefined
+  if (fields.has("replaySafe")) {
+    replaySafe = readBoolean(fields.get("replaySafe")!.value, `${where}: agent: replaySafe`, reader)
+    if (replaySafe === undefined) return undefined
+    if (replaySafe && interactive === true) {
+      reader.error(fields.get("replaySafe")!.value, `${where}: agent: replaySafe cannot be combined with interactive — an answered question may already have influenced external effects`)
+      return undefined
+    }
   }
   const limits: Partial<Record<"ttlMs" | "idleSilenceNudgeMs" | "busySilenceNudgeMs" | "maxNudges", number>> = {}
   for (const key of ["ttlMs", "idleSilenceNudgeMs", "busySilenceNudgeMs", "maxNudges"] as const) {
@@ -648,6 +657,7 @@ function readAgentBody(node: Node | null, base: StepBase, where: string, reader:
     role,
     prompt,
     ...(interactive !== undefined ? { interactive } : {}),
+    ...(replaySafe !== undefined ? { replaySafe } : {}),
     ...limits,
   }
 }

@@ -188,6 +188,7 @@ function startDaemon(input: DaemonStartInput): DaemonProcessHandle {
       ...(input.daemon.runners ? { worker: { store: daemon.store, engine: daemon.engine, readiness, clock: { now: () => Date.now() } } } : {}),
       engine: daemon.engine,
       health: () => daemon.health(),
+      testNotifications: () => daemon.testNotifications(),
       resolveWorkflow: daemon.registry.resolver,
       workflowStatus: dir => daemon.registry.getStatus(dir),
       registerProject: dir => daemon.registry.register(dir),

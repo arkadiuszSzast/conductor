@@ -14,7 +14,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { DEFAULT_CHANGE_QUEUE_INTERVAL_MS, Daemon, createApi, type ConductorApi, type ApiConfig } from "@conductor/server"
-import type { SessionClient } from "@conductor/server"
+import type { NotificationChannel, SessionClient } from "@conductor/server"
 import { validateWorkflow, parseWorkflow } from "@conductor/core"
 import { runCli, EXIT, type CliDeps, type DaemonStartInput } from "./src/cli.ts"
 import { ApiClient, ApiError } from "./src/client.ts"
@@ -106,7 +106,7 @@ interface Harness {
 
 const CLI_URL = "http://conductor.test"
 
-async function makeHarness(input?: { workflow?: string; auth?: ApiConfig["auth"]; env?: Record<string, string> }): Promise<Harness> {
+async function makeHarness(input?: { workflow?: string; auth?: ApiConfig["auth"]; env?: Record<string, string>; notificationChannel?: NotificationChannel }): Promise<Harness> {
   const project = writeProject(input?.workflow ?? gatedWorkflow)
   const sessions = new FakeSessions()
   const daemon = new Daemon(
@@ -114,8 +114,13 @@ async function makeHarness(input?: { workflow?: string; auth?: ApiConfig["auth"]
       databasePath: join(tempDir("conductor-cli-db-"), "state.db"),
       projects: [project],
       heartbeatIntervalMs: 60_000,
+      ...(input?.notificationChannel ? { notifications: { telegram: { chatId: "1", token: "t" } } } : {}),
     },
-    { sessions, logger: { log: () => {} }, scheduler: { setInterval: () => ({}), clearInterval: () => {} } },
+    {
+      sessions, logger: { log: () => {} }, scheduler: { setInterval: () => ({}), clearInterval: () => {} },
+      changeQueueTimer: { setInterval: () => ({}), clearInterval: () => {} },
+      ...(input?.notificationChannel ? { notificationChannels: { telegram: input.notificationChannel } } : {}),
+    },
   )
   daemonsToStop.push(daemon)
   await daemon.start()
@@ -127,6 +132,7 @@ async function makeHarness(input?: { workflow?: string; auth?: ApiConfig["auth"]
       health: () => daemon.health(),
       resolveWorkflow: daemon.registry.resolver,
       registerProject: dir => daemon.registry.register(dir),
+      testNotifications: () => daemon.testNotifications(),
     },
   )
   apisToClose.push(api)
@@ -1095,6 +1101,17 @@ describe("CLI: daemon config parsing", () => {
     })
   })
 
+  it("parses engine.healing and notifications (token referenced by env name only)", () => {
+    const config = assembleDaemonConfig({
+      ...base,
+      engine: { healing: { initialMs: 30000, maxMs: 600000, attentionAfter: 2, classifyTimeoutMs: 20000 } },
+      notifications: { publicBaseUrl: "https://c.example", telegram: { chatId: "-100" } },
+    })
+    expect(config.daemon.engine).toEqual({ healing: { initialMs: 30000, maxMs: 600000, attentionAfter: 2 }, fenceClassifyTimeoutMs: 20000 })
+    expect(config.notifications).toEqual({ publicBaseUrl: "https://c.example", telegram: { chatId: "-100", tokenEnv: "CONDUCTOR_TELEGRAM_BOT_TOKEN" } })
+    expect(config.daemon).not.toHaveProperty("notifications")
+  })
+
   it("omitted plugins section defaults to enabled with no extras", () => {
     const config = assembleDaemonConfig(base)
     expect(config.plugins).toEqual({ enabled: true, disabled: [], paths: [] })
@@ -1127,6 +1144,14 @@ describe("CLI: daemon config parsing", () => {
     ["non-kebab-case plugins.disabled entry", { ...base, plugins: { disabled: ["Not_Kebab"] } }, "plugins.disabled"],
     ["unknown plugins field", { ...base, plugins: { extra: true } }, "plugins.extra"],
     ["plugins not a mapping", { ...base, plugins: "nope" }, "plugins"],
+    ["inline telegram token", { ...base, notifications: { telegram: { chatId: "1", token: "secret" } } }, "must not contain the bot token"],
+    ["telegram without chatId", { ...base, notifications: { telegram: {} } }, "notifications.telegram.chatId"],
+    ["unknown notification event", { ...base, notifications: { telegram: { chatId: "1", events: ["everything"] } } }, "notifications.telegram.events"],
+    ["unknown notifications field", { ...base, notifications: { slack: {} } }, "notifications.slack"],
+    ["non-http publicBaseUrl", { ...base, notifications: { publicBaseUrl: "conductor.local" } }, "publicBaseUrl"],
+    ["unknown healing field", { ...base, engine: { healing: { forever: true } } }, "engine.healing.forever"],
+    ["healing max below initial", { ...base, engine: { healing: { initialMs: 60000, maxMs: 1000 } } }, "maxMs"],
+    ["non-integer attentionAfter", { ...base, engine: { healing: { attentionAfter: 2.5 } } }, "attentionAfter"],
   ])("rejects %s", (_name, raw, needle) => {
     expect(() => assembleDaemonConfig(raw)).toThrow(needle as string)
   })
@@ -1384,6 +1409,21 @@ auth:
     expect(h.out.some(line => line.includes("non-loopback"))).toBe(true)
   })
 
+  it("resolves the Telegram token from the environment into the daemon config", async () => {
+    const h = harnessWithConfig({ TG_TOKEN: "123:abc" })
+    h.deps.writeFile("/daemon.yaml", `${CONFIG}notifications:\n  telegram:\n    chatId: "-100"\n    tokenEnv: TG_TOKEN\n    events: [attention, escalated]\n`)
+    expect(await runCli(["daemon", "--config", "/daemon.yaml"], h.deps)).toBe(EXIT.ok)
+    expect(h.starts[0]!.daemon.notifications).toEqual({ telegram: { chatId: "-100", token: "123:abc", events: ["attention", "escalated"] } })
+  })
+
+  it("refuses to start when the Telegram token variable is unset, naming it", async () => {
+    const h = harnessWithConfig({})
+    h.deps.writeFile("/daemon.yaml", `${CONFIG}notifications:\n  telegram:\n    chatId: 42\n`)
+    expect(await runCli(["daemon", "--config", "/daemon.yaml"], h.deps)).toBe(EXIT.usage)
+    expect(h.err.join("\n")).toContain("CONDUCTOR_TELEGRAM_BOT_TOKEN")
+    expect(h.starts.length).toBe(0)
+  })
+
   it("no override leaves the config bind untouched and no non-loopback warning fires", async () => {
     const h = harnessWithConfig({})
     expect(await runCli(["daemon", "--config", "/daemon.yaml"], h.deps)).toBe(EXIT.ok)
@@ -1435,5 +1475,47 @@ auth:
     ["::", true],
   ])("host %s → non-loopback warning: %p", async (host, expected) => {
     expect(await warningFor(host as string)).toBe(expected as boolean)
+  })
+})
+
+describe("CLI: notify test", () => {
+  it("reports each channel's result and exits ok when all succeed", async () => {
+    const sent: string[] = []
+    const h = await makeHarness({ notificationChannel: { id: "telegram", send: async message => { sent.push(message.kind) } } })
+    expect(await h.run("notify", "test")).toBe(EXIT.ok)
+    expect(h.out).toContain("telegram: ok")
+    expect(sent).toEqual(["test"])
+  })
+
+  it("exits with failure and the reason when a channel fails", async () => {
+    const h = await makeHarness({ notificationChannel: { id: "telegram", send: async () => { throw new Error("HTTP 401: Unauthorized") } } })
+    expect(await h.run("notify", "test")).toBe(EXIT.failure)
+    expect(h.out.join("\n")).toContain("telegram: failed — HTTP 401: Unauthorized")
+  })
+
+  it("explains when no channel is configured", async () => {
+    const h = await makeHarness()
+    expect(await h.run("notify", "test")).toBe(EXIT.failure)
+    expect(h.err.join("\n")).toContain("no notification channels configured")
+  })
+
+  it("rejects other subcommands", async () => {
+    const h = await makeHarness()
+    expect(await h.run("notify", "send")).toBe(EXIT.usage)
+  })
+})
+
+describe("CLI: status shows attention", () => {
+  it("projects a troubled running feature as attention with per-target detail", async () => {
+    const h = await makeHarness()
+    const { featureId } = await startFeature(h)
+    h.daemon.store.upsertAttention({ featureId, jobId: "main", stepId: "implement", source: "healing", consecutiveFailures: 3, lastDiagnostic: "ACP create outcome unknown", nextAttemptAt: Date.UTC(2026, 9, 2, 0, 41) })
+    expect(await h.run("status", featureId)).toBe(EXIT.ok)
+    expect(h.out).toContain("status   attention")
+    expect(h.out.some(line => line.startsWith("attention main/implement: 3 consecutive failures (healing, next attempt"))).toBe(true)
+    expect(h.out).toContain("  ACP create outcome unknown")
+    h.out.length = 0
+    expect(await h.run("status")).toBe(EXIT.ok)
+    expect(h.out[0]).toContain("  attention  ")
   })
 })

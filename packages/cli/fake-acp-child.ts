@@ -8,7 +8,9 @@ for await (const line of lines) {
   const request = JSON.parse(line)
   const respond = (result: unknown) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\n")
   if (request.method === "initialize") respond({ protocolVersion: 1, agentCapabilities: {} })
-  else if (request.method === "session/new") {
+  else if (request.method === "session/new" && process.argv.includes("--hang-session-new")) {
+    // Reproduces a host stall: session/new never answers (self-healing e2e).
+  } else if (request.method === "session/new") {
     // --no-bridge-connect: composition conformance fixture for "missing
     // readiness -> zero prompt" (D8: "Missing readiness fails closed
     // with zero prompts") — deliberately never connects to the injected

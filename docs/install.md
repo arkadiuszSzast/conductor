@@ -368,8 +368,11 @@ boundary, Conductor treats a lost response, process death, daemon
 restart, connection EOF, a turn/no-report deadline or cancellation as
 **execution-uncertain**, never as proof of failure or success — it
 fences the run (`run.status: "uncertain"`), revokes that attempt's
-worker credential, and stops all automatic routing for it (no retry,
-no `onFail`, no nudge, no downstream dispatch). A persisted session id
+worker credential, and stops all ordinary routing for it (no retry
+budget, no `onFail`, no nudge, no downstream dispatch). Fences that are
+provably safe to replay are then healed automatically — see
+[Self-healing of uncertain runs](#self-healing-of-uncertain-runs); every
+other fence escalates. A persisted session id
 after a restart is a diagnostic only, never proof of a live process:
 Conductor never reloads or replays an ACP conversation to "recover" an
 uncertain run automatically. At startup, durably completed answer operations
@@ -396,6 +399,76 @@ on its own ACP turn ending (that would deadlock), so cleanup runs
 asynchronously and is drained before SQLite closes. This is
 best-effort process-group cleanup, not a guarantee against escaped
 descendants — see the sandbox note above.
+
+### Self-healing of uncertain runs
+
+Once the fenced process's cleanup evidence is in (bounded by
+`engine.healing.classifyTimeoutMs`, default 15 s), the fence is classified
+from durable evidence:
+
+| Classification | When | What happens |
+|---|---|---|
+| `no_effect` | No session was ever bound, no prompt left the journal's `prepared` phase, and the process group is **confirmed** terminated — e.g. `session/new` hung during a host stall. | Healed automatically. |
+| `replay_safe` | The step declares `replaySafe: true` and the process group is confirmed terminated. | Healed automatically. |
+| `unsafe` | Anything else, including any unconfirmed cleanup or an open answer delivery. | Escalates; acknowledged `recover` required (above). |
+
+Healing resolves the fence with an audit note (`system.healed` in the
+timeline; the old run stays `uncertain` in history and is never resent) and
+schedules a fresh attempt with exponential backoff and full jitter: 1 min, 2,
+4, 8, … capped at 30 min, **without an attempt limit**. Healing does not
+spend the step's `retry` budget. Pause suspends it; abandon cancels it.
+
+After `attentionAfter` consecutive failed heals (default 3) — or once an
+ordinary transient retry has used half its budget — the feature shows
+**attention**: still `running` and still retrying, but flagged on the board,
+in `conductor status` and through notifications. The first successful run of
+the troubled step clears it and sends a `recovered` notification.
+
+```yaml
+engine:
+  healing:
+    initialMs: 60000        # first heal delay
+    maxMs: 1800000          # backoff cap
+    attentionAfter: 3       # consecutive failures before "attention"
+    classifyTimeoutMs: 15000
+```
+
+Mark read-only steps (reviews, quality reports) `replaySafe: true` in the
+workflow — they then heal from lost prompts and turn deadlines too, not only
+from a session that was never created.
+
+### Notifications
+
+The daemon can push operator-relevant events to Telegram: `attention`,
+`recovered`, `escalated`, `waiting_human` (gate or question) and `done`.
+Notifications are written to a durable outbox in the same transaction as the
+state change, so a crash never loses one, and are delivered asynchronously
+with retries (up to 24 h) — a dead channel never blocks the pipeline.
+Repeats of the same kind for the same feature within `rateLimitWindowMs`
+(default 15 min) are suppressed and counted in the next message;
+`recovered` and `done` are never suppressed.
+
+```yaml
+notifications:
+  publicBaseUrl: https://conductor.example.com   # optional: adds an "open" link
+  telegram:
+    chatId: "-1001234567890"
+    tokenEnv: CONDUCTOR_TELEGRAM_BOT_TOKEN       # default; the token itself never goes in this file
+    # events: [attention, recovered, escalated, waiting_human, done]
+```
+
+Setup: create a bot with @BotFather, add it to your chat (or message it
+once), read the chat id from
+`https://api.telegram.org/bot<token>/getUpdates`, export the token in the
+daemon's environment (e.g. a systemd `EnvironmentFile`), restart the daemon,
+then verify with:
+
+```sh
+conductor notify test
+```
+
+The daemon refuses to start when a Telegram channel is configured but its
+token variable is unset.
 
 ### ACP turn completion is never workflow success
 
@@ -731,7 +804,9 @@ pause the queue and stop queueing; the queue tables can stay.
 - **A run is stuck `uncertain`** — this is the ACP integration's
   fail-closed default when a create/prompt outcome could not be proven
   (lost response, crash, restart, timeout). It is not treated as failed
-  or successful and will not automatically retry. See
+  or successful. `no_effect`/`replay_safe` fences heal on their own (the
+  run inspector says "healing scheduled"); an escalated feature means the
+  fence was classified `unsafe`. See
   [Restart, shutdown and unknown execution](#restart-shutdown-and-unknown-execution)
   above and [Recovering an escalated feature](http-api.md#recovering-an-escalated-feature)
   for the required `--acknowledge-uncertain --expected-version

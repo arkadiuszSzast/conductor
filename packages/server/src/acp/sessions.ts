@@ -127,6 +127,10 @@ function digestPayload(payload: unknown): string {
 export class ManagedSessions implements SessionClient {
   private readonly reservations = new Map<string, Reservation>()
   private readonly sessions = new Map<string, ManagedSession>()
+  /** Termination evidence for runs whose reservation was torn down before
+   *  a session existed (failed/lost session/new) — consumed by cleanupRun,
+   *  which otherwise finds no session and could only report unconfirmed. */
+  private readonly terminatedWithoutSession = new Map<string, Promise<"confirmed_terminated" | "unconfirmed">>()
   private slotsInUse = 0
 
   constructor(private readonly deps: ManagedSessionsDeps) {}
@@ -305,6 +309,7 @@ export class ManagedSessions implements SessionClient {
     }
     const submitted = reservation.journal.track(operation.id)
     let response: schema.NewSessionResponse
+    const createStartedAt = Date.now()
     try {
       const responsePromise = reservation.connectionHandle.connection.newSession(request)
       void responsePromise.catch(() => {})
@@ -323,9 +328,17 @@ export class ManagedSessions implements SessionClient {
       // `lost_create_response` fence reason rather than collapsing it
       // into the generic `lost_prompt_response` every other unknown
       // prompt/answer outcome uses.
-      this.markUnknown(operation.id, "create_response_lost")
-      await this.releaseReservation(input.reservationId, "session/new failed")
-      throw new RunnerOperationError(`ACP session/new failed or was lost: ${errorMessage(error)}`, {
+      const detail = describeUnknown("session/new", error, createStartedAt)
+      // Register the teardown BEFORE the unknown phase becomes observable:
+      // a reconcile pass may fence and ask for cleanup evidence the moment
+      // markUnknown commits, and must wait for this termination proof.
+      const teardown = this.releaseReservation(input.reservationId, "session/new failed")
+        .then(() => reservation.processHandle.groupAbsent?.() === true ? "confirmed_terminated" as const : "unconfirmed" as const)
+        .catch(() => "unconfirmed" as const)
+      this.terminatedWithoutSession.set(input.runId, teardown)
+      this.markUnknown(operation.id, "create_response_lost", detail)
+      await teardown
+      throw new RunnerOperationError(`ACP session/new failed or was lost: ${detail}`, {
         delivery: "unknown",
         ...(input.operationId !== undefined ? { operationId: input.operationId } : {}),
       })
@@ -425,7 +438,11 @@ export class ManagedSessions implements SessionClient {
   async cleanupRun(runId: string, sessionId: string | null): Promise<"confirmed_terminated" | "unconfirmed"> {
     const session = (sessionId ? this.sessions.get(sessionId) : undefined)
       ?? [...this.sessions.values()].find(candidate => candidate.runId === runId)
-    if (!session) return "unconfirmed"
+    if (!session) {
+      const evidence = await (this.terminatedWithoutSession.get(runId) ?? "unconfirmed")
+      this.terminatedWithoutSession.delete(runId)
+      return evidence
+    }
     await this.abort(sessionId ?? [...this.sessions.entries()].find(([, value]) => value === session)![0])
     return session.reservation.processHandle.groupAbsent?.() === true ? "confirmed_terminated" : "unconfirmed"
   }
@@ -523,13 +540,14 @@ export class ManagedSessions implements SessionClient {
     // `lost_prompt_response`) instead of collapsing every unknown-outcome
     // cause into one reason code. Purely descriptive/audit, exactly like
     // the reason code itself — never changes the fencing decision.
-    const fail = (diagnosticCode: "write_timeout" | "response_lost" | "turn_deadline_exceeded" = "response_lost") => {
+    const fail = (diagnosticCode: "write_timeout" | "response_lost" | "turn_deadline_exceeded" = "response_lost", detail?: string) => {
       if (turn.stopReason !== undefined || turn.diagnostic) return
       turn.cancelDeadline?.()
       turn.status = "completed"
       turn.diagnostic = "ACP turn outcome unknown"
-      this.markUnknown(operationId, diagnosticCode)
+      this.markUnknown(operationId, diagnosticCode, detail ?? defaultUnknownDetail(diagnosticCode, deadlines))
     }
+    const promptStartedAt = Date.now()
     const promptPromise = session.reservation.connectionHandle.connection.prompt(request)
     void promptPromise.catch(() => {})
     // Responses can precede write completion. Never commit completion until
@@ -546,13 +564,14 @@ export class ManagedSessions implements SessionClient {
       turn.status = "completed"
       turn.stopReason = response.stopReason
       this.deps.onOperationObserved?.(operationId, { status: "completed", stopReason: response.stopReason })
-    }).catch(() => fail("response_lost"))
+    }).catch(error => fail("response_lost", describeUnknown("session/prompt", error, promptStartedAt)))
     void completion.catch(() => {})
     try {
       await withTimeout(submitted, deadlines.writeMs, "session/prompt write")
-    } catch {
-      fail("write_timeout")
-      throw new RunnerOperationError("ACP write outcome unknown", { delivery: "unknown", operationId })
+    } catch (error) {
+      const detail = describeUnknown("session/prompt write", error, promptStartedAt)
+      fail("write_timeout", detail)
+      throw new RunnerOperationError(`ACP write outcome unknown: ${detail}`, { delivery: "unknown", operationId })
     }
     if (turn.status !== "completed") {
       this.deps.onOperationObserved?.(operationId, { status: "submitted" })
@@ -572,10 +591,13 @@ export class ManagedSessions implements SessionClient {
    *  waits, not process handles") — the durable safety layer (task 2.x)
    *  is the source of truth across restarts, this is only the live,
    *  same-process fast path. */
-  private markUnknown(operationId: string, diagnosticCode?: string): void {
+  private markUnknown(operationId: string, diagnosticCode?: string, diagnostic?: string): void {
     try {
       const operation = this.deps.store.getOperation(operationId)
-      if (operation && operation.phase !== "completed" && this.deps.store.transitionOperationPhase(operationId, operation.phase, "unknown", { diagnosticCode })) {
+      if (operation && operation.phase !== "completed" && this.deps.store.transitionOperationPhase(operationId, operation.phase, "unknown", {
+        ...(diagnosticCode !== undefined ? { diagnosticCode } : {}),
+        ...(diagnostic !== undefined ? { diagnostic } : {}),
+      })) {
         this.deps.onOperationObserved?.(operationId, { status: "unknown" })
       }
     } catch {
@@ -655,9 +677,11 @@ export class ManagedSessions implements SessionClient {
 
 // ------------------------------------------------------------------ helpers
 
+class AcpDeadlineError extends Error {}
+
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} exceeded ${timeoutMs}ms deadline`)), timeoutMs)
+    const timer = setTimeout(() => reject(new AcpDeadlineError(`${label} exceeded ${timeoutMs}ms deadline`)), timeoutMs)
     promise.then(
       value => {
         clearTimeout(timer)
@@ -674,6 +698,20 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
 function errorMessage(_error: unknown): string {
   // Provider/SDK errors may echo frames containing injected bridge credentials.
   return "ACP transport or process failure"
+}
+
+/** Only our own deadline messages are safe to persist verbatim; anything
+ *  from the peer stays redacted. Elapsed wall time is always recorded —
+ *  elapsed far beyond the deadline means the host (not the agent) stalled. */
+function describeUnknown(label: string, error: unknown, startedAt: number): string {
+  const what = error instanceof AcpDeadlineError ? error.message : `${label}: ${errorMessage(error)}`
+  return `${what} (elapsed ${Date.now() - startedAt}ms)`
+}
+
+function defaultUnknownDetail(code: string, deadlines: AcpDeadlines): string {
+  return code === "turn_deadline_exceeded"
+    ? `session/prompt turn exceeded ${deadlines.turnMs}ms deadline`
+    : `session/prompt outcome lost (${code})`
 }
 
 export { sanitizeStderrTail }

@@ -34,6 +34,7 @@ export interface DaemonFileConfig {
   readonly daemon: DaemonConfig
   readonly api: ApiConfig
   readonly plugins: PluginsFileConfig
+  readonly notifications?: NotificationsFileConfig
 }
 
 const TOP_LEVEL_FIELDS = new Set([
@@ -48,9 +49,29 @@ const TOP_LEVEL_FIELDS = new Set([
   "actions",
   "plugins",
   "runners",
+  "notifications",
 ])
 
-const ENGINE_FIELDS = new Set(["runTtlMs", "idleSilenceNudgeMs", "busySilenceNudgeMs", "nudgeIdleCycles", "maxNudges"])
+const ENGINE_FIELDS = new Set(["runTtlMs", "idleSilenceNudgeMs", "busySilenceNudgeMs", "nudgeIdleCycles", "maxNudges", "healing"])
+const HEALING_FIELDS = new Set(["initialMs", "maxMs", "attentionAfter", "classifyTimeoutMs"])
+const NOTIFICATION_FIELDS = new Set(["publicBaseUrl", "rateLimitWindowMs", "intervalMs", "telegram"])
+const TELEGRAM_FIELDS = new Set(["chatId", "tokenEnv", "events"])
+const NOTIFICATION_EVENTS = new Set(["attention", "recovered", "escalated", "waiting_human", "done"])
+
+/** Telegram channel as written in the file — the token is referenced by
+ *  environment variable name only, resolved when the daemon starts. */
+export interface TelegramFileConfig {
+  readonly chatId: string
+  readonly tokenEnv: string
+  readonly events?: readonly string[]
+}
+
+export interface NotificationsFileConfig {
+  readonly publicBaseUrl?: string
+  readonly rateLimitWindowMs?: number
+  readonly intervalMs?: number
+  readonly telegram?: TelegramFileConfig
+}
 const ACTIONS_FIELDS = new Set(["bundledPath", "localPaths"])
 const BIND_FIELDS = new Set(["host", "port"])
 const AUTH_FIELDS = new Set(["mode", "token"])
@@ -149,6 +170,10 @@ export function assembleDaemonConfig(raw: unknown): DaemonFileConfig {
     for (const field of ENGINE_FIELDS) {
       const value = engine[field]
       if (value === undefined) continue
+      if (field === "healing") {
+        engineTuning = { ...engineTuning, ...parseHealing(value) }
+        continue
+      }
       if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
         throw new UsageError(`"engine.${field}" must be a positive number`)
       }
@@ -216,6 +241,7 @@ export function assembleDaemonConfig(raw: unknown): DaemonFileConfig {
     }
   }
 
+  const notifications = raw["notifications"] === undefined ? undefined : parseNotifications(raw["notifications"])
   const runners = raw["runners"] === undefined ? undefined : parseRunners(raw["runners"])
   if (runners && apiAuth.mode !== "bearer") throw new UsageError('"runners" requires "auth.mode: bearer"')
   return {
@@ -238,6 +264,98 @@ export function assembleDaemonConfig(raw: unknown): DaemonFileConfig {
       disabled: pluginsDisabled,
       paths: pluginsPaths,
     },
+    ...(notifications !== undefined ? { notifications } : {}),
+  }
+}
+
+function positiveInteger(value: unknown, path: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) throw new UsageError(`"${path}" must be a positive integer`)
+  return value
+}
+
+function parseHealing(value: unknown): EngineOptions {
+  if (!isObject(value)) throw new UsageError('"engine.healing" must be a mapping')
+  for (const key of Object.keys(value)) {
+    if (!HEALING_FIELDS.has(key)) throw new UsageError(`unknown daemon config field "engine.healing.${key}"`)
+  }
+  const healing: { initialMs?: number; maxMs?: number; attentionAfter?: number } = {}
+  if (value["initialMs"] !== undefined) healing.initialMs = positiveInteger(value["initialMs"], "engine.healing.initialMs")
+  if (value["maxMs"] !== undefined) healing.maxMs = positiveInteger(value["maxMs"], "engine.healing.maxMs")
+  if (value["attentionAfter"] !== undefined) healing.attentionAfter = positiveInteger(value["attentionAfter"], "engine.healing.attentionAfter")
+  if (healing.initialMs !== undefined && healing.maxMs !== undefined && healing.maxMs < healing.initialMs) {
+    throw new UsageError('"engine.healing.maxMs" must be ≥ "engine.healing.initialMs"')
+  }
+  return {
+    healing,
+    ...(value["classifyTimeoutMs"] !== undefined ? { fenceClassifyTimeoutMs: positiveInteger(value["classifyTimeoutMs"], "engine.healing.classifyTimeoutMs") } : {}),
+  }
+}
+
+function parseNotifications(value: unknown): NotificationsFileConfig {
+  if (!isObject(value)) throw new UsageError('"notifications" must be a mapping')
+  for (const key of Object.keys(value)) {
+    if (!NOTIFICATION_FIELDS.has(key)) throw new UsageError(`unknown daemon config field "notifications.${key}"`)
+  }
+  const publicBaseUrl = value["publicBaseUrl"]
+  if (publicBaseUrl !== undefined && (!isNonEmptyString(publicBaseUrl) || !/^https?:\/\//.test(publicBaseUrl))) {
+    throw new UsageError('"notifications.publicBaseUrl" must be an http(s) URL')
+  }
+  let telegram: TelegramFileConfig | undefined
+  const rawTelegram = value["telegram"]
+  if (rawTelegram !== undefined) {
+    if (!isObject(rawTelegram)) throw new UsageError('"notifications.telegram" must be a mapping')
+    for (const key of Object.keys(rawTelegram)) {
+      if (key === "token" || key === "botToken") {
+        throw new UsageError('"notifications.telegram" must not contain the bot token — set "tokenEnv" to the name of an environment variable holding it')
+      }
+      if (!TELEGRAM_FIELDS.has(key)) throw new UsageError(`unknown daemon config field "notifications.telegram.${key}"`)
+    }
+    const chatId = rawTelegram["chatId"]
+    const chat = typeof chatId === "number" && Number.isSafeInteger(chatId) ? String(chatId) : chatId
+    if (!isNonEmptyString(chat)) throw new UsageError('"notifications.telegram.chatId" is required (the numeric chat id or @channel)')
+    const tokenEnv = rawTelegram["tokenEnv"] ?? "CONDUCTOR_TELEGRAM_BOT_TOKEN"
+    if (!isNonEmptyString(tokenEnv) || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(tokenEnv)) {
+      throw new UsageError('"notifications.telegram.tokenEnv" must be an environment variable name')
+    }
+    const events = rawTelegram["events"]
+    if (events !== undefined && (!Array.isArray(events) || events.length === 0 || !events.every(event => isString(event) && NOTIFICATION_EVENTS.has(event)))) {
+      throw new UsageError(`"notifications.telegram.events" must be a non-empty list of: ${[...NOTIFICATION_EVENTS].join(", ")}`)
+    }
+    telegram = { chatId: chat, tokenEnv, ...(events !== undefined ? { events: events as string[] } : {}) }
+  }
+  return {
+    ...(publicBaseUrl !== undefined ? { publicBaseUrl } : {}),
+    ...(value["rateLimitWindowMs"] !== undefined ? { rateLimitWindowMs: positiveInteger(value["rateLimitWindowMs"], "notifications.rateLimitWindowMs") } : {}),
+    ...(value["intervalMs"] !== undefined ? { intervalMs: positiveInteger(value["intervalMs"], "notifications.intervalMs") } : {}),
+    ...(telegram !== undefined ? { telegram } : {}),
+  }
+}
+
+/** Resolve secrets referenced by the notifications section into the
+ *  daemon's runtime config. A configured channel whose secret is missing
+ *  is a startup error naming the variable — never a silently dead channel. */
+export function resolveNotifications(
+  file: NotificationsFileConfig | undefined,
+  env: Readonly<Record<string, string | undefined>>,
+): import("@conductor/server").NotificationsConfig | undefined {
+  if (file === undefined) return undefined
+  let telegram: NonNullable<import("@conductor/server").NotificationsConfig["telegram"]> | undefined
+  if (file.telegram) {
+    const token = env[file.telegram.tokenEnv]
+    if (token === undefined || token.trim() === "") {
+      throw new UsageError(`notifications.telegram is configured but environment variable ${file.telegram.tokenEnv} (the bot token) is not set`)
+    }
+    telegram = {
+      chatId: file.telegram.chatId,
+      token: token.trim(),
+      ...(file.telegram.events !== undefined ? { events: file.telegram.events as import("@conductor/server").NotificationKind[] } : {}),
+    }
+  }
+  return {
+    ...(file.publicBaseUrl !== undefined ? { publicBaseUrl: file.publicBaseUrl } : {}),
+    ...(file.rateLimitWindowMs !== undefined ? { rateLimitWindowMs: file.rateLimitWindowMs } : {}),
+    ...(file.intervalMs !== undefined ? { intervalMs: file.intervalMs } : {}),
+    ...(telegram !== undefined ? { telegram } : {}),
   }
 }
 
@@ -347,6 +465,23 @@ heartbeatIntervalMs: 5000
 #   runTtlMs: 3600000
 #   idleSilenceNudgeMs: 120000
 #   busySilenceNudgeMs: 600000
+#   # Self-healing of uncertain agent runs (lost session/new, lost prompt
+#   # on a replaySafe step): exponential backoff from initialMs to maxMs,
+#   # forever; "attention" after attentionAfter consecutive failures.
+#   healing:
+#     initialMs: 60000
+#     maxMs: 1800000
+#     attentionAfter: 3
+
+# Optional push notifications (attention, recovered, escalated,
+# waiting_human, done). The bot token is read from the environment
+# variable named by tokenEnv — never written in this file.
+# notifications:
+#   publicBaseUrl: https://conductor.example.com
+#   telegram:
+#     chatId: "-1001234567890"
+#     tokenEnv: CONDUCTOR_TELEGRAM_BOT_TOKEN
+#     # events: [attention, recovered, escalated, waiting_human, done]
 
 # Optional local action registry paths. In a compiled binary the bundled
 # action manifests are not on disk: point "bundledPath" at a checkout's

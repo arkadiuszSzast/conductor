@@ -71,7 +71,10 @@ export function journalAcpStream(stream: Stream, store: RunnerSafetyStore, gener
           } catch (error) {
             if (tracked) {
               try {
-                store.transitionOperationPhase(tracked.operationId, "sending", "unknown")
+                store.transitionOperationPhase(tracked.operationId, "sending", "unknown", {
+                  diagnosticCode: "write_failed",
+                  diagnostic: error instanceof RunnerOperationError ? error.message : "ACP stdin write failed",
+                })
               } finally {
                 tracked.reject(error)
               }

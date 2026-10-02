@@ -147,6 +147,8 @@ describe("4.4: safe run/feature projections for uncertainty", () => {
       { runId, jobId: "main", stepId: "implement", reasonCode: "cancellation_during_uncertain_write", diagnostic: "ACP interrupted without authoritative report" },
       () => undefined,
     )
+    store.markRunActionHandled(runId)
+    store.classifyFenceExecution(runId, { classification: "unsafe", evidence: {}, planHealing: () => ({ delayMs: 0, attention: false }) }, () => undefined)
     expect(store.hasUnresolvedRunnerFence(featureId)).toBe(true)
 
     const response = await request("POST", `/v1/features/${featureId}/resume`)
@@ -176,5 +178,30 @@ describe("4.4: safe run/feature projections for uncertainty", () => {
     const responseB = await request("GET", `/v1/runs/${runB.runId}`)
     const bodyB = await responseB.json() as { run: Record<string, unknown> }
     expect(bodyB.run["profileId"]).toBe("profile-b")
+  })
+})
+
+describe("self-healing projections", () => {
+  it("a healable fence shows healing activity, then attention with its targets", async () => {
+    const { store, request, daemon } = await makeApi()
+    const { featureId, runId } = seedRunningRun(store, daemon.registry.list()[0]!.projectDir)
+    store.bindRunnerTransport({ runId, transport: "acp", profileId: "opencode-acp", directory: "/tmp", daemonGeneration: 1 })
+    store.fenceRunnerExecution({ runId, jobId: "main", stepId: "implement", reasonCode: "lost_create_response", diagnostic: "session/new lost" }, () => undefined)
+    store.markRunActionHandled(runId)
+    store.classifyFenceExecution(runId, { classification: "no_effect", evidence: {}, planHealing: () => ({ delayMs: 60_000, attention: false }) }, () => undefined)
+
+    let body = await (await request("GET", `/v1/features/${featureId}`)).json() as { feature: Record<string, any> }
+    expect(body.feature["status"]).toBe("running")
+    expect(body.feature["attention"]).toBeNull()
+    expect(body.feature["activity"]).toMatchObject({ state: "waiting_retry", reason: "healing:no_effect", target: { jobId: "main", stepId: "implement" } })
+    const run = await (await request("GET", `/v1/runs/${runId}`)).json() as { run: Record<string, any> }
+    expect(run.run["uncertain"]).toMatchObject({ classification: "no_effect", autoHealing: true })
+
+    store.upsertAttention({ featureId, jobId: "main", stepId: "implement", source: "healing", consecutiveFailures: 3, lastDiagnostic: "session/new lost", nextAttemptAt: 123 })
+    body = await (await request("GET", `/v1/features/${featureId}`)).json() as { feature: Record<string, any> }
+    expect(body.feature["activity"]).toMatchObject({ state: "attention", diagnostic: "session/new lost" })
+    expect(body.feature["attention"].targets).toEqual([{ jobId: "main", stepId: "implement", source: "healing", consecutiveFailures: 3, lastDiagnostic: "session/new lost", nextAttemptAt: 123 }])
+    const list = await (await request("GET", "/v1/features")).json() as { features: Record<string, any>[] }
+    expect(list.features[0]?.["attention"]?.targets).toHaveLength(1)
   })
 })

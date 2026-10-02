@@ -153,3 +153,12 @@ export {
   progressAnchors,
 } from "./invariant.ts"
 export type { AnchorState, InvariantCheckResult, ProgressAnchor } from "./invariant.ts"
+export {
+  DEFAULT_HEALING_POLICY,
+  classifyFence,
+  healingDelayMs,
+  isHealable,
+  needsAttention,
+  normalizeHealingPolicy,
+} from "./healing.ts"
+export type { FenceClassification, FenceCleanupEvidence, FenceEvidence, HealingPolicy } from "./healing.ts"

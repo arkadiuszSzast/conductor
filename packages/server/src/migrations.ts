@@ -971,6 +971,86 @@ export const migrations: readonly Migration[] = [
       db.run("CREATE INDEX idx_change_queue_transition_entry ON change_queue_transition(entry_id, id)")
     },
   },
+  {
+    id: "0026_runner_operation_diagnostic",
+    up(db) {
+      db.run("ALTER TABLE runner_operation ADD COLUMN diagnostic TEXT")
+    },
+  },
+  {
+    id: "0027_self_healing",
+    up(db) {
+      // Fence classification (self-healing D1). NULL = awaiting cleanup
+      // evidence; evidence is the JSON the classification was computed from.
+      db.run(`ALTER TABLE runner_fence ADD COLUMN classification TEXT
+        CHECK(classification IS NULL OR classification IN ('no_effect','replay_safe','unsafe'))`)
+      db.run("ALTER TABLE runner_fence ADD COLUMN evidence TEXT")
+      db.run("ALTER TABLE runner_fence ADD COLUMN classified_at INTEGER")
+      // Healing episodes (D3): one scheduled heal per fenced target. A
+      // fresh table rather than retry_episode — healing has no attempt or
+      // elapsed budget and must never collide with the one-open-retry
+      // uniqueness index or the retry budget arithmetic.
+      db.run(`
+        CREATE TABLE healing_episode (
+          id                   TEXT PRIMARY KEY,
+          feature_id           TEXT NOT NULL REFERENCES feature(id) ON DELETE CASCADE,
+          job_id               TEXT NOT NULL,
+          step_id              TEXT NOT NULL,
+          fence_run_id         TEXT NOT NULL,
+          classification       TEXT NOT NULL CHECK(classification IN ('no_effect','replay_safe')),
+          status               TEXT NOT NULL CHECK(status IN ('scheduled','claimed','closed')),
+          consecutive_failures INTEGER NOT NULL,
+          next_attempt_at      INTEGER NOT NULL,
+          delay_ms             INTEGER NOT NULL,
+          diagnostic           TEXT,
+          closed_reason        TEXT,
+          time_created         INTEGER NOT NULL,
+          time_updated         INTEGER NOT NULL
+        )
+      `)
+      db.run(`CREATE UNIQUE INDEX idx_healing_episode_open ON healing_episode(feature_id, job_id, step_id)
+        WHERE status IN ('scheduled','claimed')`)
+      db.run("CREATE UNIQUE INDEX idx_healing_episode_fence ON healing_episode(fence_run_id)")
+      db.run("CREATE INDEX idx_healing_episode_due ON healing_episode(status, next_attempt_at)")
+      // Attention (D4): durable per-target trouble; the API projects a
+      // `running` feature with any row here as `attention`.
+      db.run(`
+        CREATE TABLE feature_attention (
+          feature_id           TEXT NOT NULL REFERENCES feature(id) ON DELETE CASCADE,
+          job_id               TEXT NOT NULL,
+          step_id              TEXT NOT NULL,
+          source               TEXT NOT NULL CHECK(source IN ('healing','retry')),
+          consecutive_failures INTEGER NOT NULL,
+          last_diagnostic      TEXT,
+          next_attempt_at      INTEGER,
+          time_created         INTEGER NOT NULL,
+          time_updated         INTEGER NOT NULL,
+          PRIMARY KEY (feature_id, job_id, step_id)
+        )
+      `)
+      // Notification outbox (notifications spec).
+      db.run(`
+        CREATE TABLE notification_outbox (
+          id              TEXT PRIMARY KEY,
+          feature_id      TEXT NOT NULL,
+          kind            TEXT NOT NULL CHECK(kind IN ('attention','recovered','escalated','waiting_human','done','test')),
+          channel         TEXT NOT NULL,
+          dedup_key       TEXT NOT NULL,
+          payload         TEXT NOT NULL,
+          status          TEXT NOT NULL CHECK(status IN ('pending','claimed','sent','suppressed','failed')),
+          attempts        INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at INTEGER NOT NULL,
+          last_error      TEXT,
+          time_created    INTEGER NOT NULL,
+          time_updated    INTEGER NOT NULL,
+          time_sent       INTEGER
+        )
+      `)
+      db.run("CREATE UNIQUE INDEX idx_notification_dedup ON notification_outbox(channel, dedup_key)")
+      db.run("CREATE INDEX idx_notification_due ON notification_outbox(status, next_attempt_at)")
+      db.run("CREATE INDEX idx_notification_feature ON notification_outbox(feature_id, kind, channel, time_sent)")
+    },
+  },
 ]
 
 function validateMigrations(ordered: readonly Migration[]): void {

@@ -20,7 +20,7 @@
  *   7 daemon unreachable
  */
 
-import { ApiClient, ApiError, type FetchLike, type TransitionView } from "./client.ts"
+import { ApiClient, ApiError, type ActivityView, type AttentionView, type FetchLike, type TransitionView } from "./client.ts"
 import { resolveConnection, UsageError } from "./config.ts"
 import type { ApiConfig, DaemonConfig, DaemonLogEntry } from "@conductor/server"
 import {
@@ -28,6 +28,7 @@ import {
   addProjectToConfig,
   defaultDaemonConfig,
   loadDaemonConfig,
+  resolveNotifications,
   platformPaths,
   type PluginsFileConfig,
 } from "./daemon-config.ts"
@@ -150,6 +151,8 @@ commands:
                        (--expected-version rejects a stale view; the
                        key dedupes a retried delivery)
   logs <feature-id>    print the feature's transition timeline
+  notify test          send a test message through every configured
+                       notification channel and report per-channel results
 
 exit codes: 0 ok, 1 failure, 2 usage, 3 unauthorized, 4 not found,
             5 conflict, 6 duplicate report, 7 daemon unreachable`
@@ -338,6 +341,7 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
     "abandon",
     "recover",
     "logs",
+    "notify",
   ])
   if (!KNOWN_COMMANDS.has(parsed.command)) {
     deps.stderr(`error: unknown command "${parsed.command}"`)
@@ -382,6 +386,8 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
         return await commandRecover(parsed, deps, client, json)
       case "logs":
         return await commandLogs(parsed, deps, client, json)
+      case "notify":
+        return await commandNotify(parsed, deps, client, json)
       default:
         throw new UsageError(`unknown command "${parsed.command}"`)
     }
@@ -553,7 +559,8 @@ async function commandDaemon(parsed: Parsed, deps: CliDeps): Promise<number> {
   }
 
   const config = loadDaemonConfig(source)
-  const { daemon } = config
+  const notifications = resolveNotifications(config.notifications, deps.env)
+  const daemon = notifications !== undefined ? { ...config.daemon, notifications } : config.daemon
   let api = config.api
 
   // Environment overrides for the listener — the deployment surface
@@ -653,6 +660,8 @@ function printFeature(
       pr: number | null
       escalation: string | null
       jobs?: Readonly<Record<string, { steps?: Readonly<Record<string, { status?: string; prompt?: string }>> }>>
+      attention?: AttentionView | null
+      activity?: ActivityView
     }
     activeRun: {
       id: string
@@ -670,11 +679,20 @@ function printFeature(
   const { feature, activeRun } = payload
   deps.stdout(`feature  ${feature.id}`)
   deps.stdout(`title    ${feature.title}`)
-  deps.stdout(`status   ${feature.status}`)
+  deps.stdout(`status   ${displayStatus(feature)}`)
   deps.stdout(`step     ${feature.currentStep ?? "-"}`)
   if (feature.workflow !== null) deps.stdout(`workflow ${feature.workflow}`)
   if (feature.pr !== null) deps.stdout(`pr       #${feature.pr}`)
   if (feature.escalation !== null) deps.stdout(`escalation ${feature.escalation}`)
+  for (const target of feature.attention?.targets ?? []) {
+    const next = target.nextAttemptAt !== null ? `, next attempt ${formatTime(target.nextAttemptAt)}` : ""
+    deps.stdout(`attention ${target.jobId}/${target.stepId}: ${target.consecutiveFailures} consecutive failures (${target.source}${next})`)
+    if (target.lastDiagnostic) deps.stdout(`  ${target.lastDiagnostic}`)
+  }
+  if (!feature.attention && feature.activity?.state === "waiting_retry" && feature.activity.reason?.startsWith("healing:")) {
+    const next = feature.activity.nextAt !== null ? ` at ${formatTime(feature.activity.nextAt)}` : ""
+    deps.stdout(`healing  ${feature.activity.message}${next}`)
+  }
   if (activeRun) deps.stdout(`run      ${activeRun.id} (${activeRun.stepId}, attempt ${activeRun.attempt})`)
   if (activeRun?.pendingQuestion != null && activeRun.pendingQuestion.trim() !== "") {
     if (activeRun.answerDelivery !== undefined) {
@@ -697,6 +715,11 @@ function printFeature(
       }
     }
   }
+}
+
+/** `attention` is a projection over a `running` feature, never persisted. */
+function displayStatus(feature: { status: string; attention?: AttentionView | null }): string {
+  return feature.attention && feature.attention.targets.length > 0 && feature.status === "running" ? "attention" : feature.status
 }
 
 async function commandStart(parsed: Parsed, deps: CliDeps, client: ApiClient, json: boolean): Promise<number> {
@@ -759,7 +782,7 @@ async function commandStatus(parsed: Parsed, deps: CliDeps, client: ApiClient, j
     return EXIT.ok
   }
   for (const feature of features) {
-    deps.stdout(`${feature.id}  ${feature.status}  ${feature.currentStep ?? "-"}  ${feature.title}`)
+    deps.stdout(`${feature.id}  ${displayStatus(feature)}  ${feature.currentStep ?? "-"}  ${feature.title}`)
   }
   return EXIT.ok
 }
@@ -924,6 +947,24 @@ async function commandLifecycle(parsed: Parsed, deps: CliDeps, client: ApiClient
   }
   deps.stdout(`Feature ${payload.feature.id} is now ${payload.feature.status}`)
   return EXIT.ok
+}
+
+async function commandNotify(parsed: Parsed, deps: CliDeps, client: ApiClient, json: boolean): Promise<number> {
+  requireFlags(parsed, [])
+  if (parsed.positionals[0] !== "test" || parsed.positionals.length > 1) throw new UsageError('usage: conductor notify test')
+  const result = await client.testNotifications()
+  if (json) {
+    deps.stdout(JSON.stringify(result))
+    return result.ok ? EXIT.ok : EXIT.failure
+  }
+  if (result.channels.length === 0) {
+    deps.stderr("no notification channels configured (add a notifications section to the daemon config)")
+    return EXIT.failure
+  }
+  for (const channel of result.channels) {
+    deps.stdout(channel.ok ? `${channel.channel}: ok` : `${channel.channel}: failed — ${channel.error ?? "unknown error"}`)
+  }
+  return result.ok ? EXIT.ok : EXIT.failure
 }
 
 async function commandLogs(parsed: Parsed, deps: CliDeps, client: ApiClient, json: boolean): Promise<number> {

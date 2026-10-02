@@ -33,6 +33,7 @@
 .statusPill.paused { color: var(--status-paused); }
 .statusPill.done { color: var(--status-done); }
 .statusPill.abandoned { color: var(--text-faint); }
+.statusPill.attention { color: var(--status-waiting); }
 .meta {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
@@ -62,6 +63,12 @@
 }
 .activity_blocked, .activity_waiting_retry { border-color: var(--status-waiting); }
 .activity_escalated { border-color: var(--status-escalated); }
+.activity_attention { border-color: var(--status-waiting); border-style: dashed; }
+.activity_attention strong { color: var(--status-waiting); }
+.attentionTarget {
+  flex-basis: 100%;
+  font-size: var(--text-xs);
+}
 .activity_active strong { color: var(--status-running); }
 .escalationDetail {
   flex-basis: 100%;
