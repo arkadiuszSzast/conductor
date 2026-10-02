@@ -156,13 +156,26 @@
     return entry.status || (entry.state && entry.state.kind)
   }
 
-  function renderDependencies(change) {
-    const deps = Array.isArray(change.dependsOn) ? change.dependsOn : []
-    let html = '<div class="change-deps">'
-    if (deps.length === 0) {
+  const DEP_GLYPH = { merged: "✓", in_progress: "●", queued: "◌", stuck: "✗", pending: "✗", unknown: "?" }
+
+  function readinessOf(change) {
+    return window.OpenSpecDeps.changeReadiness(change, {
+      archived: listing.archived || [],
+      active: listing.active || [],
+      queueEntries: queue === null ? [] : queue.entries,
+    })
+  }
+
+  function renderDependencies(change, readiness) {
+    let html = '<div class="change-readiness readiness-' + readiness.readiness + '">' + escapeHtml(readiness.summary) + "</div>"
+    html += '<div class="change-deps">'
+    if (readiness.dependencies.length === 0) {
       html += '<span class="muted">No dependencies declared</span>'
     } else {
-      html += '<span class="muted">Depends on</span> ' + deps.map(dep => "<code>" + escapeHtml(dep) + "</code>").join(", ")
+      html += '<span class="muted">Depends on</span> ' + readiness.dependencies.map(dep =>
+        '<span class="dep dep-' + dep.state + '" title="' + escapeHtml(dep.label) + '">' +
+        DEP_GLYPH[dep.state] + " <code>" + escapeHtml(dep.name) + "</code></span>",
+      ).join(" ")
     }
     html += "</div>"
     if (typeof change.dependsOnWarning === "string") {
@@ -222,10 +235,11 @@
         } else if (queue !== null && !isQueued(entry)) {
           actions = '<button type="button" class="enqueue">Queue</button>' + actions
         }
+        const readiness = readinessOf(change)
         html +=
-          '<div class="change" data-name="' + escapeHtml(change.name) + '">' +
+          '<div class="change change-' + readiness.readiness + '" data-name="' + escapeHtml(change.name) + '">' +
           '<div class="change-name">' + escapeHtml(change.name) + "</div>" +
-          renderDependencies(change) +
+          renderDependencies(change, readiness) +
           renderQueueState(entry) +
           renderProgress(change.taskProgress) +
           '<div class="change-actions">' + actions + "</div>" +

@@ -6,6 +6,8 @@
   --border: #2a2d33;
   --accent: #5b8def;
   --danger: #e05a5a;
+  --ok: #4fbf7f;
+  --warn: #e0a84a;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
@@ -262,7 +264,36 @@ button:disabled {
 
 .change-deps code {
   font-size: 11px;
+  color: inherit;
 }
+
+/* Readiness: a coloured left edge per card plus a one-line summary, and
+ * each dependency coloured by its own state — scan for green to find
+ * what can be picked up next. */
+.change.change-ready { border-left: 3px solid var(--ok); }
+.change.change-waiting { border-left: 3px solid var(--warn); }
+.change.change-blocked { border-left: 3px solid var(--danger); }
+
+.change-readiness {
+  font-size: 12px;
+  font-weight: 600;
+  margin: 2px 0;
+}
+.readiness-ready { color: var(--ok); }
+.readiness-waiting { color: var(--warn); }
+.readiness-blocked { color: var(--danger); }
+
+.dep {
+  display: inline-block;
+  white-space: nowrap;
+  margin-right: 6px;
+}
+.dep-merged { color: var(--ok); }
+.dep-in_progress,
+.dep-queued { color: var(--warn); }
+.dep-stuck,
+.dep-pending,
+.dep-unknown { color: var(--danger); }
 
 .change-warning,
 .queue-warning {
