@@ -2,7 +2,7 @@ import type { EngineControl } from "./api.ts"
 import { WorkerInvocationConflict, type Store } from "./store.ts"
 import type { ReportingReadinessPort } from "./runner-execution.ts"
 import { extractBearerToken, verifyRunCredential } from "./run-auth.ts"
-import { isAlreadyConcludedMessage, ownRunStatusProjection, parseReportBody } from "./run-reporting.ts"
+import { isAlreadyConcludedMessage, ownRunStatusProjection, parseReportBody, reportRejectionLogEntry } from "./run-reporting.ts"
 
 export interface WorkerRoutesDeps {
   readonly store: Store
@@ -69,7 +69,10 @@ export async function handleWorkerReport(deps: WorkerRoutesDeps, request: Reques
   const body = await readBody(request)
   const auth = authorize(deps, request, true, body["run_id"])
   const validated = parseReportBody(body)
-  if (!validated.ok) return reject(400, "invalid_request", validated.message)
+  if (!validated.ok) {
+    if (!auth.concluded) deps.store.appendRunLog(auth.runId, [reportRejectionLogEntry(validated.message)], { requireRunning: true })
+    return reject(400, "invalid_request", validated.message)
+  }
   if (auth.concluded) {
     if (validated.ask !== undefined) throw new WorkerAuthorizationError()
     return reject(409, "run_already_concluded", "Run already concluded; no mutation performed.")
@@ -87,7 +90,10 @@ export async function handleWorkerReport(deps: WorkerRoutesDeps, request: Reques
     ...(validated.ask !== undefined ? { invocationId: invocationId as string } : {}),
     authorize: () => { authorize(deps, request, false, auth.runId) },
   })
-  if (result.startsWith("Invalid review:")) return reject(400, "invalid_request", result)
+  if (result.startsWith("Invalid review:")) {
+    deps.store.appendRunLog(auth.runId, [reportRejectionLogEntry(result)], { requireRunning: true })
+    return reject(400, "invalid_request", result)
+  }
   if (isAlreadyConcludedMessage(result, auth.runId)) return reject(409, "run_already_concluded", result)
   return { status: 200, body: { result } }
 }

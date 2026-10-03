@@ -54,6 +54,15 @@ export function parseReportBody(body: Readonly<Record<string, unknown>>): Parsed
   }
 }
 
+/** run_log marker for a report the daemon refused. The agent's run stays
+ *  open, so without this the eventual escalation only says "idle without
+ *  report" and hides that the agent did try — with a fixable payload. */
+export const REPORT_REJECTED_PREFIX = "report rejected: "
+
+export function reportRejectionLogEntry(message: string): { source: "step"; text: string } {
+  return { source: "step", text: `${REPORT_REJECTED_PREFIX}${message}` }
+}
+
 /** The stable text prefix `Engine.report` uses for an already-concluded
  *  run — matched EXACTLY here so both callers recognize the duplicate
  *  disposition identically (D8: "terminal duplicate-report disposition"). */

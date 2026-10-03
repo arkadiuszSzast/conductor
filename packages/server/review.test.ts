@@ -20,6 +20,19 @@ describe("structured review schema and lifecycle", () => {
     expect(validateReview({ head, findings: [finding], ...patch })).not.toBeNull()
   })
 
+  it.each([
+    [undefined, "review argument is missing"],
+    [JSON.stringify({ head, findings: [finding] }), "not a string"],
+    [{ head, findings: [{ ...finding, acceptanceTests: "replace the cast" }] }, 'review.findings[0].acceptanceTests must be an ARRAY of strings (e.g. ["Foo rejects empty input"]), got a string ("replace the cast")'],
+    [{ head, findings: [finding, { ...finding, acceptanceTests: ["ok", ""] }] }, "review.findings[1].acceptanceTests[1] must be a non-empty string"],
+    [{ head, findings: [{ ...finding, id: "gate-1-1" }] }, 'review.findings[0].id must match F<number> (an id from a previous round), got a string ("gate-1-1") — omit id for new findings'],
+    [{ head, findings: [{ ...finding, line: "12" }] }, 'review.findings[0].line must be a positive integer, got a string ("12")'],
+    [{ head, findings: [{ ...finding, file: "x" }] }, "review.findings[0]: unknown field(s) file"],
+    [{ head: "short", findings: [] }, 'review.head must be the full lowercase Git SHA (40 or 64 hex chars), got a string ("short")'],
+  ])("names the offending field and what actually arrived (%#)", (review, message) => {
+    expect(validateReview(review)).toContain(message)
+  })
+
   it("reuses resolved and dismissed IDs only with explicit reopening and preserves severity", () => {
     for (const status of ["fixed", "dismissed"] as const) {
       expect(() => prepareReview({ head, findings: [{ ...finding, id: "F1" }] }, [{ ...previous, status }], source, "changes_requested")).toThrow("reopened")

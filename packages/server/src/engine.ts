@@ -33,6 +33,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { createHash } from "node:crypto"
 import { prepareReview, renderFixPack, validateReview, type AcceptedReview, type ReviewReport } from "./review.ts"
+import { REPORT_REJECTED_PREFIX } from "./run-reporting.ts"
 import { join } from "node:path"
 import {
   DEFAULT_OUTCOME,
@@ -2656,11 +2657,11 @@ export class Engine {
           }
           if (isAcp) {
             log.log(`reconcile ${feature.slug}: run ${active.id} idle after ${limits.maxNudges} ACP nudge(s) — fencing (no-report timeout)`)
-            await this.fenceOrFail(feature.id, active.id, active.jobId, active.stepId, "no_report_timeout", `idle without report after ${active.nudges} ACP nudge(s)`)
+            await this.fenceOrFail(feature.id, active.id, active.jobId, active.stepId, "no_report_timeout", this.noReportReason(active.id, `idle without report after ${active.nudges} ACP nudge(s)`))
             return
           }
           log.log(`reconcile ${feature.slug}: run ${active.id} idle after ${limits.maxNudges} nudges — reaping`)
-          await this.reap(feature, active, `idle without report after ${active.nudges} nudge(s)`)
+          await this.reap(feature, active, this.noReportReason(active.id, `idle without report after ${active.nudges} nudge(s)`))
           return
         }
       }
@@ -2679,6 +2680,30 @@ export class Engine {
     }
   }
 
+  /** Reports the daemon refused for this run (count + most recent message). */
+  private reportRejections(runId: string): { count: number; last: string } | undefined {
+    let count = 0
+    let last = ""
+    let afterSeq = 0
+    for (;;) {
+      const page = this.deps.store.getRunLog(runId, { afterSeq })
+      for (const line of page.lines) {
+        if (line.source !== "step" || !line.text.startsWith(REPORT_REJECTED_PREFIX)) continue
+        count++
+        last = line.text.slice(REPORT_REJECTED_PREFIX.length)
+      }
+      if (!page.truncated) return count > 0 ? { count, last } : undefined
+      afterSeq = page.nextSeq
+    }
+  }
+
+  /** An agent that kept getting 400s is not "idle" — name the real cause. */
+  private noReportReason(runId: string, fallback: string): string {
+    const rejections = this.reportRejections(runId)
+    if (rejections === undefined) return fallback
+    return boundDiagnostic(`${fallback}; ${rejections.count} report(s) rejected, last: ${rejections.last}`)
+  }
+
   private async nudgeAgentRun(feature: FeatureState, snapshot: WorkflowSnapshot, active: RunSummary, maxNudges: number): Promise<void> {
     if (!active.sessionId) return
     const isAcp = this.deps.store.getRunnerBinding(active.id)?.transport === "acp"
@@ -2688,13 +2713,18 @@ export class Engine {
     this.deps.log.log(`reconcile ${feature.slug}: run ${active.id} without report — nudge ${nudgeNo}/${maxNudges}`)
     const step = findStep(snapshot.workflow, active.jobId, active.stepId)
     const role = step?.type === "agent" ? snapshot.workflow.roles[step.role] : undefined
+    const rejection = this.reportRejections(active.id)?.last
     try {
       await sessionClient.prompt({
         sessionID: active.sessionId,
-        text:
-          `[conductor] Your previous turn appears to have been interrupted (no report received). ` +
-          `The work state is in your context. Finish step "${active.stepId}" and report ` +
-          `run_id="${active.id}" with the appropriate outcome.`,
+        text: rejection !== undefined
+          ? `[conductor] No report has been accepted for step "${active.stepId}" yet. Your last report was rejected: ` +
+            `${rejection}\nThe tool is working; the payload was invalid. Fix exactly that field and call the report ` +
+            `tool again for run_id="${active.id}". A report written as chat text is lost — the step only concludes ` +
+            `when the report tool succeeds.`
+          : `[conductor] Your previous turn appears to have been interrupted (no report received). ` +
+            `The work state is in your context. Finish step "${active.stepId}" and report ` +
+            `run_id="${active.id}" with the appropriate outcome.`,
         ...(role ? { agent: role.agent, ...(role.model !== undefined ? { model: role.model } : {}) } : {}),
         ...(isAcp
           ? { operationId: deriveOperationLogicalKey("nudge", { runId: active.id, nudgeOrdinal: nudgeNo }), purpose: "nudge" as const }

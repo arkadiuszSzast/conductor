@@ -44,7 +44,7 @@ import type { RunnerRegistry } from "./runner-registry.ts"
 import { proxyPluginRequest } from "./plugin-proxy.ts"
 import type { PluginControl } from "./plugin-proxy.ts"
 import { pickStaticFile, serveStaticFile } from "./static-files.ts"
-import { isAlreadyConcludedMessage, parseReportBody } from "./run-reporting.ts"
+import { isAlreadyConcludedMessage, parseReportBody, reportRejectionLogEntry } from "./run-reporting.ts"
 import { createWorkerRoutes, type WorkerRoutesDeps } from "./worker-routes.ts"
 import { ChangeQueueError, type QueueEntryRecord } from "./store.ts"
 import {
@@ -1553,7 +1553,10 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     // Shared with the restricted /v1/worker/report route (run-reporting.ts,
     // task 4.2) — ONE validation authority for every reporting caller.
     const validated = parseReportBody(parsed.body)
-    if (!validated.ok) return error(requestId, "invalid_request", validated.message)
+    if (!validated.ok) {
+      if (run.status === "running") store.appendRunLog(runId, [reportRejectionLogEntry(validated.message)], { requireRunning: true })
+      return error(requestId, "invalid_request", validated.message)
+    }
     // Duplicate reports are rejected idempotently: the engine's atomic
     // conclusion claim is the authority; this pre-check only projects the
     // already-concluded state onto a 409 without touching the engine.
@@ -1574,7 +1577,10 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     // already concluded`): success messages start with `Verdict "` /
     // `Step "`, so caller-controlled verdict/notes text can never spoof
     // the duplicate shape from inside a success message.
-    if (result.startsWith("Invalid review:")) return error(requestId, "invalid_request", result)
+    if (result.startsWith("Invalid review:")) {
+      store.appendRunLog(runId, [reportRejectionLogEntry(result)], { requireRunning: true })
+      return error(requestId, "invalid_request", result)
+    }
     if (isAlreadyConcludedMessage(result, runId)) {
       return error(requestId, "run_already_concluded", result)
     }
