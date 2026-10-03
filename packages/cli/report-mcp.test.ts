@@ -165,6 +165,19 @@ describe("4.3: MCP initialize/listTools — exactly the three permitted tools", 
     expect(names).toEqual(["conductor_ask", "conductor_report", "conductor_status"])
   })
 
+  it("advertises the full review schema so agents do not guess the finding shape", async () => {
+    const { client } = await connectedClient(fakeFetch(() => ({ status: 200, body: {} })))
+    const { tools } = await client.listTools()
+    const report = tools.find(tool => tool.name === "conductor_report")!
+    const review = (report.inputSchema.properties as Record<string, any>)["review"]
+    expect(review.required).toEqual(["head", "findings"])
+    const item = review.properties.findings.items
+    expect(item.properties.acceptanceTests).toMatchObject({ type: "array", items: { type: "string" } })
+    expect(item.required).toContain("acceptanceTests")
+    expect(item.additionalProperties).toBe(false)
+    expect(report.description).toContain("call again")
+  })
+
   it("no admin config access: tool listing works with ONLY the injected run config, no daemon started", async () => {
     // If this test can construct/connect the server at all without
     // touching any daemon-start or admin-config code path, that IS the

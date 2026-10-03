@@ -29,6 +29,18 @@ export interface BoardCardModel {
   readonly updatedAt: number
   /** True when the card should be visually loud (NEEDS YOU zone). */
   readonly attention: boolean
+  /** Still progressing but repeatedly failing — retries continue. Distinct
+   *  from `attention`: nothing for a human to unblock, only to look at. */
+  readonly troubled: { readonly summary: string; readonly diagnostic: string | null } | null
+}
+
+export function troubleOf(item: Pick<FeatureListItem, "status" | "attention">): BoardCardModel["troubled"] {
+  if (item.status !== "running" || !item.attention || item.attention.targets.length === 0) return null
+  const worst = item.attention.targets.reduce((a, b) => (b.consecutiveFailures > a.consecutiveFailures ? b : a))
+  return {
+    summary: `${worst.jobId}/${worst.stepId} failed ${worst.consecutiveFailures}× — still retrying`,
+    diagnostic: worst.lastDiagnostic,
+  }
 }
 
 export function zoneOf(status: FeatureStatus): ColumnZone {
@@ -93,6 +105,7 @@ export function cardModel(item: FeatureListItem, now: number): BoardCardModel {
     pr: item.pr,
     updatedAt: item.updatedAt,
     attention: zone === "needs-you",
+    troubled: troubleOf(item),
   }
 }
 

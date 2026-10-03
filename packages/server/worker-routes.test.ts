@@ -308,6 +308,18 @@ describe("4.2: shared report validation/engine authority", () => {
     const response = await request("POST", "/v1/worker/report", {}, { authorization: `Bearer ${token}` })
     expect(response.status).toBe(400)
   })
+
+  it("journals a rejected report on the run so the eventual escalation can name it", async () => {
+    const { request, createRunningRun, daemon } = await makeWorkerApi()
+    const { runId, token } = await createRunningRun()
+    const response = await request("POST", "/v1/worker/report", { outcome: "failed", verdict: "approved" }, { authorization: `Bearer ${token}` })
+    expect(response.status).toBe(400)
+    const lines = daemon.store.getRunLog(runId).lines
+    expect(lines.at(-1)).toMatchObject({ source: "step" })
+    expect(lines.at(-1)!.text).toStartWith("report rejected: ")
+    expect(lines.at(-1)!.text).toContain("contradictory")
+    expect(daemon.store.getRunById(runId)!.status).toBe("running")
+  })
 })
 
 describe("4.1: admin routes remain unaffected by the worker namespace", () => {

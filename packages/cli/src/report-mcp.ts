@@ -135,6 +135,51 @@ function workerRequest(config: ReportMcpConfig, path: string, method: string, bo
   }
 }
 
+/** Advertised to the agent verbatim: an opaque `{type: "object"}` left
+ *  models guessing the finding shape (string acceptanceTests, custom ids,
+ *  review smuggled inside notes) and every guess was a 400. */
+export const REVIEW_JSON_SCHEMA = {
+  type: "object",
+  description:
+    "Structured gate report — a JSON object argument, never a string and never embedded in notes. " +
+    "Required on structured review gates together with verdict.",
+  properties: {
+    head: { type: "string", pattern: "^(?:[a-f0-9]{40}|[a-f0-9]{64})$", description: "Full lowercase Git SHA of the reviewed head" },
+    findings: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string", pattern: "^F[1-9][0-9]*$", description: "Only for findings from a previous round (reuse its F id). Omit for new findings — the daemon assigns ids." },
+          path: { type: "string", minLength: 1, description: "Repository-relative file path (no leading /, no ..)" },
+          line: { type: "integer", minimum: 1 },
+          severity: { type: "string", enum: ["blocker", "major", "minor", "nit"] },
+          blocking: { type: "boolean" },
+          body: { type: "string", minLength: 1 },
+          acceptanceTests: {
+            type: "array",
+            items: { type: "string", minLength: 1 },
+            description: "ARRAY of strings, e.g. [\"Foo rejects empty input\"]. Must be non-empty when blocking is true; [] otherwise.",
+          },
+          status: { type: "string", enum: ["new", "fixed", "dismissed", "reopened"] },
+          resolution: { type: "string", minLength: 1, description: "Required when status is not new" },
+        },
+        required: ["path", "line", "severity", "blocking", "body", "acceptanceTests", "status"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["head", "findings"],
+  additionalProperties: false,
+} as const
+
+const REPORT_TOOL_DESCRIPTION =
+  "Report this attempt's outcome. Pass outcome (succeeded/failed) for ordinary steps, or verdict " +
+  "(approved/changes_requested) for review steps — never verdict together with outcome=failed. " +
+  "Structured review gates also require the review object argument. If the call is rejected, read the " +
+  "error, fix exactly the named field and call again: the step only concludes when this tool succeeds; " +
+  "a report written as chat text is lost."
+
 interface ToolTextResult {
   [key: string]: unknown
   content: Array<{ type: "text"; text: string }>
@@ -167,7 +212,7 @@ export function createReportMcpServer(deps: ReportMcpDeps): McpServer {
     "conductor_report",
     {
       title: "Report step outcome",
-      description: "Reports the outcome of the current step: succeeded, failed, a verdict, or an ask question.",
+      description: REPORT_TOOL_DESCRIPTION,
       inputSchema: {
         outcome: z.enum(["succeeded", "failed"]).optional(),
         verdict: z.string().optional(),
@@ -268,7 +313,7 @@ export function createReportMcpServer(deps: ReportMcpDeps): McpServer {
   server.server.setRequestHandler(ListToolsRequestSchema, async () => {
     await postReadyPhase(deps, "tools_listed")
     return { tools: [
-      { name: "conductor_report", description: "Report this attempt's outcome or structured review", inputSchema: { type: "object" as const, properties: { outcome: { type: "string", enum: ["succeeded", "failed"] }, verdict: { type: "string" }, notes: { type: "string" }, review: { type: "object" } }, additionalProperties: false } },
+      { name: "conductor_report", description: REPORT_TOOL_DESCRIPTION, inputSchema: { type: "object" as const, properties: { outcome: { type: "string", enum: ["succeeded", "failed"] }, verdict: { type: "string" }, notes: { type: "string", description: "Short plain-text summary" }, review: REVIEW_JSON_SCHEMA }, additionalProperties: false } },
       { name: "conductor_ask", description: "Ask a human on an interactive step", inputSchema: { type: "object" as const, properties: { question: { type: "string", minLength: 1 } }, required: ["question"], additionalProperties: false } },
       { name: "conductor_status", description: "Own attempt status only", inputSchema: { type: "object" as const, properties: {}, additionalProperties: false } },
     ] }

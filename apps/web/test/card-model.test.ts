@@ -93,3 +93,25 @@ describe("zone grouping", () => {
     expect(zones["needs-you"].map(c => c.id)).toEqual(["stale", "fresh"])
   })
 })
+
+describe("attention overlay (self-healing)", () => {
+  const attention = {
+    since: 0,
+    targets: [
+      { jobId: "review", stepId: "review", source: "healing" as const, consecutiveFailures: 2, lastDiagnostic: "a", nextAttemptAt: null },
+      { jobId: "edges", stepId: "review", source: "healing" as const, consecutiveFailures: 4, lastDiagnostic: "session/new lost", nextAttemptAt: 9 },
+    ],
+  }
+
+  it("marks a running feature troubled with its worst target but keeps it in the running zone", () => {
+    const model = cardModel(item({ attention }), 61_000)
+    expect(model.zone).toBe("running")
+    expect(model.attention).toBe(false)
+    expect(model.troubled).toEqual({ summary: "edges/review failed 4× — still retrying", diagnostic: "session/new lost" })
+  })
+
+  it("never overlays a feature that already needs a human", () => {
+    expect(cardModel(item({ status: "escalated", attention }), 61_000).troubled).toBeNull()
+    expect(cardModel(item({}), 61_000).troubled).toBeNull()
+  })
+})

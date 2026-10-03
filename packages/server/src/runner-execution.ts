@@ -116,6 +116,7 @@ export interface RunnerOperationRecord {
   readonly version?: number
   readonly stopReason: string | null
   readonly diagnosticCode: string | null
+  readonly diagnostic?: string | null
   readonly createdAt: number
   readonly updatedAt: number
 }
@@ -128,6 +129,10 @@ export interface RunnerFenceRecord {
   readonly createdAt: number
   readonly resolvedAt: number | null
   readonly resolutionNote: string | null
+  /** Self-healing D1 — null until cleanup evidence lets the engine classify. */
+  readonly classification?: "no_effect" | "replay_safe" | "unsafe" | null
+  readonly evidence?: Readonly<Record<string, unknown>> | null
+  readonly classifiedAt?: number | null
 }
 
 export interface RunCredentialRecord {
@@ -282,7 +287,7 @@ export interface RunnerSafetyStore {
     operationId: string,
     from: RunnerOperationPhase,
     to: RunnerOperationPhase,
-    detail?: { readonly stopReason?: string; readonly diagnosticCode?: string; readonly expectedVersion?: number; readonly ownerGeneration?: number },
+    detail?: { readonly stopReason?: string; readonly diagnosticCode?: string; readonly diagnostic?: string; readonly expectedVersion?: number; readonly ownerGeneration?: number },
   ): boolean
 
   getOperation(operationId: string): RunnerOperationRecord | null

@@ -8,7 +8,7 @@
 
 import { useApp } from "../app-context.ts"
 import { useFindings, useTimeline } from "../api/hooks.ts"
-import type { RunLogLine, WorkflowProjection } from "../api/types.ts"
+import type { RunLogLine, RunSummary, WorkflowProjection } from "../api/types.ts"
 import { collapseToolLines, type DisplayLogLine } from "./inspector-logic.ts"
 import { useRunLog, useStepRun } from "./use-step-run.ts"
 import { FindingsPanel } from "./findings-panel.tsx"
@@ -117,7 +117,7 @@ type FullOutputsState =
 
 function OutputsTab(props: {
   readonly step: { readonly outputs: Readonly<Record<string, string>>; readonly truncated?: boolean; readonly runId?: string } | undefined
-  readonly run: { readonly status: string; readonly reason: string | null; readonly uncertain?: { readonly reasonCode: string; readonly cleanupState: string } } | null
+  readonly run: UncertainRunView | null
   readonly runId: string | null
 }): React.ReactNode {
   const { client } = useApp()
@@ -160,14 +160,7 @@ function OutputsTab(props: {
           <strong>{run.status}</strong> — {run.reason}
         </div>
       ) : null}
-      {run?.status === "uncertain" ? (
-        <div className={styles.error}>
-          <strong>Execution uncertain — not confirmed failed or succeeded.</strong>
-          <p>{run.reason ?? run.uncertain?.reasonCode}</p>
-          <p>Do not resend the previous operation. Recovery requires operator notes, current version, an idempotency key and explicit uncertainty acknowledgment.</p>
-          <p>Process cleanup: {run.uncertain?.cleanupState ?? "unconfirmed"}. Unconfirmed cleanup must be independently verified before attesting it.</p>
-        </div>
-      ) : null}
+      {run?.status === "uncertain" ? <UncertainRun run={run} /> : null}
       {entries.length === 0 ? <div className={styles.empty}>no outputs reported for this step</div> : null}
       {entries.map(([name, value]) => (
         <div key={name} className={styles.row}>
@@ -241,5 +234,42 @@ function ToolStatusRow({ group }: { readonly group: Extract<DisplayLogLine, { ki
         </span>
       </div>
     </>
+  )
+}
+
+const CLASSIFICATION_TEXT: Record<"no_effect" | "replay_safe", string> = {
+  no_effect: "no session was created and no prompt was sent, and the process is confirmed terminated",
+  replay_safe: "the step is declared replay-safe and the process is confirmed terminated",
+}
+
+type UncertainRunView = Pick<RunSummary, "status" | "reason" | "uncertain" | "healed">
+
+function UncertainRun({ run }: { readonly run: UncertainRunView }): React.ReactNode {
+  if (run.healed !== undefined) {
+    return (
+      <div className={styles.healed}>
+        <strong>Execution uncertain — healed automatically.</strong>
+        <p>{run.reason ?? "outcome unknown"}</p>
+        <p>Safe to replay: {CLASSIFICATION_TEXT[run.healed.classification]}. A fresh attempt was scheduled.</p>
+      </div>
+    )
+  }
+  const classification = run.uncertain?.classification ?? null
+  if (classification === "no_effect" || classification === "replay_safe") {
+    return (
+      <div className={styles.healed}>
+        <strong>Execution uncertain — healing scheduled.</strong>
+        <p>{run.reason ?? run.uncertain?.reasonCode}</p>
+        <p>Safe to replay: {CLASSIFICATION_TEXT[classification]}. A fresh attempt runs after backoff; no action needed.</p>
+      </div>
+    )
+  }
+  return (
+    <div className={styles.error}>
+      <strong>{classification === null ? "Execution uncertain — classifying…" : "Execution uncertain — not confirmed failed or succeeded."}</strong>
+      <p>{run.reason ?? run.uncertain?.reasonCode}</p>
+      <p>Do not resend the previous operation. Recovery requires operator notes, current version, an idempotency key and explicit uncertainty acknowledgment.</p>
+      <p>Process cleanup: {run.uncertain?.cleanupState ?? "unconfirmed"}. Unconfirmed cleanup must be independently verified before attesting it.</p>
+    </div>
   )
 }

@@ -10,7 +10,9 @@ export {
 export type { Database, DatabaseConfig, DatabaseConnection } from "./database.ts"
 export { migrations, runMigrations } from "./migrations.ts"
 export type { Migration } from "./migrations.ts"
-export { ChangeQueueError, Store } from "./store.ts"
+export { ChangeQueueError, NOTIFICATION_EVENT_KINDS, Store } from "./store.ts"
+export { NotificationDispatcher, createTelegramChannel, formatNotificationText } from "./notifications.ts"
+export type { NotificationChannel, NotificationMessage, TelegramChannelConfig } from "./notifications.ts"
 export { reconcileStartingEntries } from "./change-queue-reconcile.ts"
 export { ChangeQueueScheduler } from "./change-queue-scheduler.ts"
 export type {
@@ -58,6 +60,10 @@ export type {
   ResourceWaitStatus,
   RetryEpisodeRecord,
   RetryEpisodeStatus,
+  AttentionRecord,
+  HealingEpisodeRecord,
+  NotificationKind,
+  NotificationRecord,
   RunActionMetadata,
   RunStatus,
   RunSummary,
@@ -234,6 +240,7 @@ export type {
   DaemonPhase,
   DaemonProjectHealth,
   IntervalScheduler,
+  NotificationsConfig,
   Reconciler,
 } from "./daemon.ts"
 

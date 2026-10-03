@@ -33,6 +33,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { createHash } from "node:crypto"
 import { prepareReview, renderFixPack, validateReview, type AcceptedReview, type ReviewReport } from "./review.ts"
+import { REPORT_REJECTED_PREFIX } from "./run-reporting.ts"
 import { join } from "node:path"
 import {
   DEFAULT_OUTCOME,
@@ -41,6 +42,10 @@ import {
   buildEvalContext,
   checkActiveStateInvariant,
   checkRetryBudget,
+  classifyFence,
+  healingDelayMs,
+  needsAttention,
+  normalizeHealingPolicy,
   computeScheduledDelayMs,
   decideResourceWaitRoute,
   extractExpressions,
@@ -54,6 +59,8 @@ import {
   systemRandom,
 } from "@conductor/core"
 import type {
+  HealingPolicy,
+  Random,
   ActionInputType,
   ActionManifest,
   ActionRunContext,
@@ -129,7 +136,15 @@ export interface EngineOptions {
   readonly busySilenceNudgeMs?: number
   readonly nudgeIdleCycles?: number
   readonly maxNudges?: number
+  /** Self-healing backoff/attention policy (D3). */
+  readonly healing?: Partial<HealingPolicy>
+  /** Upper bound on waiting for cleanup evidence before a fence is
+   *  classified with whatever evidence exists (unconfirmed → unsafe). */
+  readonly fenceClassifyTimeoutMs?: number
+  readonly random?: Random
 }
+
+const DEFAULT_FENCE_CLASSIFY_TIMEOUT_MS = 15_000
 
 export type StartFeatureResult =
   | { readonly ok: true; readonly feature: FeatureState }
@@ -233,6 +248,9 @@ export class Engine {
   private readonly busySilenceNudgeMs: number
   private readonly nudgeIdleCycles: number
   private readonly maxNudges: number
+  private readonly healingPolicy: HealingPolicy
+  private readonly fenceClassifyTimeoutMs: number
+  private readonly random: Random
 
   constructor(
     private readonly deps: EngineDeps,
@@ -243,6 +261,9 @@ export class Engine {
     this.busySilenceNudgeMs = options.busySilenceNudgeMs ?? DEFAULT_BUSY_SILENCE_NUDGE_MS
     this.nudgeIdleCycles = options.nudgeIdleCycles ?? DEFAULT_NUDGE_IDLE_CYCLES
     this.maxNudges = options.maxNudges ?? DEFAULT_MAX_NUDGES
+    this.healingPolicy = normalizeHealingPolicy(options.healing)
+    this.fenceClassifyTimeoutMs = options.fenceClassifyTimeoutMs ?? DEFAULT_FENCE_CLASSIFY_TIMEOUT_MS
+    this.random = options.random ?? systemRandom
   }
 
   /** The engine's resource-wait policy — normalized core defaults (v1):
@@ -795,6 +816,7 @@ export class Engine {
     stepId: string,
     reasonCode: RunnerFenceReasonCode | "acp_not_configured",
     diagnostic: string,
+    operationId?: string,
   ): Promise<void> {
     const { store, log } = this.deps
     if (reasonCode === "acp_not_configured") {
@@ -808,7 +830,7 @@ export class Engine {
       return
     }
     const result = store.fenceRunnerExecution(
-      { runId, jobId, stepId, reasonCode, diagnostic: boundDiagnostic(diagnostic) },
+      { runId, jobId, stepId, reasonCode, diagnostic: boundDiagnostic(diagnostic), ...(operationId !== undefined ? { operationId } : {}) },
       projectDir => this.deps.workflows(projectDir) ?? undefined,
     )
     if (!result.fenced) {
@@ -820,22 +842,104 @@ export class Engine {
   }
 
   private readonly runnerCleanupTasks = new Set<Promise<void>>()
+  private readonly cleanupInFlight = new Set<string>()
 
   private cleanupRunner(runId: string): void {
     const run = this.deps.store.getRunById(runId)
-    if (!run || this.deps.store.getRunnerBinding(runId)?.transport !== "acp") return
+    if (!run) return
+    if (this.deps.store.getRunnerBinding(runId)?.transport !== "acp") {
+      void this.classifyFencedRun(runId, true)
+      return
+    }
+    this.cleanupInFlight.add(runId)
     const task = Promise.resolve().then(async () => {
       if (this.deps.cleanupAcpRun) {
         const evidence = await this.deps.cleanupAcpRun(runId, run.sessionId)
         this.deps.store.recordRunnerCleanup(runId, evidence)
       } else if (run.sessionId) await this.deps.acpSessions?.abort(run.sessionId)
     }).catch(error => this.deps.log.log(`ACP cleanup unconfirmed: ${boundDiagnostic(errorMessage(error))}`))
+      .then(() => this.classifyFencedRun(runId, true))
     this.runnerCleanupTasks.add(task)
-    void task.finally(() => this.runnerCleanupTasks.delete(task))
+    void task.finally(() => {
+      this.runnerCleanupTasks.delete(task)
+      this.cleanupInFlight.delete(runId)
+    })
   }
 
   async drainRunnerCleanup(): Promise<void> {
     await Promise.all(this.runnerCleanupTasks)
+  }
+
+  /**
+   * Self-healing D1: classify a fence from durable evidence once cleanup
+   * evidence exists (or `force` after the bounded wait), then route it —
+   * unsafe escalates, healable schedules a healing attempt.
+   */
+  async classifyFencedRun(runId: string, force = false): Promise<void> {
+    const { store, log } = this.deps
+    const fence = store.getFence(runId)
+    if (!fence || fence.resolvedAt !== null || (fence.classification ?? null) !== null) return
+    if (!force && fence.cleanupState === "unconfirmed" && this.deps.cleanupAcpRun) return
+    const run = store.getRunById(runId)
+    if (!run) return
+    const feature = store.getFeature(run.featureId)
+    if (!feature) return
+    const snapshot = this.deps.workflows(feature.projectDir)
+    const step = snapshot ? findStep(snapshot.workflow, run.jobId, run.stepId) : undefined
+    const pre = fence.evidence ?? {}
+    const evidence = {
+      sessionBound: pre["sessionBound"] !== false,
+      promptLeftPrepared: pre["promptLeftPrepared"] !== false,
+      pendingAnswerDelivery: pre["pendingAnswerDelivery"] !== false,
+      cleanup: fence.cleanupState,
+      stepReplaySafe: step?.type === "agent" && step.replaySafe === true,
+    }
+    const classification = classifyFence(evidence)
+    const result = store.classifyFenceExecution(runId, {
+      classification,
+      evidence: { ...evidence, reasonCode: fence.reasonCode },
+      planHealing: failures => ({
+        delayMs: healingDelayMs(this.healingPolicy, failures, this.random),
+        attention: needsAttention(this.healingPolicy, failures),
+      }),
+    }, projectDir => this.deps.workflows(projectDir) ?? undefined)
+    if (!result.classified) return
+    log.log(`run ${runId}: fence classified ${classification}${result.healing
+      ? ` — healing attempt ${result.healing.consecutiveFailures} in ${Math.round(result.healing.delayMs / 1000)}s` : ""}`)
+    if (classification === "unsafe") {
+      const pending = store.getPendingRunAction(run.featureId)
+      if (pending?.runId === runId) {
+        for (const decision of pending.decisions) {
+          if (decision.kind === "escalate") this.deps.notify?.(`Conductor: escalation — ${feature.slug}`, decision.reason)
+        }
+        store.markRunActionHandled(runId)
+      }
+    }
+  }
+
+  /** Reconcile-side classification: fences whose cleanup evidence landed
+   *  but whose classification did not (crash in between), or whose
+   *  evidence never arrives within the bound (e.g. after a restart). */
+  private async classifyPendingFences(): Promise<void> {
+    const now = this.deps.clock.now()
+    for (const fence of this.deps.store.listUnclassifiedFences()) {
+      const inFlight = this.cleanupInFlight.has(fence.runId)
+      const timedOut = now - fence.createdAt >= this.fenceClassifyTimeoutMs
+      if (inFlight && !timedOut) continue
+      if (fence.cleanupState === "unconfirmed" && this.deps.cleanupAcpRun && !timedOut) continue
+      await this.classifyFencedRun(fence.runId, true)
+    }
+  }
+
+  /** Dispatch due healing attempts (self-healing D3). */
+  private async healDueTargets(featureId: string, snapshot: WorkflowSnapshot): Promise<void> {
+    const { store, clock, log } = this.deps
+    for (const episode of store.listDueHealingEpisodes(featureId, clock.now())) {
+      const healed = store.healFencedTarget(episode.id, clock.now())
+      if (!healed) continue
+      log.log(`feature=${featureId}: healing "${healed.jobId}/${healed.stepId}" (${healed.classification}, attempt ${healed.consecutiveFailures})`)
+      await this.actDecision(featureId, snapshot, { kind: "execute_step", jobId: healed.jobId, stepId: healed.stepId })
+    }
   }
 
   private async executeCommand(featureId: string, snapshot: WorkflowSnapshot, jobId: string, step: CommandStep): Promise<void> {
@@ -2038,7 +2142,7 @@ export class Engine {
   }
 
   async resume(featureId: string): Promise<void> {
-    if (this.deps.store.hasUnresolvedRunnerFence(featureId)) throw new Error("Uncertain execution requires cleanup-aware recover, not resume")
+    if (this.deps.store.hasBlockingRunnerFence(featureId)) throw new Error("Uncertain execution requires cleanup-aware recover, not resume")
     await this.dispatch(featureId, { kind: "human.resumed" })
   }
 
@@ -2067,7 +2171,7 @@ export class Engine {
     if (!run || run.status !== "running") return
     if (operation.phase === "unknown") {
       await this.fenceOrFail(run.featureId, run.id, run.jobId, run.stepId,
-        acpFenceReasonCode(operation), "ACP operation outcome unknown")
+        acpFenceReasonCode(operation), describeUnknownOperation(operation), operation.id)
     } else if (operation.kind === "answer" && operation.phase === "completed") {
       const delivery = store.listAnswerDeliveries(run.featureId).find(d => d.runId === run.id && d.deliveryToken === operation.logicalKey)
       if (delivery) store.confirmAnswerDelivered(delivery.id)
@@ -2094,6 +2198,11 @@ export class Engine {
         diagnostic: "ACP execution ownership lost across daemon restart",
       }, projectDir => this.deps.workflows(projectDir) ?? undefined)
     }
+    try {
+      await this.classifyPendingFences()
+    } catch (err) {
+      this.deps.log.log(`reconcile: fence classification failed: ${boundDiagnostic(errorMessage(err))}`)
+    }
     const { store, log } = this.deps
     const features = store.listFeatures({ activeOnly: true })
     for (const feature of features) {
@@ -2112,7 +2221,7 @@ export class Engine {
     // Fence notifications need no workflow; drain them even while the
     // operator is repairing an unavailable project configuration.
     let fenceAction = store.getPendingRunAction(input.id)
-    while (fenceAction && store.getFence(fenceAction.runId) && fenceAction.decisions.every(d => d.kind === "escalate")) {
+    while (fenceAction && store.getFence(fenceAction.runId) && fenceAction.decisions.every(d => d.kind === "escalate" || d.kind === "noop")) {
       for (const decision of fenceAction.decisions) {
         if (decision.kind === "escalate") this.deps.notify?.(`Conductor: escalation — ${input.slug}`, decision.reason)
       }
@@ -2226,6 +2335,8 @@ export class Engine {
       await this.actDecision(input.id, snapshot, { kind: "execute_step", jobId: episode.jobId, stepId: episode.stepId })
     }
 
+    await this.healDueTargets(input.id, snapshot)
+
     // Restart/pause-resume/lease-expiry recovery for accepted-but-
     // undelivered answers: `listPendingAnswerDeliveries` already excludes
     // paused features (the pause barrier), and `input.status === "paused"`
@@ -2305,7 +2416,7 @@ export class Engine {
     // targeted `recover()` naming it, never an implicit whole-feature
     // reset.
     if (feature.status === "escalated" && store.getActiveRun(feature.id) !== null
-      && !store.hasUnresolvedRunnerFence(feature.id)) {
+      && !store.hasBlockingRunnerFence(feature.id)) {
       log.log(`reconcile ${feature.slug}: escalated but has active run — transitioning to running`)
       store.setFeatureStatus(feature.id, "running")
       return
@@ -2323,6 +2434,7 @@ export class Engine {
       hasUnhandledOutboxDecision: store.getPendingRunAction(feature.id) !== null
         || store.getUnhandledRecoveryDispatches(feature.id).length > 0,
       hasPreparingTarget: this.isPreparingAnyTargetFor(feature.id),
+      hasPendingFence: store.hasPendingFence(feature.id),
     })
     if (invariant.kind === "stranded_legacy_failure" || invariant.kind === "stranded_no_anchor") {
       log.log(`reconcile ${feature.slug}: ${invariant.reason} — marking escalated`)
@@ -2350,6 +2462,7 @@ export class Engine {
       // run-less: the wait/retry loops above own it, and re-executing here
       // would bypass the schedule entirely.
       if (store.getOpenResourceWait(feature.id, jobId, stepId) ?? store.getOpenRetryEpisode(feature.id, jobId, stepId)) continue
+      if (store.hasPendingFence(feature.id, jobId, stepId)) continue
 
       const active = store.getActiveRunForStep(feature.id, jobId, stepId)
       if (!active) {
@@ -2437,11 +2550,8 @@ export class Engine {
     if (isAcp) {
       const unknown = store.listRunnerOperations(active.id).find(operation => operation.phase === "unknown")
       if (unknown) {
-        store.fenceRunnerExecution({
-          runId: active.id, jobId: active.jobId, stepId: active.stepId,
-          reasonCode: acpFenceReasonCode(unknown), operationId: unknown.id,
-          diagnostic: "ACP operation outcome unknown",
-        }, projectDir => this.deps.workflows(projectDir) ?? undefined)
+        await this.fenceOrFail(feature.id, active.id, active.jobId, active.stepId,
+          acpFenceReasonCode(unknown), describeUnknownOperation(unknown), unknown.id)
         return
       }
     }
@@ -2547,11 +2657,11 @@ export class Engine {
           }
           if (isAcp) {
             log.log(`reconcile ${feature.slug}: run ${active.id} idle after ${limits.maxNudges} ACP nudge(s) — fencing (no-report timeout)`)
-            await this.fenceOrFail(feature.id, active.id, active.jobId, active.stepId, "no_report_timeout", `idle without report after ${active.nudges} ACP nudge(s)`)
+            await this.fenceOrFail(feature.id, active.id, active.jobId, active.stepId, "no_report_timeout", this.noReportReason(active.id, `idle without report after ${active.nudges} ACP nudge(s)`))
             return
           }
           log.log(`reconcile ${feature.slug}: run ${active.id} idle after ${limits.maxNudges} nudges — reaping`)
-          await this.reap(feature, active, `idle without report after ${active.nudges} nudge(s)`)
+          await this.reap(feature, active, this.noReportReason(active.id, `idle without report after ${active.nudges} nudge(s)`))
           return
         }
       }
@@ -2570,6 +2680,30 @@ export class Engine {
     }
   }
 
+  /** Reports the daemon refused for this run (count + most recent message). */
+  private reportRejections(runId: string): { count: number; last: string } | undefined {
+    let count = 0
+    let last = ""
+    let afterSeq = 0
+    for (;;) {
+      const page = this.deps.store.getRunLog(runId, { afterSeq })
+      for (const line of page.lines) {
+        if (line.source !== "step" || !line.text.startsWith(REPORT_REJECTED_PREFIX)) continue
+        count++
+        last = line.text.slice(REPORT_REJECTED_PREFIX.length)
+      }
+      if (!page.truncated) return count > 0 ? { count, last } : undefined
+      afterSeq = page.nextSeq
+    }
+  }
+
+  /** An agent that kept getting 400s is not "idle" — name the real cause. */
+  private noReportReason(runId: string, fallback: string): string {
+    const rejections = this.reportRejections(runId)
+    if (rejections === undefined) return fallback
+    return boundDiagnostic(`${fallback}; ${rejections.count} report(s) rejected, last: ${rejections.last}`)
+  }
+
   private async nudgeAgentRun(feature: FeatureState, snapshot: WorkflowSnapshot, active: RunSummary, maxNudges: number): Promise<void> {
     if (!active.sessionId) return
     const isAcp = this.deps.store.getRunnerBinding(active.id)?.transport === "acp"
@@ -2579,13 +2713,18 @@ export class Engine {
     this.deps.log.log(`reconcile ${feature.slug}: run ${active.id} without report — nudge ${nudgeNo}/${maxNudges}`)
     const step = findStep(snapshot.workflow, active.jobId, active.stepId)
     const role = step?.type === "agent" ? snapshot.workflow.roles[step.role] : undefined
+    const rejection = this.reportRejections(active.id)?.last
     try {
       await sessionClient.prompt({
         sessionID: active.sessionId,
-        text:
-          `[conductor] Your previous turn appears to have been interrupted (no report received). ` +
-          `The work state is in your context. Finish step "${active.stepId}" and report ` +
-          `run_id="${active.id}" with the appropriate outcome.`,
+        text: rejection !== undefined
+          ? `[conductor] No report has been accepted for step "${active.stepId}" yet. Your last report was rejected: ` +
+            `${rejection}\nThe tool is working; the payload was invalid. Fix exactly that field and call the report ` +
+            `tool again for run_id="${active.id}". A report written as chat text is lost — the step only concludes ` +
+            `when the report tool succeeds.`
+          : `[conductor] Your previous turn appears to have been interrupted (no report received). ` +
+            `The work state is in your context. Finish step "${active.stepId}" and report ` +
+            `run_id="${active.id}" with the appropriate outcome.`,
         ...(role ? { agent: role.agent, ...(role.model !== undefined ? { model: role.model } : {}) } : {}),
         ...(isAcp
           ? { operationId: deriveOperationLogicalKey("nudge", { runId: active.id, nudgeOrdinal: nudgeNo }), purpose: "nudge" as const }
@@ -2854,6 +2993,12 @@ function acpFenceReasonCode(operation: Pick<RunnerOperationRecord, "kind" | "dia
     default:
       return operation.kind === "answer" ? "lost_answer_response" : "lost_prompt_response"
   }
+}
+
+function describeUnknownOperation(operation: Pick<RunnerOperationRecord, "kind" | "diagnosticCode" | "diagnostic">): string {
+  const code = operation.diagnosticCode ? ` [${operation.diagnosticCode}]` : ""
+  const detail = operation.diagnostic ? `: ${operation.diagnostic}` : ""
+  return `ACP ${operation.kind} outcome unknown${code}${detail}`
 }
 
 /** A `RunnerOperationError` with an explicit `failureClass` (e.g. an

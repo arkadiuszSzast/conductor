@@ -354,6 +354,23 @@ describe("2.4: lost create/prompt responses fence, never retry", () => {
     expect(fence?.reasonCode).toBe("lost_create_response")
   })
 
+  it("carries the operation's concrete diagnostic and operation id into the fence instead of a generic message", async () => {
+    const engine = makeEngine(singleAgentWorkflow, { daemonGeneration: 1 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    const op = store.claimOperation({ runId: run.id, kind: "create", logicalKey: run.id, payloadDigest: "d", ownerGeneration: 1 })
+    store.transitionOperationPhase(op.id, "prepared", "unknown", {
+      diagnosticCode: "create_response_lost",
+      diagnostic: "session/new exceeded 30000ms deadline (elapsed 774750ms)",
+    })
+    expect(store.getOperation(op.id)?.diagnostic).toBe("session/new exceeded 30000ms deadline (elapsed 774750ms)")
+    await engine.observeRunnerOperation(op.id)
+    expect(store.getFence(run.id)?.operationId).toBe(op.id)
+    const concluded = store.getRunById(run.id)!
+    expect(concluded.reason).toContain("[create_response_lost]")
+    expect(concluded.reason).toContain("elapsed 774750ms")
+  })
+
   it("review fix: propagates the SPECIFIC turn_deadline_exceeded fence reason via observeRunnerOperation's diagnosticCode", async () => {
     const engine = makeEngine(singleAgentWorkflow, { daemonGeneration: 1 })
     const feature = await startedFeature(engine)
@@ -440,6 +457,7 @@ describe("uncertainty recovery barriers", () => {
       projectDir => (projectDir === "/tmp/acp-project" ? snapshotOf(twoJobWorkflow) : undefined),
     )
     expect(fenceResult.fenced).toBe(true)
+    await engine.classifyFencedRun(runA.id, true)
 
     const afterFence = store.getFeature(feature.id)!
     expect(afterFence.status).toBe("escalated")
@@ -574,6 +592,141 @@ describe("2.4: acpSessions not wired is a config error, never a fence", () => {
     const feature = await startedFeature(engine)
     const runs = store.listRuns(feature.id)
     expect(runs).toHaveLength(0)
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+  })
+})
+
+describe("self-healing: safe fences heal with backoff", () => {
+  const reviewWorkflow = workflow({ main: job([agentStep("review", "implementer", "review it", { replaySafe: true })]) }, roles)
+  const implementWorkflow = workflow({ main: job([agentStep("implement", "implementer", "build it")]) }, roles)
+  const fixedRandom = { next: () => 0.999999 }
+
+  function healingEngine(def: WorkflowDef, cleanup: "confirmed_terminated" | "unconfirmed" = "confirmed_terminated") {
+    return makeEngine(def, { cleanupAcpRun: async () => cleanup }, { random: fixedRandom, healing: { attentionAfter: 3 } })
+  }
+
+  it("a lost session/new with confirmed cleanup is no_effect: no escalation, healed after ~1 minute", async () => {
+    acpSessions.createSessionError = new RunnerOperationError("session/new exceeded 30000ms deadline", { delivery: "unknown" })
+    const engine = healingEngine(implementWorkflow)
+    const feature = await startedFeature(engine)
+    await engine.drainRunnerCleanup()
+    const [fenced] = store.listRuns(feature.id)
+    expect(fenced?.status).toBe("uncertain")
+    expect(store.getFence(fenced!.id)?.classification).toBe("no_effect")
+    expect(store.getFeature(feature.id)?.status).toBe("running")
+    const episode = store.getOpenHealingEpisode(feature.id, "main", "implement")!
+    expect(episode.consecutiveFailures).toBe(1)
+    expect(Math.round(episode.delayMs / 1000)).toBe(60)
+
+    await engine.reconcile()
+    expect(store.listRuns(feature.id)).toHaveLength(1)
+
+    clock.advance(60_000)
+    await engine.reconcile()
+    const runs = store.listRuns(feature.id)
+    expect(runs).toHaveLength(2)
+    expect(runs.find(run => run.id !== fenced!.id)?.status).toBe("running")
+    expect(store.getFence(fenced!.id)?.resolvedAt).not.toBeNull()
+    expect(store.getTransitions(feature.id, 5).some(entry => (entry.event as { kind: string }).kind === "system.healed")).toBe(true)
+    expect(acpSessions.prompts).toHaveLength(1)
+  })
+
+  it("a lost prompt on a non-replay-safe step with confirmed cleanup is unsafe and escalates", async () => {
+    acpSessions.promptError = new RunnerOperationError("prompt lost", { delivery: "unknown" })
+    const engine = healingEngine(implementWorkflow)
+    const feature = await startedFeature(engine)
+    await engine.drainRunnerCleanup()
+    expect(store.getFence(store.listRuns(feature.id)[0]!.id)?.classification).toBe("unsafe")
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    expect(store.getOpenHealingEpisode(feature.id, "main", "implement")).toBeNull()
+  })
+
+  it("a lost prompt on a replaySafe step heals; unconfirmed cleanup never does", async () => {
+    acpSessions.promptError = new RunnerOperationError("prompt lost", { delivery: "unknown" })
+    const engine = healingEngine(reviewWorkflow)
+    const feature = await startedFeature(engine)
+    await engine.drainRunnerCleanup()
+    expect(store.getFence(store.listRuns(feature.id)[0]!.id)?.classification).toBe("replay_safe")
+    expect(store.getFeature(feature.id)?.status).toBe("running")
+  })
+
+  it("unconfirmed cleanup is unsafe even for a replaySafe step", async () => {
+    acpSessions.promptError = new RunnerOperationError("prompt lost", { delivery: "unknown" })
+    const engine = healingEngine(reviewWorkflow, "unconfirmed")
+    const feature = await startedFeature(engine)
+    await engine.drainRunnerCleanup()
+    expect(store.getFence(store.listRuns(feature.id)[0]!.id)?.classification).toBe("unsafe")
+    expect(store.getFeature(feature.id)?.status).toBe("escalated")
+  })
+
+  it("backs off exponentially, enters attention at the third failure, keeps healing, and clears on success", async () => {
+    const engine = healingEngine(reviewWorkflow)
+    acpSessions.createSessionError = new RunnerOperationError("session/new lost", { delivery: "unknown" })
+    const feature = await startedFeature(engine)
+    await engine.drainRunnerCleanup()
+    const delays: number[] = []
+    for (let failure = 1; failure <= 4; failure++) {
+      const episode = store.getOpenHealingEpisode(feature.id, "main", "review")!
+      expect(episode.consecutiveFailures).toBe(failure)
+      delays.push(Math.round(episode.delayMs / 1000))
+      expect(store.listAttention(feature.id).length > 0).toBe(failure >= 3)
+      acpSessions.createSessionError = new RunnerOperationError("session/new lost", { delivery: "unknown" })
+      clock.advance(episode.delayMs)
+      await engine.reconcile()
+      await engine.drainRunnerCleanup()
+    }
+    expect(delays).toEqual([60, 120, 240, 480])
+    expect(store.getFeature(feature.id)?.status).toBe("running")
+    expect(store.listAttention(feature.id)[0]?.consecutiveFailures).toBe(5)
+
+    const episode = store.getOpenHealingEpisode(feature.id, "main", "review")!
+    clock.advance(episode.delayMs)
+    await engine.reconcile()
+    const live = store.getActiveRunForStep(feature.id, "main", "review")!
+    expect(live).not.toBeNull()
+    await engine.report({ runId: live.id, outcome: "succeeded", notes: "ok" })
+    expect(store.listAttention(feature.id)).toHaveLength(0)
+    expect(store.getFeature(feature.id)?.status).toBe("done")
+  })
+
+  it("pause suspends healing; resume continues it", async () => {
+    acpSessions.createSessionError = new RunnerOperationError("session/new lost", { delivery: "unknown" })
+    const engine = healingEngine(reviewWorkflow)
+    const feature = await startedFeature(engine)
+    await engine.drainRunnerCleanup()
+    await engine.pause(feature.id)
+    clock.advance(10 * 60_000)
+    await engine.reconcile()
+    expect(store.listRuns(feature.id)).toHaveLength(1)
+    await engine.resume(feature.id)
+    await engine.reconcile()
+    expect(store.listRuns(feature.id)).toHaveLength(2)
+  })
+
+  it("abandon closes pending healing", async () => {
+    acpSessions.createSessionError = new RunnerOperationError("session/new lost", { delivery: "unknown" })
+    const engine = healingEngine(reviewWorkflow)
+    const feature = await startedFeature(engine)
+    await engine.drainRunnerCleanup()
+    await engine.abandon(feature.id)
+    expect(store.getOpenHealingEpisode(feature.id, "main", "review")).toBeNull()
+    clock.advance(10 * 60_000)
+    await engine.reconcile()
+    expect(store.listRuns(feature.id)).toHaveLength(1)
+  })
+
+  it("an unclassified fence after a restart is classified unsafe once the bound expires", async () => {
+    const engine = makeEngine(reviewWorkflow, { cleanupAcpRun: async () => "unconfirmed" }, { fenceClassifyTimeoutMs: 1000 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    store.fenceRunnerExecution({ runId: run.id, jobId: "main", stepId: "review", reasonCode: "startup_recovery", diagnostic: "restart" },
+      () => snapshotOf(reviewWorkflow))
+    await engine.reconcile()
+    expect(store.getFence(run.id)?.classification).toBeNull()
+    expect(store.getFeature(feature.id)?.status).toBe("running")
+    clock.advance(1000)
+    await engine.reconcile()
+    expect(store.getFence(run.id)?.classification).toBe("unsafe")
     expect(store.getFeature(feature.id)?.status).toBe("escalated")
   })
 })

@@ -200,6 +200,23 @@ describe("steps", () => {
     expect(messages(errors)).toContain('unknown field "interactive"')
   })
 
+  it("accepts replaySafe on agent steps, absent means not replay-safe", () => {
+    const on = parsed(wrap("      - id: s\n        agent: { role: r, prompt: p, replaySafe: true }\n")).jobs.main!.steps[0]!
+    expect(on).toMatchObject({ type: "agent", replaySafe: true })
+    const off = parsed(wrap("      - id: s\n        agent: { role: r, prompt: p }\n")).jobs.main!.steps[0]!
+    expect((off as { replaySafe?: boolean }).replaySafe).toBeUndefined()
+  })
+
+  it("rejects replaySafe on non-agent steps", () => {
+    const errors = failed(wrap("      - id: s\n        command:\n          run: [ls]\n          replaySafe: true\n"))
+    expect(messages(errors)).toContain('unknown field "replaySafe"')
+  })
+
+  it("rejects replaySafe combined with interactive, naming the step", () => {
+    const errors = failed(wrap("      - id: s\n        agent: { role: r, prompt: p, interactive: true, replaySafe: true }\n"))
+    expect(messages(errors)).toContain('step "s": agent: replaySafe cannot be combined with interactive')
+  })
+
   it("rejects timeoutMs below 1", () => {
     const errors = failed(wrap("      - id: s\n        command:\n          run: [ls]\n          timeoutMs: 0\n"))
     expect(messages(errors)).toContain("timeoutMs must be ≥ 1")

@@ -122,6 +122,7 @@ export function FeatureView(): React.ReactNode {
   }
 
   const pillClass = `${styles.statusPill} ${styles[feature.status]}`
+  const troubled = feature.status === "running" && (feature.attention?.targets.length ?? 0) > 0
   const activity = feature.activity ?? {
     state: feature.status === "running" ? ("active" as const) : feature.status === "done" || feature.status === "abandoned" ? ("terminal" as const) : feature.status,
     activeCount: detail.activeRun === null ? 0 : 1,
@@ -155,7 +156,9 @@ export function FeatureView(): React.ReactNode {
           ← board
         </Link>
         <span className={styles.title}>{feature.title}</span>
-        <span className={pillClass}>{STATUS_PILL[feature.status] ?? feature.status}</span>
+        <span className={troubled ? `${styles.statusPill} ${styles.attention}` : pillClass}>
+          {troubled ? "⚠ attention" : STATUS_PILL[feature.status] ?? feature.status}
+        </span>
         <span className={styles.meta}>
           {projectBasename(feature.projectDir)} · {feature.workflow ?? "default"}
           {feature.pr !== null ? ` · pr #${feature.pr}` : ""}
@@ -198,7 +201,18 @@ export function FeatureView(): React.ReactNode {
           </code>
         ) : null}
         {activity.reason !== null ? <span>reason: {activity.reason}</span> : null}
-        {activity.nextAt !== null ? <span>next check: {formatClock(activity.nextAt)}</span> : null}
+        {activity.nextAt !== null ? <span>next attempt: {formatClock(activity.nextAt)}</span> : null}
+        {troubled
+          ? feature.attention!.targets.map(target => (
+              <span key={`${target.jobId}/${target.stepId}`} className={styles.attentionTarget}>
+                <code>
+                  {target.jobId}/{target.stepId}
+                </code>{" "}
+                {target.consecutiveFailures} consecutive failures ({target.source})
+                {target.lastDiagnostic !== null ? <pre className={styles.escalationDetail}>{target.lastDiagnostic}</pre> : null}
+              </span>
+            ))
+          : null}
         {feature.escalation !== null ? <pre className={styles.escalationDetail}>{feature.escalation}</pre> : null}
       </div>
       <div className={styles.grid}>

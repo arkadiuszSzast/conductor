@@ -190,3 +190,51 @@ test("6.4 composition: same-cwd concurrent runs get independent ACP processes an
     for (const run of runs) expect(daemon.store.listRunnerOperations(run.id).map(op => op.kind)).toContain("prompt")
   } finally { await api?.stop(); await daemon.stop(); rmSync(dir, { recursive: true, force: true }) }
 }, 15000)
+
+test("self-healing e2e: a hung session/new on a real child is fenced no_effect, healed with backoff, and notified", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "acp-composition-heal-"))
+  writeFileSync(join(dir, "conductor.yaml"), "name: fake\non: [manual]\nroles:\n  implementer: {agent: build}\njobs:\n  main:\n    steps:\n      - id: review\n        agent: {role: implementer, prompt: synthetic, replaySafe: true}\n")
+  const config = assembleDaemonConfig({
+    ...base, databasePath: join(dir, "state.db"), projects: [dir],
+    engine: { healing: { initialMs: 50, maxMs: 200, attentionAfter: 2 } },
+    runners: {
+      ...runners, projects: { [dir]: "fake" },
+      acp: { fake: { ...runners.acp.fake, args: [join(import.meta.dirname, "fake-acp-child.ts"), "--hang-session-new"], allowedRoots: [dir], deadlines: { startupMs: 300, writeMs: 2000, cancelMs: 100, killMs: 200 } } },
+      reportBridge: { command: process.env.CONDUCTOR_TEST_BINARY ?? process.execPath, args: [...(process.env.CONDUCTOR_TEST_BINARY ? [] : [join(import.meta.dirname, "src/main.ts")]), "report-mcp"] },
+    },
+  })
+  const sent: string[] = []
+  const readiness = createFakeReportingReadiness()
+  const daemon = new Daemon({ ...config.daemon, notifications: { telegram: { chatId: "1", token: "t" } } }, {
+    logger: { log() {} },
+    notificationChannels: { telegram: { id: "telegram", send: async message => { sent.push(message.kind) } } },
+    sessionFactory: (store, clock, observe) => composeManagedRunners(config.daemon.runners!, store, clock, readiness, () => "http://127.0.0.1:1", {}, observe),
+  })
+  try {
+    await daemon.initialize()
+    await daemon.activate()
+    const started = await daemon.engine.startFeature(dir, { title: "heal me" })
+    if (!started.ok) throw new Error(started.message)
+    const featureId = started.feature.id
+    const waitFor = async (predicate: () => boolean, label: string) => {
+      for (let n = 0; n < 300 && !predicate(); n++) { await Bun.sleep(20); await daemon.engine.drainRunnerCleanup(); await daemon.engine.reconcile() }
+      if (!predicate()) throw new Error(`timed out waiting for ${label}`)
+    }
+    await waitFor(() => daemon.store.listRuns(featureId).filter(run => run.status === "uncertain").length >= 2, "two healed fences")
+    const fenced = daemon.store.listRuns(featureId).filter(run => run.status === "uncertain")
+    for (const run of fenced) {
+      const fence = daemon.store.getFence(run.id)!
+      expect(fence.reasonCode).toBe("lost_create_response")
+      expect(fence.cleanupState).toBe("confirmed_terminated")
+      expect(fence.classification).toBe("no_effect")
+      expect(daemon.store.getRunById(run.id)!.reason).toContain("session/new exceeded")
+      expect(daemon.store.listRunnerOperations(run.id).map(op => op.kind)).toEqual(["create"])
+    }
+    expect(daemon.store.getFeature(featureId)?.status).toBe("running")
+    expect(daemon.store.listAttention(featureId)[0]?.consecutiveFailures).toBeGreaterThanOrEqual(2)
+    await daemon.notificationBeat()
+    expect(sent).toContain("attention")
+    expect(sent).not.toContain("escalated")
+    await daemon.engine.pause(featureId)
+  } finally { await daemon.drainWorkers(); await daemon.stop(); rmSync(dir, { recursive: true, force: true }) }
+}, 30000)

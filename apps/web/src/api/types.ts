@@ -39,6 +39,21 @@ export interface FeatureBase {
   readonly createdAt: number
   readonly updatedAt: number
   readonly findingCounts: FindingCounts
+  /** Persistent trouble on a still-progressing feature (retries/healing
+   *  continue). Null/absent when none — older daemons omit it. */
+  readonly attention?: FeatureAttention | null
+}
+
+export interface FeatureAttention {
+  readonly since: number
+  readonly targets: readonly {
+    readonly jobId: string
+    readonly stepId: string
+    readonly source: "healing" | "retry"
+    readonly consecutiveFailures: number
+    readonly lastDiagnostic: string | null
+    readonly nextAttemptAt: number | null
+  }[]
 }
 
 export interface FeatureListItem extends FeatureBase {
@@ -69,7 +84,7 @@ export interface Feedback {
 }
 
 export interface FeatureActivity {
-  readonly state: "active" | "waiting_retry" | "blocked" | "waiting_human" | "paused" | "escalated" | "terminal"
+  readonly state: "active" | "waiting_retry" | "blocked" | "waiting_human" | "paused" | "escalated" | "terminal" | "attention"
   readonly activeCount: number
   readonly targets: readonly { readonly jobId: string; readonly stepId: string }[]
   readonly target: { readonly jobId: string; readonly stepId: string } | null
@@ -124,7 +139,12 @@ export interface RunSummary {
     readonly reasonCode: string
     readonly cleanupState: "confirmed_terminated" | "operator_attested" | "unconfirmed"
     readonly recoveryRequiresCleanupAcknowledgement: boolean
+    /** Null while cleanup evidence is still being gathered. */
+    readonly classification?: "no_effect" | "replay_safe" | "unsafe" | null
+    readonly autoHealing?: boolean
   }
+  /** A fence that self-healing resolved — the run stays `uncertain` in history. */
+  readonly healed?: { readonly classification: "no_effect" | "replay_safe"; readonly resolvedAt: number | null; readonly note: string | null }
   readonly sessionId: string | null
   readonly outputs: Readonly<Record<string, string>>
   readonly reason: string | null

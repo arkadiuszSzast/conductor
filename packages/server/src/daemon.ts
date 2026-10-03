@@ -31,7 +31,8 @@ import {
   type DatabaseConnection,
 } from "./database.ts"
 import { migrations } from "./migrations.ts"
-import { Store } from "./store.ts"
+import { Store, type NotificationChannelConfig, type NotificationKind } from "./store.ts"
+import { NotificationDispatcher, createTelegramChannel, type NotificationChannel } from "./notifications.ts"
 import { WorkflowRegistry, type WorkflowDiagnostic, type WorkflowStatus } from "./workflow-registry.ts"
 import { loadActionRegistry, type ActionRegistryLoadDiagnostic, type LoadedActionRegistry } from "./action-registry.ts"
 import { Engine, type EngineOptions } from "./engine.ts"
@@ -131,6 +132,20 @@ export interface DaemonConfig {
     readonly bundledPath?: string
     readonly localPaths?: readonly string[]
   }
+  /** Push notifications (notifications spec). Absent → nothing is recorded or sent. */
+  readonly notifications?: NotificationsConfig
+}
+
+export interface NotificationsConfig {
+  readonly publicBaseUrl?: string
+  readonly rateLimitWindowMs?: number
+  readonly intervalMs?: number
+  readonly telegram?: {
+    readonly chatId: string
+    /** Resolved from the configured environment variable by the composition root. */
+    readonly token: string
+    readonly events?: readonly NotificationKind[]
+  }
 }
 
 /** The one thing the daemon needs from a reconciler: one idempotent pass. */
@@ -168,6 +183,8 @@ export interface DaemonDeps {
    */
   readonly changeQueueTimer?: IntervalScheduler
   readonly notify?: (title: string, message: string) => void
+  /** Channel overrides keyed by channel id (tests). */
+  readonly notificationChannels?: Readonly<Record<string, NotificationChannel>>
   /** Loaded action registry for resolving workflow `action` steps. Absent → any workflow using `action` steps is invalid. */
   readonly actionRegistry?: LoadedActionRegistry
   /** Reconciler override for lifecycle tests. Defaults to the constructed `Engine`. */
@@ -339,6 +356,7 @@ export class Daemon {
     this.appliedNow = migrateDatabase(connection)
     for (const id of this.appliedNow) this.log("info", "migration applied", { migration: id })
     this.storeInstance = new Store(connection.db, this.clock)
+    this.configureNotifications(this.storeInstance)
 
     const actionRegistry = this.deps.actionRegistry ?? (await this.loadActionRegistry())
     this.registryInstance = new WorkflowRegistry({
@@ -453,8 +471,47 @@ export class Daemon {
     this.queueTimerHandle = this.queueTimer.setInterval(() => {
       void this.queueBeat()
     }, changeQueueIntervalMs)
+    if (this.notificationDispatcher) {
+      this.notificationTimerHandle = this.queueTimer.setInterval(() => {
+        void this.notificationBeat()
+      }, this.config.notifications?.intervalMs ?? 5_000)
+    }
     this.phase = "ready"
     this.log("info", "daemon ready", { heartbeatIntervalMs: this.config.heartbeatIntervalMs, changeQueueIntervalMs })
+  }
+
+  private notificationDispatcher: NotificationDispatcher | null = null
+  private notificationTimerHandle: unknown = null
+
+  private configureNotifications(store: Store): void {
+    const config = this.config.notifications
+    const channels: NotificationChannel[] = []
+    const routing: NotificationChannelConfig[] = []
+    if (config?.telegram) {
+      channels.push(this.deps.notificationChannels?.["telegram"]
+        ?? createTelegramChannel({ chatId: config.telegram.chatId, token: config.telegram.token }))
+      routing.push({ id: "telegram", ...(config.telegram.events ? { events: config.telegram.events } : {}) })
+    }
+    if (channels.length === 0) return
+    store.configureNotifications(routing)
+    this.notificationDispatcher = new NotificationDispatcher(
+      { store, clock: this.clock, log: { log: text => this.log("warn", text, { component: "notifications" }) } },
+      channels,
+      {
+        ...(config?.publicBaseUrl !== undefined ? { publicBaseUrl: config.publicBaseUrl } : {}),
+        ...(config?.rateLimitWindowMs !== undefined ? { rateLimitWindowMs: config.rateLimitWindowMs } : {}),
+      },
+    )
+    this.log("info", "notifications enabled", { channels: channels.map(channel => channel.id).join(",") })
+  }
+
+  /** Deliver due notifications now (also driven by its own timer). */
+  notificationBeat(): Promise<void> {
+    return this.notificationDispatcher?.drain().catch(error => this.log("error", `notification pass failed: ${message(error)}`)) ?? Promise.resolve()
+  }
+
+  async testNotifications(): Promise<readonly { readonly channel: string; readonly ok: boolean; readonly error?: string }[]> {
+    return this.notificationDispatcher?.test() ?? []
   }
 
   /**
@@ -561,6 +618,7 @@ export class Daemon {
     this.phase = "stopping"
     if (this.timerHandle !== null) { this.scheduler.clearInterval(this.timerHandle); this.timerHandle = null }
     if (this.queueTimerHandle !== null) { this.queueTimer.clearInterval(this.queueTimerHandle); this.queueTimerHandle = null }
+    if (this.notificationTimerHandle !== null) { this.queueTimer.clearInterval(this.notificationTimerHandle); this.notificationTimerHandle = null }
     if (this.cycleInFlight) await this.cycleInFlight
     if (this.queueInFlight) await this.queueInFlight
     if (this.connection && this.storeInstance) for (const feature of this.storeInstance.listFeatures({})) {

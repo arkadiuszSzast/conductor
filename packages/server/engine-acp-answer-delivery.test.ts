@@ -249,8 +249,10 @@ describe("2.5: ACP answer delivery — lost/unknown response fences, never fails
     expect(result.ok).toBe(true)
     const after = store.getRunById(run.id)
     expect(after?.status).toBe("uncertain")
+    await engine.drainRunnerCleanup()
     const feat = store.getFeature(feature.id)
     expect(feat?.status).toBe("escalated")
+    expect(store.getFence(run.id)?.classification).toBe("unsafe")
   })
 
   it("accepted notes remain available (never lost) even when the run is fenced", async () => {
@@ -388,6 +390,7 @@ describe("D9: pause/resume/abandon — ACP interaction", () => {
     const fence = store.getFence(run.id)
     expect(fence).not.toBeNull()
     expect(fence?.reasonCode).toBe("cancellation_during_uncertain_write")
+    await engine.drainRunnerCleanup()
     expect(store.getFeature(feature.id)?.status).toBe("escalated")
     expect(store.getRunById(run.id)?.status).toBe("uncertain")
   })

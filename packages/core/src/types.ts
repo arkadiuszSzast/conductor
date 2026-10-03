@@ -111,6 +111,11 @@ export interface AgentStep extends StepBase {
    *  question (the ask/answer protocol). Absent means autonomous: the
    *  engine refuses asks and the agent must decide and report. */
   readonly interactive?: boolean
+  /** Asserts that re-running the step from scratch after a possibly
+   *  delivered prompt is harmless (e.g. a read-only review). Lets the
+   *  engine heal an uncertain execution automatically instead of
+   *  escalating. Absent means false. Never allowed with `interactive`. */
+  readonly replaySafe?: boolean
   /** Silence budget for THIS step's runs, in milliseconds — overrides
    *  the engine-wide TTL. Absent means the engine default governs. */
   readonly ttlMs?: number
@@ -312,6 +317,17 @@ export type PipelineEvent =
    *  run itself records `uncertain` at the store layer, never `failed`;
    *  this event only carries the pure workflow-routing half of that. */
   | { readonly kind: "step.execution_unknown"; readonly jobId: string; readonly stepId: string; readonly reason: string }
+  /** The engine classified a fenced execution from durable evidence
+   *  (self-healing D1). `unsafe` escalates exactly as an unrecoverable
+   *  uncertainty always did; a healable classification keeps the target
+   *  armed for an engine-scheduled healing attempt. Engine-issued only. */
+  | {
+      readonly kind: "step.fence_classified"
+      readonly jobId: string
+      readonly stepId: string
+      readonly classification: "no_effect" | "replay_safe" | "unsafe"
+      readonly reason: string
+    }
   | { readonly kind: "human.paused" }
   | { readonly kind: "human.resumed" }
   | { readonly kind: "human.abandoned" }

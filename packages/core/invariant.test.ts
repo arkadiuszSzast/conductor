@@ -147,3 +147,15 @@ describe("checkActiveStateInvariant", () => {
     expect(checkActiveStateInvariant(state, { ...NO_EXTERNAL_ANCHORS, hasPreparingTarget: true })).toEqual({ kind: "ok" })
   })
 })
+
+describe("fence_pending anchor (self-healing)", () => {
+  it("keeps a running feature with only a fenced target from being stranded", () => {
+    const feature = {
+      id: "f", title: "t", slug: "s", projectDir: "/p", workflow: null, description: null,
+      status: "running" as const, trigger: null, input: {}, sessionId: null, worktree: null, branch: null, pr: null,
+      jobs: { main: { status: "running" as const, currentStep: "review", attempts: {}, reruns: {}, outputs: {}, steps: { review: { status: "running" as const, outputs: {} } } } },
+    }
+    expect(checkActiveStateInvariant(feature, NO_EXTERNAL_ANCHORS).kind).toBe("stranded_no_anchor")
+    expect(checkActiveStateInvariant(feature, { ...NO_EXTERNAL_ANCHORS, hasPendingFence: true })).toEqual({ kind: "ok" })
+  })
+})

@@ -305,6 +305,7 @@ Performs LLM work.
 | `role` | yes | Must exist in `roles`. |
 | `prompt` | yes | Template; see [Expressions](expressions.md). |
 | `interactive` | no | Boolean, default `false`. Grants the step the right to pause mid-run and ask the human a question. |
+| `replaySafe` | no | Boolean, default `false`. Declares that re-running the step from scratch after a possibly delivered prompt is harmless (typically a read-only review). Lets the daemon [heal an uncertain run](install.md#self-healing-of-uncertain-runs) automatically instead of escalating. Not allowed together with `interactive: true`. |
 | `idleSilenceNudgeMs` | no | Positive integer ms; overrides daemon idle silence (default 120000). Every idle nudge or exhausted reap requires elapsed silence plus cycle debounce. |
 | `busySilenceNudgeMs` | no | Positive integer ms; overrides daemon busy/retry silence (default 600000). |
 | `maxNudges` | no | Positive integer; overrides daemon shared per-run idle/busy budget (default 2). Activity and restart do not reset consumed nudges. |

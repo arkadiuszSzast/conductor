@@ -21,6 +21,7 @@ export type ProgressAnchor =
   | "paused_pending_work"
   | "unhandled_outbox_decision"
   | "preparing_target"
+  | "fence_pending"
 
 /** External durable anchors the pure core cannot see for itself. */
 export interface AnchorState {
@@ -41,6 +42,9 @@ export interface AnchorState {
    * needing to durably resume "was preparing".
    */
   readonly hasPreparingTarget: boolean
+  /** A fenced run awaiting classification, or a healable fence whose
+   *  healing attempt is scheduled (self-healing D1/D3). */
+  readonly hasPendingFence?: boolean
 }
 
 export const NO_EXTERNAL_ANCHORS: AnchorState = {
@@ -83,6 +87,7 @@ export function progressAnchors(state: FeatureState, external: AnchorState): rea
   if (state.status === "paused") anchors.push("paused_pending_work")
   if (external.hasUnhandledOutboxDecision) anchors.push("unhandled_outbox_decision")
   if (external.hasPreparingTarget) anchors.push("preparing_target")
+  if (external.hasPendingFence === true) anchors.push("fence_pending")
   return anchors
 }
 

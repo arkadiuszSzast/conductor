@@ -2146,6 +2146,27 @@ describe("Engine: nudge/reap", () => {
     expect(store.getRunById(run.id)?.status).toBe("reaped")
   })
 
+  it("an agent whose reports were rejected is nudged with the error and the reap names it", async () => {
+    const engine = makeEngine(linearWorkflow, { idleSilenceNudgeMs: 100, maxNudges: 1, nudgeIdleCycles: 1, runTtlMs: 10_000 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    store.appendRunLog(run.id, [
+      { source: "step", text: "report rejected: Invalid review: review.findings[0].acceptanceTests must be an ARRAY of strings" },
+      { source: "step", text: "report rejected: Invalid review: review.findings[0].id must match F<number>" },
+    ])
+    sessions.statuses.set(run.sessionId!, "idle")
+    clock.advance(101)
+    await engine.reconcile()
+    const nudge = sessions.prompts.at(-1)!.text
+    expect(nudge).toContain("Your last report was rejected: Invalid review: review.findings[0].id must match F<number>")
+    expect(nudge).toContain(`run_id="${run.id}"`)
+    clock.advance(101)
+    await engine.reconcile()
+    const reaped = store.getRunById(run.id)!
+    expect(reaped.status).toBe("reaped")
+    expect(reaped.reason).toContain("idle without report after 1 nudge(s); 2 report(s) rejected, last: Invalid review: review.findings[0].id must match F<number>")
+  })
+
   it.each(["idle", "busy", "retry"] as const)("per-step %s limits override independently without leaking to siblings", async status => {
     const def = workflow({
       custom: job([{ ...agentStep("work", "implementer", "go"), idleSilenceNudgeMs: 200, busySilenceNudgeMs: 200, maxNudges: 3, ttlMs: 10_000 }]),

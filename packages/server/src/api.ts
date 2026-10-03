@@ -44,7 +44,7 @@ import type { RunnerRegistry } from "./runner-registry.ts"
 import { proxyPluginRequest } from "./plugin-proxy.ts"
 import type { PluginControl } from "./plugin-proxy.ts"
 import { pickStaticFile, serveStaticFile } from "./static-files.ts"
-import { isAlreadyConcludedMessage, parseReportBody } from "./run-reporting.ts"
+import { isAlreadyConcludedMessage, parseReportBody, reportRejectionLogEntry } from "./run-reporting.ts"
 import { createWorkerRoutes, type WorkerRoutesDeps } from "./worker-routes.ts"
 import { ChangeQueueError, type QueueEntryRecord } from "./store.ts"
 import {
@@ -180,6 +180,8 @@ export interface ApiDeps {
    * runners" contract (native deployments never gain this surface).
    */
   readonly worker?: WorkerRoutesDeps
+  /** Synchronous channel check (`POST /v1/notifications/test`). Absent → 404. */
+  readonly testNotifications?: () => Promise<readonly { readonly channel: string; readonly ok: boolean; readonly error?: string }[]>
 }
 
 // ------------------------------------------------------------------ errors
@@ -378,7 +380,7 @@ function parseStatusFilter(raw: string): FeatureStatus[] | null {
 type SseChangeFrame = StoreChange | { readonly kind: "plugins" }
 
 export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
-  const { store, engine, health, resolveWorkflow, workflowStatus, registerProject, runners, plugins, logger, changeQueue } = deps
+  const { store, engine, health, resolveWorkflow, workflowStatus, registerProject, runners, plugins, logger, changeQueue, testNotifications } = deps
   const staticRoot = config.ui !== undefined ? resolve(config.ui.staticDir) : null
   const sseClients = new Set<SseClient>()
   const inFlight = new Set<Promise<void>>()
@@ -483,7 +485,10 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     const activeRuns = store.listActiveRuns(featureId)
     const openWait = store.listResourceWaits(featureId).find(wait => wait.status !== "closed")
     const openRetry = store.listRetryEpisodes(featureId).find(episode => episode.status !== "closed")
-    const activity = openWait
+    const openHealing = store.listHealingEpisodes(featureId).find(episode => episode.status !== "closed")
+    const attention = attentionOf(featureId)
+    const troubled = attention !== null && (feature.status === "running" || feature.status === "waiting_human")
+    const baseActivity = openWait
       ? {
           state: "blocked",
           activeCount: activeRuns.length,
@@ -507,6 +512,18 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
             deadlineAt: openRetry.startedAt + openRetry.maxElapsedMs,
             message: "No agent is active — waiting for the next retry.",
           }
+        : openHealing
+          ? {
+              state: "waiting_retry",
+              activeCount: activeRuns.length,
+              targets: activeRuns.map(run => ({ jobId: run.jobId, stepId: run.stepId })),
+              target: { jobId: openHealing.jobId, stepId: openHealing.stepId },
+              reason: `healing:${openHealing.classification}`,
+              diagnostic: openHealing.diagnostic,
+              nextAt: openHealing.nextAttemptAt,
+              deadlineAt: null,
+              message: `Uncertain run healed automatically — attempt ${openHealing.consecutiveFailures + 1} scheduled.`,
+            }
         : {
             state: feature.status === "waiting_human"
               ? "waiting_human"
@@ -532,11 +549,21 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
                   ? "Automation stopped and needs recovery."
                   : `Feature is ${feature.status}.`,
           }
+    const activity = troubled
+      ? {
+          ...baseActivity,
+          state: "attention",
+          message: `Still retrying, needs a look: ${attention.targets.map(target => `${target.jobId}/${target.stepId} failed ${target.consecutiveFailures}×`).join(", ")}.`,
+          diagnostic: attention.targets[0]?.lastDiagnostic ?? baseActivity.diagnostic,
+          nextAt: baseActivity.nextAt ?? attention.targets.find(target => target.nextAttemptAt !== null)?.nextAttemptAt ?? null,
+        }
+      : baseActivity
     const recoverableTargets = feature.status === "escalated" ? engine.recoverableTargets?.(featureId) ?? null : null
     return {
       feature: {
         ...feature,
         activity,
+        attention: troubled ? attention : null,
         escalation: store.getEscalation(featureId),
         currentStep: currentStepOf(feature),
         createdAt: record.createdAt,
@@ -550,6 +577,18 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       },
       activeRun: activeRunProjection(featureId),
       activeRuns: activeRuns.map(run => withAnswerDelivery(run)),
+    }
+  }
+
+  function attentionOf(featureId: string): { since: number; targets: { jobId: string; stepId: string; source: string; consecutiveFailures: number; lastDiagnostic: string | null; nextAttemptAt: number | null }[] } | null {
+    const rows = store.listAttention(featureId)
+    if (rows.length === 0) return null
+    return {
+      since: Math.min(...rows.map(row => row.since)),
+      targets: rows.map(row => ({
+        jobId: row.jobId, stepId: row.stepId, source: row.source, consecutiveFailures: row.consecutiveFailures,
+        lastDiagnostic: row.lastDiagnostic, nextAttemptAt: row.nextAttemptAt,
+      })),
     }
   }
 
@@ -599,13 +638,17 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
             uncertain: {
               reasonCode: fence.reasonCode,
               cleanupState: fence.cleanupState,
+              classification: fence.classification ?? null,
+              autoHealing: fence.classification === "no_effect" || fence.classification === "replay_safe",
               // Honest signal for the operator surface (5.4): cleanup
               // must be independently confirmed/attested before recovery
               // is safe — never claimed automatically.
               recoveryRequiresCleanupAcknowledgement: fence.cleanupState === "unconfirmed",
             },
           }
-        : {}),
+        : fence !== null && (fence.classification === "no_effect" || fence.classification === "replay_safe")
+          ? { healed: { classification: fence.classification, resolvedAt: fence.resolvedAt, note: fence.resolutionNote } }
+          : {}),
     }
   }
 
@@ -679,6 +722,11 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       return json(200, health(), requestId)
     }
 
+    if (method === "POST" && path === "/v1/notifications/test" && testNotifications !== undefined) {
+      const results = await testNotifications()
+      return json(200, { channels: results, ok: results.length > 0 && results.every(result => result.ok) }, requestId)
+    }
+
     if (method === "GET" && path === "/v1/events") {
       if (closed) return error(requestId, "conflict", "server is shutting down")
       return sseResponse(requestId)
@@ -719,6 +767,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
               updatedAt: record.updatedAt,
               findingCounts: findingCounts.get(record.state.id) ?? zeroCounts,
               jobs: jobsSummary(record.state),
+              attention: record.state.status === "running" || record.state.status === "waiting_human" ? attentionOf(record.state.id) : null,
             })),
           },
           requestId,
@@ -1322,7 +1371,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
         return json(200, featurePayload(featureId), requestId)
       }
       case "resume":
-        if (store.hasUnresolvedRunnerFence(featureId)) return error(requestId, "conflict", "Uncertain execution requires recover with acknowledgeUncertain and cleanup evidence; resume cannot clear a fence.")
+        if (store.hasBlockingRunnerFence(featureId)) return error(requestId, "conflict", "Uncertain execution requires recover with acknowledgeUncertain and cleanup evidence; resume cannot clear a fence.")
         await engine.resume(featureId)
         return json(200, featurePayload(featureId), requestId)
       case "recover": {
@@ -1504,7 +1553,10 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     // Shared with the restricted /v1/worker/report route (run-reporting.ts,
     // task 4.2) — ONE validation authority for every reporting caller.
     const validated = parseReportBody(parsed.body)
-    if (!validated.ok) return error(requestId, "invalid_request", validated.message)
+    if (!validated.ok) {
+      if (run.status === "running") store.appendRunLog(runId, [reportRejectionLogEntry(validated.message)], { requireRunning: true })
+      return error(requestId, "invalid_request", validated.message)
+    }
     // Duplicate reports are rejected idempotently: the engine's atomic
     // conclusion claim is the authority; this pre-check only projects the
     // already-concluded state onto a 409 without touching the engine.
@@ -1525,7 +1577,10 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
     // already concluded`): success messages start with `Verdict "` /
     // `Step "`, so caller-controlled verdict/notes text can never spoof
     // the duplicate shape from inside a success message.
-    if (result.startsWith("Invalid review:")) return error(requestId, "invalid_request", result)
+    if (result.startsWith("Invalid review:")) {
+      store.appendRunLog(runId, [reportRejectionLogEntry(result)], { requireRunning: true })
+      return error(requestId, "invalid_request", result)
+    }
     if (isAlreadyConcludedMessage(result, runId)) {
       return error(requestId, "run_already_concluded", result)
     }

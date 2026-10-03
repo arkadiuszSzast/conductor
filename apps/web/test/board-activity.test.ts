@@ -26,6 +26,7 @@ function card(partial: Partial<FrontierCardModel> & { readonly id: string; reado
     pr: null,
     updatedAt: 0,
     attention: false,
+    troubled: null,
     ...partial,
     id: partial.id,
     jobId: partial.jobId,

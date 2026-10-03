@@ -693,6 +693,7 @@ interface RunnerOperationRow {
   version: number
   stop_reason: string | null
   diagnostic_code: string | null
+  diagnostic: string | null
   time_created: number
   time_updated: number
 }
@@ -709,6 +710,7 @@ function toRunnerOperationRecord(row: RunnerOperationRow): RunnerOperationRecord
     version: row.version,
     stopReason: row.stop_reason,
     diagnosticCode: row.diagnostic_code,
+    diagnostic: row.diagnostic ?? null,
     createdAt: row.time_created,
     updatedAt: row.time_updated,
   }
@@ -722,6 +724,9 @@ interface RunnerFenceRow {
   created_at: number
   resolved_at: number | null
   resolution_note: string | null
+  classification?: "no_effect" | "replay_safe" | "unsafe" | null
+  evidence?: string | null
+  classified_at?: number | null
 }
 
 function toRunnerFenceRecord(row: RunnerFenceRow): RunnerFenceRecord {
@@ -733,6 +738,9 @@ function toRunnerFenceRecord(row: RunnerFenceRow): RunnerFenceRecord {
     createdAt: row.created_at,
     resolvedAt: row.resolved_at,
     resolutionNote: row.resolution_note,
+    classification: row.classification ?? null,
+    evidence: row.evidence ? (JSON.parse(row.evidence) as Record<string, unknown>) : null,
+    classifiedAt: row.classified_at ?? null,
   }
 }
 
@@ -999,6 +1007,7 @@ export class Store implements RunnerSafetyStore {
         "UPDATE feature SET status = ?, escalation = ?, state = ?, time_updated = ? WHERE id = ?",
         ["escalated", reason, JSON.stringify(stateObj), now, featureId],
       )
+      this.notifyStatusChangeTx(featureId, row.status as FeatureStatus, "escalated", reason)
       this.db.run(
         "INSERT INTO transition_log (feature_id, event, decisions, time_created) VALUES (?, ?, ?, ?)",
         [featureId, JSON.stringify({ kind: "reconcile.repair" }), JSON.stringify([{ kind: "escalate", reason }]), now],
@@ -1020,6 +1029,7 @@ export class Store implements RunnerSafetyStore {
         "UPDATE feature SET status = ?, state = ?, time_updated = ?, escalation = NULL WHERE id = ?",
         [status, JSON.stringify(stateObj), now, featureId],
       )
+      this.notifyStatusChangeTx(featureId, row.status as FeatureStatus, status)
       return true
     })()
     if (changed) this.emit({ kind: "transition", featureId })
@@ -1095,6 +1105,13 @@ export class Store implements RunnerSafetyStore {
         if (runtime.status === "skipped") {
           jobs[jobId] = { ...runtime, status: "pending", currentStep: null, outputs: {}, steps: {} }
         }
+      }
+      for (const target of appliedTargets) {
+        this.db.run("DELETE FROM feature_attention WHERE feature_id = ? AND job_id = ? AND step_id = ?", [featureId, target.jobId, target.stepId])
+        this.db.run(
+          "UPDATE healing_episode SET status = 'closed', closed_reason = 'recovered', time_updated = ? WHERE feature_id = ? AND job_id = ? AND step_id = ? AND status IN ('scheduled','claimed')",
+          [now, featureId, target.jobId, target.stepId],
+        )
       }
       const next: FeatureState = { ...state, status: "running", jobs }
       this.db.run(
@@ -1252,6 +1269,7 @@ export class Store implements RunnerSafetyStore {
     }
     params.push(featureId)
     this.db.run(`UPDATE feature SET ${sets.join(", ")} WHERE id = ?`, params as never)
+    this.notifyStatusChangeTx(featureId, current.status, next.status, escalation ?? null)
     this.db.run(
       `INSERT INTO transition_log (feature_id, event, decisions, time_created)
        VALUES (?, ?, ?, ?)`,
@@ -1377,6 +1395,7 @@ export class Store implements RunnerSafetyStore {
       if (!row) return false
       const next = this.withAggregateHumanAttention(run.feature_id, toFeatureState(row))
       this.db.run("UPDATE feature SET time_updated = ?, state = ?, status = ? WHERE id = ?", [now, JSON.stringify(next), next.status, run.feature_id])
+      this.notifyStatusChangeTx(run.feature_id, row.status, next.status)
       this.db.run(
         "INSERT INTO transition_log (feature_id, event, decisions, time_created) VALUES (?, ?, ?, ?)",
         [run.feature_id, JSON.stringify({ kind: "run.ask", runId, jobId: run.job_id, stepId: run.step_id }), "[]", now],
@@ -1404,6 +1423,7 @@ export class Store implements RunnerSafetyStore {
       if (!row) return false
       const next = this.withAggregateHumanAttention(run.feature_id, toFeatureState(row))
       this.db.run("UPDATE feature SET time_updated = ?, state = ?, status = ? WHERE id = ?", [now, JSON.stringify(next), next.status, run.feature_id])
+      this.notifyStatusChangeTx(run.feature_id, row.status, next.status)
       this.db.run(
         "INSERT INTO transition_log (feature_id, event, decisions, time_created) VALUES (?, ?, ?, ?)",
         [run.feature_id, JSON.stringify({ kind: "run.answer", runId, jobId: run.job_id, stepId: run.step_id }), "[]", now],
@@ -1631,6 +1651,7 @@ export class Store implements RunnerSafetyStore {
       if (!row) return { kind: "not_claimed" }
       const next = this.withAggregateHumanAttention(run.feature_id, toFeatureState(row))
       this.db.run("UPDATE feature SET time_updated = ?, state = ?, status = ? WHERE id = ?", [now, JSON.stringify(next), next.status, run.feature_id])
+      this.notifyStatusChangeTx(run.feature_id, row.status, next.status)
       this.db.run(
         "INSERT INTO transition_log (feature_id, event, decisions, time_created) VALUES (?, ?, ?, ?)",
         [run.feature_id, JSON.stringify({ kind: "run.answer", runId: run.id, jobId: run.job_id, stepId: run.step_id }), "[]", now],
@@ -1895,8 +1916,9 @@ export class Store implements RunnerSafetyStore {
       this.revokeCredentialsForRun(runId, "run_concluded")
       this.db.run("UPDATE runner_binding SET phase = 'concluded', time_updated = ? WHERE run_id = ?", [this.clock.now(), runId])
       this.db.run("UPDATE answer_delivery SET status = 'cancelled', time_updated = ? WHERE run_id = ? AND status IN ('pending','claimed','submitted')", [this.clock.now(), runId])
-      const run = this.db.query("SELECT feature_id FROM run WHERE id = ?").get(runId) as { feature_id: string } | null
+      const run = this.db.query("SELECT feature_id, job_id, step_id FROM run WHERE id = ?").get(runId) as { feature_id: string; job_id: string; step_id: string } | null
       if (!run) return false
+      if (status === "succeeded") this.clearAttentionTx(run.feature_id, run.job_id, run.step_id, true)
       if (options?.review) {
         const review = options.review
         for (const finding of review.findings) {
@@ -1925,6 +1947,15 @@ export class Store implements RunnerSafetyStore {
           nextAttemptAt: schedule.nextAttemptAt, delayMs: schedule.delayMs, scheduleSource: schedule.scheduleSource,
           maxAttempts: schedule.maxAttempts, maxElapsedMs: schedule.maxElapsedMs, failure: schedule.failure,
         })
+        // Half the retry budget spent without a success: still retrying,
+        // but a human should know (self-healing D4).
+        const elapsed = schedule.nextAttemptAt - schedule.startedAt
+        if (episode && (schedule.attempts * 2 >= schedule.maxAttempts || elapsed * 2 >= schedule.maxElapsedMs)) {
+          this.upsertAttentionTx({
+            featureId: run.feature_id, jobId: schedule.jobId, stepId: schedule.stepId, source: "retry",
+            consecutiveFailures: schedule.attempts, lastDiagnostic: schedule.failure.diagnostic, nextAttemptAt: schedule.nextAttemptAt,
+          })
+        }
       }
       featureId = run.feature_id
       return true
@@ -2640,7 +2671,7 @@ export class Store implements RunnerSafetyStore {
     operationId: string,
     from: RunnerOperationPhase,
     to: RunnerOperationPhase,
-    detail?: { readonly stopReason?: string; readonly diagnosticCode?: string; readonly expectedVersion?: number; readonly ownerGeneration?: number },
+    detail?: { readonly stopReason?: string; readonly diagnosticCode?: string; readonly diagnostic?: string; readonly expectedVersion?: number; readonly ownerGeneration?: number },
   ): boolean {
     const allowed: Record<RunnerOperationPhase, readonly RunnerOperationPhase[]> = {
       prepared: ["sending", "not_sent", "unknown"],
@@ -2653,12 +2684,14 @@ export class Store implements RunnerSafetyStore {
     if (!current || (detail?.expectedVersion !== undefined && detail.expectedVersion !== current.version)
       || (detail?.ownerGeneration !== undefined && detail.ownerGeneration !== current.owner_generation)) return false
     const result = this.db.run(
-      `UPDATE runner_operation SET version = version + 1, phase = ?, stop_reason = COALESCE(?, stop_reason), diagnostic_code = COALESCE(?, diagnostic_code), time_updated = ?
+      `UPDATE runner_operation SET version = version + 1, phase = ?, stop_reason = COALESCE(?, stop_reason), diagnostic_code = COALESCE(?, diagnostic_code), diagnostic = COALESCE(?, diagnostic), time_updated = ?
        WHERE id = ? AND phase = ? AND phase NOT IN ('completed', 'not_sent', 'unknown')
         AND EXISTS (SELECT 1 FROM runner_binding b JOIN run r ON r.id = b.run_id
           WHERE b.run_id = runner_operation.run_id AND b.phase = 'active' AND r.status = 'running'
           AND b.daemon_generation = runner_operation.owner_generation)`,
-      [to, detail?.stopReason ?? null, detail?.diagnosticCode ?? null, this.clock.now(), operationId, from],
+      [to, detail?.stopReason ?? null, detail?.diagnosticCode ?? null,
+        detail?.diagnostic !== undefined ? boundDiagnostic(detail.diagnostic) : null,
+        this.clock.now(), operationId, from],
     )
     return result.changes > 0
   }
@@ -2705,6 +2738,15 @@ export class Store implements RunnerSafetyStore {
     return this.db.query(`SELECT 1 FROM runner_fence f JOIN run r ON r.id = f.run_id
       WHERE r.feature_id = ? AND f.resolved_at IS NULL
       AND (? IS NULL OR r.job_id = ?) AND (? IS NULL OR r.step_id = ?) LIMIT 1`).get(featureId, jobId ?? null, jobId ?? null, stepId ?? null, stepId ?? null) !== null
+  }
+
+  /** An unresolved fence that is not queued for healing: unsafe ones
+   *  need operator recovery, unclassified ones are still being routed.
+   *  Either way a plain resume must not proceed past it. */
+  hasBlockingRunnerFence(featureId: string): boolean {
+    return this.db.query(`SELECT 1 FROM runner_fence f JOIN run r ON r.id = f.run_id
+      WHERE r.feature_id = ? AND f.resolved_at IS NULL
+        AND (f.classification IS NULL OR f.classification = 'unsafe') LIMIT 1`).get(featureId) !== null
   }
 
   recordRunnerCleanup(runId: string, state: RunnerCleanupState): void {
@@ -2832,6 +2874,11 @@ export class Store implements RunnerSafetyStore {
       // never be a prerequisite for revoking a lost owner's credential.
       const snapshot = resolveWorkflow(feature.project_dir)
 
+      // 0. Pre-fence evidence (self-healing D2): step 2 below collapses every
+      //    in-flight operation to `unknown`, erasing whether a prompt ever
+      //    left `prepared` — snapshot it first.
+      const evidence = this.preFenceEvidenceTx(run)
+
       // 1. Run → uncertain (terminal for automatic execution, never
       //    "failed" — D6: "not an assertion of failure or success").
       this.db.run(
@@ -2866,16 +2913,16 @@ export class Store implements RunnerSafetyStore {
 
       // 5. Durable fence record.
       const fenceRow = this.db.query(
-        `INSERT INTO runner_fence (run_id, reason_code, operation_id, cleanup_state, created_at)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO runner_fence (run_id, reason_code, operation_id, cleanup_state, created_at, evidence)
+         VALUES (?, ?, ?, ?, ?, ?)
          RETURNING *`,
-      ).get(request.runId, request.reasonCode, request.operationId ?? null, cleanupState, now) as RunnerFenceRow
+      ).get(request.runId, request.reasonCode, request.operationId ?? null, cleanupState, now, JSON.stringify(evidence)) as RunnerFenceRow
 
-      // 6. Pure workflow transition: escalate, mark the target
-      //    failed-for-recovery, NO retry/onFail/downstream dispatch.
-      //    Also closes any open retry episode for this exact target so
-      //    a stale due-schedule can never fire a replacement dispatch
-      //    later (the retry/outbox barrier D6 requires).
+      // 6. Pure workflow transition: the target stays armed awaiting
+      //    classification — NO retry/onFail/downstream dispatch. Also
+      //    closes any open retry episode for this exact target so a stale
+      //    due-schedule can never fire a replacement dispatch later (the
+      //    retry/outbox barrier D6 requires).
       const state = toFeatureState(feature)
       const event: PipelineEvent = { kind: "step.execution_unknown", jobId: request.jobId, stepId: request.stepId, reason: request.diagnostic }
       const transition = interpret(snapshot?.workflow ?? { name: state.workflow ?? "unavailable", on: [], inputs: {}, roles: {}, jobs: {} }, state, event)
@@ -2901,6 +2948,423 @@ export class Store implements RunnerSafetyStore {
       this.emit({ kind: "transition", featureId: featureIdForEmit })
     }
     return result
+  }
+
+  // ------------------------------------------------- self-healing (D1-D4)
+
+  private preFenceEvidenceTx(run: RunRow): PreFenceEvidence {
+    const binding = this.db.query("SELECT remote_session_id FROM runner_binding WHERE run_id = ?").get(run.id) as { remote_session_id: string | null } | null
+    const createCompleted = this.db.query(
+      "SELECT 1 FROM runner_operation WHERE run_id = ? AND kind = 'create' AND phase = 'completed' LIMIT 1",
+    ).get(run.id) !== null
+    const promptLeftPrepared = this.db.query(
+      "SELECT 1 FROM runner_operation WHERE run_id = ? AND kind != 'create' AND phase NOT IN ('prepared','not_sent') LIMIT 1",
+    ).get(run.id) !== null
+    const pendingAnswerDelivery = this.db.query(
+      "SELECT 1 FROM answer_delivery WHERE run_id = ? AND status IN ('pending','claimed','submitted') LIMIT 1",
+    ).get(run.id) !== null
+    return {
+      sessionBound: run.session_id !== null || (binding?.remote_session_id ?? null) !== null || createCompleted,
+      promptLeftPrepared,
+      pendingAnswerDelivery,
+    }
+  }
+
+  /** Unresolved fences still awaiting classification, oldest first. */
+  listUnclassifiedFences(): readonly RunnerFenceRecord[] {
+    const rows = this.db.query(
+      "SELECT * FROM runner_fence WHERE resolved_at IS NULL AND classification IS NULL ORDER BY created_at ASC",
+    ).all() as RunnerFenceRow[]
+    return rows.map(toRunnerFenceRecord)
+  }
+
+  /**
+   * Persist a fence's classification and route it — one transaction
+   * (self-healing D1). `unsafe` applies the escalating
+   * `step.fence_classified` transition; a healable classification
+   * schedules (or chains) the target's healing episode and, past the
+   * attention threshold, records the target as needing attention.
+   */
+  classifyFenceExecution(
+    runId: string,
+    input: {
+      readonly classification: "no_effect" | "replay_safe" | "unsafe"
+      readonly evidence: Readonly<Record<string, unknown>>
+      readonly planHealing: (consecutiveFailures: number) => { readonly delayMs: number; readonly attention: boolean }
+    },
+    resolveWorkflow: (projectDir: string) => { readonly workflow: import("@conductor/core").WorkflowDef } | undefined,
+  ): { readonly classified: boolean; readonly healing: HealingEpisodeRecord | null } {
+    const now = this.clock.now()
+    let featureId: string | null = null
+    let healing: HealingEpisodeRecord | null = null
+    const classified = this.db.transaction((): boolean => {
+      const fence = this.db.query("SELECT * FROM runner_fence WHERE run_id = ?").get(runId) as RunnerFenceRow | null
+      if (!fence || fence.resolved_at !== null || (fence.classification ?? null) !== null) return false
+      const run = this.db.query("SELECT * FROM run WHERE id = ?").get(runId) as RunRow | null
+      if (!run) return false
+      const featureRow = this.db.query("SELECT * FROM feature WHERE id = ?").get(run.feature_id) as FeatureRow | null
+      if (!featureRow) return false
+      featureId = run.feature_id
+      this.db.run(
+        "UPDATE runner_fence SET classification = ?, evidence = ?, classified_at = ? WHERE run_id = ?",
+        [input.classification, JSON.stringify(input.evidence), now, runId],
+      )
+      const reason = run.reason ?? "ACP execution outcome unknown"
+      const event: PipelineEvent = { kind: "step.fence_classified", jobId: run.job_id, stepId: run.step_id, classification: input.classification, reason }
+      const snapshot = resolveWorkflow(featureRow.project_dir)
+      const state = toFeatureState(featureRow)
+      const transition = interpret(snapshot?.workflow ?? { name: state.workflow ?? "unavailable", on: [], inputs: {}, roles: {}, jobs: {} }, state, event)
+      if (input.classification === "unsafe") {
+        this.clearAttentionTx(run.feature_id, run.job_id, run.step_id)
+        this.applyTransitionTx(run.feature_id, event, transition)
+        this.db.run("UPDATE run SET completion_event = ?, completion_decisions = ?, action_handled = 0 WHERE id = ?",
+          [JSON.stringify(event), JSON.stringify(transition.decisions), runId])
+        return true
+      }
+      this.applyTransitionTx(run.feature_id, event, transition)
+      if (state.jobs[run.job_id]?.currentStep !== run.step_id) return true
+      const consecutiveFailures = this.priorHealingFailuresTx(run.feature_id, run.job_id, run.step_id) + 1
+      const plan = input.planHealing(consecutiveFailures)
+      const id = randomUUID()
+      const row = this.db.query(
+        `INSERT INTO healing_episode (id, feature_id, job_id, step_id, fence_run_id, classification, status,
+           consecutive_failures, next_attempt_at, delay_ms, diagnostic, time_created, time_updated)
+         VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?)
+         ON CONFLICT DO NOTHING
+         RETURNING *`,
+      ).get(id, run.feature_id, run.job_id, run.step_id, runId, input.classification, consecutiveFailures,
+        now + plan.delayMs, plan.delayMs, boundDiagnostic(reason), now, now) as HealingEpisodeRow | null
+      if (!row) return true
+      healing = toHealingEpisodeRecord(row)
+      if (plan.attention) {
+        this.upsertAttentionTx({
+          featureId: run.feature_id, jobId: run.job_id, stepId: run.step_id, source: "healing",
+          consecutiveFailures, lastDiagnostic: reason, nextAttemptAt: now + plan.delayMs,
+        })
+      }
+      return true
+    })()
+    if (classified && featureId !== null) this.emit({ kind: "transition", featureId })
+    return { classified, healing }
+  }
+
+  /** Consecutive failed heals preceding a new fence on the target: the
+   *  chain continues while the last heal was dispatched and no run for
+   *  the target has succeeded since. */
+  private priorHealingFailuresTx(featureId: string, jobId: string, stepId: string): number {
+    const last = this.db.query(
+      `SELECT consecutive_failures, time_updated FROM healing_episode
+       WHERE feature_id = ? AND job_id = ? AND step_id = ? AND status = 'closed' AND closed_reason = 'attempt_dispatched'
+       ORDER BY time_updated DESC, rowid DESC LIMIT 1`,
+    ).get(featureId, jobId, stepId) as { consecutive_failures: number; time_updated: number } | null
+    if (!last) return 0
+    const succeededSince = this.db.query(
+      `SELECT 1 FROM run WHERE feature_id = ? AND job_id = ? AND step_id = ? AND status = 'succeeded' AND time_finished >= ? LIMIT 1`,
+    ).get(featureId, jobId, stepId, last.time_updated) !== null
+    return succeededSince ? 0 : last.consecutive_failures
+  }
+
+  listHealingEpisodes(featureId: string): readonly HealingEpisodeRecord[] {
+    const rows = this.db.query("SELECT * FROM healing_episode WHERE feature_id = ? ORDER BY time_created ASC, rowid ASC").all(featureId) as HealingEpisodeRow[]
+    return rows.map(toHealingEpisodeRecord)
+  }
+
+  getOpenHealingEpisode(featureId: string, jobId: string, stepId: string): HealingEpisodeRecord | null {
+    const row = this.db.query(
+      "SELECT * FROM healing_episode WHERE feature_id = ? AND job_id = ? AND step_id = ? AND status IN ('scheduled','claimed')",
+    ).get(featureId, jobId, stepId) as HealingEpisodeRow | null
+    return row ? toHealingEpisodeRecord(row) : null
+  }
+
+  /** Due healing for features that can dispatch: paused features wait
+   *  (pause barrier), escalated ones wait for their operator recovery. */
+  listDueHealingEpisodes(featureId: string, nowMs: number): readonly HealingEpisodeRecord[] {
+    const rows = this.db.query(
+      `SELECT h.* FROM healing_episode h JOIN feature f ON f.id = h.feature_id
+       WHERE h.feature_id = ? AND h.status = 'scheduled' AND h.next_attempt_at <= ?
+         AND f.status IN ('running','waiting_human')
+       ORDER BY h.next_attempt_at ASC`,
+    ).all(featureId, nowMs) as HealingEpisodeRow[]
+    return rows.map(toHealingEpisodeRecord)
+  }
+
+  /**
+   * Claim a due episode and heal its fence in one transaction: resolve the
+   * fence with an audit note, record `system.healed`, close the episode.
+   * The caller dispatches the fresh attempt only when this returns true.
+   */
+  healFencedTarget(episodeId: string, nowMs: number): HealingEpisodeRecord | null {
+    let featureId: string | null = null
+    let healed: HealingEpisodeRecord | null = null
+    this.db.transaction(() => {
+      const row = this.db.query(
+        `SELECT h.* FROM healing_episode h JOIN feature f ON f.id = h.feature_id
+         WHERE h.id = ? AND h.status = 'scheduled' AND h.next_attempt_at <= ? AND f.status IN ('running','waiting_human')`,
+      ).get(episodeId, nowMs) as HealingEpisodeRow | null
+      if (!row) return
+      const fence = this.db.query("SELECT * FROM runner_fence WHERE run_id = ?").get(row.fence_run_id) as RunnerFenceRow | null
+      const note = `auto-heal: ${row.classification}: ${row.diagnostic ?? "no diagnostic"}`
+      if (fence && fence.resolved_at === null) {
+        this.db.run("UPDATE runner_fence SET resolved_at = ?, resolution_note = ? WHERE run_id = ?", [nowMs, note, row.fence_run_id])
+      }
+      this.db.run("UPDATE run_credential SET revoked_at = ?, revocation_reason = 'healed' WHERE run_id = ? AND revoked_at IS NULL", [nowMs, row.fence_run_id])
+      this.db.run(
+        "UPDATE healing_episode SET status = 'closed', closed_reason = 'attempt_dispatched', time_updated = ? WHERE id = ?",
+        [nowMs, episodeId],
+      )
+      this.db.run(
+        "UPDATE feature_attention SET next_attempt_at = NULL, time_updated = ? WHERE feature_id = ? AND job_id = ? AND step_id = ?",
+        [nowMs, row.feature_id, row.job_id, row.step_id],
+      )
+      this.db.run(
+        "INSERT INTO transition_log (feature_id, event, decisions, time_created) VALUES (?, ?, ?, ?)",
+        [
+          row.feature_id,
+          JSON.stringify({
+            kind: "system.healed", jobId: row.job_id, stepId: row.step_id, fencedRunId: row.fence_run_id,
+            classification: row.classification, consecutiveFailures: row.consecutive_failures, notes: note,
+          }),
+          JSON.stringify([{ kind: "execute_step", jobId: row.job_id, stepId: row.step_id }]),
+          nowMs,
+        ],
+      )
+      this.db.run("UPDATE feature SET time_updated = ? WHERE id = ?", [nowMs, row.feature_id])
+      featureId = row.feature_id
+      healed = { ...toHealingEpisodeRecord(row), status: "closed", closedReason: "attempt_dispatched" }
+    })()
+    if (featureId !== null) this.emit({ kind: "transition", featureId })
+    return healed
+  }
+
+  /** Whether a target still has execution uncertainty that is not yet
+   *  routed: an unclassified fence or a scheduled heal (progress anchor). */
+  hasPendingFence(featureId: string, jobId?: string, stepId?: string): boolean {
+    const unclassified = this.db.query(`SELECT 1 FROM runner_fence f JOIN run r ON r.id = f.run_id
+      WHERE r.feature_id = ? AND f.resolved_at IS NULL AND f.classification IS NULL
+      AND (? IS NULL OR r.job_id = ?) AND (? IS NULL OR r.step_id = ?) LIMIT 1`)
+      .get(featureId, jobId ?? null, jobId ?? null, stepId ?? null, stepId ?? null) !== null
+    if (unclassified) return true
+    return this.db.query(`SELECT 1 FROM healing_episode WHERE feature_id = ? AND status IN ('scheduled','claimed')
+      AND (? IS NULL OR job_id = ?) AND (? IS NULL OR step_id = ?) LIMIT 1`)
+      .get(featureId, jobId ?? null, jobId ?? null, stepId ?? null, stepId ?? null) !== null
+  }
+
+  // ---- attention (D4)
+
+  listAttention(featureId: string): readonly AttentionRecord[] {
+    const rows = this.db.query(
+      "SELECT * FROM feature_attention WHERE feature_id = ? ORDER BY time_created ASC",
+    ).all(featureId) as AttentionRow[]
+    return rows.map(toAttentionRecord)
+  }
+
+  upsertAttention(input: AttentionUpsert): void {
+    let changed = false
+    this.db.transaction(() => { changed = this.upsertAttentionTx(input) })()
+    if (changed) this.emit({ kind: "feature", featureId: input.featureId })
+  }
+
+  private upsertAttentionTx(input: AttentionUpsert): boolean {
+    const now = this.clock.now()
+    const before = this.attentionCountTx(input.featureId)
+    this.db.run(
+      `INSERT INTO feature_attention (feature_id, job_id, step_id, source, consecutive_failures, last_diagnostic, next_attempt_at, time_created, time_updated)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(feature_id, job_id, step_id) DO UPDATE SET source = excluded.source,
+         consecutive_failures = excluded.consecutive_failures, last_diagnostic = excluded.last_diagnostic,
+         next_attempt_at = excluded.next_attempt_at, time_updated = excluded.time_updated`,
+      [input.featureId, input.jobId, input.stepId, input.source, input.consecutiveFailures,
+        input.lastDiagnostic === null ? null : boundDiagnostic(input.lastDiagnostic), input.nextAttemptAt, now, now],
+    )
+    if (before === 0) {
+      const status = (this.db.query("SELECT status FROM feature WHERE id = ?").get(input.featureId) as { status: FeatureStatus } | null)?.status
+      if (status === "running" || status === "waiting_human") {
+        this.recordNotificationTx(input.featureId, "attention", {
+          targets: [{ jobId: input.jobId, stepId: input.stepId }],
+          consecutiveFailures: input.consecutiveFailures,
+          nextAttemptAt: input.nextAttemptAt,
+          diagnostic: input.lastDiagnostic,
+        })
+      }
+    }
+    return true
+  }
+
+  /** Remove a target's attention. `recovered` emits the recovered
+   *  notification when the feature's last troubled target clears. */
+  clearAttention(featureId: string, jobId: string, stepId: string, recovered: boolean): void {
+    let changed = false
+    this.db.transaction(() => { changed = this.clearAttentionTx(featureId, jobId, stepId, recovered) })()
+    if (changed) this.emit({ kind: "feature", featureId })
+  }
+
+  private clearAttentionTx(featureId: string, jobId: string, stepId: string, recovered = false): boolean {
+    const removed = this.db.run(
+      "DELETE FROM feature_attention WHERE feature_id = ? AND job_id = ? AND step_id = ?",
+      [featureId, jobId, stepId],
+    ).changes > 0
+    if (removed && recovered && this.attentionCountTx(featureId) === 0) {
+      this.recordNotificationTx(featureId, "recovered", { targets: [{ jobId, stepId }] })
+    }
+    return removed
+  }
+
+  private attentionCountTx(featureId: string): number {
+    return (this.db.query("SELECT COUNT(*) AS n FROM feature_attention WHERE feature_id = ?").get(featureId) as { n: number }).n
+  }
+
+  // ---- notifications
+
+  private notificationChannels: readonly NotificationChannelConfig[] = []
+
+  /** Channels the outbox records for. Empty (the default) disables
+   *  notifications entirely — nothing is recorded. */
+  configureNotifications(channels: readonly NotificationChannelConfig[]): void {
+    this.notificationChannels = channels
+  }
+
+  private recordNotificationTx(featureId: string, kind: NotificationKind, detail: Readonly<Record<string, unknown>> = {}): void {
+    if (this.notificationChannels.length === 0) return
+    const feature = this.db.query("SELECT id, title, slug, project_dir, escalation FROM feature WHERE id = ?").get(featureId) as
+      | { id: string; title: string; slug: string; project_dir: string; escalation: string | null }
+      | null
+    if (!feature) return
+    const now = this.clock.now()
+    const diagnostic = typeof detail["diagnostic"] === "string" ? boundDiagnostic(detail["diagnostic"] as string) : undefined
+    const payload: NotificationPayload = {
+      kind,
+      featureId,
+      title: feature.title,
+      slug: feature.slug,
+      projectDir: feature.project_dir,
+      at: now,
+      ...detail,
+      ...(diagnostic !== undefined ? { diagnostic } : {}),
+    }
+    const dedupKey = `${kind}:${featureId}:${now}:${randomUUID()}`
+    for (const channel of this.notificationChannels) {
+      if (channel.events !== undefined && !channel.events.includes(kind)) continue
+      this.db.run(
+        `INSERT INTO notification_outbox (id, feature_id, kind, channel, dedup_key, payload, status, attempts, next_attempt_at, time_created, time_updated)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+         ON CONFLICT(channel, dedup_key) DO NOTHING`,
+        [randomUUID(), featureId, kind, channel.id, dedupKey, JSON.stringify(payload), now, now, now],
+      )
+    }
+  }
+
+  /** Status-edge notifications — called wherever a feature's persisted
+   *  status changes, inside the same transaction. */
+  private notifyStatusChangeTx(featureId: string, from: FeatureStatus, to: FeatureStatus, reason?: string | null): void {
+    if (from === to) return
+    if (to === "escalated") this.recordNotificationTx(featureId, "escalated", reason ? { diagnostic: reason } : {})
+    else if (to === "waiting_human") this.recordNotificationTx(featureId, "waiting_human", this.humanWaitDetailTx(featureId))
+    else if (to === "done") this.recordNotificationTx(featureId, "done")
+    if (to === "done" || to === "abandoned") {
+      this.db.run("DELETE FROM feature_attention WHERE feature_id = ?", [featureId])
+      this.db.run(
+        "UPDATE healing_episode SET status = 'closed', closed_reason = ?, time_updated = ? WHERE feature_id = ? AND status IN ('scheduled','claimed')",
+        [to, this.clock.now(), featureId],
+      )
+    }
+  }
+
+  private humanWaitDetailTx(featureId: string): Readonly<Record<string, unknown>> {
+    const question = this.db.query(
+      "SELECT job_id, step_id, pending_question FROM run WHERE feature_id = ? AND status = 'running' AND pending_question IS NOT NULL ORDER BY asked_at DESC LIMIT 1",
+    ).get(featureId) as { job_id: string; step_id: string; pending_question: string } | null
+    if (question) return { targets: [{ jobId: question.job_id, stepId: question.step_id }], diagnostic: `Question: ${question.pending_question}` }
+    const row = this.db.query("SELECT state FROM feature WHERE id = ?").get(featureId) as { state: string } | null
+    if (!row) return {}
+    const state = JSON.parse(row.state) as FeatureState
+    const targets: { jobId: string; stepId: string }[] = []
+    for (const [jobId, job] of Object.entries(state.jobs)) {
+      for (const [stepId, step] of Object.entries(job.steps)) if (step.status === "waiting_human") targets.push({ jobId, stepId })
+    }
+    return { targets }
+  }
+
+  /** Record a channel test message (bypasses rate limiting). */
+  recordTestNotification(channel: string): string {
+    const now = this.clock.now()
+    const id = randomUUID()
+    const payload: NotificationPayload = { kind: "test", featureId: "", title: "Conductor test notification", slug: "test", projectDir: "", at: now }
+    this.db.run(
+      `INSERT INTO notification_outbox (id, feature_id, kind, channel, dedup_key, payload, status, attempts, next_attempt_at, time_created, time_updated)
+       VALUES (?, '', 'test', ?, ?, ?, 'claimed', 0, ?, ?, ?)`,
+      [id, channel, `test:${id}`, JSON.stringify(payload), now, now, now],
+    )
+    return id
+  }
+
+  listDueNotifications(nowMs: number, limit = 20): readonly NotificationRecord[] {
+    const rows = this.db.query(
+      `SELECT * FROM notification_outbox WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY time_created ASC, rowid ASC LIMIT ?`,
+    ).all(nowMs, limit) as NotificationRow[]
+    return rows.map(toNotificationRecord)
+  }
+
+  /** Atomic pending→claimed with a lease: a crashed sender's claim
+   *  becomes due again after `leaseMs`. */
+  claimNotification(id: string, nowMs: number, leaseMs: number): NotificationRecord | null {
+    const row = this.db.query(
+      `UPDATE notification_outbox SET status = 'claimed', attempts = attempts + 1, next_attempt_at = ?, time_updated = ?
+       WHERE id = ? AND status = 'pending' AND next_attempt_at <= ? RETURNING *`,
+    ).get(nowMs + leaseMs, nowMs, id, nowMs) as NotificationRow | null
+    return row ? toNotificationRecord(row) : null
+  }
+
+  /** Claimed rows whose lease expired (sender crashed mid-delivery) go back to pending. */
+  releaseExpiredNotificationClaims(nowMs: number): number {
+    return this.db.run(
+      "UPDATE notification_outbox SET status = 'pending', time_updated = ? WHERE status = 'claimed' AND kind != 'test' AND next_attempt_at <= ?",
+      [nowMs, nowMs],
+    ).changes
+  }
+
+  /** The latest sent notification of `kind` for a feature on a channel. */
+  lastSentNotificationAt(featureId: string, kind: NotificationKind, channel: string): number | null {
+    const row = this.db.query(
+      "SELECT MAX(time_sent) AS at FROM notification_outbox WHERE feature_id = ? AND kind = ? AND channel = ? AND status = 'sent'",
+    ).get(featureId, kind, channel) as { at: number | null }
+    return row.at
+  }
+
+  /** Suppressed rows for the feature/channel since its last delivery — folded into the next message. */
+  countSuppressedSinceLastSent(featureId: string, channel: string): number {
+    const row = this.db.query(
+      `SELECT COUNT(*) AS n FROM notification_outbox WHERE feature_id = ? AND channel = ? AND status = 'suppressed'
+       AND time_updated > COALESCE((SELECT MAX(time_sent) FROM notification_outbox WHERE feature_id = ? AND channel = ? AND status = 'sent'), 0)`,
+    ).get(featureId, channel, featureId, channel) as { n: number }
+    return row.n
+  }
+
+  markNotificationSent(id: string, nowMs: number): void {
+    this.db.run("UPDATE notification_outbox SET status = 'sent', time_sent = ?, time_updated = ?, last_error = NULL WHERE id = ?", [nowMs, nowMs, id])
+  }
+
+  markNotificationSuppressed(id: string, nowMs: number): void {
+    this.db.run("UPDATE notification_outbox SET status = 'suppressed', time_updated = ? WHERE id = ?", [nowMs, id])
+  }
+
+  /** Reschedule a failed delivery, or give up once `giveUp` is set. */
+  markNotificationFailed(id: string, nowMs: number, error: string, retryAt: number | null): void {
+    this.db.run(
+      "UPDATE notification_outbox SET status = ?, next_attempt_at = COALESCE(?, next_attempt_at), last_error = ?, time_updated = ? WHERE id = ?",
+      [retryAt === null ? "failed" : "pending", retryAt, boundDiagnostic(error), nowMs, id],
+    )
+  }
+
+  getNotification(id: string): NotificationRecord | null {
+    const row = this.db.query("SELECT * FROM notification_outbox WHERE id = ?").get(id) as NotificationRow | null
+    return row ? toNotificationRecord(row) : null
+  }
+
+  listNotifications(featureId?: string): readonly NotificationRecord[] {
+    const rows = (featureId === undefined
+      ? this.db.query("SELECT * FROM notification_outbox ORDER BY time_created ASC, rowid ASC").all()
+      : this.db.query("SELECT * FROM notification_outbox WHERE feature_id = ? ORDER BY time_created ASC, rowid ASC").all(featureId)) as NotificationRow[]
+    return rows.map(toNotificationRecord)
   }
 
   // ---- change queue (design D4) ----
@@ -3205,6 +3669,160 @@ export class Store implements RunnerSafetyStore {
       )
       .get(projectDir, since, change, change) as { id: string } | null
     return row ? row.id : null
+  }
+}
+
+interface PreFenceEvidence {
+  readonly sessionBound: boolean
+  readonly promptLeftPrepared: boolean
+  readonly pendingAnswerDelivery: boolean
+  readonly [key: string]: unknown
+}
+
+interface HealingEpisodeRow {
+  id: string
+  feature_id: string
+  job_id: string
+  step_id: string
+  fence_run_id: string
+  classification: "no_effect" | "replay_safe"
+  status: "scheduled" | "claimed" | "closed"
+  consecutive_failures: number
+  next_attempt_at: number
+  delay_ms: number
+  diagnostic: string | null
+  closed_reason: string | null
+  time_created: number
+  time_updated: number
+}
+
+export interface HealingEpisodeRecord {
+  readonly id: string
+  readonly featureId: string
+  readonly jobId: string
+  readonly stepId: string
+  readonly fenceRunId: string
+  readonly classification: "no_effect" | "replay_safe"
+  readonly status: "scheduled" | "claimed" | "closed"
+  readonly consecutiveFailures: number
+  readonly nextAttemptAt: number
+  readonly delayMs: number
+  readonly diagnostic: string | null
+  readonly closedReason: string | null
+  readonly createdAt: number
+  readonly updatedAt: number
+}
+
+function toHealingEpisodeRecord(row: HealingEpisodeRow): HealingEpisodeRecord {
+  return {
+    id: row.id, featureId: row.feature_id, jobId: row.job_id, stepId: row.step_id, fenceRunId: row.fence_run_id,
+    classification: row.classification, status: row.status, consecutiveFailures: row.consecutive_failures,
+    nextAttemptAt: row.next_attempt_at, delayMs: row.delay_ms, diagnostic: row.diagnostic, closedReason: row.closed_reason,
+    createdAt: row.time_created, updatedAt: row.time_updated,
+  }
+}
+
+interface AttentionRow {
+  feature_id: string
+  job_id: string
+  step_id: string
+  source: "healing" | "retry"
+  consecutive_failures: number
+  last_diagnostic: string | null
+  next_attempt_at: number | null
+  time_created: number
+  time_updated: number
+}
+
+export interface AttentionRecord {
+  readonly featureId: string
+  readonly jobId: string
+  readonly stepId: string
+  readonly source: "healing" | "retry"
+  readonly consecutiveFailures: number
+  readonly lastDiagnostic: string | null
+  readonly nextAttemptAt: number | null
+  readonly since: number
+  readonly updatedAt: number
+}
+
+export interface AttentionUpsert {
+  readonly featureId: string
+  readonly jobId: string
+  readonly stepId: string
+  readonly source: "healing" | "retry"
+  readonly consecutiveFailures: number
+  readonly lastDiagnostic: string | null
+  readonly nextAttemptAt: number | null
+}
+
+function toAttentionRecord(row: AttentionRow): AttentionRecord {
+  return {
+    featureId: row.feature_id, jobId: row.job_id, stepId: row.step_id, source: row.source,
+    consecutiveFailures: row.consecutive_failures, lastDiagnostic: row.last_diagnostic,
+    nextAttemptAt: row.next_attempt_at, since: row.time_created, updatedAt: row.time_updated,
+  }
+}
+
+export type NotificationKind = "attention" | "recovered" | "escalated" | "waiting_human" | "done" | "test"
+
+export const NOTIFICATION_EVENT_KINDS = ["attention", "recovered", "escalated", "waiting_human", "done"] as const
+
+export interface NotificationChannelConfig {
+  readonly id: string
+  /** Absent: every event kind. */
+  readonly events?: readonly NotificationKind[]
+}
+
+export interface NotificationPayload {
+  readonly kind: NotificationKind
+  readonly featureId: string
+  readonly title: string
+  readonly slug: string
+  readonly projectDir: string
+  readonly at: number
+  readonly targets?: readonly { readonly jobId: string; readonly stepId: string }[]
+  readonly diagnostic?: string | null
+  readonly consecutiveFailures?: number
+  readonly nextAttemptAt?: number | null
+  readonly [key: string]: unknown
+}
+
+interface NotificationRow {
+  id: string
+  feature_id: string
+  kind: NotificationKind
+  channel: string
+  dedup_key: string
+  payload: string
+  status: "pending" | "claimed" | "sent" | "suppressed" | "failed"
+  attempts: number
+  next_attempt_at: number
+  last_error: string | null
+  time_created: number
+  time_updated: number
+  time_sent: number | null
+}
+
+export interface NotificationRecord {
+  readonly id: string
+  readonly featureId: string
+  readonly kind: NotificationKind
+  readonly channel: string
+  readonly payload: NotificationPayload
+  readonly status: "pending" | "claimed" | "sent" | "suppressed" | "failed"
+  readonly attempts: number
+  readonly nextAttemptAt: number
+  readonly lastError: string | null
+  readonly createdAt: number
+  readonly sentAt: number | null
+}
+
+function toNotificationRecord(row: NotificationRow): NotificationRecord {
+  return {
+    id: row.id, featureId: row.feature_id, kind: row.kind, channel: row.channel,
+    payload: JSON.parse(row.payload) as NotificationPayload, status: row.status, attempts: row.attempts,
+    nextAttemptAt: row.next_attempt_at, lastError: row.last_error, createdAt: row.time_created, sentAt: row.time_sent,
   }
 }
 
