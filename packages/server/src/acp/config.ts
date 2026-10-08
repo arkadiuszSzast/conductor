@@ -75,9 +75,12 @@ export interface AcpReportBridgeConfig {
  *  no "disabled" flag of its own; its ABSENCE is the disable. */
 export interface RunnersConfig {
   readonly default: "native"
+  /** Project directory → profile id; profile ids are unique across `acp` and `opencode`. */
   readonly projects: Readonly<Record<string, string>>
   readonly acp: Readonly<Record<string, AcpProfileConfig>>
-  readonly reportBridge: AcpReportBridgeConfig
+  readonly opencode?: Readonly<Record<string, import("../opencode/config.ts").OpencodeProfileConfig>>
+  /** Required only when an ACP profile is configured. */
+  readonly reportBridge?: AcpReportBridgeConfig
 }
 
 /** Environment variable names that must NEVER cross into a spawned ACP

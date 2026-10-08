@@ -104,7 +104,7 @@ describe("FORBIDDEN_INHERITED_ENV_NAMES", () => {
 // ---------------------------------------------------------------------------
 
 function fakeRunnerSafetyStore(): RunnerSafetyStore {
-  const bindings = new Map<string, { runId: string; transport: "native" | "acp"; profileId: string | null; configDigest: string | null; directory: string; daemonGeneration: number; sessionRef: string | null; remoteSessionId: string | null; processGeneration: number; phase: "active" | "fenced" | "concluded"; createdAt: number; updatedAt: number }>()
+  const bindings = new Map<string, { runId: string; transport: "native" | "acp" | "opencode"; profileId: string | null; configDigest: string | null; directory: string; daemonGeneration: number; sessionRef: string | null; remoteSessionId: string | null; processGeneration: number; phase: "active" | "fenced" | "concluded"; createdAt: number; updatedAt: number }>()
   return {
     touchRunActivity() {},
     bindRunnerTransport(input) {

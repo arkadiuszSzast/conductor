@@ -1,7 +1,7 @@
 import { expect, it } from "bun:test"
 import { name as core, interpret, renderTemplate, validateWorkflow } from "@conductor/core"
 import { name as server } from "@conductor/server"
-import { name as runner } from "@conductor/runner-opencode"
+import { name as runner } from "@conductor/runner-opencode/lib"
 import { name as cli } from "@conductor/cli"
 import type { EvalContext, FeatureState, WorkflowDef } from "@conductor/core"
 

@@ -730,3 +730,47 @@ describe("self-healing: safe fences heal with backoff", () => {
     expect(store.getFeature(feature.id)?.status).toBe("escalated")
   })
 })
+
+describe("opencode transport routing", () => {
+  const opencodeRunners = (): RunnersConfig => ({
+    default: "native",
+    projects: { "/tmp/acp-project": "v2" },
+    acp: {},
+    opencode: { v2: { baseUrl: "http://fake", passwordEnv: "PW", allowedRoots: ["/tmp/acp-project"], maxConcurrent: 2, bindings: { build: { model: "omni/claude/x", variant: "medium" } } } },
+  })
+
+  it("prepares with the binding selection, binds the opencode transport and prompts with a keyed operation", async () => {
+    const opencode = new FakeAcpSessions()
+    const engine = makeEngine(singleAgentWorkflow, { runners: opencodeRunners(), opencodeSessions: opencode, releaseOpencodeReservation: async () => {} })
+    const feature = await startedFeature(engine)
+    expect(acpSessions.prepareCalls).toHaveLength(0)
+    expect(opencode.prepareCalls[0]).toMatchObject({ agent: "build", model: "omni/claude/x", variant: "medium" })
+    expect(opencode.prompts[0]?.operationId).toBeDefined()
+    const binding = store.getRunnerBinding(store.getActiveRun(feature.id)!.id)
+    expect(binding).toMatchObject({ transport: "opencode", profileId: "v2" })
+  })
+
+  it("lets the workflow role override the binding variant", async () => {
+    const opencode = new FakeAcpSessions()
+    const wf = workflow({ main: job([agentStep("implement", "implementer", "do the work")]) }, { implementer: { agent: "build", variant: "low" } })
+    const engine = makeEngine(wf, { runners: opencodeRunners(), opencodeSessions: opencode, releaseOpencodeReservation: async () => {} })
+    await startedFeature(engine)
+    expect(opencode.prepareCalls[0]).toMatchObject({ model: "omni/claude/x", variant: "low" })
+  })
+
+  it("fences a lost create response instead of retrying", async () => {
+    const opencode = new FakeAcpSessions()
+    opencode.createSessionError = new RunnerOperationError("lost", { delivery: "unknown" })
+    const engine = makeEngine(singleAgentWorkflow, { runners: opencodeRunners(), opencodeSessions: opencode, releaseOpencodeReservation: async () => {} })
+    const feature = await startedFeature(engine)
+    const runs = store.listRuns(feature.id)
+    expect(opencode.prompts).toHaveLength(0)
+    expect(store.getRunnerBinding(runs[0]!.id)?.phase).toBe("fenced")
+  })
+
+  it("fails the step when the opencode client is not wired", async () => {
+    const engine = makeEngine(singleAgentWorkflow, { runners: opencodeRunners() })
+    const feature = await startedFeature(engine)
+    expect(store.getActiveRun(feature.id)).toBeNull()
+  })
+})

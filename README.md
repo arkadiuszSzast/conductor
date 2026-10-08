@@ -66,18 +66,10 @@ CLI reads the daemon's own config for address and token. For a remote
 daemon: `export CONDUCTOR_URL=http://<host>:<port>` (+ `CONDUCTOR_TOKEN`).
 
 **4. Connect a runner** (executes `agent:` steps — without one, gates and
-the API still work but agent steps wait). The opencode adapter is configured
-by environment variables in the environment opencode runs in:
-
-```sh
-export CONDUCTOR_URL=http://127.0.0.1:4400
-export CONDUCTOR_RUNNER_HOST=127.0.0.1    # callback listener bind
-export CONDUCTOR_RUNNER_AUTH=none         # or CONDUCTOR_RUNNER_TOKEN=<token>
-# load packages/runner-opencode/src/plugin.ts in the project's opencode config
-```
-
-The runner registers itself with the daemon on startup; `GET /v1/health`
-then reports it available.
+the API still work but agent steps wait). For OpenCode 2.x, point a
+`runners.opencode` profile at an `opencode serve` instance and install
+`packages/runner-opencode` as a server plugin. See
+[docs/install.md](docs/install.md#connecting-an-opencode-v2-server).
 
 **5. Drive a feature:**
 
@@ -128,7 +120,7 @@ Full walkthrough, the compiled-binary path and troubleshooting:
 packages/
   core/              pure engine: interpreter, workflow model, validation, templates
   server/            daemon: HTTP API, reconciler, triggers, scheduler hooks
-  runner-opencode/   opencode runner adapter (the old plugin, shrunk)
+  runner-opencode/   OpenCode v2 server plugin (conductor.report tools)
   cli/               the `conductor` CLI (init, start, status, approve, report, …)
 apps/
   web/               task board + exploration view (later phase)

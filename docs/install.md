@@ -214,34 +214,84 @@ migrations ran, projects registered and the heartbeat is armed. The
 daemon stops gracefully on SIGINT/SIGTERM (drains in-flight work, closes
 the listener and SQLite, exits 0); a second signal forces exit.
 
-## Connecting the opencode runner
+## Connecting an OpenCode v2 server
 
-The runner adapter (`@conductor/runner-opencode`) is an opencode plugin.
-It is configured entirely through environment variables — set them in the
-environment opencode runs in:
+OpenCode 2.x runs as an HTTP server (`opencode serve`). Conductor drives
+it directly over that API: the daemon validates the agent, model and
+variant, creates one session per attempt with deterministic ids, and
+prompts it. There is no runner process or callback listener. The server
+itself is external to the daemon; run it as its own unit, or reuse an
+OpenChamber-managed instance.
 
-| Variable | Meaning |
-|---|---|
-| `CONDUCTOR_URL` | daemon API base URL, e.g. `http://127.0.0.1:4400` (required) |
-| `CONDUCTOR_TOKEN` | bearer token, matching the daemon's `auth` (omit for `mode: none`) |
-| `CONDUCTOR_RUNNER_HOST` | callback listen host, e.g. `127.0.0.1` (required) |
-| `CONDUCTOR_RUNNER_PORT` | callback listen port (omit/0 = ephemeral) |
-| `CONDUCTOR_RUNNER_TOKEN` | bearer token the daemon must present on callbacks — or |
-| `CONDUCTOR_RUNNER_AUTH` | `none`, the explicit opt-out (exactly one of the two) |
+1. **Run the server** with a password (Basic auth `opencode:<password>`):
 
-Load the plugin from the repo checkout in the project's opencode config
-(`.opencode/`): reference `packages/runner-opencode/src/plugin.ts`. On
-start the plugin registers its callback endpoint with the daemon
-(`POST /v1/runners`); `GET /v1/health` then reports the runner available.
+   ```ini
+   # /etc/systemd/system/opencode-server.service (example)
+   [Service]
+   EnvironmentFile=/etc/conductor/opencode-server.env   # OPENCODE_SERVER_PASSWORD=...
+   ExecStart=/opt/opencode/bin/opencode serve --hostname 127.0.0.1 --port 4096
+   ```
+
+2. **Install the reporting plugin** in the server's `opencode.json`. It
+   adds `conductor_report`, `conductor_ask` and `conductor_status`:
+
+   ```json
+   { "plugins": [{ "package": "/path/to/conductor/packages/runner-opencode" }] }
+   ```
+
+   The daemon writes each attempt's run-scoped credential into the
+   session's `metadata.conductor` at creation. The plugin reads it from
+   the calling session, so the model never sees or supplies a token, and
+   a `run_id` argument can only repeat the session's own run. A session
+   Conductor did not create is refused. Before the first prompt,
+   `prepare()` checks that `GET /api/plugin` lists `conductor.report` as
+   active for the location.
+
+3. **Add a profile** to the daemon config. It requires `auth.mode: bearer`:
+
+   ```yaml
+   runners:
+     default: native
+     projects:
+       /path/to/my-project: opencode-v2
+     opencode:
+       opencode-v2:
+         baseUrl: http://127.0.0.1:4096
+         passwordFile: /etc/conductor/opencode-server.password   # or passwordEnv: VAR
+         allowedRoots: [/path/to/my-project, /path/to/worktrees]
+         maxConcurrent: 4
+         deadlines: {startupMs: 30000, requestMs: 15000}
+         bindings:
+           build: {model: provider/model-id, variant: medium}
+   ```
+
+   - The password is never inline; it is read on each request, so a
+     rotated file needs no restart.
+   - Model selection comes from one place: a workflow role's
+     `model`/`variant` first, then the profile binding for that agent.
+     The full `{providerID, id, variant}` is sent when the session is
+     created, and never changed afterwards. `provider/id` splits at the
+     first `/`.
+   - An unknown agent, model or variant fails the step as a
+     configuration error before any session exists. A location whose
+     agent catalog is still empty (cold start) is retried within
+     `startupMs`.
+   - A lost create or prompt response is replayed with the same id. The
+     server answers a replay with the original record. If that echo
+     disagrees with the request, the run is fenced instead of guessed.
+   - `reportBridge` is only required when an ACP profile exists.
+
+Profile ids are unique across `acp` and `opencode`. A routed attempt
+stays on its transport for its whole lifetime.
 
 ## Connecting an ACP agent (OpenCode)
 
-Native runner integration (above) remains the default: an unconfigured
+The native runner protocol remains the default route: an unconfigured
 daemon uses it, and nothing below is required to run Conductor. The
 Agent Client Protocol (ACP) path is a separate, **opt-in** way to drive
 a local ACP-speaking agent — documented first for
 [OpenCode](https://opencode.ai/docs/acp/) — as a daemon-managed child
-process instead of the opencode plugin/callback runner. Enabling it for
+process instead of an OpenCode server profile. Enabling it for
 one project does not disable or replace native for any other project,
 and it never falls back silently: an ACP attempt that is dispatched
 stays on ACP for its whole lifetime, even if the config later removes
@@ -490,6 +540,11 @@ activity is not a report and does not extend the separate turn deadline.
   Conductor sets the mode, then the model, and fails closed if either is
   not confirmed), for example
   `conductor-implementer: {mode: conductor-implementer, configOptions: {model: provider/model-id}}`.
+- **Effort is applied last.** Switching the model resets OpenCode's
+  `effort` to the model default, so Conductor applies the model first,
+  then the other options, and `effort` last. It then checks that every
+  value survived. A workflow role's `model`/`variant` overrides the
+  binding's `model`/`effort`.
 - **MCP tool names are namespaced.** OpenCode exposes the report bridge's
   tools as `<server>_<tool>`, and Conductor names the server
   `conductor-<runId>`, so the tools appear as

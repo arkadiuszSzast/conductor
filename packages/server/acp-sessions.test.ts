@@ -260,6 +260,73 @@ describe("3.3: ManagedSessions — create/prompt/status lifecycle", () => {
     }
   })
 
+  describe("D6 option ordering", () => {
+    const mode = "build"
+    const modeOption = { id: "mode", name: "Mode", category: "mode", type: "select" as const, currentValue: "build", options: [{ value: "build", name: "Build" }] }
+    const modelOption = { id: "model", name: "Model", category: "model", type: "select" as const, currentValue: "p/a", options: [{ value: "p/a", name: "A" }, { value: "p/b", name: "B" }] }
+    const effortOption = { id: "effort", name: "Effort", category: "thought_level", type: "select" as const, currentValue: "high", options: [{ value: "low", name: "Low" }, { value: "medium", name: "Medium" }, { value: "high", name: "High" }] }
+
+    /** A peer whose model switch resets effort to its default, like OpenCode's. */
+    function resettingPeer(calls: { configId: string; value: string }[], keepEffort = true) {
+      const state: Record<string, string> = { mode: "build", model: "p/a", effort: "high" }
+      const snapshot = () => [modeOption, modelOption, effortOption].map(option => ({ ...option, currentValue: state[option.id]! }))
+      return fakeSpawner(() => buildAgent({ name: "ordering" })
+        .onRequest("initialize", () => ({ protocolVersion: 1 }))
+        .onRequest("session/new", () => ({ sessionId: "s", configOptions: snapshot() }))
+        .onRequest("session/set_config_option", request => {
+          const { configId, value } = request.params as { configId: string; value: string }
+          calls.push({ configId, value })
+          state[configId] = value
+          if (configId === "model") state["effort"] = "high"
+          if (!keepEffort && configId === "effort") state["effort"] = "high"
+          return { configOptions: snapshot() }
+        })
+        .onRequest("session/prompt", () => ({ stopReason: "end_turn" }))
+        .onNotification("session/cancel", () => {}))
+    }
+
+    it("applies model first and effort last so a model reset cannot win", async () => {
+      const calls: { configId: string; value: string }[] = []
+      const { spawner } = resettingPeer(calls)
+      const sessions = new ManagedSessions({ ...baseDeps({ bindings: { build: { mode, configOptions: { effort: "low", model: "p/b" } } }, deadlines: { killMs: 1 } }), spawner })
+      try {
+        const prepared = await sessions.prepare({ projectDir: "/tmp", directory: "/tmp", agent: "build" })
+        if (!prepared.ok) throw new Error("prepare failed")
+        await sessions.createSession({ title: "t", runId: "run", directory: "/tmp", reservationId: prepared.reservationId })
+        expect(calls.filter(c => c.configId !== "mode")).toEqual([{ configId: "model", value: "p/b" }, { configId: "effort", value: "low" }])
+      } finally {
+        await sessions.stop()
+      }
+    })
+
+    it("lets the role model and variant override the binding", async () => {
+      const calls: { configId: string; value: string }[] = []
+      const { spawner } = resettingPeer(calls)
+      const sessions = new ManagedSessions({ ...baseDeps({ bindings: { build: { mode, configOptions: { effort: "low", model: "p/b" } } }, deadlines: { killMs: 1 } }), spawner })
+      try {
+        const prepared = await sessions.prepare({ projectDir: "/tmp", directory: "/tmp", agent: "build", model: "p/a", variant: "medium" })
+        if (!prepared.ok) throw new Error("prepare failed")
+        await sessions.createSession({ title: "t", runId: "run", directory: "/tmp", reservationId: prepared.reservationId })
+        expect(calls.filter(c => c.configId !== "mode")).toEqual([{ configId: "model", value: "p/a" }, { configId: "effort", value: "medium" }])
+      } finally {
+        await sessions.stop()
+      }
+    })
+
+    it("rejects an unadvertised variant as invalid_config", async () => {
+      const { spawner } = resettingPeer([])
+      const sessions = new ManagedSessions({ ...baseDeps({ bindings: { build: { mode } }, deadlines: { killMs: 1 } }), spawner })
+      try {
+        const prepared = await sessions.prepare({ projectDir: "/tmp", directory: "/tmp", agent: "build", variant: "xhigh" })
+        if (!prepared.ok) throw new Error("prepare failed")
+        await expect(sessions.createSession({ title: "t", runId: "run", directory: "/tmp", reservationId: prepared.reservationId }))
+          .rejects.toMatchObject({ delivery: "not_sent", failureClass: "invalid_config" })
+      } finally {
+        await sessions.stop()
+      }
+    })
+  })
+
   it("refuses an unadvertised mode without prompting", async () => {
     let prompts = 0
     const { spawner } = fakeSpawner(() => buildAgent({ name: "missing-mode" })

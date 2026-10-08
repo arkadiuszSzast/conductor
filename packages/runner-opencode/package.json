@@ -1,17 +1,16 @@
 {
   "name": "@conductor/runner-opencode",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "opencode runner adapter — the old plugin, shrunk to a Runner.",
+  "description": "OpenCode v2 server plugin conductor.report: run-scoped reporting tools bound by session metadata.",
   "type": "module",
-  "main": "src/index.ts",
-  "module": "src/index.ts",
+  "main": "src/server.ts",
+  "module": "src/server.ts",
+  "exports": {
+    ".": "./src/server.ts",
+    "./lib": "./src/index.ts"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@conductor/cli": "workspace:*",
-    "@conductor/server": "workspace:*",
-    "@opencode-ai/plugin": "^1.18.16"
   }
 }

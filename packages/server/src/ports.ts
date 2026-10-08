@@ -174,6 +174,8 @@ export interface PrepareInput {
   readonly directory: string
   readonly agent: string
   readonly model?: string
+  /** Model variant/effort, resolved role ?? binding. */
+  readonly variant?: string
 }
 
 /**
