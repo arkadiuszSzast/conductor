@@ -133,6 +133,7 @@ export interface EngineControl {
     readonly duplicate?: boolean
     readonly ambiguous?: boolean
     readonly staleTarget?: boolean
+    readonly uncertaintyRequired?: boolean
     readonly allowAll?: boolean
     readonly targets?: readonly { readonly jobId: string; readonly stepId: string }[]
     readonly recovered?: readonly { readonly jobId: string; readonly stepId: string }[]
@@ -198,6 +199,7 @@ export type ApiErrorCode =
   | "invalid_queue_settings"
   | "conflict"
   | "stale_version"
+  | "uncertainty_required"
   | "run_already_concluded"
   | "no_pending_question"
   | "session_lost"
@@ -220,6 +222,7 @@ const ERROR_STATUS: Record<ApiErrorCode, number> = {
   invalid_queue_settings: 422,
   conflict: 409,
   stale_version: 409,
+  uncertainty_required: 409,
   run_already_concluded: 409,
   no_pending_question: 409,
   session_lost: 409,
@@ -558,7 +561,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
           nextAt: baseActivity.nextAt ?? attention.targets.find(target => target.nextAttemptAt !== null)?.nextAttemptAt ?? null,
         }
       : baseActivity
-    const recoverableTargets = feature.status === "escalated" ? engine.recoverableTargets?.(featureId) ?? null : null
+    const recoverableTargets = feature.status === "escalated" ? withFenceProjection(featureId, engine.recoverableTargets?.(featureId) ?? null) : null
     return {
       feature: {
         ...feature,
@@ -578,6 +581,27 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       activeRun: activeRunProjection(featureId),
       activeRuns: activeRuns.map(run => withAnswerDelivery(run)),
     }
+  }
+
+  /** Marks each recoverable target still behind an unresolved runner
+   *  fence, so a client knows before submitting that recover needs
+   *  `acknowledgeUncertain` (and `cleanupAttested` when cleanup is
+   *  unconfirmed). Unfenced targets keep the plain `{jobId, stepId}` shape. */
+  function withFenceProjection(
+    featureId: string,
+    targets: readonly { readonly jobId: string; readonly stepId: string }[] | null,
+  ): readonly Record<string, unknown>[] | null {
+    if (targets === null) return null
+    const fences = store.listUnresolvedFenceTargets(featureId)
+    return targets.map(target => {
+      const matching = fences.filter(fence => fence.jobId === target.jobId && fence.stepId === target.stepId)
+      if (matching.length === 0) return { jobId: target.jobId, stepId: target.stepId }
+      return {
+        jobId: target.jobId,
+        stepId: target.stepId,
+        uncertain: { cleanupAttestationRequired: matching.some(fence => fence.cleanupState === "unconfirmed") },
+      }
+    })
   }
 
   function attentionOf(featureId: string): { since: number; targets: { jobId: string; stepId: string; source: string; consecutiveFailures: number; lastDiagnostic: string | null; nextAttemptAt: number | null }[] } | null {
@@ -1452,6 +1476,9 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
               },
               requestId,
             )
+          }
+          if (result.uncertaintyRequired === true) {
+            return error(requestId, "uncertainty_required", result.message)
           }
           if (result.staleTarget === true) {
             return json(409, { error: { code: "stale_target", message: result.message, requestId } }, requestId)

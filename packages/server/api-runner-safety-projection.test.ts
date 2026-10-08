@@ -165,6 +165,41 @@ describe("4.4: safe run/feature projections for uncertainty", () => {
     expect(store.getFeature(featureId)?.status).toBe("escalated")
   })
 
+  it("an escalated fenced feature marks the fenced recoverable target, rejects a plain recover as uncertainty_required, and accepts an acknowledged one", async () => {
+    const { store, daemon } = await makeApi()
+    const api = createApi(
+      { bind: { host: "127.0.0.1", port: 0 }, auth: { mode: "none" } },
+      { store: daemon.store, engine: daemon.engine, health: () => daemon.health(), resolveWorkflow: daemon.registry.resolver },
+    )
+    apisToClose.push(api)
+    const send = (method: string, path: string, body?: unknown) => api.handle(new Request(`http://conductor.test${path}`, {
+      method, ...(body !== undefined ? { headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : {}),
+    }))
+    const { featureId, runId } = seedRunningRun(store, daemon.registry.list()[0]!.projectDir)
+    store.bindRunnerTransport({ runId, transport: "acp", profileId: "opencode-acp", directory: "/tmp", daemonGeneration: 1 })
+    store.fenceRunnerExecution(
+      { runId, jobId: "main", stepId: "implement", reasonCode: "cancellation_during_uncertain_write", diagnostic: "interrupted" },
+      () => undefined,
+    )
+    store.markRunActionHandled(runId)
+    store.classifyFenceExecution(runId, { classification: "unsafe", evidence: {}, planHealing: () => ({ delayMs: 0, attention: false }) }, () => undefined)
+
+    const detail = await (await send("GET", `/v1/features/${featureId}`)).json() as { feature: { updatedAt: number; recoverableTargets?: unknown[] } }
+    expect(detail.feature.recoverableTargets).toEqual([
+      { jobId: "main", stepId: "implement", uncertain: { cleanupAttestationRequired: store.getFence(runId)?.cleanupState === "unconfirmed" } },
+    ])
+
+    const base = { notes: "verified", expectedVersion: detail.feature.updatedAt, idempotencyKey: "k-1" }
+    const plain = await send("POST", `/v1/features/${featureId}/recover`, base)
+    expect(plain.status).toBe(409)
+    expect(((await plain.json()) as { error: { code: string } }).error.code).toBe("uncertainty_required")
+    expect(store.getFeature(featureId)?.status).toBe("escalated")
+
+    const acknowledged = await send("POST", `/v1/features/${featureId}/recover`, { ...base, acknowledgeUncertain: true, cleanupAttested: true })
+    expect(acknowledged.status).toBe(200)
+    expect(store.hasUnresolvedRunnerFence(featureId)).toBe(false)
+  })
+
   it("rejects a stale/late worker's data leaking into another attempt's projection (each run has its own independent binding)", async () => {
     const { store, request, daemon } = await makeApi()
     const projectDir = daemon.registry.list()[0]!.projectDir

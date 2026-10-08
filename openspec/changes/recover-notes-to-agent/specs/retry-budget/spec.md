@@ -25,6 +25,19 @@ of dispatch-intent handling or first-run consumption. Completion, terminal
 routing, rerun/reset and replacement recovery SHALL end the old episode;
 no unrelated target or later workflow visit SHALL inherit its notes.
 
+A recovered target that is not an agent step cannot show notes to anyone.
+If its failure routes a rerun before any agent run in that episode has
+received the notes, the episode SHALL be handed to the rerun's entry steps
+as a new episode carrying the same notes in the same transaction. That new
+episode follows the same lifetime rules. Notes an agent has already
+received SHALL NOT be handed off.
+
+#### Scenario: Recovered CI wait hands notes to the fix agent
+
+- **GIVEN** an escalated feature whose failed target is an action step (`checks`) with `onFail: rerun [fix, push, checks]`
+- **WHEN** the operator recovers it with notes and `checks` fails again
+- **THEN** the rerun's `fix` agent run and its prompt carry the notes verbatim, and the following rerun round's `fix` run does not.
+
 #### Scenario: Automatic retry retains literal guidance across restart and resource waits
 
 - **GIVEN** a recovered target has dispatched with operator notes and fails within its fresh retry budget

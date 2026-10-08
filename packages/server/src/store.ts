@@ -1205,8 +1205,12 @@ export class Store implements RunnerSafetyStore {
     const patched = applyPatch(current, transition.patch)
     const next = this.withAggregateHumanAttention(featureId, patched)
     const episodes = this.db.query(
-      "SELECT id, job_id, step_id FROM recovery_dispatch WHERE feature_id = ? AND episode_closed = 0",
-    ).all(featureId) as Array<{ id: string; job_id: string; step_id: string }>
+      `SELECT d.id, d.job_id, d.step_id, d.notes,
+              EXISTS (SELECT 1 FROM run r WHERE r.feature_id = d.feature_id AND r.job_id = d.job_id AND r.step_id = d.step_id
+                        AND r.step_type = 'agent' AND r.time_started >= d.time_created) AS delivered_to_agent
+       FROM recovery_dispatch d WHERE d.feature_id = ? AND d.episode_closed = 0`,
+    ).all(featureId) as Array<{ id: string; job_id: string; step_id: string; notes: string | null; delivered_to_agent: number }>
+    const handoffNotes: string[] = []
     for (const episode of episodes) {
       const runtime = next.jobs[episode.job_id]
       const targetConcluded = (event.kind === "step.completed" || event.kind === "step.budget_exhausted")
@@ -1219,6 +1223,28 @@ export class Store implements RunnerSafetyStore {
       if (targetConcluded || failureRouted || reset || runtime?.currentStep !== episode.step_id
         || runtime.status !== "running" || next.status === "done" || next.status === "abandoned" || next.status === "escalated") {
         this.db.run("UPDATE recovery_dispatch SET episode_closed = 1 WHERE id = ?", [episode.id])
+        const targetRoutedRerun = reset && "jobId" in event && event.jobId === episode.job_id
+          && "stepId" in event && event.stepId === episode.step_id
+        if (targetRoutedRerun && episode.delivered_to_agent === 0 && episode.notes !== null) handoffNotes.push(episode.notes)
+      }
+    }
+    // A recovered action/command target (e.g. a CI wait) cannot act on the
+    // operator's notes; when its failure reruns earlier steps, the rerun's
+    // entry steps open a fresh episode carrying them so the agent that
+    // actually does the fix sees the guidance.
+    if (handoffNotes.length > 0) {
+      const notes = handoffNotes.join("\n\n")
+      for (const decision of transition.decisions) {
+        if (decision.kind !== "execute_step") continue
+        this.db.run(
+          "UPDATE recovery_dispatch SET episode_closed = 1 WHERE feature_id = ? AND job_id = ? AND step_id = ? AND episode_closed = 0",
+          [featureId, decision.jobId, decision.stepId],
+        )
+        this.db.run(
+          `INSERT INTO recovery_dispatch (id, feature_id, job_id, step_id, status, time_created, time_updated, notes)
+           VALUES (?, ?, ?, ?, 'handled', ?, ?, ?)`,
+          [randomUUID(), featureId, decision.jobId, decision.stepId, this.clock.now(), this.clock.now(), notes],
+        )
       }
     }
     const now = this.clock.now()
@@ -2738,6 +2764,15 @@ export class Store implements RunnerSafetyStore {
     return this.db.query(`SELECT 1 FROM runner_fence f JOIN run r ON r.id = f.run_id
       WHERE r.feature_id = ? AND f.resolved_at IS NULL
       AND (? IS NULL OR r.job_id = ?) AND (? IS NULL OR r.step_id = ?) LIMIT 1`).get(featureId, jobId ?? null, jobId ?? null, stepId ?? null, stepId ?? null) !== null
+  }
+
+  /** Unresolved fences per job/step — the same set `recoverStepTargets`
+   *  demands acknowledgement for, so the operator surface can ask for it
+   *  up front instead of discovering it from a rejected recover. */
+  listUnresolvedFenceTargets(featureId: string): readonly { readonly jobId: string; readonly stepId: string; readonly cleanupState: RunnerCleanupState }[] {
+    const rows = this.db.query(`SELECT r.job_id, r.step_id, f.cleanup_state FROM runner_fence f JOIN run r ON r.id = f.run_id
+      WHERE r.feature_id = ? AND f.resolved_at IS NULL ORDER BY f.created_at ASC`).all(featureId) as Array<{ job_id: string; step_id: string; cleanup_state: RunnerCleanupState }>
+    return rows.map(row => ({ jobId: row.job_id, stepId: row.step_id, cleanupState: row.cleanup_state }))
   }
 
   /** An unresolved fence that is not queued for healing: unsafe ones

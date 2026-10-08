@@ -292,6 +292,14 @@ means "at least one rerun has ever happened".
     observe it itself). `cleanupAttested` without `acknowledgeUncertain`
     is rejected.
 
+  A recover missing any of these is rejected with `409
+  uncertainty_required` (distinct from `stale_version`, so a client can
+  prompt for the acknowledgement instead of reporting a stale view). The
+  feature detail's `recoverableTargets` marks each fenced target up front
+  with `uncertain: {cleanupAttestationRequired}` — `true` when the daemon
+  could not confirm the old process stopped and `cleanupAttested` is
+  needed; unfenced targets keep the plain `{jobId, stepId}` shape.
+
   Recovery never resends the old create/prompt operation and never
   reuses the old attempt's credential or delivery token: it revokes the
   old credential, leaves the old run's `uncertain` disposition and audit
@@ -322,7 +330,12 @@ means "at least one rerun has ever happened".
   A subsequent recover replaces the selected target's guidance. Historical
   run snapshots remain unchanged. Migration 0020 does not reactivate
   already-consumed pre-upgrade notes; those need a separately authorized
-  new recovery. A normal first-attempt prompt has no recovery block. See
+  new recovery. A normal first-attempt prompt has no recovery block.
+  When the recovered target is an action or command step (e.g. a CI
+  wait) whose failure reruns earlier steps, the notes have not reached
+  any agent yet, so they are handed to the rerun's entry steps as a new
+  episode with the same lifetime rules: the agent that does the fix sees
+  them once, and later rerun rounds do not. See
   `openspec/changes/recover-notes-to-agent` for the design.
 
 ## Starting a feature
