@@ -2740,6 +2740,15 @@ export class Store implements RunnerSafetyStore {
       AND (? IS NULL OR r.job_id = ?) AND (? IS NULL OR r.step_id = ?) LIMIT 1`).get(featureId, jobId ?? null, jobId ?? null, stepId ?? null, stepId ?? null) !== null
   }
 
+  /** Unresolved fences per job/step — the same set `recoverStepTargets`
+   *  demands acknowledgement for, so the operator surface can ask for it
+   *  up front instead of discovering it from a rejected recover. */
+  listUnresolvedFenceTargets(featureId: string): readonly { readonly jobId: string; readonly stepId: string; readonly cleanupState: RunnerCleanupState }[] {
+    const rows = this.db.query(`SELECT r.job_id, r.step_id, f.cleanup_state FROM runner_fence f JOIN run r ON r.id = f.run_id
+      WHERE r.feature_id = ? AND f.resolved_at IS NULL ORDER BY f.created_at ASC`).all(featureId) as Array<{ job_id: string; step_id: string; cleanup_state: RunnerCleanupState }>
+    return rows.map(row => ({ jobId: row.job_id, stepId: row.step_id, cleanupState: row.cleanup_state }))
+  }
+
   /** An unresolved fence that is not queued for healing: unsafe ones
    *  need operator recovery, unclassified ones are still being routed.
    *  Either way a plain resume must not proceed past it. */

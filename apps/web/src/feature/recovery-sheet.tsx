@@ -14,6 +14,13 @@
  * candidate after this sheet loaded) surfaces the server's target list
  * the same way, so the operator can retry with an explicit selection
  * even before a refetch lands.
+ *
+ * A selected target behind an unresolved runner fence (execution
+ * uncertain) cannot be recovered with a plain request: the operator must
+ * explicitly acknowledge the unproven effects and, when the daemon could
+ * not confirm the old process stopped, attest cleanup themselves. Those
+ * confirmations render only when needed and are sent as
+ * `acknowledgeUncertain` / `cleanupAttested`.
  */
 
 import { useEffect, useState } from "react"
@@ -24,6 +31,7 @@ import { mapGateError } from "../gate/gate-logic.ts"
 import { pushToast } from "../ui/toast-store.ts"
 import { ActionSheet } from "../ui/action-sheet.tsx"
 import { ApiError } from "../api/client.ts"
+import type { RecoverableTarget } from "../api/types.ts"
 import styles from "./recovery-sheet.module.css"
 
 export interface RecoverySheetProps {
@@ -48,14 +56,20 @@ export function RecoverySheet({ featureId, onClose }: RecoverySheetProps): React
   const [error, setError] = useState<string | null>(null)
   const [stale, setStale] = useState(false)
   const [checkedTargets, setCheckedTargets] = useState<ReadonlySet<string> | null>(null)
-  const [ambiguousTargets, setAmbiguousTargets] = useState<readonly { readonly jobId: string; readonly stepId: string }[] | null>(null)
+  const [ambiguousTargets, setAmbiguousTargets] = useState<readonly RecoverableTarget[] | null>(null)
+  // Set when the server demanded uncertainty acknowledgement this view did
+  // not know about (a fence appeared after load, or an older projection):
+  // ask for both confirmations rather than guess which one is missing.
+  const [uncertaintyDemanded, setUncertaintyDemanded] = useState(false)
+  const [acknowledged, setAcknowledged] = useState(false)
+  const [cleanupAttested, setCleanupAttested] = useState(false)
   // Fixed for the lifetime of this sheet instance: a retry after a
   // conflict must reuse the same key so the server can dedupe it as the
   // same logical attempt, per the recover command's idempotency contract.
   const [idempotencyKey] = useState(() => createIdempotencyKey())
 
   const feature = detailState.data?.feature
-  const candidates = ambiguousTargets ?? feature?.recoverableTargets ?? []
+  const candidates: readonly RecoverableTarget[] = ambiguousTargets ?? feature?.recoverableTargets ?? []
   const showList = candidates.length > 1
   // Pre-check everything once the candidate set is known: recovering the
   // whole frontier is the common case after a shared-cause outage, and a
@@ -68,8 +82,14 @@ export function RecoverySheet({ featureId, onClose }: RecoverySheetProps): React
 
   const checked = checkedTargets ?? new Set<string>()
   const selectedCandidates = candidates.filter(candidate => checked.has(targetKey(candidate)))
+  const uncertainSelected = selectedCandidates.filter(candidate => candidate.uncertain !== undefined)
+  const needsAcknowledgement = uncertaintyDemanded || uncertainSelected.length > 0
+  const needsCleanupAttestation = uncertainSelected.length > 0
+    ? uncertainSelected.some(candidate => candidate.uncertain?.cleanupAttestationRequired === true)
+    : uncertaintyDemanded
   const trimmed = notes.trim()
   const invalid = trimmed === "" || feature === undefined || (showList && selectedCandidates.length === 0)
+    || (needsAcknowledgement && !acknowledged) || (needsCleanupAttestation && !cleanupAttested)
 
   const toggleTarget = (key: string): void => {
     const next = new Set(checked)
@@ -86,13 +106,17 @@ export function RecoverySheet({ featureId, onClose }: RecoverySheetProps): React
       // Exact selection under the version check: send `targets` (not
       // `all`) so the server re-arms precisely what this view showed,
       // even if the candidate set widened concurrently.
+      const pick = (candidate: RecoverableTarget) => ({ jobId: candidate.jobId, stepId: candidate.stepId })
       const selection = candidates.length === 1
-        ? { target: candidates[0]! }
+        ? { target: pick(candidates[0]!) }
         : selectedCandidates.length === candidates.length || selectedCandidates.length > 1
-          ? { targets: selectedCandidates }
-          : { target: selectedCandidates[0]! }
+          ? { targets: selectedCandidates.map(pick) }
+          : { target: pick(selectedCandidates[0]!) }
+      const uncertainty = needsAcknowledgement
+        ? { acknowledgeUncertain: true, ...(needsCleanupAttestation ? { cleanupAttested: true } : {}) }
+        : {}
       const response = await runCommand(featureId, client =>
-        client.recover(featureId, notes, { expectedVersion: feature.updatedAt, idempotencyKey, ...selection }),
+        client.recover(featureId, notes, { expectedVersion: feature.updatedAt, idempotencyKey, ...selection, ...uncertainty }),
       )
       pushToast(`✓ ${response.result}`)
       onClose()
@@ -100,11 +124,15 @@ export function RecoverySheet({ featureId, onClose }: RecoverySheetProps): React
       if (err instanceof ApiError && err.code === "ambiguous_target" && err.targets !== null) {
         setAmbiguousTargets(err.targets)
         setError(err.message)
+      } else if (err instanceof ApiError && err.code === "uncertainty_required") {
+        store.refetchFeatureDetail(featureId)
+        setUncertaintyDemanded(true)
+        setError("A selected step's execution is uncertain — confirm below before recovering.")
       } else {
         const handled = mapGateError(err)
         if (handled.refetch) {
           store.refetchFeatureDetail(featureId)
-          setStale(true)
+          if (err instanceof ApiError && (err.code === "stale_version" || err.code === "stale_target")) setStale(true)
           setError(handled.toast !== "" ? handled.toast : "feature state changed — review and resubmit")
         } else {
           setError(handled.toast !== "" ? handled.toast : "recovery failed")
@@ -164,6 +192,7 @@ export function RecoverySheet({ featureId, onClose }: RecoverySheetProps): React
                   />
                   <span>
                     {candidate.jobId}/{candidate.stepId}
+                    {candidate.uncertain !== undefined ? <span className={styles.uncertainTag}> · uncertain</span> : null}
                   </span>
                 </label>
               )
@@ -187,6 +216,32 @@ export function RecoverySheet({ featureId, onClose }: RecoverySheetProps): React
               clear
             </button>
           </div>
+        </div>
+      ) : null}
+      {needsAcknowledgement ? (
+        <div className={styles.uncertainBox} role="group" aria-label="uncertain execution">
+          <strong>Execution uncertain{uncertainSelected.length > 0 ? `: ${uncertainSelected.map(c => `${c.jobId}/${c.stepId}`).join(", ")}` : ""}</strong>
+          <p>
+            The previous attempt was neither confirmed failed nor succeeded — it may have had effects. Recovery never
+            resends it; it starts a fresh attempt.
+          </p>
+          <label className={styles.confirmRow}>
+            <input type="checkbox" checked={acknowledged} onChange={e => setAcknowledged(e.target.checked)} disabled={pending} />
+            <span>I acknowledge the previous attempt's effects are unproven, not confirmed absent.</span>
+          </label>
+          {needsCleanupAttestation ? (
+            <label className={styles.confirmRow}>
+              <input
+                type="checkbox"
+                checked={cleanupAttested}
+                onChange={e => setCleanupAttested(e.target.checked)}
+                disabled={pending}
+              />
+              <span>
+                I independently verified the old runner process was terminated (the daemon could not confirm it).
+              </span>
+            </label>
+          ) : null}
         </div>
       ) : null}
       <label className={styles.field}>

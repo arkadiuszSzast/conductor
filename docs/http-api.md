@@ -292,6 +292,14 @@ means "at least one rerun has ever happened".
     observe it itself). `cleanupAttested` without `acknowledgeUncertain`
     is rejected.
 
+  A recover missing any of these is rejected with `409
+  uncertainty_required` (distinct from `stale_version`, so a client can
+  prompt for the acknowledgement instead of reporting a stale view). The
+  feature detail's `recoverableTargets` marks each fenced target up front
+  with `uncertain: {cleanupAttestationRequired}` — `true` when the daemon
+  could not confirm the old process stopped and `cleanupAttested` is
+  needed; unfenced targets keep the plain `{jobId, stepId}` shape.
+
   Recovery never resends the old create/prompt operation and never
   reuses the old attempt's credential or delivery token: it revokes the
   old credential, leaves the old run's `uncertain` disposition and audit

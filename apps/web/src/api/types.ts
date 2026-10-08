@@ -103,7 +103,16 @@ export interface FeatureDetail extends FeatureBase {
   /** Every currently recoverable job/step target — present only while
    *  `status` is `"escalated"`; the order `POST .../recover` would pick
    *  as its default (untargeted) choice. */
-  readonly recoverableTargets?: readonly { readonly jobId: string; readonly stepId: string }[]
+  readonly recoverableTargets?: readonly RecoverableTarget[]
+}
+
+/** `uncertain` is present only when the target sits behind an unresolved
+ *  runner fence: recover then needs `acknowledgeUncertain`, plus
+ *  `cleanupAttested` when `cleanupAttestationRequired`. */
+export interface RecoverableTarget {
+  readonly jobId: string
+  readonly stepId: string
+  readonly uncertain?: { readonly cleanupAttestationRequired: boolean }
 }
 
 export interface FeatureDetailResponse {

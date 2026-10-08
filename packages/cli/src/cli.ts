@@ -296,6 +296,7 @@ function exitCodeFor(error: ApiError): number {
     case "run_already_concluded":
       return EXIT.duplicateReport
     case "conflict":
+    case "uncertainty_required":
     case "no_pending_question":
     case "session_lost":
       return EXIT.conflict

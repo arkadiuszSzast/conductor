@@ -1996,6 +1996,7 @@ export class Engine {
     readonly duplicate?: boolean
     readonly ambiguous?: boolean
     readonly staleTarget?: boolean
+    readonly uncertaintyRequired?: boolean
     readonly allowAll?: boolean
     readonly targets?: readonly { readonly jobId: string; readonly stepId: string }[]
     readonly recovered?: readonly { readonly jobId: string; readonly stepId: string }[]
@@ -2096,7 +2097,7 @@ export class Engine {
     )
     switch (txResult) {
       case "uncertainty_prerequisites":
-        return { ok: false, message: "Uncertain execution requires acknowledgeUncertain, expectedVersion, idempotencyKey, notes and confirmed cleanup or cleanupAttested." }
+        return { ok: false, uncertaintyRequired: true, message: "Uncertain execution requires acknowledgeUncertain, expectedVersion, idempotencyKey, notes and confirmed cleanup or cleanupAttested." }
       case "not_found":
         return { ok: false, message: `unknown feature "${featureId}"` }
       case "duplicate":
