@@ -1,0 +1,67 @@
+.history {
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.history.open {
+  max-height: min(40vh, 22rem);
+}
+.head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-1) var(--space-2);
+}
+.toggle {
+  background: none;
+  border: none;
+  padding: 4px 6px;
+  min-height: 28px;
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--text-dim);
+}
+.tabs {
+  display: inline-flex;
+  gap: 4px;
+}
+.tab {
+  font-size: var(--text-xs);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px 10px;
+  color: var(--text-dim);
+  min-height: 26px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.tab.active {
+  color: var(--text);
+  border-color: var(--cyan);
+  background: color-mix(in oklch, var(--cyan) 10%, var(--bg-panel));
+}
+.badge {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--amber);
+}
+.body {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 var(--space-3) var(--space-2);
+  min-height: 0;
+}
+
+@media (pointer: coarse) {
+  .toggle,
+  .tab {
+    min-height: 40px;
+  }
+}

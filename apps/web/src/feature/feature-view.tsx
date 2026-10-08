@@ -6,6 +6,7 @@ import { WorkflowGraph } from "../graph/workflow-graph.tsx"
 import { inspectorTitle, StepInspector } from "./step-inspector.tsx"
 import { GateModal } from "./gate-modal.tsx"
 import { RecoverySheet } from "./recovery-sheet.tsx"
+import { FeatureHistory } from "./feature-history.tsx"
 import { ConfirmSheet } from "../ui/confirm-sheet.tsx"
 import { ActionSheet } from "../ui/action-sheet.tsx"
 import { projectBasename, workflowCompatible } from "../graph/merge.ts"
@@ -81,8 +82,13 @@ export function FeatureView(): React.ReactNode {
   // the primary review/recover action is reachable directly from a card.
   useEffect(() => {
     const jobId = params.get("job")
-    if (jobId !== null) setInspector({ jobId, stepId: null })
     const open = params.get("open")
+    if (jobId !== null) {
+      setInspector({ jobId, stepId: null })
+      // A phone has no side inspector: a job deep link (board card, plugin
+      // "show run") is a request to see that job, so open the sheet.
+      if (isNarrow && open === null) setMobileInspectorOpen(true)
+    }
     if (open === "gate") setGateOpen(true)
     if (open === "recover") setRecoveryOpen(true)
     // Only consume the deep link once per feature mount.
@@ -255,6 +261,7 @@ export function FeatureView(): React.ReactNode {
           </aside>
         ) : null}
       </div>
+      <FeatureHistory featureId={featureId} defaultOpen={!isNarrow} newFindings={feature.findingCounts.new} />
       {isNarrow && mobileInspectorOpen ? (
         <ActionSheet
           title={inspectorTitle(

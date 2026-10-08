@@ -32,10 +32,24 @@
   min-height: unset;
 }
 .tabs {
-  display: inline-flex;
+  display: flex;
+  align-items: center;
   gap: 4px;
   flex-wrap: wrap;
 }
+.runStatus {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 8px;
+}
+.run_running { color: var(--status-running); border-color: color-mix(in oklch, var(--status-running) 45%, var(--border)); }
+.run_succeeded { color: var(--status-done); }
+.run_failed, .run_reaped { color: var(--status-escalated); }
+.run_uncertain { color: var(--status-waiting); }
 .tab {
   font-size: var(--text-xs);
   background: none;
@@ -65,9 +79,15 @@
   border-radius: var(--radius-sm);
   background: var(--bg-inset);
 }
+.logPanel {
+  max-height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
 .line {
   display: flex;
   gap: var(--space-2);
+  padding: 1px 0;
 }
 .line .src {
   color: var(--text-faint);
