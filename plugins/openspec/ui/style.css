@@ -383,3 +383,14 @@ button:disabled {
 .change-actions {
   gap: 6px;
 }
+
+.badge-waiting_human {
+  border-color: #f2a93c;
+  color: #f2a93c;
+}
+
+button.show-run {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}

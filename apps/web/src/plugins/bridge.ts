@@ -35,7 +35,7 @@ export type HostToPanelMessage =
 
 export type PanelToHostMessage =
   | { readonly type: "ready"; readonly payload: { readonly v: number } }
-  | { readonly type: "navigate"; readonly payload: { readonly to: { readonly feature?: string } } }
+  | { readonly type: "navigate"; readonly payload: { readonly to: { readonly feature?: string; readonly job?: string } } }
   | { readonly type: "refresh"; readonly payload: Record<string, never> }
 
 interface BridgeEnvelope {
@@ -73,7 +73,12 @@ export function parsePanelMessage(data: unknown): PanelToHostMessage | null {
     if (typeof to !== "object" || to === null) return null
     const feature = (to as { feature?: unknown }).feature
     if (feature !== undefined && typeof feature !== "string") return null
-    return { type: "navigate", payload: { to: feature !== undefined ? { feature } : {} } }
+    const job = (to as { job?: unknown }).job
+    if (job !== undefined && typeof job !== "string") return null
+    return {
+      type: "navigate",
+      payload: { to: { ...(feature !== undefined ? { feature } : {}), ...(feature !== undefined && job !== undefined ? { job } : {}) } },
+    }
   }
   if (envelope.type === "refresh") {
     return { type: "refresh", payload: {} }
@@ -84,7 +89,7 @@ export function parsePanelMessage(data: unknown): PanelToHostMessage | null {
 export interface UsePluginBridgeInput {
   readonly iframeRef: React.RefObject<HTMLIFrameElement | null>
   readonly context: BridgeContextPayload
-  readonly onNavigateToFeature: (featureId: string) => void
+  readonly onNavigateToFeature: (featureId: string, jobId?: string) => void
   readonly onRefresh: () => void
 }
 
@@ -118,7 +123,7 @@ export function usePluginBridge(input: UsePluginBridgeInput): void {
       }
       if (message.type === "navigate") {
         const featureId = message.payload.to.feature
-        if (featureId !== undefined) onNavigateToFeature(featureId)
+        if (featureId !== undefined) onNavigateToFeature(featureId, message.payload.to.job)
         return
       }
       if (message.type === "refresh") {

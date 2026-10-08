@@ -18,6 +18,16 @@ import { mountedTestsSupported, useDomEnv, flush } from "./dom-env.ts"
 const { load } = useDomEnv()
 const describe_ = describe.skipIf(!mountedTestsSupported)
 
+/** index.html loads `deps.js` (window.OpenSpecDeps) before `app.js`;
+ *  the mounted tests must reproduce that order. */
+async function loadPanelDeps(): Promise<void> {
+  // Under Bun `deps.js` takes its CommonJS branch, so the global the
+  // browser gets is installed by hand.
+  const depsPath = "../../../plugins/openspec/ui/deps.js"
+  const deps = (await import(depsPath)) as { default?: unknown }
+  ;(window as unknown as { OpenSpecDeps: unknown }).OpenSpecDeps = deps.default ?? deps
+}
+
 interface HappyDomWindow {
   readonly happyDOM: { setURL(url: string): void }
 }
@@ -35,12 +45,15 @@ describe_("bundled OpenSpec plugin app.js: query-string preservation (M7)", () =
       return new Response(JSON.stringify({ openspec: false }), { status: 200 })
     }) as typeof fetch
 
+    await loadPanelDeps()
     // @ts-expect-error — a plain third-party-style JS file, no type
     // declarations; imported dynamically purely for its side effect.
     await import("../../../plugins/openspec/ui/app.js")
     await flush()
 
-    expect(calls).toEqual(["../changes?project=%2Fproj%2Fa"])
+    // Every panel read forwards the project query: the listing, the
+    // queue and the live-run lookup.
+    expect(calls.sort()).toEqual(["../changes?project=%2Fproj%2Fa", "../queue?project=%2Fproj%2Fa", "../runs?project=%2Fproj%2Fa"])
   })
 
   it("forwards the panel's ?project= query string on the POST /start-work fetch", async () => {
@@ -67,6 +80,7 @@ describe_("bundled OpenSpec plugin app.js: query-string preservation (M7)", () =
     // the first test's closures across files in the same process. (No
     // `@ts-expect-error` needed here — the query-string specifier isn't
     // statically resolved against `app.js`'s missing declaration file.)
+    await loadPanelDeps()
     await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
     await flush()
 
@@ -120,6 +134,7 @@ describe_("bundled OpenSpec plugin app.js: change detail inline expansion", () =
       )
     }) as typeof fetch
 
+    await loadPanelDeps()
     await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
     await flush()
 
@@ -165,6 +180,7 @@ describe_("bundled OpenSpec plugin app.js: change detail inline expansion", () =
       })
     }) as typeof fetch
 
+    await loadPanelDeps()
     await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
     await flush()
 
@@ -204,6 +220,7 @@ describe_("bundled OpenSpec plugin app.js: change detail inline expansion", () =
       return new Response(JSON.stringify({ name, archived: false, why: "Why text." }), { status: 200 })
     }) as typeof fetch
 
+    await loadPanelDeps()
     await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
     await flush()
 
@@ -246,6 +263,7 @@ describe_("bundled OpenSpec plugin app.js: change detail inline expansion", () =
       )
     }) as typeof fetch
 
+    await loadPanelDeps()
     await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
     await flush()
 
@@ -283,6 +301,7 @@ describe_("bundled OpenSpec plugin app.js: change detail inline expansion", () =
       return new Response("{}", { status: 404 })
     }) as typeof fetch
 
+    await loadPanelDeps()
     await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
     await flush()
     ;(document.querySelector(".change") as HTMLElement).click()
@@ -314,6 +333,7 @@ describe_("bundled OpenSpec plugin app.js: change detail inline expansion", () =
       })
     }) as typeof fetch
 
+    await loadPanelDeps()
     await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
     await flush()
 
@@ -333,5 +353,41 @@ describe_("bundled OpenSpec plugin app.js: change detail inline expansion", () =
 
     expect(tile.getAttribute("aria-expanded")).toBe("false")
     expect((document.querySelector(".change-detail") as HTMLElement).hidden).toBe(true)
+  })
+})
+
+describe_("bundled OpenSpec plugin app.js: live runs", () => {
+  it("replaces Start work with Show run for a change a live feature delivers, navigating to its job", async () => {
+    await load()
+    ;(window as unknown as HappyDomWindow).happyDOM.setURL("http://conductor.test/v1/plugins/openspec/ui/?project=%2Fproj%2Fr")
+    document.body.innerHTML = '<div id="root"></div>'
+    globalThis.fetch = (async (url: string) => {
+      const path = String(url)
+      if (path.startsWith("../changes")) {
+        return new Response(
+          JSON.stringify({ openspec: true, active: [{ name: "busy", taskProgress: null }, { name: "idle", taskProgress: null }], archived: [] }),
+          { status: 200 },
+        )
+      }
+      if (path.startsWith("../runs")) {
+        return new Response(JSON.stringify({ runs: { busy: { featureId: "f-9", status: "running", jobId: "impl", stepId: "implement" } } }), { status: 200 })
+      }
+      return new Response("{}", { status: 404 })
+    }) as typeof fetch
+    const posted: unknown[] = []
+    const parentStub = { postMessage: (message: unknown) => posted.push(message) }
+    Object.defineProperty(window, "parent", { value: parentStub, configurable: true })
+
+    await loadPanelDeps()
+    await import(`../../../plugins/openspec/ui/app.js?cachebust=${Date.now()}-${Math.random()}`)
+    await flush()
+
+    const busy = document.querySelector('.change[data-name="busy"]')!
+    const idle = document.querySelector('.change[data-name="idle"]')!
+    expect(busy.querySelector(".start-work")).toBeNull()
+    expect(busy.textContent).toContain("impl › implement")
+    expect(idle.querySelector(".start-work")).not.toBeNull()
+    ;(busy.querySelector(".show-run") as HTMLButtonElement).click()
+    expect(posted).toContainEqual(expect.objectContaining({ type: "navigate", payload: { to: { feature: "f-9", job: "impl" } } }))
   })
 })

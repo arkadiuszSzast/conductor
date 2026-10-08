@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test"
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import { handleRequest, type ExecResult, type OpenSpecServeDeps } from "./serve.ts"
+import { changeRunsFromFeatures, handleRequest, type ExecResult, type OpenSpecServeDeps } from "./serve.ts"
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), "openspec-plugin-test-"))
@@ -354,6 +354,54 @@ describe("POST /start-work", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe("GET /runs", () => {
+  const feature = (partial: Record<string, unknown>) => ({
+    id: "f-1",
+    projectDir: "/p",
+    status: "running",
+    updatedAt: 10,
+    input: { change_slug: "retry-policy" },
+    jobs: { prepare: { status: "succeeded", currentStep: null }, impl: { status: "running", currentStep: "implement" } },
+    ...partial,
+  })
+
+  it("maps live features to their change with the running job and step", () => {
+    expect(changeRunsFromFeatures({ features: [feature({})] }, "/p")).toEqual({
+      "retry-policy": { featureId: "f-1", status: "running", jobId: "impl", stepId: "implement" },
+    })
+  })
+
+  it("reads the `change` input, prefers the newest feature, and ignores other projects or features without a change", () => {
+    const runs = changeRunsFromFeatures(
+      {
+        features: [
+          feature({ id: "old", updatedAt: 1 }),
+          feature({ id: "new", updatedAt: 5 }),
+          feature({ id: "other", projectDir: "/q", input: { change_slug: "x" } }),
+          feature({ id: "plain", input: {} }),
+          feature({ id: "alt", input: { change: "zero-config" }, status: "escalated", jobs: { impl: { status: "failed", currentStep: "quality" } } }),
+        ],
+      },
+      "/p",
+    )
+    expect(Object.keys(runs).sort()).toEqual(["retry-policy", "zero-config"])
+    expect(runs["retry-policy"]!.featureId).toBe("new")
+    expect(runs["zero-config"]).toEqual({ featureId: "alt", status: "escalated", jobId: "impl", stepId: "quality" })
+  })
+
+  it("queries the daemon for this project's live features with the plugin token", async () => {
+    let calledUrl = ""
+    const fetchFn = (async (url: string) => {
+      calledUrl = url
+      return new Response(JSON.stringify({ features: [feature({ projectDir: "/nonexistent" })] }), { status: 200 })
+    }) as unknown as typeof fetch
+    const response = await handleRequest(new Request("http://x/runs"), baseDeps({ fetchFn }))
+    expect(response.status).toBe(200)
+    expect(calledUrl).toBe("http://127.0.0.1:4400/v1/features?project=%2Fnonexistent&status=running,waiting_human,escalated,paused")
+    expect(((await response.json()) as { runs: Record<string, unknown> }).runs["retry-policy"]).toBeDefined()
   })
 })
 

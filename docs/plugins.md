@@ -177,7 +177,7 @@ Panel → host:
 | `type` | `payload` | Meaning |
 |---|---|---|
 | `ready` | `{ "v": 1 }` | sent once on panel startup; the host replies with `context` |
-| `navigate` | `{ "to": { "feature"?: string } }` | ask the host to navigate the Control Room to a feature's view; the panel stays open |
+| `navigate` | `{ "to": { "feature"?: string, "job"?: string } }` | ask the host to navigate the Control Room to a feature's view, optionally with a job selected (`job` is ignored without `feature`); the panel stays open |
 | `refresh` | `{}` | ask the host to refetch the plugin listing |
 
 Host → panel:
@@ -291,7 +291,8 @@ rail whenever that project is the active scope. Opening it shows:
 - active changes with task progress (done/total, parsed from
   `tasks.md` checkboxes),
 - archived changes,
-- a "Start work" button per active change,
+- a "Start work" button per active change that nothing is delivering yet,
+  or a **Show run** button for one that a live feature already delivers,
 - each active change's declared dependencies, and — when queued — its queue
   state and reason, with "Queue"/"Dequeue" actions and the project's queue
   controls ([below](#queueing-changes-from-the-panel)).
@@ -304,10 +305,20 @@ then the panel navigates the Control Room to the new feature via the
 bridge's `navigate` message. A project with no `openspec/` root gets an
 explanatory empty state, never an error.
 
+The panel asks the plugin's `GET /runs` route which changes already have a
+live feature (status `running`, `waiting_human`, `escalated` or `paused`),
+matched by the `change_slug`/`change` input Start work fills in — so features
+started from the panel and from the queue both count. For such a change the
+panel hides Start work and Queue, shows the feature's status and its current
+`job › step`, and offers **Show run**, which navigates to the feature with
+that job selected (`navigate` with `to: {feature, job}`). The panel re-reads
+the listing, queue and runs every 15 s while visible, when it becomes visible
+again, and when the host changes its context.
+
 ### Queueing changes from the panel
 
-Next to "Start work", every active change has a **Queue** button. Start work
-still runs the change immediately and outside the queue; Queue hands it to
+Next to "Start work", every active change without a live run has a **Queue**
+button. Start work runs the change immediately and outside the queue; Queue hands it to
 the daemon's [change queue](install.md#running-unattended-change-queue), which
 starts it by itself once its dependencies have merged. Neither action hides
 the other.
@@ -345,6 +356,6 @@ token, via the backend routes `GET /queue`, `POST /queue/entries`
 (`{change}`), `DELETE /queue/entries/:id` and `PATCH /queue`
 (`{paused?, parallelism?}`; the project directory is always the plugin's own,
 and order is not exposed). The panel reads the queue when it loads and after
-each action; use Refresh to see the scheduler's latest decisions, which
-arrive on its own interval (see `changeQueueIntervalMs` in
+each action and refreshes in the background as described above; use Refresh
+to see the scheduler's latest decisions at once — they arrive on its own interval (see `changeQueueIntervalMs` in
 [Install](install.md)). The plugin declares no new capabilities for this.

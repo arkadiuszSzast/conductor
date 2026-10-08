@@ -27,7 +27,8 @@ export function PluginRail(): React.ReactNode {
     selection: { feature: rail.activeFeature },
     theme: { mode: "dark" },
   }
-  const onNavigateToFeature = (featureId: string): void => navigate(`/feature/${featureId}`)
+  const onNavigateToFeature = (featureId: string, jobId?: string): void =>
+    navigate(`/feature/${featureId}${jobId !== undefined ? `?job=${encodeURIComponent(jobId)}` : ""}`)
 
   const tabs = (
     <div className={styles.tabs} role="tablist" aria-label="Plugins" aria-orientation="vertical">
