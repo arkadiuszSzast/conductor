@@ -191,6 +191,29 @@ describe("3.3: ManagedSessions — create/prompt/status lifecycle", () => {
     expect((deps.store as Store).getRunById("run")!.timeLastActivity).toBe(now)
     await sessions.stop()
   })
+  it("writes agent narrative and tool status from session updates to the run log", async () => {
+    const { spawner, agentConnections } = fakeSpawner(cooperativeAgent())
+    const base = baseDeps()
+    const store = base.store as Store
+    const deps = { ...base, runLog: (runId: string, lines: readonly { source: "agent" | "tool"; text: string }[]) => { store.appendRunLog(runId, lines) } }
+    const sessions = new ManagedSessions({ ...deps, spawner })
+    const prepared = await sessions.prepare({ projectDir: "/tmp", directory: "/tmp", agent: "build" })
+    if (!prepared.ok) throw new Error("prepare failed")
+    await sessions.createSession({ title: "t", runId: "run", directory: "/tmp", reservationId: prepared.reservationId })
+    const remoteId = store.getRunnerBinding("run")!.remoteSessionId!
+    const notify = (update: unknown) => agentConnections[0]!.client.notify("session/update", { sessionId: remoteId, update } as never)
+    await notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Implementing " } })
+    await notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "the change" } })
+    await notify({ sessionUpdate: "tool_call", toolCallId: "t1", title: "edit src/a.ts", kind: "edit" })
+    await notify({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "hidden" } })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await sessions.stop()
+    const lines = store.getRunLog("run", {}).lines.map(line => ({ source: line.source, text: line.text }))
+    expect(lines).toEqual([
+      { source: "agent", text: "Implementing the change" },
+      { source: "tool", text: "editing file" },
+    ])
+  })
   it.each([
     { shape: "OpenCode config only", id: "mode", category: "mode", legacy: false, confirmed: true },
     { shape: "mode category with custom id", id: "agent", category: "mode", legacy: false, confirmed: true },

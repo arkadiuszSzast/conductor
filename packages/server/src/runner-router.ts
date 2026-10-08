@@ -27,6 +27,7 @@ export function composeManagedRunners(config: RunnersConfig, store: Store, clock
     return [id, new ManagedSessions({ ...profile, env: selectedEnv, spawner: realAcpProcessSpawner, store, generation, readiness,
       activityNow: () => clock.now(),
       onOperationObserved: id => observe(id),
+      runLog: (runId, lines) => { store.appendRunLog(runId, lines) },
       reportBridge: runId => {
         const run = store.getRunById(runId)!
         const binding = store.getRunnerBinding(runId)!
