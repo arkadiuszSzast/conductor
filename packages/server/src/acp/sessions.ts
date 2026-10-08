@@ -38,6 +38,7 @@ import { operationKindForPurpose, type ReportingReadinessPort, type RunnerSafety
 import { validateAcpSpawn, type AcpProcessHandle, type AcpProcessSpawner } from "./process.ts"
 import { BoundedActivityLog, sanitizeStderrTail } from "./diagnostics.ts"
 import { decidePermissionBounded } from "./permissions.ts"
+import { AcpRunLogWriter, type AcpRunLogSink } from "./run-log.ts"
 
 export const ACP_SESSION_CAPABILITIES: SessionCapabilities = {
   parentSessions: false,
@@ -112,6 +113,8 @@ export interface ManagedSessionsDeps {
   readonly maxConcurrent: number
   /** Optional notification; persistence always precedes observation. */
   readonly onOperationObserved?: (operationId: string, observation: OperationObservation) => void
+  /** Optional run-log sink for agent narrative and tool status lines. */
+  readonly runLog?: AcpRunLogSink
 }
 
 /** Substitutes the ONE supported template token, a whole `{directory}`
@@ -133,7 +136,11 @@ export class ManagedSessions implements SessionClient {
   private readonly terminatedWithoutSession = new Map<string, Promise<"confirmed_terminated" | "unconfirmed">>()
   private slotsInUse = 0
 
-  constructor(private readonly deps: ManagedSessionsDeps) {}
+  private readonly runLog: AcpRunLogWriter | null
+
+  constructor(private readonly deps: ManagedSessionsDeps) {
+    this.runLog = deps.runLog ? new AcpRunLogWriter({ sink: deps.runLog }) : null
+  }
 
   capabilities(): SessionCapabilities {
     return ACP_SESSION_CAPABILITIES
@@ -455,6 +462,7 @@ export class ManagedSessions implements SessionClient {
   async abort(sessionID: string): Promise<void> {
     const session = this.sessions.get(sessionID)
     if (!session) return
+    this.runLog?.release(session.runId)
     session.reservation.revoked = true
     session.currentTurn?.cancelDeadline?.()
     try {
@@ -563,6 +571,7 @@ export class ManagedSessions implements SessionClient {
       turn.cancelDeadline?.()
       turn.status = "completed"
       turn.stopReason = response.stopReason
+      this.runLog?.flush(session.runId)
       this.deps.onOperationObserved?.(operationId, { status: "completed", stopReason: response.stopReason })
     }).catch(error => fail("response_lost", describeUnknown("session/prompt", error, promptStartedAt)))
     void completion.catch(() => {})
@@ -632,6 +641,7 @@ export class ManagedSessions implements SessionClient {
         const binding = this.deps.store.getRunnerBinding(session.runId)
         if (binding?.phase !== "active" || binding.daemonGeneration !== this.deps.generation) return
         activity.record(notification.update)
+        this.runLog?.record(session.runId, notification.update)
         const now = (this.deps.activityNow ?? Date.now)()
         if (session.lastActivityTouchedAt === 0 || now - session.lastActivityTouchedAt >= 1000) {
           this.deps.store.touchRunActivity(session.runId, now)

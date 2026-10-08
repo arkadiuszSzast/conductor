@@ -37,6 +37,7 @@
     const message = parseHostMessage(event.data)
     if (message === null) return
     applyTheme(message.payload && message.payload.theme)
+    if (message.type === "context-changed" && listing !== null) load(true)
   })
 
   function applyTheme(theme) {
@@ -128,6 +129,10 @@
   let listing = null
   let queue = null
   let queueError = null
+  // change name -> { featureId, status, jobId, stepId } for changes a live
+  // feature is already delivering. Unavailable → empty: the panel then
+  // degrades to the old behaviour (Start work always shown).
+  let runs = {}
 
   const LIVE_STARTED = ["starting", "running", "escalated"]
 
@@ -194,6 +199,25 @@
     return html + "</div>"
   }
 
+  /** The live run delivering a change: from the daemon's feature list,
+   *  else from a started queue entry that already carries its feature. */
+  function runFor(name, entry) {
+    if (Object.prototype.hasOwnProperty.call(runs, name)) return runs[name]
+    if (entry !== null && LIVE_STARTED.includes(entry.status) && typeof entry.featureId === "string") {
+      return { featureId: entry.featureId, status: entry.status, jobId: null, stepId: null }
+    }
+    return null
+  }
+
+  function renderRunState(run) {
+    const where = run.jobId ? run.jobId + (run.stepId ? " › " + run.stepId : "") : ""
+    return (
+      '<div class="queue-state"><span class="badge badge-' + escapeHtml(run.status) + '">' + escapeHtml(run.status.replace("_", " ")) + "</span>" +
+      (where !== "" ? '<span class="queue-reason"><code>' + escapeHtml(where) + "</code></span>" : "") +
+      "</div>"
+    )
+  }
+
   function renderQueueControls() {
     if (queue === null) {
       if (queueError === null) return ""
@@ -229,8 +253,12 @@
     } else {
       for (const change of active) {
         const entry = entryFor(change.name)
+        const run = runFor(change.name, entry)
         let actions = '<button type="button" class="start-work">Start work</button>'
-        if (queue !== null && canDequeue(entry)) {
+        if (run !== null) {
+          actions = '<button type="button" class="show-run primary" data-feature="' + escapeHtml(run.featureId) + '"' +
+            (run.jobId ? ' data-job="' + escapeHtml(run.jobId) + '"' : "") + ">Show run →</button>"
+        } else if (queue !== null && canDequeue(entry)) {
           actions = '<button type="button" class="dequeue" data-entry="' + escapeHtml(entry.id) + '">Dequeue</button>' + actions
         } else if (queue !== null && !isQueued(entry)) {
           actions = '<button type="button" class="enqueue">Queue</button>' + actions
@@ -240,7 +268,7 @@
           '<div class="change change-' + readiness.readiness + '" data-name="' + escapeHtml(change.name) + '">' +
           '<div class="change-name">' + escapeHtml(change.name) + "</div>" +
           renderDependencies(change, readiness) +
-          renderQueueState(entry) +
+          (run !== null ? renderRunState(run) : renderQueueState(entry)) +
           renderProgress(change.taskProgress) +
           '<div class="change-actions">' + actions + "</div>" +
           '<div class="error-message" hidden></div>' +
@@ -259,12 +287,21 @@
     root.innerHTML = html
 
     const refreshButton = document.getElementById("refresh")
-    if (refreshButton) refreshButton.addEventListener("click", load)
+    if (refreshButton) refreshButton.addEventListener("click", () => load())
 
     for (const button of root.querySelectorAll(".start-work")) {
       button.addEventListener("click", event => {
         event.stopPropagation()
         startWork(button)
+      })
+    }
+
+    for (const button of root.querySelectorAll(".show-run")) {
+      button.addEventListener("click", event => {
+        event.stopPropagation()
+        const to = { feature: button.dataset.feature }
+        if (button.dataset.job) to.job = button.dataset.job
+        postToHost("navigate", { to })
       })
     }
 
@@ -328,6 +365,11 @@
     }
   }
 
+  async function reloadRuns() {
+    const result = await request("GET", "../runs")
+    runs = result.ok && result.payload && typeof result.payload.runs === "object" && result.payload.runs !== null ? result.payload.runs : {}
+  }
+
   async function reloadQueue() {
     const result = await request("GET", "../queue")
     if (result.ok && result.payload && result.payload.settings && Array.isArray(result.payload.entries)) {
@@ -350,7 +392,7 @@
       button.disabled = false
       return
     }
-    await reloadQueue()
+    await Promise.all([reloadQueue(), reloadRuns()])
     renderChanges()
   }
 
@@ -399,6 +441,7 @@
         return
       }
       postToHost("navigate", { to: { feature: payload.featureId } })
+      reloadRuns().then(renderChanges)
     } catch (error) {
       errorEl.textContent = String(error)
       errorEl.hidden = false
@@ -414,10 +457,18 @@
     return runStartWork(name, button, errorEl)
   }
 
-  async function load() {
-    root.innerHTML = '<p class="loading">Loading…</p>'
+  let loading = false
+
+  /** `quiet` keeps the current listing on screen while refetching — the
+   *  background refresh path must not flash "Loading…" or collapse an
+   *  expanded change every few seconds. */
+  async function load(quiet) {
+    if (loading) return
+    if (quiet === true && (expandedTile !== null || root.contains(document.activeElement) && document.activeElement.tagName === "INPUT")) return
+    loading = true
+    if (quiet !== true) root.innerHTML = '<p class="loading">Loading…</p>'
     try {
-      const [response] = await Promise.all([fetch(withQuery("../changes")), reloadQueue()])
+      const [response] = await Promise.all([fetch(withQuery("../changes")), reloadQueue(), reloadRuns()])
       const data = await response.json()
       if (!data.openspec) {
         renderEmptyState()
@@ -426,9 +477,22 @@
       listing = data
       renderChanges()
     } catch (error) {
-      root.innerHTML = '<p class="error-message">' + escapeHtml(String(error)) + "</p>"
+      if (quiet !== true) root.innerHTML = '<p class="error-message">' + escapeHtml(String(error)) + "</p>"
+    } finally {
+      loading = false
     }
   }
+
+  // Live-ish refresh: the panel has no event stream of its own, so it
+  // re-reads on host context changes, when it becomes visible again, and
+  // on a slow timer while visible.
+  const BACKGROUND_REFRESH_MS = 15000
+  setInterval(() => {
+    if (document.visibilityState === "visible") load(true)
+  }, BACKGROUND_REFRESH_MS)
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") load(true)
+  })
 
   // --- Change detail expansion ---------------------------------------
   //

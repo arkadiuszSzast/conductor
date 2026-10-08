@@ -23,7 +23,7 @@ import styles from "./panel.module.css"
 export interface PluginPanelProps {
   readonly plugin: PluginListingItem
   readonly context: BridgeContextPayload
-  readonly onNavigateToFeature: (featureId: string) => void
+  readonly onNavigateToFeature: (featureId: string, jobId?: string) => void
   readonly onRetry: () => void
 }
 

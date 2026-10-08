@@ -1,0 +1,93 @@
+.rail {
+  flex: 0 0 auto;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  padding: 2px 0 var(--space-1);
+}
+.list {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: max-content;
+}
+.item {
+  display: flex;
+  align-items: center;
+}
+.item + .item::before {
+  content: "";
+  width: 10px;
+  height: 1px;
+  margin-right: 2px;
+  background: var(--border-strong);
+}
+.empty {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 4px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+.pip {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  flex: 0 0 auto;
+}
+.emptyLabel {
+  max-width: 9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stage {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  border-radius: 999px;
+  padding: 3px 10px;
+  min-height: 26px;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  border-color: color-mix(in oklch, var(--cyan) 50%, var(--border-strong));
+  background: color-mix(in oklch, var(--cyan) 10%, var(--bg-panel));
+  color: var(--text);
+}
+.stage.attention {
+  border-color: color-mix(in oklch, var(--amber) 60%, var(--border-strong));
+  background: color-mix(in oklch, var(--amber) 12%, var(--bg-panel));
+}
+.label {
+  font-weight: 600;
+}
+.count {
+  color: var(--cyan);
+}
+.attention .count {
+  color: var(--amber);
+}
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amber);
+}
+
+/* Narrow screens: empty stages shrink to bare pips so the rail reads as
+   a progress line instead of a second scrolling list. */
+@media (max-width: 767px) {
+  .emptyLabel {
+    display: none;
+  }
+}
+
+@media (pointer: coarse) {
+  .stage {
+    min-height: 36px;
+  }
+}

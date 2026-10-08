@@ -1,8 +1,8 @@
 /**
- * One frontier card — a feature's presence at a single job column. When a
- * feature has more than one active job, every instance carries the same
- * `parallelCount` so the card can mark itself as part of parallel work
- * without pretending one job is more "primary" than the other.
+ * One frontier card — a feature's presence in a single pipeline stage,
+ * listing each of its active jobs there with the step it is on. When the
+ * feature's frontier spans more jobs than this stage holds, the card
+ * carries `parallelCount` so it can mark itself as part of parallel work.
  *
  * The quick-review/recover links carry an `open=` query param the feature
  * workspace reads on mount to surface the right sheet immediately — the
@@ -40,7 +40,8 @@ const STATUS_CLASS: Record<FrontierCardModel["status"], string> = {
 export function JobFrontierCard({ card }: JobFrontierCardProps): React.ReactNode {
   const cls = STATUS_CLASS[card.status]
   const attention = card.status === "waiting_human" || card.status === "escalated"
-  const baseHref = `/feature/${card.id}?job=${encodeURIComponent(card.jobId)}`
+  const primaryJob = card.activeJobs[0]?.jobId ?? ""
+  const baseHref = `/feature/${card.id}?job=${encodeURIComponent(primaryJob)}`
   const actionHref = card.status === "waiting_human" ? `${baseHref}&open=gate` : card.status === "escalated" ? `${baseHref}&open=recover` : baseHref
   const progressPercent = card.jobsTotal > 0 ? Math.min(100, Math.max(0, (card.jobsDone / card.jobsTotal) * 100)) : 0
 
@@ -52,7 +53,7 @@ export function JobFrontierCard({ card }: JobFrontierCardProps): React.ReactNode
             {statusGlyph(card.status)}
           </span>
           <span className={styles.statusLabel}>{card.troubled !== null ? "attention" : STATUS_LABEL[card.status]}</span>
-          {card.parallelCount > 1 ? (
+          {card.parallelCount > card.activeJobs.length ? (
             <span className={styles.parallel} title={`Active at ${card.parallelCount} jobs in parallel`}>
               ⑂ ×{card.parallelCount}
             </span>
@@ -60,9 +61,21 @@ export function JobFrontierCard({ card }: JobFrontierCardProps): React.ReactNode
           <span className={styles.age}>{card.age}</span>
         </div>
         <div className={styles.title}>{card.title}</div>
-        <div className={styles.meta}>
-          {card.project} · {card.workflow}
-        </div>
+      </Link>
+      <ul className={styles.jobs}>
+        {card.activeJobs.map(job => (
+          <li key={job.jobId}>
+            <Link href={`/feature/${card.id}?job=${encodeURIComponent(job.jobId)}`} className={`${styles.job} ${styles[`job_${job.status}`] ?? ""}`}>
+              <span className={styles.jobGlyph} aria-hidden="true">
+                {jobGlyph(job.status)}
+              </span>
+              <span className={styles.jobId}>{job.jobId}</span>
+              {job.stepId !== null ? <span className={styles.stepId}>› {job.stepId}</span> : null}
+            </Link>
+          </li>
+        ))}
+      </ul>
+      <div className={styles.footer}>
         <div className={styles.progress}>
           <span className={styles.progressTrack} aria-hidden="true">
             <span className={styles.progressFill} style={{ width: `${progressPercent}%` }} />
@@ -83,7 +96,7 @@ export function JobFrontierCard({ card }: JobFrontierCardProps): React.ReactNode
           </div>
         ) : null}
         {card.findingsNew > 0 ? <div className={styles.findings}>⚑ {card.findingsNew} new</div> : null}
-      </Link>
+      </div>
       {attention ? (
         <Link href={actionHref} className={`${styles.quickAction} ${card.status === "escalated" ? styles.recoverAction : ""} tap-target`}>
           {card.status === "waiting_human" ? "review →" : "recover →"}
@@ -91,4 +104,17 @@ export function JobFrontierCard({ card }: JobFrontierCardProps): React.ReactNode
       ) : null}
     </div>
   )
+}
+
+function jobGlyph(status: FrontierCardModel["activeJobs"][number]["status"]): string {
+  switch (status) {
+    case "running":
+      return "●"
+    case "ready":
+      return "○"
+    case "failed":
+      return "✖"
+    default:
+      return "·"
+  }
 }

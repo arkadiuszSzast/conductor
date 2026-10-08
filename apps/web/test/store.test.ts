@@ -671,3 +671,77 @@ describe("invalidation store: snapshot stability", () => {
     expect(store.getFeatureDetail("a") as unknown).toBe(store.getRuns("b") as unknown)
   })
 })
+
+describe("invalidation store: foreground resume and reconnect resync", () => {
+  const health = () => ({ alive: true, ready: true, phase: "ready", database: { path: "", migrated: true, appliedNow: [], knownMigrations: 0 }, heartbeat: { intervalMs: 0, running: true, inFlight: false, lastStartedAt: null, lastCompletedAt: null, lastError: null, cycles: 0 }, projects: [], runner: "available" })
+
+  it("a second hello (reconnect) refetches the list and the open feature, since invalidations were missed", async () => {
+    const scheduler = new FakeScheduler()
+    const { client, calls } = makeStack({
+      "/v1/features/f-1/runs": () => ({ runs: [] }),
+      "/v1/features/f-1": () => detailResponse("f-1"),
+      "/v1/features": () => ({ features: [listItem("f-1")] }),
+      "/v1/health": health,
+    })
+    const store = new DataSource({ client, setTimeoutFn: scheduler.set, clearTimeoutFn: scheduler.clear })
+    store.setActiveFeature("f-1")
+    store.ensureRunsLoaded("f-1")
+    await settle()
+    const anyStore = store as unknown as { onFrame(frame: { type: "hello"; requestId: string }): void }
+    anyStore.onFrame({ type: "hello", requestId: "a" })
+    await settle()
+    calls.length = 0
+    anyStore.onFrame({ type: "hello", requestId: "b" })
+    await settle()
+    expect(calls.some(c => c.path === "/v1/features")).toBe(true)
+    expect(calls.some(c => c.path === "/v1/features/f-1")).toBe(true)
+    expect(calls.some(c => c.path === "/v1/features/f-1/runs")).toBe(true)
+  })
+
+  it("resume() on a healthy stream resyncs, but at most once per window", async () => {
+    let now = 1_000_000
+    const scheduler = new FakeScheduler()
+    const { client, calls } = makeStack({
+      "/v1/features": () => ({ features: [] }),
+      "/v1/health": health,
+    })
+    const store = new DataSource({ client, now: () => now, setTimeoutFn: scheduler.set, clearTimeoutFn: scheduler.clear })
+    const internals = store as unknown as { streamConnected: boolean; lastStreamActivity: number }
+    internals.streamConnected = true
+    internals.lastStreamActivity = now
+    store.resume()
+    await settle()
+    expect(calls.filter(c => c.path === "/v1/features").length).toBe(1)
+    store.resume()
+    await settle()
+    expect(calls.filter(c => c.path === "/v1/features").length).toBe(1)
+    now += 11_000
+    internals.lastStreamActivity = now
+    store.resume()
+    await settle()
+    expect(calls.filter(c => c.path === "/v1/features").length).toBe(2)
+  })
+
+  it("resume() on a stale stream aborts it and reconnects without backoff", async () => {
+    let now = 1_000_000
+    const scheduler = new FakeScheduler()
+    const aborted: boolean[] = []
+    const { client } = makeStack({ "/v1/health": health })
+    const store = new DataSource({ client, now: () => now, setTimeoutFn: scheduler.set, clearTimeoutFn: scheduler.clear })
+    const internals = store as unknown as {
+      streamConnected: boolean
+      streamRunning: boolean
+      lastStreamActivity: number
+      streamAbort: { abort(): void } | null
+      reconnectImmediately: boolean
+    }
+    internals.streamConnected = true
+    internals.streamRunning = true
+    internals.lastStreamActivity = now
+    internals.streamAbort = { abort: () => aborted.push(true) }
+    now += 60_000
+    store.resume()
+    expect(aborted).toEqual([true])
+    expect(internals.reconnectImmediately).toBe(true)
+  })
+})

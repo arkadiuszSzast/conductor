@@ -142,6 +142,7 @@ async function makeApi(input?: {
   workflow?: string
   auth?: ApiConfig["auth"]
   ui?: ApiConfig["ui"]
+  sseKeepAliveMs?: number
   actionRegistry?: LoadedActionRegistry
 }): Promise<{
   api: ConductorApi
@@ -174,6 +175,7 @@ async function makeApi(input?: {
       bind: { host: "127.0.0.1", port: 0 },
       auth: input?.auth ?? { mode: "none" },
       ...(input?.ui !== undefined ? { ui: input.ui } : {}),
+      ...(input?.sseKeepAliveMs !== undefined ? { sseKeepAliveMs: input.sseKeepAliveMs } : {}),
     },
     {
       store: daemon.store,
@@ -1614,6 +1616,15 @@ describe("API: SSE invalidation events", () => {
 
     const afterClose = await api.handle(new Request("http://conductor.test/v1/events"))
     expect(afterClose.status).toBe(409)
+  })
+
+  it("sends keep-alive comment frames so idle streams are not dropped by proxies", async () => {
+    const { api } = await makeApi({ sseKeepAliveMs: 10 })
+    const events = await api.handle(new Request("http://conductor.test/v1/events"))
+    const reader = events.body!.getReader()
+    const text = await readFrames(reader, buffered => buffered.includes(": ping"))
+    expect(text).toContain(": ping\n\n")
+    reader.cancel()
   })
 
   it("events endpoint honors the auth boundary", async () => {

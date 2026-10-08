@@ -8,6 +8,8 @@
  *                        (each active change carries its declared `dependsOn`)
  *   GET  /change      -> per-change detail (proposal sections, delta specs, tasks, dependsOn) | { error }
  *   POST /start-work  -> { featureId } | { error }
+ *   GET  /runs        -> { runs: { [change]: { featureId, status, jobId, stepId } } } | { error }
+ *                        (the live feature delivering each change, if any)
  *   GET    /queue                -> the daemon's change queue for this project | { error }
  *   POST   /queue/entries        -> queue a change ({ change }) | { error }
  *   DELETE /queue/entries/:id    -> dequeue an entry that has not started | { error }
@@ -24,7 +26,7 @@
 import { spawn } from "node:child_process"
 import { readdir, readFile as fsReadFile, stat } from "node:fs/promises"
 import { extname, join, resolve, sep } from "node:path"
-import { deriveChangeStart, extractSection, parseDependsOn, type ParseYaml } from "./change-start.ts"
+import { CHANGE_INPUT_NAMES, deriveChangeStart, extractSection, parseDependsOn, type ParseYaml } from "./change-start.ts"
 
 export interface ExecResult {
   readonly code: number
@@ -403,6 +405,66 @@ async function readJsonObject(request: Request): Promise<Record<string, unknown>
   return isRecord(body) ? body : jsonResponse(400, { error: "request body must be a JSON object" })
 }
 
+const LIVE_FEATURE_STATUSES = "running,waiting_human,escalated,paused"
+
+export interface ChangeRun {
+  readonly featureId: string
+  readonly status: string
+  readonly jobId: string | null
+  readonly stepId: string | null
+}
+
+/** The job a "show run" link should land on: a running job first, then a
+ *  ready one, then a failed one (an escalated feature's stuck job). */
+function frontierJob(jobs: unknown): { jobId: string; stepId: string | null } | null {
+  if (!isRecord(jobs)) return null
+  for (const wanted of ["running", "ready", "failed"]) {
+    for (const [jobId, job] of Object.entries(jobs)) {
+      if (isRecord(job) && job.status === wanted) {
+        return { jobId, stepId: typeof job.currentStep === "string" ? job.currentStep : null }
+      }
+    }
+  }
+  return null
+}
+
+/** Live features of this project that deliver an OpenSpec change, keyed
+ *  by change name — read from the start input the plugin itself fills
+ *  (`change_slug` / `change`), so manual starts and queue starts both
+ *  show up. The most recently updated feature wins a tie. */
+export function changeRunsFromFeatures(payload: unknown, projectDir: string): Record<string, ChangeRun> {
+  const runs: Record<string, ChangeRun & { updatedAt: number }> = {}
+  const features = isRecord(payload) && Array.isArray(payload.features) ? payload.features : []
+  for (const feature of features) {
+    if (!isRecord(feature) || feature.projectDir !== projectDir || typeof feature.id !== "string") continue
+    const input = isRecord(feature.input) ? feature.input : {}
+    const change = CHANGE_INPUT_NAMES.map(name => input[name]).find((value): value is string => typeof value === "string" && value !== "")
+    if (change === undefined) continue
+    const updatedAt = typeof feature.updatedAt === "number" ? feature.updatedAt : 0
+    const existing = runs[change]
+    if (existing !== undefined && existing.updatedAt >= updatedAt) continue
+    const frontier = frontierJob(feature.jobs)
+    runs[change] = {
+      featureId: feature.id,
+      status: typeof feature.status === "string" ? feature.status : "running",
+      jobId: frontier?.jobId ?? null,
+      stepId: frontier?.stepId ?? null,
+      updatedAt,
+    }
+  }
+  return Object.fromEntries(Object.entries(runs).map(([change, { updatedAt: _updatedAt, ...run }]) => [change, run]))
+}
+
+async function handleRuns(deps: OpenSpecServeDeps): Promise<Response> {
+  const call = await callDaemon(
+    deps,
+    "GET",
+    `/v1/features?project=${encodeURIComponent(deps.projectDir)}&status=${LIVE_FEATURE_STATUSES}`,
+  )
+  if (!call.ok) return call.response
+  return jsonResponse(200, { runs: changeRunsFromFeatures(call.payload, deps.projectDir) })
+}
+
 async function handleQueueRead(deps: OpenSpecServeDeps): Promise<Response> {
   const call = await callDaemon(deps, "GET", `/v1/projects/queue?dir=${encodeURIComponent(deps.projectDir)}`)
   return call.ok ? jsonResponse(call.status, call.payload) : call.response
@@ -476,6 +538,7 @@ export async function handleRequest(request: Request, deps: OpenSpecServeDeps): 
   if (request.method === "GET" && path === "/changes") return handleChanges(deps)
   if (request.method === "GET" && path === "/change") return handleChangeDetail(request, deps)
   if (request.method === "POST" && path === "/start-work") return handleStartWork(request, deps)
+  if (request.method === "GET" && path === "/runs") return handleRuns(deps)
   if (path === "/queue" && request.method === "GET") return handleQueueRead(deps)
   if (path === "/queue" && request.method === "PATCH") return handleQueueSettings(request, deps)
   if (path === "/queue/entries" && request.method === "POST") return handleQueueAdd(request, deps)

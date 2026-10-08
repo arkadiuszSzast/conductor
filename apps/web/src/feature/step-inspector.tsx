@@ -1,18 +1,14 @@
 /**
- * Workspace inspector — the one place that owns run selection, outputs,
- * logs, findings, and timeline for the feature workspace (spec: "Step
- * inspector integrates outputs, logs, findings, and history"). `jobId`
- * null means nothing is selected on the graph yet; findings/timeline stay
- * available regardless since they are feature-scoped, not job-scoped.
+ * Step inspector — run selection, outputs and logs for the job/step
+ * selected on the graph. Feature-wide history (findings, timeline) lives
+ * in `FeatureActivity` on the page itself, not per step. `jobId` null
+ * means nothing is selected on the graph yet.
  */
 
 import { useApp } from "../app-context.ts"
-import { useFindings, useTimeline } from "../api/hooks.ts"
 import type { RunLogLine, RunSummary, WorkflowProjection } from "../api/types.ts"
 import { collapseToolLines, type DisplayLogLine } from "./inspector-logic.ts"
 import { useRunLog, useStepRun } from "./use-step-run.ts"
-import { FindingsPanel } from "./findings-panel.tsx"
-import { TimelinePanel } from "./timeline-panel.tsx"
 import { formatClock } from "../lib/time.ts"
 import { useEffect, useRef, useState } from "react"
 import { LatestGuard } from "../lib/latest-guard.ts"
@@ -31,7 +27,7 @@ export interface StepInspectorProps {
   readonly hideHeader?: boolean
 }
 
-type Tab = "outputs" | "logs" | "findings" | "timeline"
+type Tab = "logs" | "outputs"
 
 /** The "job · step" label shown as the inspector's title, or by a caller
  *  that renders its own header (e.g. the mobile ActionSheet) instead. */
@@ -41,16 +37,15 @@ export function inspectorTitle(jobId: string | null, effectiveStepId: string | n
 }
 
 export function StepInspector({ featureId, jobId, stepId, workflow, onClose, inline, hideHeader }: StepInspectorProps): React.ReactNode {
-  const { store } = useApp()
-  const findingsState = useFindings(store, featureId)
-  const timelineState = useTimeline(store, featureId)
   const { effectiveStepId, step, run, runId } = useStepRun(featureId, jobId, stepId, workflow)
   const { cursor } = useRunLog(featureId, runId)
 
-  const [tab, setTab] = useState<Tab>("outputs")
+  // Logs first: "what is the agent doing" is the question a live step
+  // answers; outputs only exist once it has reported.
+  const [tab, setTab] = useState<Tab>("logs")
 
   const hasStep = jobId !== null && effectiveStepId !== null
-  const activeTab = tab === "outputs" || tab === "logs" ? (hasStep ? tab : "findings") : tab
+  const activeTab = tab
 
   return (
     <div className={`${styles.inspector} ${inline ? styles.inline : ""}`}>
@@ -66,14 +61,6 @@ export function StepInspector({ featureId, jobId, stepId, workflow, onClose, inl
       ) : null}
       <div className={styles.tabs} role="group" aria-label="Inspector panel">
         <button
-          aria-pressed={activeTab === "outputs"}
-          className={`${styles.tab} ${activeTab === "outputs" ? styles.active : ""}`}
-          onClick={() => setTab("outputs")}
-          disabled={!hasStep}
-        >
-          outputs
-        </button>
-        <button
           aria-pressed={activeTab === "logs"}
           className={`${styles.tab} ${activeTab === "logs" ? styles.active : ""}`}
           onClick={() => setTab("logs")}
@@ -82,31 +69,29 @@ export function StepInspector({ featureId, jobId, stepId, workflow, onClose, inl
           logs
         </button>
         <button
-          aria-pressed={activeTab === "findings"}
-          className={`${styles.tab} ${activeTab === "findings" ? styles.active : ""}`}
-          onClick={() => setTab("findings")}
+          aria-pressed={activeTab === "outputs"}
+          className={`${styles.tab} ${activeTab === "outputs" ? styles.active : ""}`}
+          onClick={() => setTab("outputs")}
+          disabled={!hasStep}
         >
-          findings
+          outputs
         </button>
-        <button
-          aria-pressed={activeTab === "timeline"}
-          className={`${styles.tab} ${activeTab === "timeline" ? styles.active : ""}`}
-          onClick={() => setTab("timeline")}
-        >
-          timeline
-        </button>
+        {run !== null ? <span className={`${styles.runStatus} ${styles[`run_${run.status}`] ?? ""}`}>{run.status}</span> : null}
       </div>
       <div className={styles.body}>
-        {!hasStep && (activeTab === "outputs" || activeTab === "logs") ? (
-          <div className={styles.empty}>select a job or step on the graph to inspect it</div>
-        ) : null}
+        {!hasStep ? <div className={styles.empty}>select a job or step on the graph to inspect it</div> : null}
         {activeTab === "outputs" && hasStep ? <OutputsTab step={step} run={run} runId={runId} /> : null}
-        {activeTab === "logs" && hasStep ? <LogsTab cursor={cursor} runId={runId} /> : null}
-        {activeTab === "findings" ? <FindingsPanel findings={findingsState.data ?? undefined} /> : null}
-        {activeTab === "timeline" ? <TimelinePanel entries={timelineState.data ?? undefined} /> : null}
+        {activeTab === "logs" && hasStep ? (
+          <LogsTab cursor={cursor} runId={runId} live={run?.status === "running"} kind={stepKind(workflow, jobId, effectiveStepId)} />
+        ) : null}
       </div>
     </div>
   )
+}
+
+function stepKind(workflow: WorkflowProjection | null, jobId: string | null, stepId: string | null): string | null {
+  if (workflow === null || jobId === null || stepId === null) return null
+  return workflow.jobs[jobId]?.steps.find(step => step.id === stepId)?.kind ?? null
 }
 
 type FullOutputsState =
@@ -182,12 +167,41 @@ function OutputsTab(props: {
   )
 }
 
-function LogsTab({ cursor, runId }: { readonly cursor: { readonly lines: readonly RunLogLine[] }; readonly runId: string | null }): React.ReactNode {
+function LogsTab({
+  cursor,
+  runId,
+  live,
+  kind,
+}: {
+  readonly cursor: { readonly lines: readonly RunLogLine[] }
+  readonly runId: string | null
+  readonly live: boolean
+  readonly kind: string | null
+}): React.ReactNode {
+  // Follow the tail while the operator is at the bottom; scrolling up to
+  // read earlier lines pauses following until they return to the end.
+  const panelRef = useRef<HTMLDivElement>(null)
+  const pinnedRef = useRef(true)
+  useEffect(() => {
+    const panel = panelRef.current
+    if (panel !== null && pinnedRef.current) panel.scrollTop = panel.scrollHeight
+  }, [cursor.lines.length])
   if (runId === null) return <div className={styles.empty}>no run for this step yet</div>
-  if (cursor.lines.length === 0) return <div className={styles.empty}>no log lines yet</div>
+  if (cursor.lines.length === 0) {
+    const waiting =
+      kind === "command" ? "command running — its output is captured when it finishes" : kind === "agent" ? "waiting for the agent's first output…" : "running — no log lines yet"
+    return <div className={styles.empty}>{live ? waiting : "no log lines for this run"}</div>
+  }
   const display = collapseToolLines(cursor.lines)
   return (
-    <div className={styles.panel}>
+    <div
+      ref={panelRef}
+      className={`${styles.panel} ${styles.logPanel}`}
+      onScroll={event => {
+        const el = event.currentTarget
+        pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+      }}
+    >
       {display.map(entry =>
         entry.kind === "line" ? (
           <div key={entry.line.seq} className={styles.line}>

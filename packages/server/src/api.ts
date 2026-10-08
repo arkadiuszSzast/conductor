@@ -80,6 +80,8 @@ export interface ApiConfig {
   readonly ui?: {
     readonly staticDir: string
   }
+  /** SSE keep-alive comment interval; defaults to `SSE_KEEPALIVE_MS`. */
+  readonly sseKeepAliveMs?: number
 }
 
 // ------------------------------------------------------------------- deps
@@ -260,6 +262,7 @@ export interface ConductorApi {
 const MAX_FINAL_QUEUE_ENTRIES = 20
 
 const encoder = new TextEncoder()
+export const SSE_KEEPALIVE_MS = 20_000
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void
@@ -401,6 +404,20 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
       }
     }
   }
+
+  // Keep-alive comment frames: proxies and mobile networks silently drop
+  // idle streams, and a client can only detect a dead stream by silence.
+  const keepAlive = setInterval(() => {
+    const frame = encoder.encode(": ping\n\n")
+    for (const client of [...sseClients]) {
+      try {
+        client.controller.enqueue(frame)
+      } catch {
+        sseClients.delete(client)
+      }
+    }
+  }, config.sseKeepAliveMs ?? SSE_KEEPALIVE_MS)
+  ;(keepAlive as { unref?: () => void }).unref?.()
 
   const unsubscribe = store.onChange(broadcast)
   const unsubscribePlugins = plugins?.subscribe(() => broadcast({ kind: "plugins" }))
@@ -1662,6 +1679,7 @@ export function createApi(config: ApiConfig, deps: ApiDeps): ConductorApi {
   function close(): void {
     if (closed) return
     closed = true
+    clearInterval(keepAlive)
     unsubscribe()
     unsubscribePlugins?.()
     for (const client of [...sseClients]) {

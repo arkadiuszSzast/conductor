@@ -2,12 +2,12 @@
  * Board movement diffing — pure, DOM-free.
  *
  * The workflow board re-renders on every SSE-driven feature-list refetch;
- * a card whose feature moved to a different job column unmounts from its
- * old column and remounts in the new one (different `cardId`), which
+ * a card whose feature moved to a different stage unmounts from its old
+ * lane and remounts in the new one (different `cardId`), which
  * silently drops any focus a keyboard/AT user had on it and gives no
  * indication anything changed. `diffBoardMovements` compares two board
- * snapshots and reports which features arrived, moved between job
- * columns, or left the board entirely, so a caller can announce the
+ * snapshots and reports which features arrived, moved between jobs,
+ * or left the board entirely, so a caller can announce the
  * change through a polite live region and attempt focus recovery.
  */
 
@@ -30,14 +30,14 @@ interface FeatureJobs {
 
 function collectFeatureJobs(board: WorkflowBoardModel): Map<string, FeatureJobs> {
   const map = new Map<string, FeatureJobs>()
-  for (const column of board.columns) {
-    for (const card of column.cards) {
+  for (const stage of board.stages) {
+    for (const card of stage.cards) {
       let entry = map.get(card.id)
       if (entry === undefined) {
         entry = { title: card.title, jobIds: [] }
         map.set(card.id, entry)
       }
-      entry.jobIds.push(column.jobId)
+      for (const job of card.activeJobs) entry.jobIds.push(job.jobId)
     }
   }
   return map
@@ -50,7 +50,7 @@ function sameJobSet(a: readonly string[], b: readonly string[]): boolean {
 }
 
 /**
- * Diff two board snapshots for the *same scope* (same job column set).
+ * Diff two board snapshots for the *same scope* (same stage set).
  * `previous === null` (first render / scope switch) always yields no
  * movements — there is nothing meaningful to announce about a change
  * from nothing to the initial state.

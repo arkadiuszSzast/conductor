@@ -33,21 +33,58 @@
   overflow-wrap: break-word;
 }
 .tlEntry {
-  padding: 3px 0;
+  padding: 4px 0;
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   color: var(--text-dim);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px var(--space-2);
+  border-bottom: 1px solid var(--border-hairline);
 }
 .tlTime {
   color: var(--text-faint);
-  margin-right: var(--space-2);
 }
 .tlTarget {
-  margin-left: var(--space-2);
   color: var(--text);
 }
+.tlKind {
+  font-weight: 600;
+}
+.tone_ok { color: var(--status-done); }
+.tone_bad { color: var(--status-escalated); }
+.tone_warn { color: var(--status-waiting); }
+.tone_info { color: var(--cyan); }
+.tlOutcome {
+  color: var(--text-dim);
+}
 .tlReason {
-  margin-left: var(--space-2);
+  flex-basis: 100%;
   color: var(--status-escalated);
   word-break: break-word;
+  white-space: pre-wrap;
+}
+.tlClamped {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  position: relative;
+  padding-right: 3.5em;
+}
+.tlMore {
+  background: none;
+  border: none;
+  padding: 0 0 0 var(--space-2);
+  min-height: unset;
+  color: var(--cyan);
+  font: inherit;
+  cursor: pointer;
+}
+.tlClamped .tlMore {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  background: var(--bg-panel);
 }

@@ -73,3 +73,14 @@ describe("encodeHostMessage", () => {
     expect(envelope.payload).toEqual(payload)
   })
 })
+
+describe("bridge: navigate with a job target", () => {
+  it("carries an optional job alongside the feature", async () => {
+    const { parsePanelMessage } = await import("../src/plugins/bridge.ts")
+    expect(parsePanelMessage({ conductor: true, v: 1, type: "navigate", payload: { to: { feature: "f-1", job: "impl" } } })).toEqual({
+      type: "navigate",
+      payload: { to: { feature: "f-1", job: "impl" } },
+    })
+    expect(parsePanelMessage({ conductor: true, v: 1, type: "navigate", payload: { to: { feature: "f-1", job: 3 } } })).toBeNull()
+  })
+})
