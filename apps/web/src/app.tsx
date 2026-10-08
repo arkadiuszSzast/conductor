@@ -46,8 +46,21 @@ export function App(): React.ReactNode {
       if (session.status === "authenticated") void store.start()
       setServices({ session, client, store })
     })
+    // A backgrounded PWA/tab loses its stream silently; coming back must
+    // reconnect and resync instead of showing state from before sleep.
+    const resume = (): void => {
+      if (document.visibilityState === "visible" && session.status === "authenticated") store.resume()
+    }
+    document.addEventListener("visibilitychange", resume)
+    window.addEventListener("pageshow", resume)
+    window.addEventListener("online", resume)
+    window.addEventListener("focus", resume)
     return () => {
       active = false
+      document.removeEventListener("visibilitychange", resume)
+      window.removeEventListener("pageshow", resume)
+      window.removeEventListener("online", resume)
+      window.removeEventListener("focus", resume)
       store.stop()
     }
   }, [])

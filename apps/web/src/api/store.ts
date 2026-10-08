@@ -63,6 +63,12 @@ const ECHO_WINDOW_MS = 2_000
 const RECONNECT_HEALTH_POLL_MS = 5_000
 /** Cap on the reconnect backoff (brief rule 6). */
 const RECONNECT_BACKOFF_CAP_MS = 30_000
+/** No bytes (frames or keep-alive comments) for this long means the
+ *  stream is dead even though the socket never reported it — common on
+ *  mobile after sleep and behind proxies. Server pings every 20 s. */
+const STREAM_STALE_MS = 50_000
+/** Minimum spacing between foreground resyncs on a healthy stream. */
+const RESUME_RESYNC_MIN_MS = 10_000
 /** Bounded retry for transient load failures (base delay, doubling). */
 const LOAD_RETRY_BASE_MS = 1_000
 const LOAD_RETRY_MAX_ATTEMPTS = 3
@@ -130,6 +136,15 @@ export class DataSource {
   private reconnectHandle: unknown | null = null
   private healthPollHandle: unknown | null = null
   private readonly reconnectDelay = { ms: 2_000 }
+  private streamAbort: AbortController | null = null
+  private watchdogHandle: unknown | null = null
+  private lastStreamActivity = 0
+  /** True once any stream has said hello — a later hello is a reconnect
+   *  and must resync everything, since invalidations were missed. */
+  private everConnected = false
+  /** Next reconnect skips backoff (set by `resume`'s forced abort). */
+  private reconnectImmediately = false
+  private lastResyncAt = Number.NEGATIVE_INFINITY
 
   private activeFeatureId: string | null = null
 
@@ -589,9 +604,77 @@ export class DataSource {
     void this.connectStream()
   }
 
+  /**
+   * The app came back to the foreground (tab visible, page restored from
+   * bfcache, network back online). A backgrounded mobile PWA usually has
+   * its stream killed without any error surfacing, so a stale or dead
+   * stream is replaced immediately — no backoff — and every on-screen
+   * resource is refetched because invalidations sent meanwhile are lost.
+   */
+  resume(): void {
+    if (this.streamStopped) return
+    const stale = this.now() - this.lastStreamActivity > STREAM_STALE_MS
+    if (!this.streamConnected || stale) {
+      this.reconnectDelay.ms = 2_000
+      if (this.reconnectHandle !== null) {
+        this.clearTimeoutFn(this.reconnectHandle)
+        this.reconnectHandle = null
+      }
+      if (this.streamRunning) {
+        this.reconnectImmediately = true
+        this.streamAbort?.abort()
+      } else {
+        void this.connectStream()
+      }
+      return
+    }
+    // Healthy stream: still resync (the OS may have frozen the page
+    // while the socket stayed up), but not on every focus flicker.
+    if (this.now() - this.lastResyncAt >= RESUME_RESYNC_MIN_MS) this.resyncAll()
+  }
+
+  /** Force-refetch every resource that has been loaded and is still
+   *  relevant: the list, health, workflows, plugins, and the open feature. */
+  resyncAll(): void {
+    this.lastResyncAt = this.now()
+    void this.refreshFeatures()
+    void this.refreshHealth()
+    for (const projectDir of this.workflows.keys()) void this.refetchWorkflow(projectDir)
+    for (const scope of this.plugins.keys()) void this.refetchPlugins(scope)
+    const featureId = this.activeFeatureId
+    if (featureId !== null) {
+      void this.refetchFeatureDetail(featureId)
+      if (this.runs.has(featureId)) void this.refetchRuns(featureId)
+      if (this.findings.has(featureId)) void this.refetchFindings(featureId)
+      if (this.timelines.has(featureId)) void this.refetchTimeline(featureId)
+      this.emitRunLog(featureId)
+    }
+  }
+
+  private markStreamActivity(): void {
+    this.lastStreamActivity = this.now()
+  }
+
+  private armWatchdog(): void {
+    if (this.watchdogHandle !== null) this.clearTimeoutFn(this.watchdogHandle)
+    this.watchdogHandle = this.setTimeoutFn(() => {
+      this.watchdogHandle = null
+      if (this.streamStopped || !this.streamRunning) return
+      if (this.now() - this.lastStreamActivity >= STREAM_STALE_MS) {
+        this.streamAbort?.abort()
+        return
+      }
+      this.armWatchdog()
+    }, STREAM_STALE_MS)
+  }
+
   private async connectStream(): Promise<void> {
     if (this.streamStopped || this.streamRunning) return
     this.streamRunning = true
+    const abort = typeof AbortController === "undefined" ? null : new AbortController()
+    this.streamAbort = abort
+    this.markStreamActivity()
+    this.armWatchdog()
     try {
       await readSseStream({
         url: this.eventsUrl,
@@ -600,6 +683,8 @@ export class DataSource {
         onRetryDelay: ms => {
           this.reconnectDelay.ms = ms
         },
+        onActivity: () => this.markStreamActivity(),
+        ...(abort !== null ? { signal: abort.signal } : {}),
       })
       this.streamRunning = false
       if (this.streamStopped) return
@@ -625,8 +710,9 @@ export class DataSource {
 
   private scheduleReconnect(): void {
     if (this.streamStopped || this.reconnectHandle !== null) return
-    const delay = Math.min(this.reconnectDelay.ms, RECONNECT_BACKOFF_CAP_MS)
-    this.reconnectDelay.ms = this.reconnectDelay.ms * 2
+    const delay = this.reconnectImmediately ? 0 : Math.min(this.reconnectDelay.ms, RECONNECT_BACKOFF_CAP_MS)
+    if (this.reconnectImmediately) this.reconnectImmediately = false
+    else this.reconnectDelay.ms = this.reconnectDelay.ms * 2
     this.reconnectHandle = this.setTimeoutFn(() => {
       this.reconnectHandle = null
       void this.connectStream()
@@ -649,6 +735,8 @@ export class DataSource {
 
   private onFrame(frame: SseFrame): void {
     if (frame.type === "hello") {
+      const reconnect = this.everConnected
+      this.everConnected = true
       this.streamConnected = true
       this.reconnectDelay.ms = 2_000
       if (this.healthPollHandle !== null) {
@@ -656,7 +744,8 @@ export class DataSource {
         this.healthPollHandle = null
       }
       this.emit("connection")
-      this.refreshHealth()
+      if (reconnect) this.resyncAll()
+      else this.refreshHealth()
       return
     }
     this.queue(frame.change)
@@ -801,6 +890,12 @@ export class DataSource {
 
   stop(): void {
     this.streamStopped = true
+    this.streamAbort?.abort()
+    this.streamAbort = null
+    if (this.watchdogHandle !== null) {
+      this.clearTimeoutFn(this.watchdogHandle)
+      this.watchdogHandle = null
+    }
     if (this.coalesceTimer !== null) {
       this.clearTimeoutFn(this.coalesceTimer)
       this.coalesceTimer = null

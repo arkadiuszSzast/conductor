@@ -301,6 +301,8 @@ export class ApiClient {
       readonly target?: { readonly jobId: string; readonly stepId: string }
       readonly targets?: readonly { readonly jobId: string; readonly stepId: string }[]
       readonly all?: boolean
+      readonly acknowledgeUncertain?: boolean
+      readonly cleanupAttested?: boolean
     },
   ): Promise<CommandResponse> {
     return this.request<CommandResponse>(`/v1/features/${encodeURIComponent(featureId)}/recover`, {
@@ -313,6 +315,8 @@ export class ApiClient {
         ...(options?.target !== undefined ? { target: options.target } : {}),
         ...(options?.targets !== undefined ? { targets: options.targets } : {}),
         ...(options?.all === true ? { all: true } : {}),
+        ...(options?.acknowledgeUncertain === true ? { acknowledgeUncertain: true } : {}),
+        ...(options?.cleanupAttested === true ? { cleanupAttested: true } : {}),
       }),
     })
   }
@@ -367,15 +371,19 @@ export interface SseReaderInput {
   readonly fetch?: FetchLike
   readonly onFrame: (frame: SseFrame) => void
   readonly onRetryDelay?: (ms: number) => void
+  /** Called on every received chunk, keep-alive comments included —
+   *  the caller's liveness watchdog for a silently dead stream. */
+  readonly onActivity?: () => void
+  readonly signal?: AbortSignal
 }
 
 export async function readSseStream(input: SseReaderInput): Promise<void> {
-  const { url, token, onFrame, onRetryDelay } = input
+  const { url, token, onFrame, onRetryDelay, onActivity, signal } = input
   const fetchImpl = input.fetch ?? globalThis.fetch
   const tokenValue = token()
   const headers: Record<string, string> = {}
   if (tokenValue !== null) headers["authorization"] = `Bearer ${tokenValue}`
-  const response = await fetchImpl(url, { headers })
+  const response = await fetchImpl(url, signal !== undefined ? { headers, signal } : { headers })
   if (response.status !== 200) throw new SseHttpError(response.status)
   if (response.body === null) throw new SseDropError("network-error", "no response body")
 
@@ -433,6 +441,7 @@ export async function readSseStream(input: SseReaderInput): Promise<void> {
       dispatch(remainder.slice(0, -1))
       throw new SseDropError("closed", "stream closed by server")
     }
+    onActivity?.()
     buffer += decoder.decode(value, { stream: true })
     const frames = buffer.split("\n\n")
     buffer = frames.pop() ?? ""

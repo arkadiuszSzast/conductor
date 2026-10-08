@@ -15,7 +15,7 @@ Authentication is explicit (`auth.mode: "none"` or `"bearer"`); only
 |---|---|
 | `GET /v1/livez`, `GET /v1/readyz` | Probes (unauthenticated). |
 | `GET /v1/health` | Full daemon health snapshot: heartbeat, per-project workflow state (`valid`/`stale`/`invalid`/`unregistered`) with diagnostics, runner availability. |
-| `GET /v1/events` | SSE invalidation stream: `{kind: feature\|transition\|run\|finding\|run_log, featureId}` or `{kind: "plugins"}`; subscribers refetch over REST. `run_log` notifications are throttled at the source (at most one per run per second). |
+| `GET /v1/events` | SSE invalidation stream: `{kind: feature\|transition\|run\|finding\|run_log, featureId}` or `{kind: "plugins"}`; subscribers refetch over REST. `run_log` notifications are throttled at the source (at most one per run per second). A `: ping` comment frame is sent every 20 s so proxies and mobile networks keep the idle stream open and clients can detect a dead one. |
 | `GET /v1/features` | Feature list. Filters: `?project=<dir>`, `?active=true`, `?status=a,b` (comma list of feature statuses; unknown value → 400). |
 | `POST /v1/features` | Start a feature (below). |
 | `GET /v1/features/:id` | Feature detail (see payloads below). |
