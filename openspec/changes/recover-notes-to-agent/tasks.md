@@ -12,3 +12,5 @@
 - [x] [test] Verify immediate and scheduled retry prompts, database reopen, resource waits including post-insertion runner loss, replacement notes, target isolation and successful recovery followed by a later rerun.
 - [x] [docs] Update episode lifetime and conservative migration/deployment semantics.
 - [x] [test][review] Run typecheck, lint and full test script; review the fix without changing existing runner-liveness work.
+- [x] [server][db] Hand undelivered notes from a recovered non-agent target to the entry steps of the rerun its failure routes; "already received by an agent" is derived from agent runs of the target started within the episode, so no migration is needed.
+- [x] [test] Cover the CI-wait handoff to the fix agent, retry inheritance inside the handed-off episode, no carry into the next rerun round, and no handoff of notes an agent already received.

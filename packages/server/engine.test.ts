@@ -1285,6 +1285,101 @@ describe("Engine: durable recovery-dispatch replay", () => {
     expect(sessions.prompts.at(-1)?.text).toContain("Keep {{ feature.title }} literal")
     expect(store.getRecoverNotesForTarget(feature.id, "main", "implement")).toBe("Keep {{ feature.title }} literal")
   })
+  describe("non-agent recovered target hands notes to the rerun's agent", () => {
+    const ciLoop = workflow({
+      post: job([
+        agentStep("fix", "fixer", "Fix CI."),
+        actionStepDef("push", "test/push@v1"),
+        { ...actionStepDef("checks", "test/checks@v1"), onFail: rerunSteps(["fix", "push", "checks"], 1) },
+      ]),
+    }, roles, "ci-loop")
+    const ciBindings = (): ResolvedActionBindings => actionBindings([
+      { jobId: "post", stepId: "push", uses: "test/push@v1", manifest: actionManifest({ name: "test/push" }) },
+      { jobId: "post", stepId: "checks", uses: "test/checks@v1", manifest: actionManifest({ name: "test/checks" }) },
+    ])
+    const escalateOnChecks = async (engine: Engine) => {
+      actions.handler = binding => binding.stepId === "checks" ? { ok: false, error: "checks failed: PR Gate" } : { ok: true, outputs: {} }
+      const feature = await startedFeature(engine)
+      for (let round = 0; round < 2; round++) {
+        await engine.report({ runId: store.getActiveRunForStep(feature.id, "post", "fix")!.id, outcome: "succeeded" })
+        await engine.settleActions()
+      }
+      expect(store.getFeature(feature.id)?.status).toBe("escalated")
+      return feature
+    }
+
+    it("delivers the notes to the fix agent once, not to later rounds", async () => {
+      const engine = makeEngine(ciLoop, {}, {}, ciBindings())
+      const feature = await escalateOnChecks(engine)
+      const promptsBefore = sessions.prompts.length
+
+      await engine.recover(feature.id, { notes: "the test is flaky, rerun the failed CI jobs" })
+      await engine.settleActions()
+
+      const fix = store.getActiveRunForStep(feature.id, "post", "fix")!
+      expect(fix.recoverNotes).toBe("the test is flaky, rerun the failed CI jobs")
+      expect(sessions.prompts.length).toBe(promptsBefore + 1)
+      expect(sessions.prompts.at(-1)?.text).toContain("Operator notes:\nthe test is flaky, rerun the failed CI jobs\n\n")
+      expect(store.getRecoverNotesForTarget(feature.id, "post", "checks")).toBeNull()
+
+      await engine.report({ runId: fix.id, outcome: "succeeded" })
+      await engine.settleActions()
+      expect(store.getFeature(feature.id)?.status).toBe("escalated")
+    })
+
+    it("an agent's failure retry within the handed-off episode keeps the notes; a later rerun round does not", async () => {
+      const loop = workflow({
+        post: job([
+          agentStep("fix", "fixer", "Fix CI.", { retry: backoff(2, 10) }),
+          actionStepDef("push", "test/push@v1"),
+          { ...actionStepDef("checks", "test/checks@v1"), onFail: rerunSteps(["fix", "push", "checks"], 2) },
+        ]),
+      }, roles, "ci-loop-retry")
+      const engine = makeEngine(loop, {}, {}, ciBindings())
+      actions.handler = binding => binding.stepId === "checks" ? { ok: false, error: "checks failed" } : { ok: true, outputs: {} }
+      const feature = await startedFeature(engine)
+      for (let round = 0; round < 3; round++) {
+        await engine.report({ runId: store.getActiveRunForStep(feature.id, "post", "fix")!.id, outcome: "succeeded" })
+        await engine.settleActions()
+      }
+      expect(store.getFeature(feature.id)?.status).toBe("escalated")
+
+      await engine.recover(feature.id, { notes: "investigate the flake" })
+      await engine.settleActions()
+      await engine.report({ runId: store.getActiveRunForStep(feature.id, "post", "fix")!.id, outcome: "failed" })
+      clock.advance(10)
+      await engine.reconcile()
+      expect(store.getActiveRunForStep(feature.id, "post", "fix")?.recoverNotes).toBe("investigate the flake")
+
+      await engine.report({ runId: store.getActiveRunForStep(feature.id, "post", "fix")!.id, outcome: "succeeded" })
+      await engine.settleActions()
+      const nextRound = store.getActiveRunForStep(feature.id, "post", "fix")!
+      expect(nextRound.recoverNotes).toBeNull()
+      expect(sessions.prompts.at(-1)?.text).not.toContain("Operator notes:")
+    })
+
+    it("does not forward notes a recovered agent target already received", async () => {
+      const loop = workflow({
+        main: job([
+          agentStep("implement", "implementer", "go"),
+          agentStep("review", "reviewer", "review", {
+            outcomes: { approved: next, changes_requested: rerunSteps(["implement", "review"], 2) },
+          }),
+        ]),
+      }, roles, "agent-target")
+      const engine = makeEngine(loop)
+      const feature = await startedFeature(engine)
+      await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "succeeded" })
+      await engine.report({ runId: store.getActiveRun(feature.id)!.id, outcome: "failed" })
+      expect(store.getFeature(feature.id)?.status).toBe("escalated")
+      await engine.recover(feature.id, { notes: "review guidance" })
+      expect(store.getActiveRun(feature.id)?.recoverNotes).toBe("review guidance")
+      await engine.report({ runId: store.getActiveRun(feature.id)!.id, verdict: "changes_requested" })
+      expect(store.getActiveRun(feature.id)?.stepId).toBe("implement")
+      expect(store.getActiveRun(feature.id)?.recoverNotes).toBeNull()
+    })
+  })
+
   it("crash boundary: a recoverStepTargets commit with no dispatch yet is durably replayed by reconcile — one run, feature stays running (not invariant-escalated); a second reconcile is a no-op", async () => {
     const engine = makeEngine(retryWorkflow)
     const feature = await startedFeature(engine)

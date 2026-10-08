@@ -330,7 +330,12 @@ means "at least one rerun has ever happened".
   A subsequent recover replaces the selected target's guidance. Historical
   run snapshots remain unchanged. Migration 0020 does not reactivate
   already-consumed pre-upgrade notes; those need a separately authorized
-  new recovery. A normal first-attempt prompt has no recovery block. See
+  new recovery. A normal first-attempt prompt has no recovery block.
+  When the recovered target is an action or command step (e.g. a CI
+  wait) whose failure reruns earlier steps, the notes have not reached
+  any agent yet, so they are handed to the rerun's entry steps as a new
+  episode with the same lifetime rules: the agent that does the fix sees
+  them once, and later rerun rounds do not. See
   `openspec/changes/recover-notes-to-agent` for the design.
 
 ## Starting a feature
