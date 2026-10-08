@@ -1,10 +1,12 @@
 .strip {
+  flex: 0 0 auto;
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-4);
   padding: var(--space-2) 0 var(--space-3);
   border-bottom: 1px solid var(--border-hairline);
 }
+
 .group {
   display: flex;
   flex-direction: column;
@@ -42,6 +44,15 @@
   gap: 6px;
   flex-wrap: wrap;
   max-width: 42rem;
+}
+/* Expanded history is a bounded scroll box: the list can hold hundreds
+   of entries and must never push the lanes off-screen. */
+.chips.expanded {
+  max-height: min(40vh, 22rem);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  align-content: flex-start;
+  padding-right: 4px;
 }
 .chip {
   display: inline-flex;
@@ -103,5 +114,50 @@
   .pulse {
     animation: none;
     opacity: 0.8;
+  }
+}
+
+/* Phone: one column, chips full-width rows so titles are readable. */
+@media (max-width: 767px) {
+  .strip {
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+  .group {
+    width: 100%;
+  }
+  .chips {
+    flex-direction: column;
+    flex-wrap: nowrap;
+    max-width: 100%;
+    width: 100%;
+  }
+  .chip {
+    display: flex;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .chipTitle {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .chipMeta {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .chipTitle {
+    max-width: none;
+    flex: 1;
+    min-width: 0;
+  }
+  .chipProject {
+    display: none;
+  }
+  .chipMeta {
+    margin-left: auto;
   }
 }

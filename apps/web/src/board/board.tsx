@@ -15,10 +15,10 @@ import {
 import { describeBoardMovements, diffBoardMovements } from "./board-activity.ts"
 import { OverviewStrip } from "./overview-strip.tsx"
 import { ScopeTabs } from "./scope-tabs.tsx"
-import { JobColumn } from "./job-column.tsx"
-import { JobFrontierCard } from "./job-frontier-card.tsx"
-import { StageSelector, type StageOption } from "./stage-selector.tsx"
-import { useIsNarrowViewport } from "../lib/viewport.ts"
+import { StageLane } from "./stage-lane.tsx"
+import { StageRail } from "./stage-rail.tsx"
+import { focusStageIndex } from "./workflow-board.ts"
+import { useIsNarrowViewport, usePrefersReducedMotion } from "../lib/viewport.ts"
 import { statusGlyph, type BoardCardModel } from "./card-model.ts"
 import { publishActiveScope } from "../plugins/active-scope.ts"
 import styles from "./board.module.css"
@@ -30,7 +30,7 @@ export function Board(): React.ReactNode {
   const [params, setParams] = useSearchParams()
   const [now, setNow] = useState<number>(() => Date.now())
   const isNarrow = useIsNarrowViewport()
-  const [mobileStage, setMobileStage] = useState<string | null>(null)
+  const reducedMotion = usePrefersReducedMotion()
 
   useEffect(() => {
     const id = globalThis.setInterval(() => setNow(Date.now()), 30_000)
@@ -143,8 +143,7 @@ export function Board(): React.ReactNode {
           // div only carries the identity attribute, so the anchor is
           // targeted specifically rather than falling back to an
           // unfocusable container.
-          const nextCardId = `${moved.featureId}::${moved.toJobIds[0]}`
-          const container = document.querySelector<HTMLElement>(`[data-card-id="${CSS.escape(nextCardId)}"]`)
+          const container = document.querySelector<HTMLElement>(`[data-card-id^="${CSS.escape(`${moved.featureId}::`)}"]`)
           const focusTarget = container?.querySelector<HTMLElement>("a") ?? container
           focusTarget?.focus()
         }
@@ -159,29 +158,27 @@ export function Board(): React.ReactNode {
       next.set("scope", key)
       return next
     })
-    setMobileStage(null)
     prevBoardRef.current = null
   }
 
-  const stageOptions: readonly StageOption[] = useMemo(
-    () =>
-      (board?.columns ?? []).map(col => ({
-        jobId: col.jobId,
-        count: col.cards.length,
-        hasAttention: col.cards.some(c => c.status === "waiting_human" || c.status === "escalated"),
-      })),
-    [board],
-  )
-
+  // Bring the first stage that needs a human (else the first occupied
+  // one) into view once per scope — on a phone the lanes stack, and
+  // hunting for the active card by scrolling is the main complaint.
+  const lanesRef = useRef<HTMLDivElement>(null)
+  const focusedScopeRef = useRef<string | null>(null)
   useEffect(() => {
-    if (mobileStage !== null && stageOptions.some(s => s.jobId === mobileStage)) return
-    const firstWithAttention = stageOptions.find(s => s.hasAttention)
-    const firstWithCards = stageOptions.find(s => s.count > 0)
-    setMobileStage((firstWithAttention ?? firstWithCards ?? stageOptions[0])?.jobId ?? null)
-    // mobileStage intentionally excluded: this effect only picks a
-    // *default* when the current selection becomes invalid, and must not
-    // re-run every time the operator changes it by hand.
-  }, [stageOptions])
+    if (board === null || selectedScope === null) return
+    if (focusedScopeRef.current === selectedScope) return
+    const index = focusStageIndex(board)
+    if (index === null) return
+    focusedScopeRef.current = selectedScope
+    scrollToStage(index, "auto")
+  }, [board, selectedScope])
+
+  const scrollToStage = (index: number, behavior: ScrollBehavior = reducedMotion ? "auto" : "smooth"): void => {
+    const lane = lanesRef.current?.querySelector<HTMLElement>(`[data-stage-index="${index}"]`)
+    lane?.scrollIntoView({ behavior, block: isNarrow ? "start" : "nearest", inline: "start" })
+  }
 
   // Health readiness gates the empty state too: `scopes` now derives
   // from registered projects, so if /v1/features resolves before
@@ -189,7 +186,7 @@ export function Board(): React.ReactNode {
   // that does have a registered (feature-less) project — the exact
   // absent-scope flash this change eliminates.
   const loading = featuresState.status === "loading" || items === null || (healthState.status === "loading" && healthState.data === null)
-  const activeStageCol = board?.columns.find(c => c.jobId === mobileStage) ?? null
+  const occupied = board?.stages.filter(stage => stage.cards.length > 0) ?? []
 
   return (
     <div className={styles.board} ref={boardRootRef}>
@@ -223,25 +220,18 @@ export function Board(): React.ReactNode {
               showing a historical/stale projection is unsafe, so this scope's board is unavailable until you select a
               current scope
             </div>
-          ) : board === null ? null : isNarrow ? (
-            <div className={styles.mobileBoard}>
-              <StageSelector stages={stageOptions} selected={mobileStage} onSelect={setMobileStage} />
-              <div className={styles.mobileCards}>
-                {activeStageCol === null || activeStageCol.cards.length === 0 ? (
-                  <div className={styles.empty}>nothing at this stage</div>
-                ) : (
-                  activeStageCol.cards.map(card => <JobFrontierCard key={card.cardId} card={card} />)
-                )}
-              </div>
-              <UnresolvedTray unresolved={board.unresolved} />
-            </div>
-          ) : (
+          ) : board === null ? null : (
             <>
-              <div className={styles.columns}>
-                {board.columns.map(column => (
-                  <JobColumn key={column.jobId} column={column} />
-                ))}
-              </div>
+              <StageRail stages={board.stages} onSelect={index => scrollToStage(index)} />
+              {occupied.length === 0 ? (
+                <div className={styles.empty}>nothing in flight for this workflow</div>
+              ) : (
+                <div ref={lanesRef} className={isNarrow ? styles.lanesStacked : styles.lanes}>
+                  {occupied.map(stage => (
+                    <StageLane key={stage.index} stage={stage} total={board.stages.length} />
+                  ))}
+                </div>
+              )}
               <UnresolvedTray unresolved={board.unresolved} />
             </>
           )}

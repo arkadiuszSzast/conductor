@@ -4,11 +4,14 @@
  */
 import { describe, expect, it } from "bun:test"
 import { describeBoardMovements, diffBoardMovements } from "../src/board/board-activity.ts"
-import type { FrontierCardModel, JobColumnModel, WorkflowBoardModel } from "../src/board/workflow-board.ts"
+import type { FrontierCardModel, StageColumnModel, WorkflowBoardModel } from "../src/board/workflow-board.ts"
 
 function card(partial: Partial<FrontierCardModel> & { readonly id: string; readonly jobId: string }): FrontierCardModel {
+  const { jobId: _jobId, ...rest } = partial
+  void _jobId
   return {
-    jobStatus: "running",
+    stageIndex: 0,
+    activeJobs: [{ jobId: partial.jobId, status: "running", stepId: null }],
     frontierKind: "running",
     parallelCount: 1,
     title: partial.title ?? partial.id,
@@ -27,15 +30,17 @@ function card(partial: Partial<FrontierCardModel> & { readonly id: string; reado
     updatedAt: 0,
     attention: false,
     troubled: null,
-    ...partial,
+    ...rest,
     id: partial.id,
-    jobId: partial.jobId,
     cardId: `${partial.id}::${partial.jobId}`,
   }
 }
 
 function board(columns: readonly { readonly jobId: string; readonly cards: readonly FrontierCardModel[] }[]): WorkflowBoardModel {
-  return { columns: columns as readonly JobColumnModel[], unresolved: [] }
+  return {
+    stages: columns.map((column, index): StageColumnModel => ({ index, label: column.jobId, jobIds: [column.jobId], cards: column.cards })),
+    unresolved: [],
+  }
 }
 
 describe("diffBoardMovements", () => {

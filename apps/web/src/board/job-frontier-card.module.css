@@ -11,8 +11,7 @@
   transition: border-color var(--duration-fast) var(--ease-out), background var(--duration-fast) var(--ease-out), transform var(--duration-fast) var(--ease-out);
 }
 .card:hover {
-  background: var(--bg-hover);
-  transform: translateY(-1px);
+  border-color: var(--border-strong);
 }
 .cardLink {
   display: flex;
@@ -22,6 +21,56 @@
 }
 .cardLink:hover {
   text-decoration: none;
+}
+.footer {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.jobs {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 0;
+  border-top: 1px solid var(--border-hairline);
+  border-bottom: 1px solid var(--border-hairline);
+}
+.job {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 4px;
+  margin: 0 -4px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-dim);
+  min-width: 0;
+}
+.job:hover {
+  background: var(--bg-hover);
+  text-decoration: none;
+}
+.jobGlyph {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+}
+.job_running .jobGlyph {
+  color: var(--status-running);
+}
+.job_failed .jobGlyph {
+  color: var(--status-escalated);
+}
+.jobId {
+  color: var(--text);
+  white-space: nowrap;
+}
+.stepId {
+  color: var(--cyan);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .card.waiting { border-left-color: var(--status-waiting); }
 .card.escalated { border-left-color: var(--status-escalated); }
@@ -69,12 +118,8 @@
 }
 .title {
   font-weight: 600;
-  font-size: var(--text-base);
-}
-.meta {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-dim);
+  font-size: var(--text-md);
+  line-height: 1.3;
 }
 .progress {
   font-family: var(--font-mono);
@@ -146,14 +191,12 @@
   background: color-mix(in oklch, var(--coral) 14%, transparent);
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .card:hover {
-    transform: none;
-  }
-}
-
 @media (pointer: coarse) {
   .quickAction {
     min-height: 40px;
+  }
+  .job {
+    min-height: 32px;
+    align-items: center;
   }
 }

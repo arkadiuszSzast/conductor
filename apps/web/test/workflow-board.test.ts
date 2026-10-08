@@ -5,13 +5,16 @@
 import { describe, expect, it } from "bun:test"
 import {
   deriveOverview,
+  deriveStages,
   deriveWorkflowBoard,
+  focusStageIndex,
   deriveWorkflowScopes,
   jobColumnOrder,
   pickStableDefaultScopeKey,
   resolveFrontierJobIds,
   scopeKey,
   scopeMatchesWorkflow,
+  stageLabel,
 } from "../src/board/workflow-board.ts"
 import type { FeatureListItem, WorkflowProjection } from "../src/api/types.ts"
 
@@ -258,8 +261,73 @@ describe("pickStableDefaultScopeKey", () => {
   })
 })
 
+const SCOPE = { projectDir: "/home/dev/projects/conductor", workflow: "delivery" }
+const stageOf = (board: ReturnType<typeof deriveWorkflowBoard>, jobId: string) => board.stages.find(s => s.jobIds.includes(jobId))!
+
+function fanOutWorkflow(): WorkflowProjection {
+  return {
+    name: "delivery",
+    stale: false,
+    diagnostics: [],
+    inputs: {},
+    jobs: {
+      prepare: { needs: [], steps: [{ id: "sync", kind: "command" }] },
+      impl: { needs: ["prepare"], steps: [{ id: "implement", kind: "agent" }, { id: "quality", kind: "command" }] },
+      review_code_core: { needs: ["impl"], steps: [{ id: "review", kind: "agent" }] },
+      review_code_web: { needs: ["impl"], steps: [{ id: "review", kind: "agent" }] },
+      review_gpt: { needs: ["impl"], steps: [{ id: "review", kind: "agent" }] },
+      gate: { needs: ["review_code_core", "review_code_web", "review_gpt"], steps: [{ id: "gate", kind: "human" }] },
+    },
+  }
+}
+
+describe("deriveStages / stageLabel", () => {
+  it("groups jobs at the same dependency layer into one stage", () => {
+    const stages = deriveStages(fanOutWorkflow())
+    expect(stages.map(s => s.jobIds)).toEqual([["prepare"], ["impl"], ["review_code_core", "review_code_web", "review_gpt"], ["gate"]])
+    expect(stages.map(s => s.index)).toEqual([0, 1, 2, 3])
+  })
+
+  it("labels a stage by its shared job-id stem", () => {
+    expect(stageLabel(["impl"])).toBe("impl")
+    expect(stageLabel(["review_code_core", "review_code_web", "review_gpt"])).toBe("review ×3")
+    expect(stageLabel(["architect_system", "architect_ddd"])).toBe("architect ×2")
+    expect(stageLabel(["lint", "test"])).toBe("lint +1")
+  })
+})
+
 describe("deriveWorkflowBoard", () => {
-  it("places a feature at each of its running jobs with a parallel marker", () => {
+  it("one card per stage, listing every active job there with its current step", () => {
+    const board = deriveWorkflowBoard(
+      [
+        item({
+          id: "f-1",
+          jobs: {
+            prepare: { status: "succeeded", currentStep: null },
+            impl: { status: "succeeded", currentStep: null },
+            review_code_core: { status: "running", currentStep: "review" },
+            review_code_web: { status: "succeeded", currentStep: null },
+            review_gpt: { status: "running", currentStep: "review" },
+            gate: { status: "pending", currentStep: null },
+          },
+        }),
+      ],
+      fanOutWorkflow(),
+      SCOPE,
+      100_000,
+    )
+    const reviews = stageOf(board, "review_gpt")
+    expect(reviews.cards).toHaveLength(1)
+    expect(reviews.cards[0]!.cardId).toBe("f-1::2")
+    expect(reviews.cards[0]!.activeJobs).toEqual([
+      { jobId: "review_code_core", status: "running", stepId: "review" },
+      { jobId: "review_gpt", status: "running", stepId: "review" },
+    ])
+    expect(reviews.cards[0]!.parallelCount).toBe(2)
+    expect(board.stages.filter(s => s.cards.length > 0)).toHaveLength(1)
+  })
+
+  it("a frontier spanning two stages yields one card in each", () => {
     const board = deriveWorkflowBoard(
       [
         item({
@@ -272,15 +340,12 @@ describe("deriveWorkflowBoard", () => {
         }),
       ],
       workflow(),
-      { projectDir: "/home/dev/projects/conductor", workflow: "delivery" },
+      SCOPE,
       100_000,
     )
-    const architectCol = board.columns.find(c => c.jobId === "architect")!
-    const implementCol = board.columns.find(c => c.jobId === "implement")!
-    expect(architectCol.cards.map(c => c.cardId)).toEqual(["f-1::architect"])
-    expect(implementCol.cards.map(c => c.cardId)).toEqual(["f-1::implement"])
-    expect(architectCol.cards[0]!.parallelCount).toBe(2)
-    expect(implementCol.cards[0]!.parallelCount).toBe(2)
+    expect(stageOf(board, "architect").cards.map(c => c.cardId)).toEqual(["f-1::0"])
+    expect(stageOf(board, "implement").cards.map(c => c.cardId)).toEqual(["f-1::1"])
+    expect(stageOf(board, "implement").cards[0]!.parallelCount).toBe(2)
   })
 
   it("falls back to ready jobs when no job runs", () => {
@@ -297,33 +362,32 @@ describe("deriveWorkflowBoard", () => {
         }),
       ],
       workflow(),
-      { projectDir: "/home/dev/projects/conductor", workflow: "delivery" },
+      SCOPE,
       100_000,
     )
-    expect(board.columns.find(c => c.jobId === "implement")!.cards).toHaveLength(1)
-    expect(board.columns.find(c => c.jobId === "architect")!.cards).toHaveLength(0)
+    expect(stageOf(board, "implement").cards).toHaveLength(1)
+    expect(stageOf(board, "architect").cards).toHaveLength(0)
   })
 
-  it("orders columns topologically regardless of job declaration order in runtime", () => {
+  it("keeps every stage in pipeline order, occupied or not", () => {
     const board = deriveWorkflowBoard([], workflow(), { projectDir: "/x", workflow: "delivery" }, 0)
-    expect(board.columns.map(c => c.jobId)).toEqual(["architect", "implement", "review"])
+    expect(board.stages.map(s => s.label)).toEqual(["architect", "implement", "review"])
   })
 
-  it("waiting_human cards sort before ordinary running cards in the same column", () => {
+  it("waiting_human cards sort before ordinary running cards in the same stage", () => {
     const board = deriveWorkflowBoard(
       [
         item({ id: "running-1", status: "running", updatedAt: 10, jobs: { implement: { status: "running", currentStep: "code" } } }),
         item({ id: "waiting-1", status: "waiting_human", updatedAt: 90, jobs: { implement: { status: "running", currentStep: "code" } } }),
       ],
       workflow(),
-      { projectDir: "/home/dev/projects/conductor", workflow: "delivery" },
+      SCOPE,
       100_000,
     )
-    const col = board.columns.find(c => c.jobId === "implement")!
-    expect(col.cards.map(c => c.id)).toEqual(["waiting-1", "running-1"])
+    expect(stageOf(board, "implement").cards.map(c => c.id)).toEqual(["waiting-1", "running-1"])
   })
 
-  it("escalated features with no running/ready job land in the failed job's column", () => {
+  it("escalated features with no running/ready job land in the failed job's stage", () => {
     const board = deriveWorkflowBoard(
       [
         item({
@@ -337,41 +401,46 @@ describe("deriveWorkflowBoard", () => {
         }),
       ],
       workflow(),
-      { projectDir: "/home/dev/projects/conductor", workflow: "delivery" },
+      SCOPE,
       100_000,
     )
-    expect(board.columns.find(c => c.jobId === "implement")!.cards[0]!.frontierKind).toBe("escalated-fallback")
+    expect(stageOf(board, "implement").cards[0]!.frontierKind).toBe("escalated-fallback")
     expect(board.unresolved).toHaveLength(0)
   })
 
-  it("an unresolvable frontier lands in the diagnostic tray, not a column", () => {
+  it("an unresolvable frontier lands in the diagnostic tray, not a stage", () => {
     const board = deriveWorkflowBoard(
-      [
-        item({
-          id: "f-1",
-          status: "waiting_human",
-          jobs: { architect: { status: "succeeded", currentStep: null } },
-        }),
-      ],
+      [item({ id: "f-1", status: "waiting_human", jobs: { architect: { status: "succeeded", currentStep: null } } })],
       workflow(),
-      { projectDir: "/home/dev/projects/conductor", workflow: "delivery" },
+      SCOPE,
       100_000,
     )
     expect(board.unresolved.map(c => c.id)).toEqual(["f-1"])
-    for (const column of board.columns) expect(column.cards).toHaveLength(0)
+    for (const stage of board.stages) expect(stage.cards).toHaveLength(0)
   })
 
-  it("paused and terminal features never occupy a job column", () => {
+  it("a runtime-only job (stale projection) gets a trailing stage instead of vanishing", () => {
+    const board = deriveWorkflowBoard(
+      [item({ id: "f-1", jobs: { ghost: { status: "running", currentStep: "x" } } })],
+      workflow(),
+      SCOPE,
+      100_000,
+    )
+    expect(board.stages.at(-1)!.jobIds).toEqual(["ghost"])
+    expect(board.stages.at(-1)!.cards).toHaveLength(1)
+  })
+
+  it("paused and terminal features never occupy a stage", () => {
     const board = deriveWorkflowBoard(
       [
         item({ id: "paused-1", status: "paused", jobs: { implement: { status: "running", currentStep: "code" } } }),
         item({ id: "done-1", status: "done", jobs: { implement: { status: "succeeded", currentStep: null } } }),
       ],
       workflow(),
-      { projectDir: "/home/dev/projects/conductor", workflow: "delivery" },
+      SCOPE,
       100_000,
     )
-    for (const column of board.columns) expect(column.cards).toHaveLength(0)
+    for (const stage of board.stages) expect(stage.cards).toHaveLength(0)
     expect(board.unresolved).toHaveLength(0)
   })
 
@@ -379,10 +448,20 @@ describe("deriveWorkflowBoard", () => {
     const board = deriveWorkflowBoard(
       [item({ id: "other", projectDir: "/other", jobs: { implement: { status: "running", currentStep: "code" } } })],
       workflow(),
-      { projectDir: "/home/dev/projects/conductor", workflow: "delivery" },
+      SCOPE,
       100_000,
     )
-    for (const column of board.columns) expect(column.cards).toHaveLength(0)
+    for (const stage of board.stages) expect(stage.cards).toHaveLength(0)
+  })
+})
+
+describe("focusStageIndex", () => {
+  it("prefers the earliest stage needing a human, else the earliest occupied one", () => {
+    const running = item({ id: "r", status: "running", jobs: { architect: { status: "running", currentStep: "plan" } } })
+    const waiting = item({ id: "w", status: "waiting_human", jobs: { review: { status: "running", currentStep: "approve" } } })
+    expect(focusStageIndex(deriveWorkflowBoard([running, waiting], workflow(), SCOPE, 0))).toBe(2)
+    expect(focusStageIndex(deriveWorkflowBoard([running], workflow(), SCOPE, 0))).toBe(0)
+    expect(focusStageIndex(deriveWorkflowBoard([], workflow(), SCOPE, 0))).toBeNull()
   })
 })
 

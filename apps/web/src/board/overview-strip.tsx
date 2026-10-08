@@ -4,15 +4,17 @@
  * per-scope job columns are currently visible. Keeps triage possible
  * without mixing incompatible workflow job sets into one board.
  *
- * Recent history shows a capped preview by default; every terminal
- * feature remains reachable through "show all" rather than being made
- * permanently inaccessible past the preview cap (`recentAll` carries the
+ * Recent history shows a capped preview by default (two entries on a
+ * phone, where vertical space is scarce); every terminal feature remains
+ * reachable through "show all", which opens a bounded, scrollable list
+ * rather than growing the strip without limit (`recentAll` carries the
  * complete collection — see `deriveOverview`).
  */
 
 import { useState } from "react"
 import { Link } from "wouter"
-import type { OverviewModel } from "./workflow-board.ts"
+import { RECENT_PREVIEW_LIMIT, type OverviewModel } from "./workflow-board.ts"
+import { useIsNarrowViewport } from "../lib/viewport.ts"
 import { statusGlyph, type BoardCardModel } from "./card-model.ts"
 import styles from "./overview-strip.module.css"
 
@@ -20,12 +22,16 @@ export interface OverviewStripProps {
   readonly overview: OverviewModel
 }
 
+export const RECENT_PREVIEW_LIMIT_NARROW = 2
+
 export function OverviewStrip({ overview }: OverviewStripProps): React.ReactNode {
   const [showAllRecent, setShowAllRecent] = useState(false)
+  const isNarrow = useIsNarrowViewport()
   const hasAny = overview.urgent.length > 0 || overview.paused.length > 0 || overview.recentAll.length > 0
   if (!hasAny) return null
-  const hiddenCount = overview.recentAll.length - overview.recent.length
-  const recentShown = showAllRecent ? overview.recentAll : overview.recent
+  const previewLimit = isNarrow ? RECENT_PREVIEW_LIMIT_NARROW : RECENT_PREVIEW_LIMIT
+  const hiddenCount = Math.max(0, overview.recentAll.length - previewLimit)
+  const recentShown = showAllRecent ? overview.recentAll : overview.recentAll.slice(0, previewLimit)
 
   return (
     <section className={styles.strip} aria-label="Cross-workflow overview">
@@ -57,18 +63,18 @@ export function OverviewStrip({ overview }: OverviewStripProps): React.ReactNode
         </div>
       ) : null}
       {overview.recentAll.length > 0 ? (
-        <div className={styles.group}>
+        <div className={`${styles.group} ${styles.recentGroup}`}>
           <div className={styles.groupHead}>
             RECENT
             <span className={styles.count}>({overview.recentAll.length})</span>
           </div>
-          <div className={styles.chips}>
+          <div className={`${styles.chips} ${showAllRecent ? styles.expanded : ""}`}>
             {recentShown.map(card => (
               <OverviewChip key={card.id} card={card} tone="recent" />
             ))}
           </div>
           {hiddenCount > 0 ? (
-            <button type="button" className={styles.showAll} onClick={() => setShowAllRecent(v => !v)}>
+            <button type="button" className={styles.showAll} aria-expanded={showAllRecent} onClick={() => setShowAllRecent(v => !v)}>
               {showAllRecent ? "show fewer" : `show all ${overview.recentAll.length} →`}
             </button>
           ) : null}
@@ -84,7 +90,8 @@ function OverviewChip({ card, tone }: { readonly card: BoardCardModel; readonly 
       <span aria-hidden="true">{statusGlyph(card.status)}</span>
       <span className={styles.chipTitle}>{card.title}</span>
       <span className={styles.chipMeta}>
-        {card.project} · {card.age}
+        <span className={styles.chipProject}>{card.project} · </span>
+        {card.age}
       </span>
     </Link>
   )

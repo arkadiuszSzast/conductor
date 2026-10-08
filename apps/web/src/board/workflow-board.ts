@@ -1,21 +1,22 @@
 /**
  * Workflow-scoped board derivation — pure, DOM-free.
  *
- * Replaces status-column grouping with per-scope (project + workflow) job
- * columns whose cards are a feature's active job *frontier*: every
- * currently running job, or every ready job when none is running, or (for
- * an escalated feature with no running/ready job) every failed job as a
- * fallback so the escalation still lands somewhere concrete. A feature
- * that resolves to no frontier job stays out of the columns entirely and
- * surfaces in an explicit diagnostic tray instead of silently vanishing.
+ * The board is organised by pipeline *stage*: every job at the same
+ * dependency layer (longest path through `needs`, the same `assignLayers`
+ * the graph canvas uses) shares one stage. A wide fan-out — eight
+ * parallel reviewers — is one stage, not eight mostly-empty columns.
  *
- * Column order follows topological (longest-path) layering, reusing the
- * same `assignLayers` the graph canvas uses for layout — jobs earlier in
- * the workflow's dependency chain sit in earlier columns.
+ * A feature's cards sit at its active job *frontier*: every currently
+ * running job, or every ready job when none is running, or (for an
+ * escalated feature with no running/ready job) every failed job as a
+ * fallback so the escalation still lands somewhere concrete. One card
+ * per stage the frontier touches, listing the jobs and current steps
+ * inside it. A feature that resolves to no frontier job stays out of the
+ * lanes entirely and surfaces in an explicit diagnostic tray instead.
  *
- * Paused and terminal (done/abandoned) features never occupy job columns:
+ * Paused and terminal (done/abandoned) features never occupy a stage:
  * they belong to the compact cross-workflow overview/recent sections
- * (`deriveOverview`) so active columns stay focused on work in flight.
+ * (`deriveOverview`) so the lanes stay focused on work in flight.
  */
 
 import type { FeatureListItem, JobStatus, WorkflowProjection } from "../api/types.ts"
@@ -166,23 +167,73 @@ export function jobColumnOrder(workflow: WorkflowProjection): readonly string[] 
   return jobs.map(job => job.id).sort((a, b) => (layers.get(a) ?? 0) - (layers.get(b) ?? 0))
 }
 
-export interface FrontierCardModel extends BoardCardModel {
-  /** `${featureId}::${jobId}` — card identity when one feature spans columns. */
-  readonly cardId: string
+/** One pipeline stage: every job at the same dependency layer. Parallel
+ *  fan-out jobs (e.g. eight reviewers) share a stage instead of each
+ *  claiming an almost-always-empty column of its own. */
+export interface StageDef {
+  readonly index: number
+  readonly label: string
+  readonly jobIds: readonly string[]
+}
+
+export function deriveStages(workflow: WorkflowProjection): readonly StageDef[] {
+  const jobs = Object.entries(workflow.jobs).map(([id, def]) => ({ id, needs: def.needs, stepCount: def.steps.length }))
+  const layers = assignLayers(jobs)
+  const byLayer = new Map<number, string[]>()
+  for (const job of jobs) {
+    const layer = layers.get(job.id) ?? 0
+    const bucket = byLayer.get(layer)
+    if (bucket === undefined) byLayer.set(layer, [job.id])
+    else bucket.push(job.id)
+  }
+  return [...byLayer.keys()]
+    .sort((a, b) => a - b)
+    .map((layer, index) => {
+      const jobIds = byLayer.get(layer)!
+      return { index, label: stageLabel(jobIds), jobIds }
+    })
+}
+
+/** `review_code_core`+`review_gpt` → "review ×2"; a single job keeps its
+ *  own id; unrelated parallel jobs read "first +N". */
+export function stageLabel(jobIds: readonly string[]): string {
+  if (jobIds.length === 1) return jobIds[0]!
+  let prefix = jobIds[0]!
+  for (const id of jobIds.slice(1)) {
+    let i = 0
+    while (i < prefix.length && i < id.length && prefix[i] === id[i]) i++
+    prefix = prefix.slice(0, i)
+  }
+  const cut = Math.max(prefix.lastIndexOf("_"), prefix.lastIndexOf("-"), prefix.lastIndexOf("."))
+  const stem = cut > 0 ? prefix.slice(0, cut) : ""
+  return stem !== "" ? `${stem} ×${jobIds.length}` : `${jobIds[0]} +${jobIds.length - 1}`
+}
+
+/** One active job of a feature inside a stage, with the step it is on. */
+export interface ActiveJobRef {
   readonly jobId: string
-  readonly jobStatus: JobStatus
+  readonly status: JobStatus
+  readonly stepId: string | null
+}
+
+export interface FrontierCardModel extends BoardCardModel {
+  /** `${featureId}::${stageIndex}` — card identity when one feature spans stages. */
+  readonly cardId: string
+  readonly stageIndex: number
+  /** The feature's frontier jobs inside this stage. */
+  readonly activeJobs: readonly ActiveJobRef[]
   readonly frontierKind: FrontierKind
-  /** Count of frontier job instances for this feature; >1 marks it parallel. */
+  /** Count of frontier jobs across the whole workflow; >1 marks it parallel. */
   readonly parallelCount: number
 }
 
-export interface JobColumnModel {
-  readonly jobId: string
+export interface StageColumnModel extends StageDef {
   readonly cards: readonly FrontierCardModel[]
 }
 
 export interface WorkflowBoardModel {
-  readonly columns: readonly JobColumnModel[]
+  /** Every stage in pipeline order, occupied or not — the rail. */
+  readonly stages: readonly StageColumnModel[]
   readonly unresolved: readonly BoardCardModel[]
 }
 
@@ -195,21 +246,27 @@ const ATTENTION_ORDER: Record<FeatureListItem["status"], number> = {
   abandoned: 4,
 }
 
+export function isAttentionStatus(status: FeatureListItem["status"]): boolean {
+  return status === "waiting_human" || status === "escalated"
+}
+
 export interface ScopeIdentity {
   readonly projectDir: string
   readonly workflow: string
 }
 
-/** Build the job columns for one project+workflow scope. */
+/** Build the stage lanes for one project+workflow scope. */
 export function deriveWorkflowBoard(
   items: readonly FeatureListItem[],
   workflow: WorkflowProjection,
   scope: ScopeIdentity,
   now: number,
 ): WorkflowBoardModel {
-  const order = jobColumnOrder(workflow)
-  const columnMap = new Map<string, FrontierCardModel[]>()
-  for (const jobId of order) columnMap.set(jobId, [])
+  const stageDefs = deriveStages(workflow)
+  const stageOfJob = new Map<string, number>()
+  for (const stage of stageDefs) for (const jobId of stage.jobIds) stageOfJob.set(jobId, stage.index)
+  const extraStages: StageDef[] = []
+  const buckets = new Map<number, FrontierCardModel[]>()
   const unresolved: BoardCardModel[] = []
 
   for (const item of items) {
@@ -223,36 +280,55 @@ export function deriveWorkflowBoard(
       unresolved.push(base)
       continue
     }
+    const byStage = new Map<number, ActiveJobRef[]>()
     for (const jobId of frontier.jobIds) {
+      let stageIndex = stageOfJob.get(jobId)
+      if (stageIndex === undefined) {
+        // A job only present in runtime state (stale projection) gets a
+        // trailing stage of its own rather than vanishing.
+        stageIndex = stageDefs.length + extraStages.length
+        extraStages.push({ index: stageIndex, label: jobId, jobIds: [jobId] })
+        stageOfJob.set(jobId, stageIndex)
+      }
+      const job = item.jobs[jobId]
+      const ref: ActiveJobRef = { jobId, status: job?.status ?? "pending", stepId: job?.currentStep ?? null }
+      const list = byStage.get(stageIndex)
+      if (list === undefined) byStage.set(stageIndex, [ref])
+      else list.push(ref)
+    }
+    for (const [stageIndex, activeJobs] of byStage) {
       const card: FrontierCardModel = {
         ...base,
-        cardId: `${item.id}::${jobId}`,
-        jobId,
-        jobStatus: item.jobs[jobId]?.status ?? "pending",
+        cardId: `${item.id}::${stageIndex}`,
+        stageIndex,
+        activeJobs,
         frontierKind: frontier.kind,
         parallelCount: frontier.jobIds.length,
       }
-      const bucket = columnMap.get(jobId)
-      if (bucket === undefined) columnMap.set(jobId, [card])
+      const bucket = buckets.get(stageIndex)
+      if (bucket === undefined) buckets.set(stageIndex, [card])
       else bucket.push(card)
     }
   }
 
-  for (const bucket of columnMap.values()) {
+  for (const bucket of buckets.values()) {
     bucket.sort((a, b) => ATTENTION_ORDER[a.status] - ATTENTION_ORDER[b.status] || a.updatedAt - b.updatedAt)
   }
   unresolved.sort((a, b) => a.updatedAt - b.updatedAt)
 
-  // Columns follow workflow declaration order, plus any job id that only
-  // shows up in runtime status (e.g. a stale projection) appended after.
-  const known = new Set(order)
-  const extra = [...columnMap.keys()].filter(id => !known.has(id))
-  const columns: JobColumnModel[] = [...order, ...extra].map(jobId => ({
-    jobId,
-    cards: columnMap.get(jobId) ?? [],
+  const stages: StageColumnModel[] = [...stageDefs, ...extraStages].map(stage => ({
+    ...stage,
+    cards: buckets.get(stage.index) ?? [],
   }))
+  return { stages, unresolved }
+}
 
-  return { columns, unresolved }
+/** The stage to bring into view first: earliest one needing a human,
+ *  else the earliest occupied one. */
+export function focusStageIndex(board: WorkflowBoardModel): number | null {
+  const attention = board.stages.find(stage => stage.cards.some(card => isAttentionStatus(card.status)))
+  if (attention !== undefined) return attention.index
+  return board.stages.find(stage => stage.cards.length > 0)?.index ?? null
 }
 
 export const RECENT_PREVIEW_LIMIT = 8

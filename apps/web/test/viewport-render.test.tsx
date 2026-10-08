@@ -1,13 +1,13 @@
 import { describe, expect, it } from "bun:test"
 import { renderToStaticMarkup } from "react-dom/server"
 import { ScopeTabs } from "../src/board/scope-tabs.tsx"
-import { StageSelector } from "../src/board/stage-selector.tsx"
+import { StageRail } from "../src/board/stage-rail.tsx"
 import { WorkflowGraph } from "../src/graph/workflow-graph.tsx"
 import type { FeatureDetail, WorkflowProjection } from "../src/api/types.ts"
 
 const stages = [
-  { jobId: "design", count: 2, hasAttention: true },
-  { jobId: "deliver", count: 1, hasAttention: false },
+  { index: 0, label: "design", jobIds: ["design"], cards: [] },
+  { index: 1, label: "deliver", jobIds: ["deliver"], cards: [] },
 ]
 
 const workflow: WorkflowProjection = {
@@ -61,13 +61,11 @@ const feature: FeatureDetail = {
 }
 
 describe("responsive component markup", () => {
-  it("renders stage and scope selectors as named pressed-button groups", () => {
-    const stageMarkup = renderToStaticMarkup(
-      <StageSelector stages={stages} selected="design" onSelect={() => {}} />,
-    )
-    expect(stageMarkup).toContain('role="group"')
-    expect(stageMarkup).toContain('aria-label="Workflow job stage"')
-    expect(stageMarkup).toContain('aria-pressed="true"')
+  it("renders the pipeline rail as a named ordered list and scope selectors as a pressed-button group", () => {
+    const stageMarkup = renderToStaticMarkup(<StageRail stages={stages} onSelect={() => {}} />)
+    expect(stageMarkup).toContain('aria-label="Pipeline stages"')
+    expect(stageMarkup).toContain("<ol")
+    expect(stageMarkup).toContain("design")
     expect(stageMarkup).not.toContain('role="tab"')
 
     const scopeMarkup = renderToStaticMarkup(
