@@ -69,6 +69,17 @@ An agent step MAY declare `cwd`, a template rendered against the feature context
 - **WHEN** an agent step declares `cwd: "{{ needs.prepare.outputs.path }}"`
 - **THEN** the session's location is the rendered worktree path
 
+### Requirement: A feature's step sessions are grouped under one root session
+Each feature SHALL have one root session, with an id derived deterministically from the feature id, created idempotently in the project directory and recorded on the feature. Every step session SHALL be created as its child. A child that the server places at the parent's location SHALL be moved to the step's directory before its first prompt; a failed move SHALL fail session creation as not sent. Conductor SHALL never delete the root session. If the root cannot be ensured, the step SHALL proceed with an ungrouped session.
+
+#### Scenario: Worktree step grouped under the feature
+- **WHEN** a step with `cwd` in a worktree starts for a feature
+- **THEN** its session is a child of the feature's root session and runs in the worktree
+
+#### Scenario: Move fails
+- **WHEN** moving the child session to the step directory fails
+- **THEN** no prompt is sent and the step fails as a retryable creation failure
+
 ### Requirement: Timeline notes never trigger inference
 Notes to a feature's parent session SHALL be delivered so that they do not start an agent turn.
 

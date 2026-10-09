@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test"
 import { RunnerOperationError } from "./src/ports.ts"
-import { OpencodeSessions, deterministicId, messageIdFor, sessionIdForRun } from "./src/opencode/sessions.ts"
+import { OpencodeSessions, deterministicId, messageIdFor, sessionIdForFeature, sessionIdForRun } from "./src/opencode/sessions.ts"
 import { resolveModelSelection, splitModelRef } from "./src/opencode/config.ts"
 
 interface FakeOptions {
@@ -9,6 +9,7 @@ interface FakeOptions {
   dropCreateResponses?: number
   dropPromptResponses?: number
   refuse?: boolean
+  failMove?: boolean
 }
 
 function fakeServer(options: FakeOptions = {}) {
@@ -36,7 +37,10 @@ function fakeServer(options: FakeOptions = {}) {
     if (path === "/api/session/active") return json(Object.fromEntries([...active].map(([id, type]) => [id, { type }])))
     if (path === "/api/session" && request.method === "POST") {
       const id = String(body!.id)
-      if (!sessions.has(id)) sessions.set(id, { ...body, location: undefined })
+      // Real v2 behaviour: a child is placed at its parent's location,
+      // ignoring the requested one, until it is moved.
+      const parent = body!.parentID !== undefined ? sessions.get(String(body!.parentID)) : undefined
+      if (!sessions.has(id)) sessions.set(id, { ...body, ...(parent ? { location: parent.location } : {}) })
       if (dropCreate > 0) { dropCreate--; throw new Error("socket closed") }
       return json(sessions.get(id))
     }
@@ -54,6 +58,11 @@ function fakeServer(options: FakeOptions = {}) {
       }
       if (action === "/synthetic") return json({ id: "msg_synthetic", resume: body!.resume })
       if (action === "/interrupt") { active.delete(id!); return json(null) }
+      if (action === "/move") {
+        if (options.failMove) return json(null, 400)
+        session.location = { directory: body!.directory }
+        return new Response(null, { status: 204 })
+      }
     }
     return json(null, 404)
   }
@@ -182,6 +191,54 @@ describe("OpencodeSessions.createSession / prompt", () => {
     const error = await c.createSession({ title: "t", directory: "/repo/wt", runId: "run-1", reservationId: await prepared(c), operationId: "op" }).catch(e => e)
     expect(error).toBeInstanceOf(RunnerOperationError)
     expect((error as RunnerOperationError).delivery).toBe("unknown")
+  })
+
+  it("groups a step session under the feature root and moves it to the step directory", async () => {
+    const server = fakeServer()
+    const c = client(server)
+    const root = await c.ensureParentSession({ featureId: "feat-1", title: "[conductor] f", directory: "/repo" })
+    expect(root.id).toBe(sessionIdForFeature("feat-1"))
+    expect((await c.ensureParentSession({ featureId: "feat-1", title: "[conductor] f", directory: "/repo" })).id).toBe(root.id)
+    expect(server.sessions.size).toBe(1)
+    const { id } = await c.createSession({ title: "t", directory: "/repo/wt", parentID: root.id, runId: "run-1", reservationId: await prepared(c), operationId: "op" })
+    expect(server.sessions.get(id)).toMatchObject({ parentID: root.id, location: { directory: "/repo/wt" } })
+    const moves = server.requests.filter(r => r.path.endsWith("/move"))
+    expect(moves).toHaveLength(1)
+    expect(moves[0]!.body).toEqual({ directory: "/repo/wt" })
+    expect(server.requests.findIndex(r => r.path.endsWith("/move"))).toBeGreaterThan(server.requests.findIndex(r => r.body !== undefined && (r.body as { id?: unknown }).id === id))
+  })
+
+  it("does not move a child that already sits in the step directory", async () => {
+    const server = fakeServer()
+    const c = client(server)
+    const root = await c.ensureParentSession({ featureId: "feat-1", title: "f", directory: "/repo/wt" })
+    await c.createSession({ title: "t", directory: "/repo/wt", parentID: root.id, runId: "run-1", reservationId: await prepared(c), operationId: "op" })
+    expect(server.requests.filter(r => r.path.endsWith("/move"))).toHaveLength(0)
+  })
+
+  it("reports a failed move as not_sent so the step can retry", async () => {
+    const server = fakeServer({ failMove: true })
+    const c = client(server)
+    const root = await c.ensureParentSession({ featureId: "feat-1", title: "f", directory: "/repo" })
+    const error = await c.createSession({ title: "t", directory: "/repo/wt", parentID: root.id, runId: "run-1", reservationId: await prepared(c), operationId: "op" }).catch(e => e)
+    expect((error as RunnerOperationError).delivery).toBe("not_sent")
+    expect(server.requests.filter(r => r.path.includes("/prompt"))).toHaveLength(0)
+  })
+
+  it("fences when the replayed step session hangs off a different parent", async () => {
+    const server = fakeServer()
+    const c = client(server)
+    await c.createSession({ title: "t", directory: "/repo/wt", runId: "run-1", reservationId: await prepared(c), operationId: "op" })
+    const root = await c.ensureParentSession({ featureId: "feat-1", title: "f", directory: "/repo/wt" })
+    const error = await c.createSession({ title: "t", directory: "/repo/wt", parentID: root.id, runId: "run-1", reservationId: await prepared(c), operationId: "op" }).catch(e => e)
+    expect((error as RunnerOperationError).delivery).toBe("unknown")
+  })
+
+  it("refuses to adopt a child session as a feature root", async () => {
+    const server = fakeServer()
+    server.sessions.set(sessionIdForFeature("feat-1"), { id: sessionIdForFeature("feat-1"), parentID: "ses_other" })
+    const error = await client(server).ensureParentSession({ featureId: "feat-1", title: "f", directory: "/repo" }).catch(e => e)
+    expect(error).toBeInstanceOf(RunnerOperationError)
   })
 
   it("reports an unreachable server as not_sent", async () => {

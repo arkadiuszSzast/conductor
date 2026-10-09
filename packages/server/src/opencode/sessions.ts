@@ -19,7 +19,7 @@ import { DEFAULT_OPENCODE_DEADLINES, splitModelRef } from "./config.ts"
 import type { OpencodeDeadlines } from "./config.ts"
 
 export const OPENCODE_SESSION_CAPABILITIES: SessionCapabilities = {
-  parentSessions: false,
+  parentSessions: true,
   nonInferentialNotes: true,
   promptConfirmation: "immediate",
 }
@@ -74,6 +74,10 @@ export function deterministicId(prefix: "ses" | "msg", identity: string): string
 
 export function sessionIdForRun(runId: string): string {
   return deterministicId("ses", `conductor:create:${runId}`)
+}
+
+export function sessionIdForFeature(featureId: string): string {
+  return deterministicId("ses", `conductor:feature:${featureId}`)
 }
 
 export function messageIdFor(sessionID: string, purpose: OperationPurpose, operationId: string): string {
@@ -281,19 +285,54 @@ export class OpencodeSessions implements SessionClient {
     const echo = await this.idempotentWrite("/api/session", {
       id,
       title: input.title,
+      ...(input.parentID !== undefined ? { parentID: input.parentID } : {}),
       agent: selection.agent,
       model,
       location: { directory: input.directory },
       metadata: { conductor: { runUrl, runId: input.runId, token } },
-    }, input.operationId ?? input.runId, input.directory) as { id?: unknown; agent?: unknown; model?: { providerID?: unknown; id?: unknown; variant?: unknown }; metadata?: { conductor?: { runId?: unknown } } } | null
+    }, input.operationId ?? input.runId, input.directory) as {
+      id?: unknown; parentID?: unknown; agent?: unknown; model?: { providerID?: unknown; id?: unknown; variant?: unknown }
+      metadata?: { conductor?: { runId?: unknown } }; location?: { directory?: unknown }
+    } | null
     if (!echo || echo.id !== id || echo.agent !== selection.agent || echo.model?.providerID !== model.providerID
-      || echo.model?.id !== model.id || (echo.model?.variant ?? undefined) !== model.variant || echo.metadata?.conductor?.runId !== input.runId) {
+      || echo.model?.id !== model.id || (echo.model?.variant ?? undefined) !== model.variant || echo.metadata?.conductor?.runId !== input.runId
+      || (echo.parentID ?? undefined) !== input.parentID) {
       throw new RunnerOperationError("opencode session identity conflict", {
         delivery: "unknown", ...(input.operationId !== undefined ? { operationId: input.operationId } : {}),
-        diagnostic: `session ${id} exists with a different agent, model or run binding`,
+        diagnostic: `session ${id} exists with a different agent, model, parent or run binding`,
+      })
+    }
+    // A child is created at its parent's location regardless of the
+    // requested one; moving it before the first prompt is what makes the
+    // agent run (and load plugins/skills) in the step's directory.
+    if (input.parentID !== undefined && echo.location?.directory !== input.directory) await this.moveSession(id, input.directory, input.operationId)
+    return { id }
+  }
+
+  async ensureParentSession(input: { featureId: string; title: string; directory: string }): Promise<{ id: string }> {
+    const id = sessionIdForFeature(input.featureId)
+    const echo = await this.idempotentWrite("/api/session", {
+      id, title: input.title, location: { directory: input.directory },
+    }, `feature:${input.featureId}`, input.directory) as { id?: unknown; parentID?: unknown } | null
+    if (!echo || echo.id !== id || echo.parentID != null) {
+      throw new RunnerOperationError("opencode feature session identity conflict", {
+        delivery: "not_sent", diagnostic: `session ${id} exists but is not this feature's root session`,
       })
     }
     return { id }
+  }
+
+  private async moveSession(sessionID: string, directory: string, operationId: string | undefined): Promise<void> {
+    try {
+      await this.idempotentWrite(`/api/session/${encodeURIComponent(sessionID)}/move`, { directory }, operationId ?? sessionID)
+    } catch (error) {
+      // Nothing has been prompted yet, so no agent work can have started:
+      // a failed move is a clean, retryable creation failure.
+      throw new RunnerOperationError(`opencode session move to ${directory} failed`, {
+        delivery: "not_sent", ...(operationId !== undefined ? { operationId } : {}),
+        diagnostic: error instanceof RunnerOperationError ? error.diagnostic : String(error),
+      })
+    }
   }
 
   // ---------------------------------------------------------------- prompt

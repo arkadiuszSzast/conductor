@@ -770,11 +770,25 @@ export class Engine {
     // Only consume the reserved process here; never prepare a second process.
     const prepareResult = { ok: true as const, reservationId }
 
+    let parentID: string | undefined
+    if (acpSessions.ensureParentSession) {
+      const state = store.getFeature(featureId)
+      try {
+        parentID = (await acpSessions.ensureParentSession({
+          featureId, title: `[conductor] ${state?.title ?? featureId}`, directory: state?.projectDir ?? directory,
+        })).id
+        if (state && state.sessionId !== parentID) store.setFeatureFields(featureId, { sessionId: parentID })
+      } catch (err) {
+        log.log(`run ${runId}: ${label} feature session unavailable, creating an ungrouped session — ${errorMessage(err)}`)
+      }
+    }
+
     let sessionId: string
     try {
       sessionId = (await acpSessions.createSession({
-        title: `[${role.agent}] run ${runId}`,
+        title: `[${role.agent}] ${jobId}/${step.id}${attempt > 1 ? ` (attempt ${attempt})` : ""} · run ${runId}`,
         directory,
+        ...(parentID !== undefined ? { parentID } : {}),
         runId,
         reservationId: prepareResult.reservationId,
         operationId: deriveOperationLogicalKey("create", { runId }),

@@ -289,6 +289,13 @@ OpenChamber-managed instance.
    - A lost create or prompt response is replayed with the same id. The
      server answers a replay with the original record. If that echo
      disagrees with the request, the run is fenced instead of guessed.
+   - Each feature gets one root session (`[conductor] <title>`) in the
+     project directory, and every step session is created as its child,
+     so a UI such as OpenChamber shows one entry per feature. The server
+     places a child at its parent's location, so the daemon moves it to
+     the step's directory (for example a worktree from `cwd`) before the
+     first prompt. Never delete a root session by hand while its feature
+     runs: deleting a parent deletes its children.
    - `reportBridge` is only required when an ACP profile exists.
 
 Profile ids are unique across `acp` and `opencode`. A routed attempt

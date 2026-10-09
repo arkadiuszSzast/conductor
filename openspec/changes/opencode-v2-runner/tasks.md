@@ -36,3 +36,4 @@
 
 - [x] 6.1 [server] Let a reported OpenCode session settle idle before interrupting it (bounded `engine.reportSettleMs`, daemon-injected `sleep`), so the final report call is no longer shown as aborted.
 - [x] 6.2 [core][server] Add optional agent-step `cwd` (template, absolute, within `allowedRoots`) used as the session directory, with parser, engine and docs coverage.
+- [x] 6.3 [server] Group a feature's OpenCode step sessions under a deterministic per-feature root session (`ensureParentSession`), creating each step session with `parentID` and moving it to the step directory before the first prompt.
