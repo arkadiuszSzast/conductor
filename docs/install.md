@@ -247,6 +247,11 @@ OpenChamber-managed instance.
    `prepare()` checks that `GET /api/plugin` lists `conductor.report` as
    active for the location.
 
+   OpenCode loads a plugin package from its root `index.ts` only, so point
+   the entry at the package directory, not at a file under `src/`. A
+   running server picks up a new plugin entry after
+   `POST /api/location/reload`; no restart is needed.
+
 3. **Add a profile** to the daemon config. It requires `auth.mode: bearer`:
 
    ```yaml

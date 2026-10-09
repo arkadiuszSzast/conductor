@@ -5,6 +5,7 @@
   },
   "include": [
     "packages/*/src",
+    "packages/runner-opencode/index.ts",
     "packages/*/*.test.ts",
     "plugins/*/*.ts",
     "test"

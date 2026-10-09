@@ -4,10 +4,10 @@
   "private": true,
   "description": "OpenCode v2 server plugin conductor.report: run-scoped reporting tools bound by session metadata.",
   "type": "module",
-  "main": "src/server.ts",
-  "module": "src/server.ts",
+  "main": "index.ts",
+  "module": "index.ts",
   "exports": {
-    ".": "./src/server.ts",
+    ".": "./index.ts",
     "./lib": "./src/index.ts"
   },
   "scripts": {

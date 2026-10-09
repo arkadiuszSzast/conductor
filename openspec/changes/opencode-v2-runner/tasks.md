@@ -30,4 +30,4 @@
 - [x] 5.3 [test] ACP ordering test: a model switch that resets effort still ends at the configured effort.
 - [x] 5.4 [docs] `docs/install.md`: native v2 setup (dedicated `opencode serve` unit, password file, plugin install), updated ACP section, removal of the v1 plugin.
 - [x] 5.5 [test] Run `bun run typecheck`, `bun test` and `bun run lint`; review the final diff.
-- [ ] 5.6 [review] Pilot on the host: route gloam-idle to the opencode profile, run one small feature, and verify sessions carry the expected `variant` (gates `low`), skills/repowise tools are native, and `sed -i` is rejected.
+- [x] 5.6 [review] Pilot on the host: route gloam-idle to the opencode profile, run one small feature, and verify sessions carry the expected `variant` (gates `low`), skills/repowise tools are native, and `sed -i` is rejected.
