@@ -60,6 +60,10 @@ describe("OpencodeRunLogWriter", () => {
 
   it("keeps tool arguments out of the log beyond a curated target", () => {
     expect(toolLine("shell", { command: "FOO=1 curl -H 'Authorization: Bearer abc' https://x" })).toBe("running curl")
+    expect(toolLine("shell", { command: "cd /w && PW=$(head -c 24 /dev/urandom | base64 | tr -dc A-Za-z0-9); SM=$(mktemp -d); bun run x" })).toBe("running bun")
+    expect(toolLine("shell", { command: "F=/tmp/out; grep -n \"a\\|b\" $F" })).toBe("running grep")
+    expect(toolLine("shell", { command: "S=$(ls -d /c/*/ | head -1); echo $S" })).toBe("running echo")
+    expect(toolLine("shell", { command: "cd /w && git log --oneline | head -3" })).toBe("running git")
     expect(toolLine("write", { path: "/repo/secrets/key.txt", content: "s3cret" })).toBe("writing key.txt")
     expect(toolLine("lsp", { operation: "findReferences", path: "/r/A.kt", line: 3 })).toBe("lsp findReferences A.kt")
     expect(toolLine("skill", { id: "kotest-patterns" })).toBe("loading skill kotest-patterns")

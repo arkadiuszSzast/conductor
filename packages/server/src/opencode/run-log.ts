@@ -71,10 +71,56 @@ function fileOf(input: Input): string | undefined {
 }
 
 /** The program a shell line starts with, past env assignments and `cd …&&`. */
+/**
+ * Blanks quoted text and `$(…)` / backtick substitutions so their `|`, `;`
+ * and spaces do not split the command: `PW=$(head -c 24 … | tr …); curl …`
+ * would otherwise be logged as `running -c`.
+ */
+function maskNested(command: string): string {
+  let out = ""
+  let depth = 0
+  let quote: string | undefined
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!
+    if (quote !== undefined) {
+      if (ch === "\\" && quote !== "'" && i + 1 < command.length) {
+        i++
+        out += "_"
+      } else if (ch === quote) quote = undefined
+      out += "_"
+    } else if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch
+      out += "_"
+    } else if (ch === "$" && command[i + 1] === "(") {
+      depth++
+      i++
+      out += "__"
+    } else if (depth > 0) {
+      if (ch === "(") depth++
+      else if (ch === ")") depth--
+      out += "_"
+    } else out += ch
+  }
+  return out
+}
+
 function programOf(command: string): string | undefined {
-  const segment = command.split(/&&|\|\||;|\|/).map(part => part.trim()).find(part => part !== "" && !/^cd\s/.test(part))
-  const word = segment?.split(/\s+/).find(token => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(token))
-  return word !== undefined ? basename(word) : undefined
+  const masked = maskNested(command)
+  let start = 0
+  for (const separator of masked.matchAll(/&&|\|\||;|\||\n|$/g)) {
+    const end = separator.index
+    const segment = masked.slice(start, end)
+    const offset = start
+    start = end + separator[0].length
+    if (/^\s*cd\s/.test(segment)) continue
+    for (const token of segment.matchAll(/\S+/g)) {
+      const word = command.slice(offset + token.index, offset + token.index + token[0].length)
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) continue
+      return basename(word.replace(/^["']|["']$/g, ""))
+    }
+    if (end === masked.length) break
+  }
+  return undefined
 }
 
 function targetOf(name: string, input: Input): string | undefined {
