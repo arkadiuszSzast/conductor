@@ -80,6 +80,17 @@ Each feature SHALL have one root session, with an id derived deterministically f
 - **WHEN** moving the child session to the step directory fails
 - **THEN** no prompt is sent and the step fails as a retryable creation failure
 
+### Requirement: Agent activity streams into the run log
+The daemon SHALL follow each OpenCode profile's server event stream and append, for a session bound to a running attempt, one `agent` line per finished assistant text part and one `tool` line per tool call. A tool line SHALL carry a phrase and at most a curated short target (file name, skill id, search pattern, program name, lsp operation), never the raw tool input. Lines SHALL be redacted and bounded before persistence. Events for unbound sessions, including a feature's root session, SHALL be dropped. A broken stream SHALL be retried with capped backoff and SHALL never affect a run.
+
+#### Scenario: Implementer edits a file
+- **WHEN** a bound implementer session says what it will do and then edits `Standings.kt`
+- **THEN** the run log gains an `agent` line with that text followed by a `tool` line "editing Standings.kt"
+
+#### Scenario: Shell command with a credential
+- **WHEN** a bound session runs `curl -H 'Authorization: Bearer …' …`
+- **THEN** the tool line reads "running curl" and contains no part of the command's arguments
+
 ### Requirement: Timeline notes never trigger inference
 Notes to a feature's parent session SHALL be delivered so that they do not start an agent turn.
 

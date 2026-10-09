@@ -12,6 +12,7 @@ import { directoryWithinRoots, resolveAcpProfileForProject } from "./acp/config.
 import type { AcpProfileConfig, RunnersConfig } from "./acp/config.ts"
 import type { OpencodeProfileConfig } from "./opencode/config.ts"
 import { OPENCODE_SESSION_CAPABILITIES, OpencodeSessions } from "./opencode/sessions.ts"
+import { OpencodeEventStream, OpencodeRunLogWriter } from "./opencode/run-log.ts"
 import { RunnerOperationError } from "./ports.ts"
 import { readFileSync } from "node:fs"
 import type { RunnerTransport, ReportingReadinessPort } from "./runner-execution.ts"
@@ -156,9 +157,29 @@ export function composeOpencodeRunners(config: RunnersConfig, store: Store, cloc
     status: async id => { try { return await bySession(id).status(id) } catch { return "unknown" } },
     sessionExists: async id => { try { return await bySession(id).sessionExists(id) } catch { return true } },
   }
+  const runIdForSession = (sessionID: string): string | undefined => {
+    const binding = store.getRunnerBindingBySessionRef(sessionID)
+    if (binding?.transport !== "opencode" || binding.phase !== "active") return undefined
+    return store.getRunById(binding.runId)?.status === "running" ? binding.runId : undefined
+  }
+  const streams = Object.entries(config.opencode ?? {}).map(([, profile]) => {
+    const writer = new OpencodeRunLogWriter({ runIdForSession, sink: (runId, lines) => { store.appendRunLog(runId, lines) } })
+    const stream = new OpencodeEventStream({
+      baseUrl: profile.baseUrl,
+      ...(profile.username !== undefined ? { username: profile.username } : {}),
+      password: opencodePassword(profile, env),
+      onEvent: event => writer.record(event),
+    })
+    return { writer, stream }
+  })
   return {
     sessions,
     async releaseReservation(id: string) { await reservations.get(id)?.releaseReservation(id); reservations.delete(id) },
+    start() { for (const { stream } of streams) stream.start() },
+    async stop() {
+      await Promise.all(streams.map(({ stream }) => stream.stop()))
+      for (const { writer } of streams) writer.close()
+    },
   }
 }
 

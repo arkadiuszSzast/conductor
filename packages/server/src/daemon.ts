@@ -175,6 +175,9 @@ export interface DaemonDeps {
   readonly opencodeFactory?: (store: Store, clock: Clock) => {
     sessions: SessionClient
     releaseReservation(id: string): Promise<void>
+    /** Starts following the server's event stream (run logs). */
+    start?(): void
+    stop?(): Promise<void>
   }
   readonly runnerAvailability?: () => boolean
   readonly process?: ProcessRunner
@@ -269,6 +272,7 @@ function unavailableSessionClient(): SessionClient {
 export class Daemon {
   private phase: DaemonPhase = "created"
   private managed: ReturnType<NonNullable<DaemonDeps["sessionFactory"]>> | undefined
+  private opencode: ReturnType<NonNullable<DaemonDeps["opencodeFactory"]>> | undefined
   private connection: DatabaseConnection | null = null
   private storeInstance: Store | null = null
   private registryInstance: WorkflowRegistry | null = null
@@ -391,6 +395,7 @@ export class Daemon {
       void this.engineInstance?.observeRunnerOperation(id).catch(() => this.log("error", "runner observation failed"))
     })
     const opencode = this.deps.opencodeFactory?.(this.storeInstance, this.clock)
+    this.opencode = opencode
     const processRunner = this.deps.process ?? realProcessRunner
     const engineLogger = { log: (text: string) => this.log("info", text, { component: "engine" }) }
     const actionHost = new ActionHost(bundledHandlers, { process: processRunner, log: engineLogger })
@@ -474,6 +479,7 @@ export class Daemon {
     // Settle `starting` queue claims left by a crash before anything else
     // can start a change (DB-only; the passes themselves run on the timer).
     this.queueScheduler?.recover()
+    this.opencode?.start?.()
 
     this.timerHandle = this.scheduler.setInterval(() => {
       void this.beat()
@@ -642,6 +648,7 @@ export class Daemon {
       }
     }
     await this.managed?.stop()
+    await this.opencode?.stop?.()
     await this.engineInstance?.drainRunnerCleanup()
   }
 
