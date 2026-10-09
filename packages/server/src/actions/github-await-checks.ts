@@ -7,6 +7,9 @@ interface Observation {
 
 const PASS = new Set(["success", "neutral", "skipped"])
 const FAIL = new Set(["failure", "error", "action_required", "timed_out", "cancelled", "startup_failure", "stale"])
+/** GitHub can serve the PR's previous head for a few seconds after a push. */
+const HEAD_SETTLE_MS = 120_000
+const HEAD_SETTLE_POLL_MS = 10_000
 const object = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value)
 
 export const githubAwaitChecks: ActionHandler = async (ctx, deps) => {
@@ -29,18 +32,30 @@ export const githubAwaitChecks: ActionHandler = async (ctx, deps) => {
     if (result.code !== 0) throw new Error(`gh ${args.slice(0, 2).join(" ")} exited ${result.code}: ${result.output.slice(-2000)}`)
     return JSON.parse(result.stdout) as unknown
   }
-  const verifyHead = async (): Promise<void> => {
+  const readHead = async (): Promise<string> => {
     const head = await read(["pr", "view", String(pr), "--json", "headRefOid"])
     if (!object(head) || typeof head.headRefOid !== "string") throw new Error("invalid PR head response")
-    if (head.headRefOid !== sha) throw new Error(`PR #${pr} head moved: expected ${sha}, observed ${head.headRefOid}`)
+    return head.headRefOid
+  }
+  const headSince = typeof ctx.resume?.headSince === "number" ? ctx.resume.headSince : undefined
+  // A mismatch right after the push is GitHub lagging, not a moved head:
+  // poll again until the head settles, and fail only once it stays foreign.
+  const headMismatch = (observed: string) => {
+    const since = headSince ?? deps.now()
+    if (deps.now() - since >= HEAD_SETTLE_MS || deps.now() >= deadline) {
+      return { status: "failed" as const, error: `PR #${pr} head moved: expected ${sha}, observed ${observed}` }
+    }
+    return { status: "pending" as const, nextPollMs: Math.min(pollSeconds * 1000, HEAD_SETTLE_POLL_MS), state: { deadline, sha, headSince: since } }
   }
   try {
-    await verifyHead()
+    const before = await readHead()
+    if (before !== sha) return headMismatch(before)
     const prefix = `repos/{owner}/{repo}/commits/${sha}`
     const checkPages = await read(["api", `${prefix}/check-runs?filter=latest&per_page=100`, "--paginate", "--slurp"])
     const statusPages = await read(["api", `${prefix}/status?per_page=100`, "--paginate", "--slurp"])
     const observations = parseObservations(checkPages, statusPages, sha)
-    await verifyHead()
+    const after = await readHead()
+    if (after !== sha) return headMismatch(after)
     const relevant = observations.filter(row => required.includes(row.name))
     const failed = relevant.filter(row => row.state === "fail")
     if (failed.length > 0) return { status: "failed", error: `checks failed for ${sha}: ${failed.map(row => row.name).join(", ")}` }

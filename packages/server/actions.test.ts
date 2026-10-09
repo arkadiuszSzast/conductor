@@ -300,10 +300,17 @@ describe("github/await-checks", () => {
     expect(result.status).toBe("succeeded")
   })
 
-  it.each(["before", "during"])("fails when PR head moves %s observation", async when => {
-    const result = await githubAwaitChecks(ctx(inputs), deps(observation([check("build"), check("test")], [], when === "before" ? old : sha, old)))
-    expect(result.status).toBe("failed")
-    if (result.status === "failed") expect(result.error).toContain("head moved")
+  it.each(["before", "during"])("waits out a lagging PR head %s observation, then fails if it stays moved", async when => {
+    const moved = () => observation([check("build"), check("test")], [], when === "before" ? old : sha, old)
+    const first = await githubAwaitChecks(ctx(inputs), deps(moved(), undefined, () => 0))
+    expect(first).toEqual({ status: "pending", nextPollMs: 10000, state: { deadline: 60000, sha, headSince: 0 } })
+    if (first.status !== "pending") return
+    const settled = await githubAwaitChecks(ctx(inputs, { resume: first.state }), deps(observation([check("build"), check("test")]), undefined, () => 10000))
+    expect(settled.status).toBe("succeeded")
+    const longInputs = { ...inputs, timeout_minutes: 60 }
+    const stale = await githubAwaitChecks(ctx(longInputs, { resume: { deadline: 3_600_000, sha, headSince: 0 } }), deps(moved(), undefined, () => 120_000))
+    expect(stale.status).toBe("failed")
+    if (stale.status === "failed") expect(stale.error).toContain("head moved")
   })
 
   it("accepts latest status contexts, but requires both producers when names collide", async () => {
