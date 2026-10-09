@@ -10,6 +10,11 @@
 
 import { directoryWithinRoots, resolveAcpProfileForProject } from "./acp/config.ts"
 import type { AcpProfileConfig, RunnersConfig } from "./acp/config.ts"
+import type { OpencodeProfileConfig } from "./opencode/config.ts"
+import { OPENCODE_SESSION_CAPABILITIES, OpencodeSessions } from "./opencode/sessions.ts"
+import { OpencodeEventStream, OpencodeRunLogWriter } from "./opencode/run-log.ts"
+import { RunnerOperationError } from "./ports.ts"
+import { readFileSync } from "node:fs"
 import type { RunnerTransport, ReportingReadinessPort } from "./runner-execution.ts"
 import type { Store } from "./store.ts"
 import type { Clock, SessionClient } from "./ports.ts"
@@ -32,7 +37,9 @@ export function composeManagedRunners(config: RunnersConfig, store: Store, clock
         const run = store.getRunById(runId)!
         const binding = store.getRunnerBinding(runId)!
         const { token } = issueRunCredential(store, { runId, attempt: run.attempt, processGeneration: binding.processGeneration, nowMs: clock.now() })
-        return { command: config.reportBridge.command, args: [...config.reportBridge.args], env: { CONDUCTOR_RUN_URL: url(), CONDUCTOR_RUN_ID: runId, CONDUCTOR_RUN_TOKEN: token } }
+        const bridgeConfig = config.reportBridge
+        if (!bridgeConfig) throw new Error("runners.reportBridge is required for ACP profiles")
+        return { command: bridgeConfig.command, args: [...bridgeConfig.args], env: { CONDUCTOR_RUN_URL: url(), CONDUCTOR_RUN_ID: runId, CONDUCTOR_RUN_TOKEN: token } }
       },
     })] as const
   }))
@@ -80,9 +87,106 @@ export function composeManagedRunners(config: RunnersConfig, store: Store, clock
   }
 }
 
+/** Reads a profile's server password at call time — never cached, never logged. */
+function opencodePassword(profile: OpencodeProfileConfig, env: Readonly<Record<string, string | undefined>>): () => string {
+  return () => {
+    const value = profile.passwordEnv !== undefined ? env[profile.passwordEnv] : readFileSync(profile.passwordFile!, "utf8").trim()
+    if (!value) throw new Error("opencode server password is not available")
+    return value
+  }
+}
+
+/**
+ * One `OpencodeSessions` per `runners.opencode` profile behind a single
+ * `SessionClient`: new work goes to the project's profile, every later
+ * operation follows the run's persisted binding.
+ */
+export function composeOpencodeRunners(config: RunnersConfig, store: Store, clock: Clock, url: () => string, env: Readonly<Record<string, string | undefined>>) {
+  const profiles = new Map(Object.entries(config.opencode ?? {}).map(([profileId, profile]) => [profileId, new OpencodeSessions({
+    profileId,
+    baseUrl: profile.baseUrl,
+    ...(profile.username !== undefined ? { username: profile.username } : {}),
+    password: opencodePassword(profile, env),
+    allowedRoots: profile.allowedRoots,
+    maxConcurrent: profile.maxConcurrent,
+    ...(profile.deadlines !== undefined ? { deadlines: profile.deadlines } : {}),
+    activeRuns: () => store.countRunningBoundRuns("opencode", profileId),
+    now: () => clock.now(),
+    credential: runId => {
+      const run = store.getRunById(runId)
+      const binding = store.getRunnerBinding(runId)
+      if (!run || !binding) throw new Error("opencode run binding unavailable")
+      const { token } = issueRunCredential(store, { runId, attempt: run.attempt, processGeneration: binding.processGeneration, nowMs: clock.now() })
+      return { runUrl: url(), token }
+    },
+  })] as const))
+  const reservations = new Map<string, OpencodeSessions>()
+  const bySession = (id: string): OpencodeSessions => {
+    const binding = store.getRunnerBindingBySessionRef(id)
+    const owner = binding?.transport === "opencode" ? profiles.get(binding.profileId ?? "") : undefined
+    if (!owner) throw new Error("opencode binding owner unavailable")
+    return owner
+  }
+  const sessions: SessionClient = {
+    capabilities: () => OPENCODE_SESSION_CAPABILITIES,
+    async prepare(input) {
+      const owner = profiles.get(config.projects[input.projectDir] ?? "")
+      if (!owner) return { ok: false, reason: "incompatible", diagnostic: "opencode project profile unavailable" }
+      const result = await owner.prepare(input)
+      if (result.ok) reservations.set(result.reservationId, owner)
+      return result
+    },
+    async createSession(input) {
+      const owner = input.reservationId !== undefined ? reservations.get(input.reservationId) : undefined
+      if (input.reservationId !== undefined) reservations.delete(input.reservationId)
+      if (!owner || !input.runId) throw new RunnerOperationError("opencode reservation unavailable", { delivery: "not_sent" })
+      const created = await owner.createSession(input)
+      if (!store.setBindingSessionRef(input.runId, created.id, created.id)) {
+        throw new RunnerOperationError("opencode binding lost", { delivery: "unknown", ...(input.operationId !== undefined ? { operationId: input.operationId } : {}) })
+      }
+      return created
+    },
+    async ensureParentSession(input) {
+      const owner = profiles.get(config.projects[input.directory] ?? "")
+      if (!owner) throw new RunnerOperationError("opencode project profile unavailable", { delivery: "not_sent" })
+      return owner.ensureParentSession(input)
+    },
+    prompt: input => bySession(input.sessionID).prompt(input),
+    note: input => bySession(input.sessionID).note(input),
+    abort: async id => { try { await bySession(id).abort(id) } catch (error) { if (!(error instanceof Error && error.message === "opencode binding owner unavailable")) throw error } },
+    status: async id => { try { return await bySession(id).status(id) } catch { return "unknown" } },
+    sessionExists: async id => { try { return await bySession(id).sessionExists(id) } catch { return true } },
+  }
+  const runIdForSession = (sessionID: string): string | undefined => {
+    const binding = store.getRunnerBindingBySessionRef(sessionID)
+    if (binding?.transport !== "opencode" || binding.phase !== "active") return undefined
+    return store.getRunById(binding.runId)?.status === "running" ? binding.runId : undefined
+  }
+  const streams = Object.entries(config.opencode ?? {}).map(([, profile]) => {
+    const writer = new OpencodeRunLogWriter({ runIdForSession, sink: (runId, lines) => { store.appendRunLog(runId, lines) } })
+    const stream = new OpencodeEventStream({
+      baseUrl: profile.baseUrl,
+      ...(profile.username !== undefined ? { username: profile.username } : {}),
+      password: opencodePassword(profile, env),
+      onEvent: event => writer.record(event),
+    })
+    return { writer, stream }
+  })
+  return {
+    sessions,
+    async releaseReservation(id: string) { await reservations.get(id)?.releaseReservation(id); reservations.delete(id) },
+    start() { for (const { stream } of streams) stream.start() },
+    async stop() {
+      await Promise.all(streams.map(({ stream }) => stream.stop()))
+      for (const { writer } of streams) writer.close()
+    },
+  }
+}
+
 export type RouteDecision =
   | { readonly transport: "native" }
   | { readonly transport: "acp"; readonly profileId: string; readonly profile: AcpProfileConfig }
+  | { readonly transport: "opencode"; readonly profileId: string; readonly profile: OpencodeProfileConfig }
   | { readonly transport: "acp_misconfigured"; readonly reason: string }
 
 /**
@@ -93,6 +197,14 @@ export type RouteDecision =
  * itself, this is only the routing decision.
  */
 export function routeNewDispatch(config: RunnersConfig | undefined, projectDir: string, directory: string): RouteDecision {
+  const opencodeId = config?.projects[projectDir]
+  const opencode = opencodeId !== undefined ? config?.opencode?.[opencodeId] : undefined
+  if (opencodeId !== undefined && opencode) {
+    if (!directoryWithinRoots(directory, opencode.allowedRoots)) {
+      return { transport: "acp_misconfigured", reason: `directory "${directory}" is outside configured allowedRoots for profile "${opencodeId}"` }
+    }
+    return { transport: "opencode", profileId: opencodeId, profile: opencode }
+  }
   const resolved = resolveAcpProfileForProject(config, projectDir)
   if (!resolved) return { transport: "native" }
   if (!directoryWithinRoots(directory, resolved.profile.allowedRoots)) {

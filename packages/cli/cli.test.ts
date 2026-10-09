@@ -1077,7 +1077,7 @@ describe("CLI: daemon config parsing", () => {
       heartbeatIntervalMs: 250,
       changeQueueIntervalMs: 90_000,
       createDatabaseDirectory: false,
-      engine: { runTtlMs: 1000, busySilenceNudgeMs: 500, nudgeIdleCycles: 2, maxNudges: 3 },
+      engine: { runTtlMs: 1000, busySilenceNudgeMs: 500, nudgeIdleCycles: 2, maxNudges: 3, reportSettleMs: 5000 },
       actions: { bundledPath: "/actions", localPaths: ["/more"] },
       plugins: { enabled: false, disabled: ["openspec"], paths: ["/opt/conductor-plugins"] },
     })
@@ -1087,7 +1087,7 @@ describe("CLI: daemon config parsing", () => {
       heartbeatIntervalMs: 250,
       changeQueueIntervalMs: 90_000,
       createDatabaseDirectory: false,
-      engine: { runTtlMs: 1000, busySilenceNudgeMs: 500, nudgeIdleCycles: 2, maxNudges: 3 },
+      engine: { runTtlMs: 1000, busySilenceNudgeMs: 500, nudgeIdleCycles: 2, maxNudges: 3, reportSettleMs: 5000 },
       actions: { bundledPath: "/actions", localPaths: ["/more"] },
     })
     expect(config.api).toEqual({

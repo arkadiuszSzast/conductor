@@ -1,0 +1,99 @@
+## ADDED Requirements
+
+### Requirement: OpenCode v2 profiles are explicit and routed per project
+The daemon SHALL drive steps through an OpenCode v2 server only for projects explicitly routed to a configured `runners.opencode` profile. A profile SHALL name a base URL, a password source that is an environment variable or a file and never an inline secret, a non-empty list of absolute allowed roots, and a positive concurrency limit. A step whose working directory is outside the profile's allowed roots SHALL fail as a configuration error without contacting the server. The server password SHALL never be logged, persisted in run state or exposed through the API.
+
+#### Scenario: Directory outside allowed roots
+- **WHEN** a feature routed to an opencode profile has a worktree outside every allowed root
+- **THEN** the step fails with an actionable configuration diagnostic and no HTTP request is sent
+
+#### Scenario: Inline secret in configuration
+- **WHEN** the daemon configuration contains an inline password for an opencode profile
+- **THEN** configuration loading is rejected
+
+### Requirement: Agent, model and variant are validated before session creation
+Before creating a session, the daemon SHALL confirm that the location's agent catalog is loaded and contains the role's agent, and that the selected model and variant are offered by the server. An empty agent catalog SHALL be retried within a bounded startup period, because it is evidence of a cold location and not of a missing agent. An agent, model or variant still absent after the catalog has loaded SHALL fail the step as an invalid configuration, and the step SHALL NOT be retried as a transient error.
+
+#### Scenario: Cold location
+- **WHEN** the first catalog read for a location returns no agents and a later read within the startup period returns them
+- **THEN** session creation proceeds without failing the step
+
+#### Scenario: Unknown variant
+- **WHEN** the role selects a variant the model does not offer
+- **THEN** the step fails as invalid configuration before any session is created
+
+### Requirement: Model and variant come from one Conductor-side source
+Each session SHALL be created with the complete model reference: provider, model id and variant. The workflow role's model and variant SHALL take precedence. The profile binding for the role's agent SHALL be used only for the fields the role omits. The daemon SHALL NOT rely on the agent definition's default model, and SHALL NOT change model or variant after the initial prompt of an attempt.
+
+#### Scenario: Gate role with low effort
+- **WHEN** a role specifies a model with variant `low`
+- **THEN** the created session records that model with variant `low`, and every turn of the attempt runs with it
+
+#### Scenario: Role omits the variant
+- **WHEN** the role names only an agent and the binding supplies model and variant
+- **THEN** the session is created with the binding's model and variant
+
+### Requirement: Session creation and prompting are idempotent per durable operation
+Session and prompt identities sent to the server SHALL be derived deterministically from the durable operation identity of the attempt. A create or prompt whose response is lost SHALL be replayed with the same identity, and SHALL NOT produce a second session or a second turn. A reused identity whose server-side record differs from the request, whether the server reports a conflict or returns the original record, SHALL be treated as unknown delivery and fenced, never retried with a fresh identity.
+
+#### Scenario: Lost create response
+- **WHEN** session creation times out after the server accepted it and the daemon retries
+- **THEN** the retry resolves to the same session and the attempt continues
+
+#### Scenario: Identity conflict
+- **WHEN** a replayed prompt identity resolves to a record whose text differs from the request
+- **THEN** the run is fenced as unknown delivery and is not automatically re-prompted
+
+### Requirement: Status and abort reflect server evidence
+Session status SHALL be busy while the server lists the session as active, idle when it is not active and the session is recorded idle, missing only on a confirmed not-found response, and unknown for every other failure. Abort SHALL interrupt the session without resuming queued input. Aborting an idle or missing session SHALL succeed.
+
+#### Scenario: Server temporarily unavailable
+- **WHEN** a status read fails with a connection error or a server error
+- **THEN** the status is unknown and the run is neither reaped nor recreated on that evidence
+
+### Requirement: A reported session ends its turn on its own
+After a run concludes through an accepted report, the engine SHALL let the session finish its current turn and SHALL interrupt it only if it is still not idle after a bounded settle window. Fenced and reaped runs SHALL be interrupted immediately.
+
+#### Scenario: Agent stops after reporting
+- **WHEN** a run's report is accepted and the session goes idle within the settle window
+- **THEN** no interrupt is sent and the report tool call completes normally
+
+#### Scenario: Agent keeps working after reporting
+- **WHEN** the session is still busy when the settle window ends
+- **THEN** the engine interrupts it
+
+### Requirement: Agent steps may run in a templated directory
+An agent step MAY declare `cwd`, a template rendered against the feature context; the session SHALL be prepared and created in that directory, which SHALL be absolute and within the profile's allowed roots, otherwise the step fails before any session is created.
+
+#### Scenario: Session opened in the feature worktree
+- **WHEN** an agent step declares `cwd: "{{ needs.prepare.outputs.path }}"`
+- **THEN** the session's location is the rendered worktree path
+
+### Requirement: A feature's step sessions are grouped under one root session
+Each feature SHALL have one root session, with an id derived deterministically from the feature id, created idempotently in the project directory and recorded on the feature. Every step session SHALL be created as its child. A child that the server places at the parent's location SHALL be moved to the step's directory before its first prompt; a failed move SHALL fail session creation as not sent. Conductor SHALL never delete the root session. If the root cannot be ensured, the step SHALL proceed with an ungrouped session.
+
+#### Scenario: Worktree step grouped under the feature
+- **WHEN** a step with `cwd` in a worktree starts for a feature
+- **THEN** its session is a child of the feature's root session and runs in the worktree
+
+#### Scenario: Move fails
+- **WHEN** moving the child session to the step directory fails
+- **THEN** no prompt is sent and the step fails as a retryable creation failure
+
+### Requirement: Agent activity streams into the run log
+The daemon SHALL follow each OpenCode profile's server event stream and append, for a session bound to a running attempt, one `agent` line per finished assistant text part and one `tool` line per tool call. A tool line SHALL carry a phrase and at most a curated short target (file name, skill id, search pattern, program name, lsp operation), never the raw tool input. Lines SHALL be redacted and bounded before persistence. Events for unbound sessions, including a feature's root session, SHALL be dropped. A broken stream SHALL be retried with capped backoff and SHALL never affect a run.
+
+#### Scenario: Implementer edits a file
+- **WHEN** a bound implementer session says what it will do and then edits `Standings.kt`
+- **THEN** the run log gains an `agent` line with that text followed by a `tool` line "editing Standings.kt"
+
+#### Scenario: Shell command with a credential
+- **WHEN** a bound session runs `curl -H 'Authorization: Bearer …' …`
+- **THEN** the tool line reads "running curl" and contains no part of the command's arguments
+
+### Requirement: Timeline notes never trigger inference
+Notes to a feature's parent session SHALL be delivered so that they do not start an agent turn.
+
+#### Scenario: Step summary note
+- **WHEN** the engine appends a step summary to an idle parent session
+- **THEN** the note is recorded and the session stays idle with no tokens spent

@@ -34,7 +34,7 @@ import { tmpdir } from "node:os"
 import { createHash } from "node:crypto"
 import { prepareReview, renderFixPack, validateReview, type AcceptedReview, type ReviewReport } from "./review.ts"
 import { REPORT_REJECTED_PREFIX } from "./run-reporting.ts"
-import { join } from "node:path"
+import { isAbsolute, join } from "node:path"
 import {
   DEFAULT_OUTCOME,
   behaviourForClass,
@@ -87,8 +87,9 @@ import type { ActionExecutor } from "./action-host.ts"
 import { actionBindingsForReconciler } from "./workflow-reservation.ts"
 import type { ResolvedActionBinding } from "./workflow-reservation.ts"
 import { routeNewDispatch } from "./runner-router.ts"
-import { deriveOperationLogicalKey, type RunnerFenceReasonCode, type RunnerOperationRecord } from "./runner-execution.ts"
+import { deriveOperationLogicalKey, type RunnerFenceReasonCode, type RunnerOperationRecord, type RunnerTransport } from "./runner-execution.ts"
 import type { RunnersConfig } from "./acp/config.ts"
+import { resolveModelSelection, type OpencodeProfileConfig } from "./opencode/config.ts"
 
 const DEFAULT_RUN_TTL_MS = 3_600_000
 const DEFAULT_IDLE_SILENCE_NUDGE_MS = 120_000
@@ -110,6 +111,8 @@ export interface EngineDeps {
   readonly sessions: SessionClient
   readonly process: ProcessRunner
   readonly clock: Clock
+  /** Daemon-owned delay; absent means the engine never waits on a timer. */
+  readonly sleep?: (ms: number) => Promise<void>
   readonly log: Logger
   readonly actions: ActionExecutor
   readonly runnerAvailable?: () => boolean
@@ -123,6 +126,9 @@ export interface EngineDeps {
   /** Composition must release an unused preparation; abort is not cleanup evidence. */
   readonly releaseAcpReservation?: (reservationId: string) => Promise<void>
   readonly cleanupAcpRun?: (runId: string, sessionId: string | null) => Promise<"confirmed_terminated" | "unconfirmed">
+  /** The OpenCode v2 SessionClient — required only when `runners.opencode` has a profile. */
+  readonly opencodeSessions?: SessionClient
+  readonly releaseOpencodeReservation?: (reservationId: string) => Promise<void>
   /** Monotonic daemon generation (D5/D10) — incremented every process
    *  start, persisted alongside bindings/operations so a restart can
    *  identify and fence stale-generation work before dispatching new
@@ -141,10 +147,15 @@ export interface EngineOptions {
   /** Upper bound on waiting for cleanup evidence before a fence is
    *  classified with whatever evidence exists (unconfirmed → unsafe). */
   readonly fenceClassifyTimeoutMs?: number
+  /** How long a reported OpenCode session may keep running its final turn
+   *  before the engine interrupts it. */
+  readonly reportSettleMs?: number
   readonly random?: Random
 }
 
 const DEFAULT_FENCE_CLASSIFY_TIMEOUT_MS = 15_000
+const DEFAULT_REPORT_SETTLE_MS = 30_000
+const REPORT_SETTLE_POLL_MS = 1_000
 
 export type StartFeatureResult =
   | { readonly ok: true; readonly feature: FeatureState }
@@ -250,6 +261,7 @@ export class Engine {
   private readonly maxNudges: number
   private readonly healingPolicy: HealingPolicy
   private readonly fenceClassifyTimeoutMs: number
+  private readonly reportSettleMs: number
   private readonly random: Random
 
   constructor(
@@ -263,6 +275,7 @@ export class Engine {
     this.maxNudges = options.maxNudges ?? DEFAULT_MAX_NUDGES
     this.healingPolicy = normalizeHealingPolicy(options.healing)
     this.fenceClassifyTimeoutMs = options.fenceClassifyTimeoutMs ?? DEFAULT_FENCE_CLASSIFY_TIMEOUT_MS
+    this.reportSettleMs = options.reportSettleMs ?? DEFAULT_REPORT_SETTLE_MS
     this.random = options.random ?? systemRandom
   }
 
@@ -496,7 +509,19 @@ export class Engine {
     }
 
     if (store.getActiveRunForStep(featureId, jobId, step.id) || store.hasUnresolvedRunnerFence(featureId, jobId, step.id)) return
-    const directory = state.worktree ?? state.projectDir
+    const feedback = store.getFeedback(featureId) ?? undefined
+    const context = buildEvalContext(snapshot.workflow, state, jobId, feedback)
+    let directory = state.worktree ?? state.projectDir
+    if (step.cwd !== undefined) {
+      const renderedCwd = renderTemplate(step.cwd, context)
+      const cwd = renderedCwd.text.trim()
+      if (renderedCwd.errors.length > 0 || !isAbsolute(cwd)) {
+        const why = renderedCwd.errors.length > 0 ? renderedCwd.errors.join("; ") : `"${cwd}" is not an absolute path`
+        await this.dispatch(featureId, { kind: "step.failed", jobId, stepId: step.id, reason: `agent cwd: ${why}` })
+        return
+      }
+      directory = cwd
+    }
     const route = routeNewDispatch(this.deps.runners, state.projectDir, directory)
     if (route.transport === "acp_misconfigured") {
       await this.dispatch(featureId, { kind: "step.failed", jobId, stepId: step.id, reason: route.reason })
@@ -523,8 +548,6 @@ export class Engine {
     }
 
     const attempt = (state.jobs[jobId]?.attempts[step.id] ?? 0) + 1
-    const feedback = store.getFeedback(featureId) ?? undefined
-    const context = buildEvalContext(snapshot.workflow, state, jobId, feedback)
     let prompt = step.prompt
     let fixEvidence = ""
     try {
@@ -563,12 +586,18 @@ export class Engine {
     // never called for an already-running run; the active-run guard in
     // actDecision/reconcile ensures that).
     let reservationId: string | undefined
-    if (route.transport === "acp") {
-      if (!this.deps.releaseAcpReservation) {
-        await this.dispatch(featureId, { kind: "step.failed", jobId, stepId: step.id, reason: "ACP requires a reservation release hook before preparation" })
+    const selection = route.transport === "opencode" ? resolveModelSelection(role, route.profile.bindings[role.agent]) : role
+    if (route.transport === "acp" || route.transport === "opencode") {
+      const label = route.transport === "acp" ? "ACP" : "OpenCode"
+      const release = route.transport === "acp" ? this.deps.releaseAcpReservation : this.deps.releaseOpencodeReservation
+      const client = this.sessionClientFor(route.transport)
+      if (!release || !client) {
+        await this.dispatch(featureId, { kind: "step.failed", jobId, stepId: step.id, reason: `${label} requires a session client and reservation release hook before preparation` })
         return
       }
-      const prepared = await this.deps.acpSessions?.prepare?.({ projectDir: state.projectDir, directory, agent: role.agent, ...(role.model !== undefined ? { model: role.model } : {}) })
+      const prepared = await client.prepare?.({ projectDir: state.projectDir, directory, agent: role.agent,
+        ...(selection.model !== undefined ? { model: selection.model } : {}),
+        ...(selection.variant !== undefined ? { variant: selection.variant } : {}) })
       if (!prepared?.ok) {
         if (prepared?.reason === "unavailable") {
           const now = this.deps.clock.now()
@@ -577,7 +606,7 @@ export class Engine {
           store.upsertResourceWait({ featureId, jobId, stepId: step.id, reason: "runner_unavailable", observedAt: now,
             nextObservationAt: now + 1000, deadlineAt: prior?.deadlineAt ?? now + policy.maxWaitMs, diagnostic: prepared.diagnostic })
         } else {
-          await this.dispatch(featureId, { kind: "step.failed", jobId, stepId: step.id, reason: prepared?.diagnostic ?? "ACP preparation unavailable" })
+          await this.dispatch(featureId, { kind: "step.failed", jobId, stepId: step.id, reason: prepared?.diagnostic ?? `${label} preparation unavailable` })
         }
         return
       }
@@ -587,7 +616,7 @@ export class Engine {
         || current.jobs[jobId]?.currentStep !== step.id
         || store.getActiveRunForStep(featureId, jobId, step.id)
         || store.hasUnresolvedRunnerFence(featureId, jobId, step.id)) {
-        await this.deps.releaseAcpReservation?.(reservationId)
+        await release(reservationId)
         return
       }
     }
@@ -607,11 +636,12 @@ export class Engine {
         directory,
         daemonGeneration: this.deps.daemonGeneration ?? 0,
         ...(route.transport === "acp" ? { profileId: route.profileId, configDigest: acpConfigDigest(route.profile) } : {}),
+        ...(route.transport === "opencode" ? { profileId: route.profileId, configDigest: opencodeConfigDigest(route.profile) } : {}),
       },
     })
 
-    if (route.transport === "acp") {
-      await this.executeAgentAcp(featureId, jobId, step, role, route.profileId, route.profile, runId, attempt, directory, rendered.text + fixEvidence, reservationId!)
+    if (route.transport === "acp" || route.transport === "opencode") {
+      await this.executeAgentManaged(route.transport, featureId, jobId, step, role, runId, attempt, directory, rendered.text + fixEvidence, reservationId!)
       return
     }
 
@@ -625,7 +655,7 @@ export class Engine {
       if (!parentId) {
         const created = await sessions.createSession({
           title: `[conductor] ${state.title}`,
-          directory: state.worktree ?? state.projectDir,
+          directory,
         })
         parentId = created.id
         createdParent = true
@@ -634,7 +664,7 @@ export class Engine {
       const sessionId = (
         await sessions.createSession({
           title: `[${role.agent}] ${state.title}${attempt > 1 ? ` (attempt ${attempt})` : ""}`,
-          directory: state.worktree ?? state.projectDir,
+          directory,
           parentID: parentId,
           // Optional runner hint so agent output can be attributed to this
           // run's log. The parent session (no run) is deliberately bare.
@@ -711,13 +741,12 @@ export class Engine {
    * mean a create/prompt effect landed on the agent side fences the run
    * (D6) instead of routing through ordinary `step.failed`.
    */
-  private async executeAgentAcp(
+  private async executeAgentManaged(
+    transport: "acp" | "opencode",
     featureId: string,
     jobId: string,
     step: AgentStep,
     role: { agent: string; model?: string; variant?: string },
-    profileId: string,
-    profile: import("./acp/config.ts").AcpProfileConfig,
     runId: string,
     attempt: number,
     directory: string,
@@ -725,9 +754,11 @@ export class Engine {
     reservationId: string,
   ): Promise<void> {
     const { store, log } = this.deps
-    const acpSessions = this.deps.acpSessions
+    const label = transport === "acp" ? "ACP" : "OpenCode"
+    const source = transport
+    const acpSessions = this.sessionClientFor(transport)
     if (!acpSessions) {
-      await this.fenceOrFail(featureId, runId, jobId, step.id, "acp_not_configured", "ACP profile is routed but no ACP session client is wired into the engine")
+      await this.fenceOrFail(featureId, runId, jobId, step.id, "acp_not_configured", `${label} profile is routed but no ${label} session client is wired into the engine`)
       return
     }
     // role→mode binding validation (D3: "each must map explicitly to an
@@ -739,31 +770,45 @@ export class Engine {
     // Only consume the reserved process here; never prepare a second process.
     const prepareResult = { ok: true as const, reservationId }
 
+    let parentID: string | undefined
+    if (acpSessions.ensureParentSession) {
+      const state = store.getFeature(featureId)
+      try {
+        parentID = (await acpSessions.ensureParentSession({
+          featureId, title: `[conductor] ${state?.title ?? featureId}`, directory: state?.projectDir ?? directory,
+        })).id
+        if (state && state.sessionId !== parentID) store.setFeatureFields(featureId, { sessionId: parentID })
+      } catch (err) {
+        log.log(`run ${runId}: ${label} feature session unavailable, creating an ungrouped session — ${errorMessage(err)}`)
+      }
+    }
+
     let sessionId: string
     try {
       sessionId = (await acpSessions.createSession({
-        title: `[${role.agent}] run ${runId}`,
+        title: `[${role.agent}] ${jobId}/${step.id}${attempt > 1 ? ` (attempt ${attempt})` : ""} · run ${runId}`,
         directory,
+        ...(parentID !== undefined ? { parentID } : {}),
         runId,
         reservationId: prepareResult.reservationId,
         operationId: deriveOperationLogicalKey("create", { runId }),
       })).id
     } catch (err) {
       if (!(err instanceof RunnerOperationError) || err.delivery === "unknown") {
-        await this.fenceOrFail(featureId, runId, jobId, step.id, "lost_create_response", err instanceof RunnerOperationError ? err.diagnostic : "ACP create outcome unknown")
+        await this.fenceOrFail(featureId, runId, jobId, step.id, "lost_create_response", err instanceof RunnerOperationError ? err.diagnostic : `${label} create outcome unknown`)
         return
       }
-      const reason = boundDiagnostic(`ACP session creation failed: ${errorMessage(err)}`)
+      const reason = boundDiagnostic(`${label} session creation failed: ${errorMessage(err)}`)
       await this.concludeAndDispatch(
         featureId, runId, "failed",
-        { reason, failure: makeFailureEnvelope({ class: acpFailureClass(err), diagnostic: reason, source: "acp" }) },
+        { reason, failure: makeFailureEnvelope({ class: acpFailureClass(err), diagnostic: reason, source }) },
         { kind: "step.failed", jobId, stepId: step.id, reason },
       )
       return
     }
 
     if (!store.setRunSession(runId, sessionId)) {
-      log.log(`run ${runId}: concluded before its ACP session was ready — not prompting`)
+      log.log(`run ${runId}: concluded before its ${label} session was ready — not prompting`)
       return
     }
 
@@ -789,18 +834,28 @@ export class Engine {
       // awaited here.
     } catch (err) {
       if (!(err instanceof RunnerOperationError) || err.delivery === "unknown") {
-        await this.fenceOrFail(featureId, runId, jobId, step.id, "lost_prompt_response", err instanceof RunnerOperationError ? err.diagnostic : "ACP prompt outcome unknown")
+        await this.fenceOrFail(featureId, runId, jobId, step.id, "lost_prompt_response", err instanceof RunnerOperationError ? err.diagnostic : `${label} prompt outcome unknown`)
         return
       }
-      const reason = boundDiagnostic(`ACP prompt failed: ${errorMessage(err)}`)
+      const reason = boundDiagnostic(`${label} prompt failed: ${errorMessage(err)}`)
       await this.concludeAndDispatch(
         featureId, runId, "failed",
-        { reason, failure: makeFailureEnvelope({ class: acpFailureClass(err), diagnostic: reason, source: "acp" }) },
+        { reason, failure: makeFailureEnvelope({ class: acpFailureClass(err), diagnostic: reason, source }) },
         { kind: "step.failed", jobId, stepId: step.id, reason },
       )
     }
-    void profileId
-    void profile
+  }
+
+  /** The SessionClient a transport resolves to — new routes and persisted bindings alike. */
+  private sessionClientFor(transport: RunnerTransport | undefined): SessionClient | undefined {
+    if (transport === "acp") return this.deps.acpSessions
+    if (transport === "opencode") return this.deps.opencodeSessions
+    return this.deps.sessions
+  }
+
+  /** Durable operation identity is carried by every transport that replays by id. */
+  private static keyedTransport(transport: RunnerTransport | undefined): boolean {
+    return transport === "acp" || transport === "opencode"
   }
 
   /** Fences a run for durable execution uncertainty (D6) — the
@@ -847,7 +902,29 @@ export class Engine {
   private cleanupRunner(runId: string): void {
     const run = this.deps.store.getRunById(runId)
     if (!run) return
-    if (this.deps.store.getRunnerBinding(runId)?.transport !== "acp") {
+    const transport = this.deps.store.getRunnerBinding(runId)?.transport
+    if (transport === "opencode") {
+      this.cleanupInFlight.add(runId)
+      const task = Promise.resolve().then(async () => {
+        if (!run.sessionId) return
+        // A run concluded by its own report lets the reporting turn end on
+        // its own; interrupting immediately would abort the report tool call
+        // the agent is still inside. Fenced or reaped runs stop at once.
+        const reported = run.status === "succeeded" || run.status === "failed"
+        if (reported && !this.deps.store.getFence(runId) && await this.settlesIdle(run.sessionId)) return
+        await this.deps.opencodeSessions?.abort(run.sessionId)
+        // An interrupt is not proof the server stopped every effect, so the
+        // fence stays `unconfirmed` and classifies as unsafe.
+      }).catch(error => this.deps.log.log(`OpenCode cleanup failed: ${boundDiagnostic(errorMessage(error))}`))
+        .then(() => this.classifyFencedRun(runId, true))
+      this.runnerCleanupTasks.add(task)
+      void task.finally(() => {
+        this.runnerCleanupTasks.delete(task)
+        this.cleanupInFlight.delete(runId)
+      })
+      return
+    }
+    if (transport !== "acp") {
       void this.classifyFencedRun(runId, true)
       return
     }
@@ -864,6 +941,20 @@ export class Engine {
       this.runnerCleanupTasks.delete(task)
       this.cleanupInFlight.delete(runId)
     })
+  }
+
+  /** Waits up to `reportSettleMs` for a session to go idle on its own. */
+  private async settlesIdle(sessionId: string): Promise<boolean> {
+    const client = this.deps.opencodeSessions
+    const sleep = this.deps.sleep
+    if (!client || !sleep) return false
+    const polls = Math.max(1, Math.ceil(this.reportSettleMs / REPORT_SETTLE_POLL_MS))
+    for (let poll = 0; ; poll++) {
+      const status = await client.status(sessionId).catch(() => "unknown" as const)
+      if (status === "idle" || status === "missing") return true
+      if (poll >= polls) return false
+      await sleep(REPORT_SETTLE_POLL_MS)
+    }
   }
 
   async drainRunnerCleanup(): Promise<void> {
@@ -1610,12 +1701,13 @@ export class Engine {
     const sessionId = claimed.targetSessionId ?? run.sessionId
     const binding = store.getRunnerBinding(run.id)
     const isAcp = binding?.transport === "acp"
-    const sessionClient = isAcp ? this.deps.acpSessions : this.deps.sessions
+    const keyed = Engine.keyedTransport(binding?.transport)
+    const sessionClient = this.sessionClientFor(binding?.transport)
     if (!sessionClient) {
       // A wiring defect (ACP-bound run but no acpSessions dependency) —
       // treat the same as a lost session: fail the step honestly rather
       // than silently dropping the answer forever.
-      const reason = `run ${run.id} is bound to acp transport but no ACP session client is configured`
+      const reason = `run ${run.id} is bound to ${binding?.transport ?? "native"} transport but no session client is configured`
       store.failAnswerDelivery(claimed.id, reason)
       await this.concludeAndDispatch(
         run.featureId, run.id, "failed",
@@ -1661,7 +1753,7 @@ export class Engine {
         ...(answerRole
           ? { agent: answerRole.agent, ...(answerRole.model !== undefined ? { model: answerRole.model } : {}) }
           : {}),
-        ...(isAcp
+        ...(keyed
           ? { operationId: deriveOperationLogicalKey("answer", { runId: run.id, deliveryToken: claimed.deliveryToken }), purpose: "answer" as const }
           : {}),
       })
@@ -1675,7 +1767,7 @@ export class Engine {
         return { kind: "transient", message: "answer submitted to ACP; awaiting turn completion" }
       }
     } catch (err) {
-      if (isAcp && (!(err instanceof RunnerOperationError) || err.delivery === "unknown")) {
+      if (keyed && (!(err instanceof RunnerOperationError) || err.delivery === "unknown")) {
         // D6: uncertain ACP delivery fences the run — retains accepted
         // notes/question for audit, never replays, never fails the step.
         const result = store.fenceRunnerExecution(
@@ -2134,7 +2226,7 @@ export class Engine {
 
   private async fenceActiveRunners(featureId: string, interruptedOnly = false): Promise<void> {
     for (const run of this.deps.store.listRuns(featureId)) {
-      if (run.status === "running" && this.deps.store.getRunnerBinding(run.id)?.transport === "acp") {
+      if (run.status === "running" && Engine.keyedTransport(this.deps.store.getRunnerBinding(run.id)?.transport)) {
         if (interruptedOnly && !this.deps.store.listRunnerOperations(run.id).some(operation =>
           operation.phase === "sending" || operation.phase === "submitted" || operation.phase === "unknown")) continue
         await this.fenceOrFail(featureId, run.id, run.jobId, run.stepId, "cancellation_during_uncertain_write", "ACP interrupted without authoritative report")
@@ -2253,7 +2345,7 @@ export class Engine {
         })
         continue
       }
-      if (this.deps.runnerAvailable?.() === true || routeNewDispatch(this.deps.runners, input.projectDir, input.worktree ?? input.projectDir).transport === "acp") {
+      if (this.deps.runnerAvailable?.() === true || ["acp", "opencode"].includes(routeNewDispatch(this.deps.runners, input.projectDir, input.worktree ?? input.projectDir).transport)) {
         const claimed = store.claimResourceWait(wait.id, clock.now())
         if (!claimed) continue
         const step = findStep(snapshot.workflow, wait.jobId, wait.stepId)
@@ -2547,7 +2639,7 @@ export class Engine {
     const { log, store } = this.deps
     const binding = store.getRunnerBinding(active.id)
     const isAcp = binding?.transport === "acp"
-    const sessionClient = isAcp ? this.deps.acpSessions : this.deps.sessions
+    const sessionClient = this.sessionClientFor(binding?.transport)
     if (isAcp) {
       const unknown = store.listRunnerOperations(active.id).find(operation => operation.phase === "unknown")
       if (unknown) {
@@ -2707,8 +2799,9 @@ export class Engine {
 
   private async nudgeAgentRun(feature: FeatureState, snapshot: WorkflowSnapshot, active: RunSummary, maxNudges: number): Promise<void> {
     if (!active.sessionId) return
-    const isAcp = this.deps.store.getRunnerBinding(active.id)?.transport === "acp"
-    const sessionClient = isAcp ? this.deps.acpSessions : this.deps.sessions
+    const transport = this.deps.store.getRunnerBinding(active.id)?.transport
+    const keyed = Engine.keyedTransport(transport)
+    const sessionClient = this.sessionClientFor(transport)
     if (!sessionClient) return
     const nudgeNo = this.deps.store.incrementNudges(active.id)
     this.deps.log.log(`reconcile ${feature.slug}: run ${active.id} without report — nudge ${nudgeNo}/${maxNudges}`)
@@ -2727,12 +2820,12 @@ export class Engine {
             `The work state is in your context. Finish step "${active.stepId}" and report ` +
             `run_id="${active.id}" with the appropriate outcome.`,
         ...(role ? { agent: role.agent, ...(role.model !== undefined ? { model: role.model } : {}) } : {}),
-        ...(isAcp
+        ...(keyed
           ? { operationId: deriveOperationLogicalKey("nudge", { runId: active.id, nudgeOrdinal: nudgeNo }), purpose: "nudge" as const }
           : {}),
       })
     } catch (err) {
-      if (isAcp && (!(err instanceof RunnerOperationError) || err.delivery === "unknown")) {
+      if (keyed && (!(err instanceof RunnerOperationError) || err.delivery === "unknown")) {
         // D6: an uncertain nudge delivery is exactly the same durable
         // uncertainty as a lost prompt — fence, never treat the failed
         // nudge as proof of anything, never keep silently retrying.
@@ -2790,7 +2883,7 @@ export class Engine {
     this.commandRuns.get(active.id)?.controller.abort()
     if (active.sessionId) {
       try {
-        await this.deps.sessions.abort(active.sessionId)
+        await this.sessionClientFor(this.deps.store.getRunnerBinding(active.id)?.transport)?.abort(active.sessionId)
       } catch (err) {
         this.deps.log.log(`session abort failed for run ${active.id}: ${boundDiagnostic(errorMessage(err))}`)
       }
@@ -2943,6 +3036,17 @@ function acpConfigDigest(profile: import("./acp/config.ts").AcpProfileConfig): s
     inheritEnv: profile.inheritEnv ?? [],
     maxConcurrent: profile.maxConcurrent,
     bindings: Object.keys(profile.bindings).sort(),
+  }
+  return createHash("sha256").update(JSON.stringify(shape)).digest("hex")
+}
+
+/** Nonsecret digest of an OpenCode profile: never the password source value. */
+function opencodeConfigDigest(profile: OpencodeProfileConfig): string {
+  const shape = {
+    baseUrl: profile.baseUrl,
+    allowedRoots: profile.allowedRoots,
+    maxConcurrent: profile.maxConcurrent,
+    bindings: Object.fromEntries(Object.entries(profile.bindings).sort(([a], [b]) => a.localeCompare(b))),
   }
   return createHash("sha256").update(JSON.stringify(shape)).digest("hex")
 }

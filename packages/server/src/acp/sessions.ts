@@ -377,23 +377,50 @@ export class ManagedSessions implements SessionClient {
         throw new RunnerOperationError("ACP mode selection not confirmed", { delivery: "not_sent", failureClass: "invalid_config" })
       }
     }
-    for (const [configId, value] of Object.entries(this.deps.bindings[reservation.assignment.agent]!.configOptions ?? {})) {
-      const option = response.configOptions?.find(candidate => candidate.id === configId)
-      if (!option || option.type !== "select" || !option.options.some(candidate => "value" in candidate ? candidate.value === value : candidate.options.some(entry => entry.value === value))) {
+    // D6: model first (a model switch may reset effort), then the other
+    // options, effort last; the role overrides the binding for model and
+    // effort, and the final echo must still carry every applied value.
+    const advertised = response.configOptions ?? []
+    const offers = (option: (typeof advertised)[number], value: string) => option.type === "select"
+      && option.options.some(candidate => "value" in candidate ? candidate.value === value : candidate.options.some(entry => entry.value === value))
+    const bound = this.deps.bindings[reservation.assignment.agent]!.configOptions ?? {}
+    const modelOption = advertised.find(candidate => candidate.category === "model" && candidate.type === "select")
+    const effortOption = advertised.find(candidate => candidate.id === "effort" || candidate.category === "thought_level")
+    const plan: [string, string][] = []
+    const modelValue = reservation.assignment.model ?? (modelOption ? bound[modelOption.id] : undefined)
+    if (reservation.assignment.model !== undefined && (!modelOption || !offers(modelOption, reservation.assignment.model))) {
+      await this.releaseReservation(reservation.id, "unsupported model")
+      throw new RunnerOperationError("ACP requested model is not advertised", { delivery: "not_sent", diagnostic: "unsupported_model", failureClass: "invalid_config" })
+    }
+    if (modelOption && modelValue !== undefined) plan.push([modelOption.id, modelValue])
+    for (const [configId, value] of Object.entries(bound)) {
+      if (configId !== modelOption?.id && configId !== effortOption?.id) plan.push([configId, value])
+    }
+    const effortValue = reservation.assignment.variant ?? (effortOption ? bound[effortOption.id] : undefined)
+    if (effortValue !== undefined) {
+      if (!effortOption) {
+        await this.releaseReservation(reservation.id, "unsupported option")
+        throw new RunnerOperationError("ACP effort option is not advertised", { delivery: "not_sent", diagnostic: "unsupported_effort", failureClass: "invalid_config" })
+      }
+      plan.push([effortOption.id, effortValue])
+    }
+    let echo = advertised
+    for (const [configId, value] of plan) {
+      const option = advertised.find(candidate => candidate.id === configId)
+      if (!option || !offers(option, value)) {
         await this.releaseReservation(reservation.id, "unsupported option")
         throw new RunnerOperationError("ACP requested option is not advertised", { delivery: "not_sent", failureClass: "invalid_config" })
       }
       const selected = await withTimeout(reservation.connectionHandle.connection.setSessionConfigOption({ sessionId: response.sessionId, configId, value }), Math.max(1, reservation.startupDeadline - Date.now()), "session/set_config_option")
-      if (!selected.configOptions.some(candidate => candidate.id === configId && candidate.currentValue === value)) throw new RunnerOperationError("ACP option selection not confirmed", { delivery: "not_sent", failureClass: "invalid_config" })
-    }
-    if (reservation.assignment.model !== undefined) {
-      const option = response.configOptions?.find(candidate => candidate.category === "model" && candidate.type === "select")
-      if (!option || option.type !== "select" || !option.options.some(candidate => "value" in candidate ? candidate.value === reservation.assignment.model : candidate.options.some(entry => entry.value === reservation.assignment.model))) {
-        await this.releaseReservation(reservation.id, "unsupported model")
-        throw new RunnerOperationError("ACP requested model is not advertised", { delivery: "not_sent", diagnostic: "unsupported_model", failureClass: "invalid_config" })
+      if (!selected.configOptions.some(candidate => candidate.id === configId && candidate.currentValue === value)) {
+        throw new RunnerOperationError(configId === modelOption?.id ? "ACP model selection not confirmed" : "ACP option selection not confirmed", { delivery: "not_sent", failureClass: "invalid_config" })
       }
-      const selected = await withTimeout(reservation.connectionHandle.connection.setSessionConfigOption({ sessionId: response.sessionId, configId: option.id, value: reservation.assignment.model }), Math.max(1, reservation.startupDeadline - Date.now()), "session/set_config_option")
-      if (!selected.configOptions.some(candidate => candidate.id === option.id && candidate.currentValue === reservation.assignment.model)) throw new RunnerOperationError("ACP model selection not confirmed", { delivery: "not_sent", failureClass: "invalid_config" })
+      echo = selected.configOptions
+    }
+    for (const [configId, value] of plan) {
+      if (!echo.some(candidate => candidate.id === configId && candidate.currentValue === value)) {
+        throw new RunnerOperationError(`ACP option "${configId}" did not keep its configured value`, { delivery: "not_sent", diagnostic: "effective_option_mismatch", failureClass: "invalid_config" })
+      }
     }
     const localId = `acp-${randomUUID()}`
     if (!this.deps.store.setBindingSessionRef(input.runId, localId, response.sessionId)) {

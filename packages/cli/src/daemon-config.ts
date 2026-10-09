@@ -52,7 +52,7 @@ const TOP_LEVEL_FIELDS = new Set([
   "notifications",
 ])
 
-const ENGINE_FIELDS = new Set(["runTtlMs", "idleSilenceNudgeMs", "busySilenceNudgeMs", "nudgeIdleCycles", "maxNudges", "healing"])
+const ENGINE_FIELDS = new Set(["runTtlMs", "idleSilenceNudgeMs", "busySilenceNudgeMs", "nudgeIdleCycles", "maxNudges", "reportSettleMs", "healing"])
 const HEALING_FIELDS = new Set(["initialMs", "maxMs", "attentionAfter", "classifyTimeoutMs"])
 const NOTIFICATION_FIELDS = new Set(["publicBaseUrl", "rateLimitWindowMs", "intervalMs", "telegram"])
 const TELEGRAM_FIELDS = new Set(["chatId", "tokenEnv", "events"])
@@ -374,7 +374,7 @@ function parseRunners(value: unknown): import("@conductor/server").RunnersConfig
     return v.map(item => text(item, path, absolute))
   }
   const forbidden = (key: string) => key.startsWith("CONDUCTOR_")
-  const root = object(value, "runners", ["default", "projects", "acp", "reportBridge"])
+  const root = object(value, "runners", ["default", "projects", "acp", "opencode", "reportBridge"])
   if (root.default !== "native") throw new UsageError('"runners.default" must be native')
   const acp: Record<string, import("@conductor/server").AcpProfileConfig> = {}
   for (const [id, raw] of Object.entries(object(root.acp, "runners.acp"))) {
@@ -408,15 +408,57 @@ function parseRunners(value: unknown): import("@conductor/server").RunnersConfig
     }
     acp[id] = { command: text(p.command, `${path}.command`, true), args, allowedRoots, env, inheritEnv, maxConcurrent, deadlines, permissions: { allowKinds: strings(permissions.allowKinds, `${path}.permissions.allowKinds`) }, bindings }
   }
+  const opencode: Record<string, import("@conductor/server").OpencodeProfileConfig> = {}
+  for (const [id, raw] of Object.entries(object(root.opencode ?? {}, "runners.opencode"))) {
+    const path = `runners.opencode.${id}`
+    if (Object.hasOwn(acp, id)) throw new UsageError(`"${path}" reuses ACP profile id "${id}"`)
+    if (isObject(raw) && ("password" in raw || "token" in raw)) throw new UsageError(`"${path}" must not contain an inline secret; use passwordEnv or passwordFile`)
+    const p = object(raw, path, ["baseUrl", "username", "passwordEnv", "passwordFile", "allowedRoots", "maxConcurrent", "deadlines", "bindings"])
+    const baseUrl = text(p.baseUrl, `${path}.baseUrl`)
+    let parsed: URL
+    try { parsed = new URL(baseUrl) } catch { throw new UsageError(`"${path}.baseUrl" must be an http(s) URL`) }
+    if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.username || parsed.password || parsed.search || parsed.hash) {
+      throw new UsageError(`"${path}.baseUrl" must be an http(s) URL without credentials, query or fragment`)
+    }
+    if ((p.passwordEnv === undefined) === (p.passwordFile === undefined)) throw new UsageError(`"${path}" requires exactly one of passwordEnv or passwordFile`)
+    const allowedRoots = strings(p.allowedRoots, `${path}.allowedRoots`, true)
+    if (!allowedRoots.length) throw new UsageError(`"${path}.allowedRoots" must not be empty`)
+    const maxConcurrent = p.maxConcurrent
+    if (typeof maxConcurrent !== "number" || !Number.isSafeInteger(maxConcurrent) || maxConcurrent < 1) throw new UsageError(`"${path}.maxConcurrent" must be a positive integer`)
+    const deadlines: Partial<import("@conductor/server").OpencodeDeadlines> = {}
+    for (const [key, val] of Object.entries(object(p.deadlines ?? {}, `${path}.deadlines`, ["startupMs", "requestMs"]))) {
+      if (typeof val !== "number" || !Number.isSafeInteger(val) || val < 1 || val > 2147483647) throw new UsageError(`"${path}.deadlines.${key}" must be a positive bounded integer`)
+      Object.assign(deadlines, { [key]: val })
+    }
+    const bindings: Record<string, import("@conductor/server").OpencodeRoleBinding> = {}
+    for (const [agent, rawBinding] of Object.entries(object(p.bindings ?? {}, `${path}.bindings`))) {
+      const b = object(rawBinding, `${path}.bindings.${agent}`, ["model", "variant"])
+      const model = b.model === undefined ? undefined : text(b.model, `${path}.bindings.${agent}.model`)
+      if (model !== undefined && !/^[^/]+\/.+$/.test(model)) throw new UsageError(`"${path}.bindings.${agent}.model" must be "provider/id"`)
+      const variant = b.variant === undefined ? undefined : text(b.variant, `${path}.bindings.${agent}.variant`)
+      bindings[agent] = { ...(model !== undefined ? { model } : {}), ...(variant !== undefined ? { variant } : {}) }
+    }
+    opencode[id] = {
+      baseUrl: baseUrl.replace(/\/+$/, ""),
+      ...(p.username !== undefined ? { username: text(p.username, `${path}.username`) } : {}),
+      ...(p.passwordEnv !== undefined ? { passwordEnv: text(p.passwordEnv, `${path}.passwordEnv`) } : {}),
+      ...(p.passwordFile !== undefined ? { passwordFile: text(p.passwordFile, `${path}.passwordFile`, true) } : {}),
+      allowedRoots, maxConcurrent, deadlines, bindings,
+    }
+  }
   const projects: Record<string, string> = {}
   for (const [project, profile] of Object.entries(object(root.projects, "runners.projects"))) {
     text(project, "runners.projects", true)
     const id = text(profile, `runners.projects.${project}`)
-    if (!Object.hasOwn(acp, id)) throw new UsageError(`"runners.projects.${project}" references unknown profile`)
+    if (!Object.hasOwn(acp, id) && !Object.hasOwn(opencode, id)) throw new UsageError(`"runners.projects.${project}" references unknown profile`)
     projects[project] = id
   }
+  if (root.reportBridge === undefined) {
+    if (Object.keys(acp).length > 0) throw new UsageError('"runners.reportBridge" is required when an ACP profile is configured')
+    return { default: "native", projects, acp, opencode }
+  }
   const bridge = object(root.reportBridge, "runners.reportBridge", ["command", "args"])
-  return { default: "native", projects, acp, reportBridge: { command: text(bridge.command, "runners.reportBridge.command", true), args: strings(bridge.args, "runners.reportBridge.args") } }
+  return { default: "native", projects, acp, opencode, reportBridge: { command: text(bridge.command, "runners.reportBridge.command", true), args: strings(bridge.args, "runners.reportBridge.args") } }
 }
 
 /** Parse the daemon config file text into the daemon + api config pair. */
@@ -460,7 +502,7 @@ auth:
 heartbeatIntervalMs: 5000
 
 # Optional engine tuning (runTtlMs, idleSilenceNudgeMs, busySilenceNudgeMs,
-# nudgeIdleCycles, maxNudges) — see docs/install.md#engine-tuning.
+# nudgeIdleCycles, maxNudges, reportSettleMs) — see docs/install.md#engine-tuning.
 # engine:
 #   runTtlMs: 3600000
 #   idleSilenceNudgeMs: 120000
@@ -491,7 +533,7 @@ heartbeatIntervalMs: 5000
 #   localPaths:
 #     - /path/to/team/actions
 
-# Optional ACP execution (native remains default). Requires auth.mode: bearer.
+# Optional ACP / OpenCode v2 execution (native remains default). Requires auth.mode: bearer.
 # Operator-installed executable/profile; no provider, model or gateway default.
 # Permission callbacks are NOT an OS sandbox. Use an isolated OS account/container.
 # runners:
@@ -508,6 +550,18 @@ heartbeatIntervalMs: 5000
 #       deadlines: {startupMs: 30000, writeMs: 5000, turnMs: 3600000, cancelMs: 5000, killMs: 2000}
 #       permissions: {allowKinds: []}
 #       bindings: {build: {mode: build}}
+#   # OpenCode v2 server profiles ("opencode serve", external to the daemon).
+#   # The password comes from an env var or a file, never inline.
+#   # Bindings are the model fallback when a workflow role omits model/variant.
+#   opencode:
+#     opencode-v2:
+#       baseUrl: http://127.0.0.1:4096
+#       passwordFile: /etc/conductor/opencode-server.password
+#       allowedRoots: [/path/to/my-project, /path/to/worktrees]
+#       maxConcurrent: 4
+#       deadlines: {startupMs: 30000, requestMs: 15000}
+#       bindings: {build: {model: provider/model-id, variant: medium}}
+#   # Required only when an ACP profile is configured.
 #   reportBridge:
 #     command: /opt/conductor/conductor
 #     args: [report-mcp]

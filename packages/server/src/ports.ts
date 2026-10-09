@@ -174,6 +174,8 @@ export interface PrepareInput {
   readonly directory: string
   readonly agent: string
   readonly model?: string
+  /** Model variant/effort, resolved role ?? binding. */
+  readonly variant?: string
 }
 
 /**
@@ -307,6 +309,13 @@ export interface SessionClient {
      *  advertises `promptConfirmation: "submitted"`. */
     | { readonly kind: "submitted"; readonly operationId: string }
   >
+  /**
+   * Optional: idempotently ensure one grouping session per feature so a
+   * UI can show every step's session under a single root. Keyed by the
+   * feature id; never deleted by Conductor (deleting a parent cascades to
+   * its children). Absent means the transport does not group sessions.
+   */
+  ensureParentSession?(input: { featureId: string; title: string; directory: string }): Promise<{ id: string }>
   sessionExists(sessionID: string): Promise<boolean>
   status(sessionID: string): Promise<SessionStatus>
   /**

@@ -37,7 +37,10 @@ class FakeAcpSessions implements SessionClient {
     return this.prepareResult
   }
 
-  async createSession(input: { title: string; directory: string; reservationId?: string; operationId?: string }): Promise<{ id: string }> {
+  creates: Array<{ title: string; directory: string; parentID?: string }> = []
+
+  async createSession(input: { title: string; directory: string; parentID?: string; reservationId?: string; operationId?: string }): Promise<{ id: string }> {
+    this.creates.push(input)
     if (this.createSessionError) {
       const error = this.createSessionError
       this.createSessionError = null
@@ -78,6 +81,17 @@ class FakeAcpSessions implements SessionClient {
 
   capabilities(): SessionCapabilities {
     return { parentSessions: false, nonInferentialNotes: false, promptConfirmation: "submitted" }
+  }
+}
+
+class FakeGroupingSessions extends FakeAcpSessions {
+  parents: Array<{ featureId: string; title: string; directory: string }> = []
+  parentError: Error | null = null
+
+  async ensureParentSession(input: { featureId: string; title: string; directory: string }): Promise<{ id: string }> {
+    this.parents.push(input)
+    if (this.parentError) throw this.parentError
+    return { id: `root-${input.featureId}` }
   }
 }
 
@@ -728,5 +742,108 @@ describe("self-healing: safe fences heal with backoff", () => {
     await engine.reconcile()
     expect(store.getFence(run.id)?.classification).toBe("unsafe")
     expect(store.getFeature(feature.id)?.status).toBe("escalated")
+  })
+})
+
+describe("opencode transport routing", () => {
+  const opencodeRunners = (): RunnersConfig => ({
+    default: "native",
+    projects: { "/tmp/acp-project": "v2" },
+    acp: {},
+    opencode: { v2: { baseUrl: "http://fake", passwordEnv: "PW", allowedRoots: ["/tmp/acp-project"], maxConcurrent: 2, bindings: { build: { model: "omni/claude/x", variant: "medium" } } } },
+  })
+
+  it("prepares with the binding selection, binds the opencode transport and prompts with a keyed operation", async () => {
+    const opencode = new FakeAcpSessions()
+    const engine = makeEngine(singleAgentWorkflow, { runners: opencodeRunners(), opencodeSessions: opencode, releaseOpencodeReservation: async () => {} })
+    const feature = await startedFeature(engine)
+    expect(acpSessions.prepareCalls).toHaveLength(0)
+    expect(opencode.prepareCalls[0]).toMatchObject({ agent: "build", model: "omni/claude/x", variant: "medium" })
+    expect(opencode.prompts[0]?.operationId).toBeDefined()
+    const binding = store.getRunnerBinding(store.getActiveRun(feature.id)!.id)
+    expect(binding).toMatchObject({ transport: "opencode", profileId: "v2" })
+  })
+
+  it("lets the workflow role override the binding variant", async () => {
+    const opencode = new FakeAcpSessions()
+    const wf = workflow({ main: job([agentStep("implement", "implementer", "do the work")]) }, { implementer: { agent: "build", variant: "low" } })
+    const engine = makeEngine(wf, { runners: opencodeRunners(), opencodeSessions: opencode, releaseOpencodeReservation: async () => {} })
+    await startedFeature(engine)
+    expect(opencode.prepareCalls[0]).toMatchObject({ model: "omni/claude/x", variant: "low" })
+  })
+
+  it("fences a lost create response instead of retrying", async () => {
+    const opencode = new FakeAcpSessions()
+    opencode.createSessionError = new RunnerOperationError("lost", { delivery: "unknown" })
+    const engine = makeEngine(singleAgentWorkflow, { runners: opencodeRunners(), opencodeSessions: opencode, releaseOpencodeReservation: async () => {} })
+    const feature = await startedFeature(engine)
+    const runs = store.listRuns(feature.id)
+    expect(opencode.prompts).toHaveLength(0)
+    expect(store.getRunnerBinding(runs[0]!.id)?.phase).toBe("fenced")
+  })
+
+  it("lets a reported session finish its turn instead of interrupting it", async () => {
+    const opencode = new FakeAcpSessions()
+    const engine = makeEngine(singleAgentWorkflow, { runners: opencodeRunners(), opencodeSessions: opencode, releaseOpencodeReservation: async () => {}, sleep: async () => {} })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    opencode.statuses.set(run.sessionId!, "idle")
+    await engine.report({ runId: run.id, outcome: "succeeded" })
+    await engine.drainRunnerCleanup()
+    expect(opencode.aborted).toHaveLength(0)
+  })
+
+  it("interrupts a reported session that is still busy after the settle window", async () => {
+    const opencode = new FakeAcpSessions()
+    const engine = makeEngine(singleAgentWorkflow, { runners: opencodeRunners(), opencodeSessions: opencode, releaseOpencodeReservation: async () => {}, sleep: async () => {} }, { reportSettleMs: 3000 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    await engine.report({ runId: run.id, outcome: "succeeded" })
+    await engine.drainRunnerCleanup()
+    expect(opencode.aborted).toEqual([run.sessionId!])
+  })
+
+  it("opens the session in the step's rendered cwd", async () => {
+    const opencode = new FakeAcpSessions()
+    const wf = workflow({ main: job([agentStep("implement", "implementer", "do the work", { cwd: "/tmp/acp-project/wt/{{ feature.slug }}" })]) }, roles)
+    const engine = makeEngine(wf, { runners: opencodeRunners(), opencodeSessions: opencode, releaseOpencodeReservation: async () => {} })
+    const feature = await startedFeature(engine)
+    expect(opencode.prepareCalls[0]?.directory).toBe(`/tmp/acp-project/wt/${feature.slug}`)
+    expect(store.getRunnerBinding(store.getActiveRun(feature.id)!.id)?.directory).toBe(`/tmp/acp-project/wt/${feature.slug}`)
+  })
+
+  it("groups the step session under the feature's root session", async () => {
+    const opencode = new FakeGroupingSessions()
+    const wf = workflow({ main: job([agentStep("implement", "implementer", "do the work", { cwd: "/tmp/acp-project/wt/{{ feature.slug }}" })]) }, roles)
+    const engine = makeEngine(wf, { runners: opencodeRunners(), opencodeSessions: opencode, releaseOpencodeReservation: async () => {} })
+    const feature = await startedFeature(engine)
+    expect(opencode.parents[0]).toMatchObject({ featureId: feature.id, directory: "/tmp/acp-project" })
+    expect(opencode.creates[0]).toMatchObject({ parentID: `root-${feature.id}`, directory: `/tmp/acp-project/wt/${feature.slug}` })
+    expect(store.getFeature(feature.id)?.sessionId).toBe(`root-${feature.id}`)
+    expect(opencode.prompts).toHaveLength(1)
+  })
+
+  it("falls back to an ungrouped session when the root session cannot be ensured", async () => {
+    const opencode = new FakeGroupingSessions()
+    opencode.parentError = new RunnerOperationError("down", { delivery: "not_sent" })
+    const engine = makeEngine(singleAgentWorkflow, { runners: opencodeRunners(), opencodeSessions: opencode, releaseOpencodeReservation: async () => {} })
+    await startedFeature(engine)
+    expect(opencode.creates[0]?.parentID).toBeUndefined()
+    expect(opencode.prompts).toHaveLength(1)
+  })
+
+  it("fails the step when the rendered cwd is not absolute", async () => {
+    const opencode = new FakeAcpSessions()
+    const wf = workflow({ main: job([agentStep("implement", "implementer", "do the work", { cwd: "relative/dir" })]) }, roles)
+    const engine = makeEngine(wf, { runners: opencodeRunners(), opencodeSessions: opencode, releaseOpencodeReservation: async () => {} })
+    const feature = await startedFeature(engine)
+    expect(opencode.prepareCalls).toHaveLength(0)
+    expect(store.getActiveRun(feature.id)).toBeNull()
+  })
+
+  it("fails the step when the opencode client is not wired", async () => {
+    const engine = makeEngine(singleAgentWorkflow, { runners: opencodeRunners() })
+    const feature = await startedFeature(engine)
+    expect(store.getActiveRun(feature.id)).toBeNull()
   })
 })

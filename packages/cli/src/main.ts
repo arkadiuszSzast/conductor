@@ -16,6 +16,7 @@ import { spawnSync } from "node:child_process"
 import {
   Daemon,
   composeManagedRunners,
+  composeOpencodeRunners,
   createReportingReadiness,
   PluginRegistry,
   PluginSupervisor,
@@ -111,6 +112,9 @@ function startDaemon(input: DaemonStartInput): DaemonProcessHandle {
   const reportingHost = input.api.bind.host === "0.0.0.0" ? "127.0.0.1" : input.api.bind.host === "::" ? "[::1]" : input.api.bind.host
   const daemon = new Daemon(input.daemon, {
     ...(input.daemon.runners ? { sessionFactory: (store, clock, observe) => composeManagedRunners(input.daemon.runners!, store, clock, readiness, () => `http://${reportingHost}:${input.api.bind.port}`, process.env, observe) } : {}),
+    ...(input.daemon.runners?.opencode && Object.keys(input.daemon.runners.opencode).length > 0
+      ? { opencodeFactory: (store, clock) => composeOpencodeRunners(input.daemon.runners!, store, clock, () => `http://${reportingHost}:${input.api.bind.port}`, process.env) }
+      : {}),
     sessions,
     runnerAvailability: () => runners.list().length > 0,
     logger,
