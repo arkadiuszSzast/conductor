@@ -145,6 +145,11 @@ export function composeOpencodeRunners(config: RunnersConfig, store: Store, cloc
       }
       return created
     },
+    async ensureParentSession(input) {
+      const owner = profiles.get(config.projects[input.directory] ?? "")
+      if (!owner) throw new RunnerOperationError("opencode project profile unavailable", { delivery: "not_sent" })
+      return owner.ensureParentSession(input)
+    },
     prompt: input => bySession(input.sessionID).prompt(input),
     note: input => bySession(input.sessionID).note(input),
     abort: async id => { try { await bySession(id).abort(id) } catch (error) { if (!(error instanceof Error && error.message === "opencode binding owner unavailable")) throw error } },

@@ -309,3 +309,39 @@ describe("OpencodeSessions status / abort / note", () => {
     expect(server.requests.find(r => r.path.endsWith("/synthetic"))!.body).toEqual({ text: "fyi", resume: false })
   })
 })
+
+describe("composed opencode runners", () => {
+  it("expose feature-session grouping, routed by the project's profile", async () => {
+    const { composeOpencodeRunners } = await import("./src/runner-router.ts")
+    const { openMigratedDatabase } = await import("./src/database.ts")
+    const { Store } = await import("./src/store.ts")
+    const { mkdtempSync, rmSync } = await import("node:fs")
+    const { join } = await import("node:path")
+    const { tmpdir } = await import("node:os")
+    const directory = mkdtempSync(join(tmpdir(), "opencode-router-"))
+    const db = openMigratedDatabase({ path: join(directory, "state.db") })
+    try {
+      const server = fakeServer()
+      const realFetch = globalThis.fetch
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => server.fetch(new Request(input as string, init))) as typeof fetch
+      try {
+        const { sessions } = composeOpencodeRunners({
+          default: "native",
+          projects: { "/repo": "v2" },
+          acp: {},
+          opencode: { v2: { baseUrl: "http://fake/", passwordEnv: "PW", allowedRoots: ["/repo"], maxConcurrent: 2, bindings: {} } },
+        }, new Store(db.db), { now: () => 0 } as never, () => "http://daemon", { PW: "pw" })
+        expect(sessions.ensureParentSession).toBeDefined()
+        const root = await sessions.ensureParentSession!({ featureId: "feat-1", title: "f", directory: "/repo" })
+        expect(root.id).toBe(sessionIdForFeature("feat-1"))
+        const unrouted = await sessions.ensureParentSession!({ featureId: "feat-2", title: "f", directory: "/elsewhere" }).catch(e => e)
+        expect((unrouted as RunnerOperationError).delivery).toBe("not_sent")
+      } finally {
+        globalThis.fetch = realFetch
+      }
+    } finally {
+      db.close?.()
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
