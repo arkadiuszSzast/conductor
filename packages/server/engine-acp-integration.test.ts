@@ -768,6 +768,45 @@ describe("opencode transport routing", () => {
     expect(store.getRunnerBinding(runs[0]!.id)?.phase).toBe("fenced")
   })
 
+  it("lets a reported session finish its turn instead of interrupting it", async () => {
+    const opencode = new FakeAcpSessions()
+    const engine = makeEngine(singleAgentWorkflow, { runners: opencodeRunners(), opencodeSessions: opencode, releaseOpencodeReservation: async () => {}, sleep: async () => {} })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    opencode.statuses.set(run.sessionId!, "idle")
+    await engine.report({ runId: run.id, outcome: "succeeded" })
+    await engine.drainRunnerCleanup()
+    expect(opencode.aborted).toHaveLength(0)
+  })
+
+  it("interrupts a reported session that is still busy after the settle window", async () => {
+    const opencode = new FakeAcpSessions()
+    const engine = makeEngine(singleAgentWorkflow, { runners: opencodeRunners(), opencodeSessions: opencode, releaseOpencodeReservation: async () => {}, sleep: async () => {} }, { reportSettleMs: 3000 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    await engine.report({ runId: run.id, outcome: "succeeded" })
+    await engine.drainRunnerCleanup()
+    expect(opencode.aborted).toEqual([run.sessionId!])
+  })
+
+  it("opens the session in the step's rendered cwd", async () => {
+    const opencode = new FakeAcpSessions()
+    const wf = workflow({ main: job([agentStep("implement", "implementer", "do the work", { cwd: "/tmp/acp-project/wt/{{ feature.slug }}" })]) }, roles)
+    const engine = makeEngine(wf, { runners: opencodeRunners(), opencodeSessions: opencode, releaseOpencodeReservation: async () => {} })
+    const feature = await startedFeature(engine)
+    expect(opencode.prepareCalls[0]?.directory).toBe(`/tmp/acp-project/wt/${feature.slug}`)
+    expect(store.getRunnerBinding(store.getActiveRun(feature.id)!.id)?.directory).toBe(`/tmp/acp-project/wt/${feature.slug}`)
+  })
+
+  it("fails the step when the rendered cwd is not absolute", async () => {
+    const opencode = new FakeAcpSessions()
+    const wf = workflow({ main: job([agentStep("implement", "implementer", "do the work", { cwd: "relative/dir" })]) }, roles)
+    const engine = makeEngine(wf, { runners: opencodeRunners(), opencodeSessions: opencode, releaseOpencodeReservation: async () => {} })
+    const feature = await startedFeature(engine)
+    expect(opencode.prepareCalls).toHaveLength(0)
+    expect(store.getActiveRun(feature.id)).toBeNull()
+  })
+
   it("fails the step when the opencode client is not wired", async () => {
     const engine = makeEngine(singleAgentWorkflow, { runners: opencodeRunners() })
     const feature = await startedFeature(engine)

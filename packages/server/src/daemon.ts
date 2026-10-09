@@ -407,6 +407,7 @@ export class Daemon {
         ...(opencode ? {
           opencodeSessions: opencode.sessions,
           releaseOpencodeReservation: (id: string) => opencode.releaseReservation(id),
+          sleep: (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)),
         } : {}),
         workflows: this.registryInstance.resolver,
         sessions: this.deps.sessions ?? unavailableSessionClient(),

@@ -51,6 +51,24 @@ Session status SHALL be busy while the server lists the session as active, idle 
 - **WHEN** a status read fails with a connection error or a server error
 - **THEN** the status is unknown and the run is neither reaped nor recreated on that evidence
 
+### Requirement: A reported session ends its turn on its own
+After a run concludes through an accepted report, the engine SHALL let the session finish its current turn and SHALL interrupt it only if it is still not idle after a bounded settle window. Fenced and reaped runs SHALL be interrupted immediately.
+
+#### Scenario: Agent stops after reporting
+- **WHEN** a run's report is accepted and the session goes idle within the settle window
+- **THEN** no interrupt is sent and the report tool call completes normally
+
+#### Scenario: Agent keeps working after reporting
+- **WHEN** the session is still busy when the settle window ends
+- **THEN** the engine interrupts it
+
+### Requirement: Agent steps may run in a templated directory
+An agent step MAY declare `cwd`, a template rendered against the feature context; the session SHALL be prepared and created in that directory, which SHALL be absolute and within the profile's allowed roots, otherwise the step fails before any session is created.
+
+#### Scenario: Session opened in the feature worktree
+- **WHEN** an agent step declares `cwd: "{{ needs.prepare.outputs.path }}"`
+- **THEN** the session's location is the rendered worktree path
+
 ### Requirement: Timeline notes never trigger inference
 Notes to a feature's parent session SHALL be delivered so that they do not start an agent turn.
 

@@ -31,3 +31,8 @@
 - [x] 5.4 [docs] `docs/install.md`: native v2 setup (dedicated `opencode serve` unit, password file, plugin install), updated ACP section, removal of the v1 plugin.
 - [x] 5.5 [test] Run `bun run typecheck`, `bun test` and `bun run lint`; review the final diff.
 - [x] 5.6 [review] Pilot on the host: route gloam-idle to the opencode profile, run one small feature, and verify sessions carry the expected `variant` (gates `low`), skills/repowise tools are native, and `sed -i` is rejected.
+
+## 6. Pilot follow-ups
+
+- [x] 6.1 [server] Let a reported OpenCode session settle idle before interrupting it (bounded `engine.reportSettleMs`, daemon-injected `sleep`), so the final report call is no longer shown as aborted.
+- [x] 6.2 [core][server] Add optional agent-step `cwd` (template, absolute, within `allowedRoots`) used as the session directory, with parser, engine and docs coverage.

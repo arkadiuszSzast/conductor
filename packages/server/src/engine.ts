@@ -34,7 +34,7 @@ import { tmpdir } from "node:os"
 import { createHash } from "node:crypto"
 import { prepareReview, renderFixPack, validateReview, type AcceptedReview, type ReviewReport } from "./review.ts"
 import { REPORT_REJECTED_PREFIX } from "./run-reporting.ts"
-import { join } from "node:path"
+import { isAbsolute, join } from "node:path"
 import {
   DEFAULT_OUTCOME,
   behaviourForClass,
@@ -111,6 +111,8 @@ export interface EngineDeps {
   readonly sessions: SessionClient
   readonly process: ProcessRunner
   readonly clock: Clock
+  /** Daemon-owned delay; absent means the engine never waits on a timer. */
+  readonly sleep?: (ms: number) => Promise<void>
   readonly log: Logger
   readonly actions: ActionExecutor
   readonly runnerAvailable?: () => boolean
@@ -145,10 +147,15 @@ export interface EngineOptions {
   /** Upper bound on waiting for cleanup evidence before a fence is
    *  classified with whatever evidence exists (unconfirmed → unsafe). */
   readonly fenceClassifyTimeoutMs?: number
+  /** How long a reported OpenCode session may keep running its final turn
+   *  before the engine interrupts it. */
+  readonly reportSettleMs?: number
   readonly random?: Random
 }
 
 const DEFAULT_FENCE_CLASSIFY_TIMEOUT_MS = 15_000
+const DEFAULT_REPORT_SETTLE_MS = 30_000
+const REPORT_SETTLE_POLL_MS = 1_000
 
 export type StartFeatureResult =
   | { readonly ok: true; readonly feature: FeatureState }
@@ -254,6 +261,7 @@ export class Engine {
   private readonly maxNudges: number
   private readonly healingPolicy: HealingPolicy
   private readonly fenceClassifyTimeoutMs: number
+  private readonly reportSettleMs: number
   private readonly random: Random
 
   constructor(
@@ -267,6 +275,7 @@ export class Engine {
     this.maxNudges = options.maxNudges ?? DEFAULT_MAX_NUDGES
     this.healingPolicy = normalizeHealingPolicy(options.healing)
     this.fenceClassifyTimeoutMs = options.fenceClassifyTimeoutMs ?? DEFAULT_FENCE_CLASSIFY_TIMEOUT_MS
+    this.reportSettleMs = options.reportSettleMs ?? DEFAULT_REPORT_SETTLE_MS
     this.random = options.random ?? systemRandom
   }
 
@@ -500,7 +509,19 @@ export class Engine {
     }
 
     if (store.getActiveRunForStep(featureId, jobId, step.id) || store.hasUnresolvedRunnerFence(featureId, jobId, step.id)) return
-    const directory = state.worktree ?? state.projectDir
+    const feedback = store.getFeedback(featureId) ?? undefined
+    const context = buildEvalContext(snapshot.workflow, state, jobId, feedback)
+    let directory = state.worktree ?? state.projectDir
+    if (step.cwd !== undefined) {
+      const renderedCwd = renderTemplate(step.cwd, context)
+      const cwd = renderedCwd.text.trim()
+      if (renderedCwd.errors.length > 0 || !isAbsolute(cwd)) {
+        const why = renderedCwd.errors.length > 0 ? renderedCwd.errors.join("; ") : `"${cwd}" is not an absolute path`
+        await this.dispatch(featureId, { kind: "step.failed", jobId, stepId: step.id, reason: `agent cwd: ${why}` })
+        return
+      }
+      directory = cwd
+    }
     const route = routeNewDispatch(this.deps.runners, state.projectDir, directory)
     if (route.transport === "acp_misconfigured") {
       await this.dispatch(featureId, { kind: "step.failed", jobId, stepId: step.id, reason: route.reason })
@@ -527,8 +548,6 @@ export class Engine {
     }
 
     const attempt = (state.jobs[jobId]?.attempts[step.id] ?? 0) + 1
-    const feedback = store.getFeedback(featureId) ?? undefined
-    const context = buildEvalContext(snapshot.workflow, state, jobId, feedback)
     let prompt = step.prompt
     let fixEvidence = ""
     try {
@@ -636,7 +655,7 @@ export class Engine {
       if (!parentId) {
         const created = await sessions.createSession({
           title: `[conductor] ${state.title}`,
-          directory: state.worktree ?? state.projectDir,
+          directory,
         })
         parentId = created.id
         createdParent = true
@@ -645,7 +664,7 @@ export class Engine {
       const sessionId = (
         await sessions.createSession({
           title: `[${role.agent}] ${state.title}${attempt > 1 ? ` (attempt ${attempt})` : ""}`,
-          directory: state.worktree ?? state.projectDir,
+          directory,
           parentID: parentId,
           // Optional runner hint so agent output can be attributed to this
           // run's log. The parent session (no run) is deliberately bare.
@@ -873,7 +892,13 @@ export class Engine {
     if (transport === "opencode") {
       this.cleanupInFlight.add(runId)
       const task = Promise.resolve().then(async () => {
-        if (run.sessionId) await this.deps.opencodeSessions?.abort(run.sessionId)
+        if (!run.sessionId) return
+        // A run concluded by its own report lets the reporting turn end on
+        // its own; interrupting immediately would abort the report tool call
+        // the agent is still inside. Fenced or reaped runs stop at once.
+        const reported = run.status === "succeeded" || run.status === "failed"
+        if (reported && !this.deps.store.getFence(runId) && await this.settlesIdle(run.sessionId)) return
+        await this.deps.opencodeSessions?.abort(run.sessionId)
         // An interrupt is not proof the server stopped every effect, so the
         // fence stays `unconfirmed` and classifies as unsafe.
       }).catch(error => this.deps.log.log(`OpenCode cleanup failed: ${boundDiagnostic(errorMessage(error))}`))
@@ -902,6 +927,20 @@ export class Engine {
       this.runnerCleanupTasks.delete(task)
       this.cleanupInFlight.delete(runId)
     })
+  }
+
+  /** Waits up to `reportSettleMs` for a session to go idle on its own. */
+  private async settlesIdle(sessionId: string): Promise<boolean> {
+    const client = this.deps.opencodeSessions
+    const sleep = this.deps.sleep
+    if (!client || !sleep) return false
+    const polls = Math.max(1, Math.ceil(this.reportSettleMs / REPORT_SETTLE_POLL_MS))
+    for (let poll = 0; ; poll++) {
+      const status = await client.status(sessionId).catch(() => "unknown" as const)
+      if (status === "idle" || status === "missing") return true
+      if (poll >= polls) return false
+      await sleep(REPORT_SETTLE_POLL_MS)
+    }
   }
 
   async drainRunnerCleanup(): Promise<void> {

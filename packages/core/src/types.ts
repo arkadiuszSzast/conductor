@@ -116,6 +116,9 @@ export interface AgentStep extends StepBase {
    *  engine heal an uncertain execution automatically instead of
    *  escalating. Absent means false. Never allowed with `interactive`. */
   readonly replaySafe?: boolean
+  /** Template for the session's working directory (e.g. the feature
+   *  worktree). Absent means the job's working directory. */
+  readonly cwd?: string
   /** Silence budget for THIS step's runs, in milliseconds — overrides
    *  the engine-wide TTL. Absent means the engine default governs. */
   readonly ttlMs?: number

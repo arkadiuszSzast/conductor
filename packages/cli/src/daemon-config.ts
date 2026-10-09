@@ -52,7 +52,7 @@ const TOP_LEVEL_FIELDS = new Set([
   "notifications",
 ])
 
-const ENGINE_FIELDS = new Set(["runTtlMs", "idleSilenceNudgeMs", "busySilenceNudgeMs", "nudgeIdleCycles", "maxNudges", "healing"])
+const ENGINE_FIELDS = new Set(["runTtlMs", "idleSilenceNudgeMs", "busySilenceNudgeMs", "nudgeIdleCycles", "maxNudges", "reportSettleMs", "healing"])
 const HEALING_FIELDS = new Set(["initialMs", "maxMs", "attentionAfter", "classifyTimeoutMs"])
 const NOTIFICATION_FIELDS = new Set(["publicBaseUrl", "rateLimitWindowMs", "intervalMs", "telegram"])
 const TELEGRAM_FIELDS = new Set(["chatId", "tokenEnv", "events"])
@@ -502,7 +502,7 @@ auth:
 heartbeatIntervalMs: 5000
 
 # Optional engine tuning (runTtlMs, idleSilenceNudgeMs, busySilenceNudgeMs,
-# nudgeIdleCycles, maxNudges) — see docs/install.md#engine-tuning.
+# nudgeIdleCycles, maxNudges, reportSettleMs) — see docs/install.md#engine-tuning.
 # engine:
 #   runTtlMs: 3600000
 #   idleSilenceNudgeMs: 120000

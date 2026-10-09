@@ -304,6 +304,7 @@ Performs LLM work.
 |---|---|---|
 | `role` | yes | Must exist in `roles`. |
 | `prompt` | yes | Template; see [Expressions](expressions.md). |
+| `cwd` | no | Template rendering to an absolute directory the runner session opens in, typically the feature worktree (`"{{ needs.prepare.outputs.path }}"`). Must fall within the routed runner profile's `allowedRoots`. Absent means the project checkout. |
 | `interactive` | no | Boolean, default `false`. Grants the step the right to pause mid-run and ask the human a question. |
 | `replaySafe` | no | Boolean, default `false`. Declares that re-running the step from scratch after a possibly delivered prompt is harmless (typically a read-only review). Lets the daemon [heal an uncertain run](install.md#self-healing-of-uncertain-runs) automatically instead of escalating. Not allowed together with `interactive: true`. |
 | `idleSilenceNudgeMs` | no | Positive integer ms; overrides daemon idle silence (default 120000). Every idle nudge or exhausted reap requires elapsed silence plus cycle debounce. |

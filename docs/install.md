@@ -117,7 +117,12 @@ engine:
   busySilenceNudgeMs: 600000
   nudgeIdleCycles: 2
   maxNudges: 2
+  reportSettleMs: 30000
 ```
+
+`reportSettleMs` (OpenCode v2 runner only, default 30 s) is how long a
+session whose report was accepted may keep running its final turn before
+the daemon interrupts it.
 
 `runTtlMs` is the silence TTL (default one hour), overridden by an agent
 step's `ttlMs`. `busySilenceNudgeMs` is a positive integer in milliseconds
