@@ -16,6 +16,7 @@ function fakeServer(options: FakeOptions = {}) {
   const sessions = new Map<string, Record<string, unknown>>()
   const messages = new Map<string, Record<string, unknown>>()
   const active = new Map<string, string>()
+  const turns = new Map<string, Record<string, unknown>[]>()
   const requests: { method: string; path: string; auth: string | null; body: unknown }[] = []
   let catalogPolls = 0
   let dropCreate = options.dropCreateResponses ?? 0
@@ -50,6 +51,7 @@ function fakeServer(options: FakeOptions = {}) {
       const session = sessions.get(id!)
       if (!session) return json({ name: "SessionNotFoundError" }, 404)
       if (!action) return json(session)
+      if (action === "/message" && request.method === "GET") return json(turns.get(id!) ?? [])
       if (action === "/prompt") {
         const mid = String(body!.id)
         if (!messages.has(mid)) { messages.set(mid, { id: mid, payload: { text: body!.text } }); active.set(id!, "running") }
@@ -66,7 +68,7 @@ function fakeServer(options: FakeOptions = {}) {
     }
     return json(null, 404)
   }
-  return { fetch, sessions, messages, active, requests }
+  return { fetch, sessions, messages, active, turns, requests }
 }
 
 function client(server: ReturnType<typeof fakeServer>, overrides: Partial<ConstructorParameters<typeof OpencodeSessions>[0]> = {}) {
@@ -293,6 +295,25 @@ describe("OpencodeSessions status / abort / note", () => {
     expect(await c.sessionExists(id)).toBe(true)
     expect(await client(fakeServer({ refuse: true })).status(id)).toBe("unknown")
     expect(await client(fakeServer({ refuse: true })).sessionExists(id)).toBe(true)
+  })
+
+  it("reads the provider error that ended the latest model turn", async () => {
+    const server = fakeServer()
+    const c = client(server)
+    const { id } = await c.createSession({ title: "t", directory: "/repo/wt", runId: "run-1", reservationId: await prepared(c), operationId: "op" })
+    expect(await c.lastTurnError(id)).toBeUndefined()
+    server.turns.set(id, [
+      { type: "idle", outcome: "failed" },
+      { type: "assistant", finish: "error", error: { type: "provider.invalid-request", message: "Combo has no executable targets", status: 404 } },
+      { type: "user", text: "nudge" },
+    ])
+    expect(await c.lastTurnError(id)).toEqual({ type: "provider.invalid-request", message: "Combo has no executable targets", status: 404 })
+    expect(server.requests.at(-1)!.path).toBe(`/api/session/${id}/message?limit=5`)
+    server.turns.set(id, [{ type: "assistant", finish: "error", error: { type: "aborted", message: "Step interrupted" } }])
+    expect(await c.lastTurnError(id)).toBeUndefined()
+    server.turns.set(id, [{ type: "assistant", finish: "stop" }, { type: "assistant", error: { type: "provider.auth", message: "403" } }])
+    expect(await c.lastTurnError(id)).toBeUndefined()
+    expect(await client(fakeServer({ refuse: true })).lastTurnError(id)).toBeUndefined()
   })
 
   it("aborts idempotently and notes without resuming", async () => {

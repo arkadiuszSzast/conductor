@@ -155,6 +155,7 @@ export function composeOpencodeRunners(config: RunnersConfig, store: Store, cloc
     note: input => bySession(input.sessionID).note(input),
     abort: async id => { try { await bySession(id).abort(id) } catch (error) { if (!(error instanceof Error && error.message === "opencode binding owner unavailable")) throw error } },
     status: async id => { try { return await bySession(id).status(id) } catch { return "unknown" } },
+    lastTurnError: async id => { try { return await bySession(id).lastTurnError(id) } catch { return undefined } },
     sessionExists: async id => { try { return await bySession(id).sessionExists(id) } catch { return true } },
   }
   const runIdForSession = (sessionID: string): string | undefined => {

@@ -82,7 +82,7 @@ import type { RunSummary, Store } from "./store.ts"
 import { applyPatch } from "./state.ts"
 import { NoLiveRunnerError } from "./runner-transport.ts"
 import type { WorkflowResolver, WorkflowSnapshot } from "./workflow-registry.ts"
-import { RunnerOperationError, type Clock, type Logger, type ProcessRunner, type SessionClient } from "./ports.ts"
+import { RunnerOperationError, type Clock, type Logger, type ProcessRunner, type ProviderTurnError, type SessionClient } from "./ports.ts"
 import type { ActionExecutor } from "./action-host.ts"
 import { actionBindingsForReconciler } from "./workflow-reservation.ts"
 import type { ResolvedActionBinding } from "./workflow-reservation.ts"
@@ -2742,8 +2742,23 @@ export class Engine {
         }
         const cycles = (this.idleCycles.get(active.id) ?? 0) + 1
         this.idleCycles.set(active.id, cycles)
+        const providerError = !isAcp && cycles >= this.nudgeIdleCycles
+          ? await sessionClient.lastTurnError?.(active.sessionId)
+          : undefined
+        if (providerError && !isTransientProviderError(providerError)) {
+          // A nudge only re-sends the prompt to the same broken model
+          // selection; fail now and name the provider, not the agent.
+          this.idleCycles.delete(active.id)
+          log.log(`reconcile ${feature.slug}: run ${active.id} stopped on a provider error — failing without nudges`)
+          await this.reap(feature, active, describeProviderError(providerError), "invalid_config")
+          return
+        }
         if (cycles >= this.nudgeIdleCycles && silence > limits.idleSilenceNudgeMs) {
           this.idleCycles.delete(active.id)
+          if (providerError && active.nudges >= limits.maxNudges) {
+            await this.reap(feature, active, describeProviderError(providerError), "transient_upstream")
+            return
+          }
           if (active.nudges < limits.maxNudges) {
             await this.nudgeAgentRun(feature, snapshot, active, limits.maxNudges)
             return
@@ -2901,6 +2916,21 @@ export class Engine {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Provider failures a later turn can outlive (outage, throttling,
+ *  dropped stream). Everything else — auth, unknown model/route,
+ *  rejected request — repeats on every turn until someone fixes it. */
+const TRANSIENT_PROVIDER_ERRORS = new Set([
+  "provider.internal", "provider.transport", "provider.timeout", "provider.rate-limit", "provider.connect", "provider.unknown",
+])
+
+function isTransientProviderError(error: ProviderTurnError): boolean {
+  return TRANSIENT_PROVIDER_ERRORS.has(error.type) || (error.status !== undefined && (error.status === 429 || error.status >= 500))
+}
+
+function describeProviderError(error: ProviderTurnError): string {
+  return boundDiagnostic(`provider error, not agent silence: ${error.type}${error.status !== undefined ? ` (HTTP ${error.status})` : ""}: ${error.message}`)
+}
 
 function findStep(workflow: WorkflowDef, jobId: string, stepId: string): StepDef | undefined {
   return workflow.jobs[jobId]?.steps.find(step => step.id === stepId)

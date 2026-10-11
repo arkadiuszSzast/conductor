@@ -51,6 +51,17 @@ Session status SHALL be busy while the server lists the session as active, idle 
 - **WHEN** a status read fails with a connection error or a server error
 - **THEN** the status is unknown and the run is neither reaped nor recreated on that evidence
 
+### Requirement: A provider error is not agent silence
+When an idle, unreported session's latest assistant turn ended on a `provider.*` error, the engine SHALL NOT treat it as a silent agent. A persistent provider error (anything other than internal, transport, timeout, rate-limit, connect or unknown errors and HTTP 429/5xx) SHALL fail the run after the idle debounce without nudging, as `invalid_config`, with a reason naming the error type, HTTP status and message. A transient provider error SHALL keep the nudge budget, and its exhausted-budget reap SHALL name the error and be classed `transient_upstream`. A failed read of the message list SHALL fall back to the ordinary idle handling.
+
+#### Scenario: Model route has no targets
+- **WHEN** an idle step session's latest turn failed with `provider.invalid-request` HTTP 404 "Combo has no executable targets"
+- **THEN** the run is reaped without a nudge and its reason reads "provider error, not agent silence: provider.invalid-request (HTTP 404): Combo has no executable targets"
+
+#### Scenario: Provider stream dropped
+- **WHEN** an idle step session's latest turn failed with `provider.internal` "terminated"
+- **THEN** the session is nudged as usual and, if the budget runs out, the reap names the provider error
+
 ### Requirement: A reported session ends its turn on its own
 After a run concludes through an accepted report, the engine SHALL let the session finish its current turn and SHALL interrupt it only if it is still not idle after a bounded settle window. Fenced and reaped runs SHALL be interrupted immediately.
 

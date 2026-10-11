@@ -13,7 +13,7 @@
 
 import { createHash, randomUUID } from "node:crypto"
 import { RunnerOperationError } from "../ports.ts"
-import type { OperationPurpose, PrepareInput, PrepareResult, SessionCapabilities, SessionClient, SessionStatus } from "../ports.ts"
+import type { OperationPurpose, PrepareInput, PrepareResult, ProviderTurnError, SessionCapabilities, SessionClient, SessionStatus } from "../ports.ts"
 import { directoryWithinRoots } from "../acp/config.ts"
 import { DEFAULT_OPENCODE_DEADLINES, splitModelRef } from "./config.ts"
 import type { OpencodeDeadlines } from "./config.ts"
@@ -374,6 +374,24 @@ export class OpencodeSessions implements SessionClient {
       return "idle"
     } catch (error) {
       return error instanceof HttpFailure && error.status === 404 ? "missing" : "unknown"
+    }
+  }
+
+  async lastTurnError(sessionID: string): Promise<ProviderTurnError | undefined> {
+    let page: unknown
+    try {
+      page = OpencodeSessions.data((await this.request("GET", `/api/session/${encodeURIComponent(sessionID)}/message?limit=5`)).json)
+    } catch {
+      return undefined
+    }
+    if (!Array.isArray(page)) return undefined
+    const latest = (page as { type?: unknown; error?: unknown }[]).find(message => message?.type === "assistant")
+    const error = latest?.error as { type?: unknown; message?: unknown; status?: unknown } | undefined
+    if (typeof error?.type !== "string" || !error.type.startsWith("provider.")) return undefined
+    return {
+      type: error.type,
+      message: bounded(typeof error.message === "string" ? error.message : ""),
+      ...(typeof error.status === "number" ? { status: error.status } : {}),
     }
   }
 

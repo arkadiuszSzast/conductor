@@ -128,6 +128,14 @@ export interface PluginProcessSpawner {
  */
 export type SessionStatus = "busy" | "idle" | "retry" | "missing" | "unknown"
 
+/** The provider error that ended a session's most recent model turn, as
+ *  the runtime recorded it (e.g. OpenCode's `provider.auth`). */
+export interface ProviderTurnError {
+  readonly type: string
+  readonly message: string
+  readonly status?: number
+}
+
 /**
  * What a session client can actually do, queried once per attempt so the
  * engine never guesses. Absent (no `capabilities()` method) means the
@@ -318,6 +326,13 @@ export interface SessionClient {
   ensureParentSession?(input: { featureId: string; title: string; directory: string }): Promise<{ id: string }>
   sessionExists(sessionID: string): Promise<boolean>
   status(sessionID: string): Promise<SessionStatus>
+  /**
+   * Optional: the provider error that ended the session's latest model
+   * turn, or undefined when that turn did not fail on the provider (or
+   * the transport cannot tell). Lets the engine tell a broken model from
+   * a silent agent instead of nudging a session that cannot answer.
+   */
+  lastTurnError?(sessionID: string): Promise<ProviderTurnError | undefined>
   /**
    * Append an informational message to a session WITHOUT triggering
    * inference (noReply). Used to keep the feature's parent session a

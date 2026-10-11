@@ -138,6 +138,14 @@ exhausted-budget reap, both elapsed silence and `nudgeIdleCycles` debounce
 must pass. Failed nudge delivery consumes budget and restarts grace too.
 Agent steps override each silence threshold and `maxNudges` independently;
 omitted fields inherit daemon settings, then the defaults above.
+
+On the OpenCode transport an idle session whose latest model turn ended on
+a provider error is not treated as a silent agent. Once the idle debounce
+passes, a persistent error (auth, unknown model or empty route, rejected
+request) fails the run at once without nudges, class `invalid_config`, and
+the reason names the provider error. A transient one (internal, transport,
+timeout, rate limit, HTTP 429/5xx) keeps the normal nudge budget, and the
+final reap names the provider error with class `transient_upstream`.
 Restart the daemon to load changed daemon settings or code, and reload the
 OpenCode runner to activate timeline fixes. Reload workflow configuration
 after applying step overrides. These are operator actions, not automatic deployment.
