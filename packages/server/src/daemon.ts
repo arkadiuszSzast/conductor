@@ -171,6 +171,14 @@ export interface DaemonDeps {
    * `() => runnerRegistry.hasAny()`. Absent → availability stays the
    * static "was a SessionClient injected" answer.
    */
+  /** OpenCode v2 profiles (`runners.opencode`): sessions live on an external server. */
+  readonly opencodeFactory?: (store: Store, clock: Clock) => {
+    sessions: SessionClient
+    releaseReservation(id: string): Promise<void>
+    /** Starts following the server's event stream (run logs). */
+    start?(): void
+    stop?(): Promise<void>
+  }
   readonly runnerAvailability?: () => boolean
   readonly process?: ProcessRunner
   readonly clock?: Clock
@@ -264,6 +272,7 @@ function unavailableSessionClient(): SessionClient {
 export class Daemon {
   private phase: DaemonPhase = "created"
   private managed: ReturnType<NonNullable<DaemonDeps["sessionFactory"]>> | undefined
+  private opencode: ReturnType<NonNullable<DaemonDeps["opencodeFactory"]>> | undefined
   private connection: DatabaseConnection | null = null
   private storeInstance: Store | null = null
   private registryInstance: WorkflowRegistry | null = null
@@ -385,6 +394,8 @@ export class Daemon {
     this.managed = this.deps.sessionFactory?.(this.storeInstance, this.clock, id => {
       void this.engineInstance?.observeRunnerOperation(id).catch(() => this.log("error", "runner observation failed"))
     })
+    const opencode = this.deps.opencodeFactory?.(this.storeInstance, this.clock)
+    this.opencode = opencode
     const processRunner = this.deps.process ?? realProcessRunner
     const engineLogger = { log: (text: string) => this.log("info", text, { component: "engine" }) }
     const actionHost = new ActionHost(bundledHandlers, { process: processRunner, log: engineLogger })
@@ -397,6 +408,11 @@ export class Daemon {
           daemonGeneration: this.managed.generation,
           releaseAcpReservation: (id: string) => this.managed!.releaseReservation(id),
           cleanupAcpRun: (runId: string, sessionId: string | null) => this.managed!.cleanupRun(runId, sessionId),
+        } : {}),
+        ...(opencode ? {
+          opencodeSessions: opencode.sessions,
+          releaseOpencodeReservation: (id: string) => opencode.releaseReservation(id),
+          sleep: (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)),
         } : {}),
         workflows: this.registryInstance.resolver,
         sessions: this.deps.sessions ?? unavailableSessionClient(),
@@ -463,6 +479,7 @@ export class Daemon {
     // Settle `starting` queue claims left by a crash before anything else
     // can start a change (DB-only; the passes themselves run on the timer).
     this.queueScheduler?.recover()
+    this.opencode?.start?.()
 
     this.timerHandle = this.scheduler.setInterval(() => {
       void this.beat()
@@ -631,6 +648,7 @@ export class Daemon {
       }
     }
     await this.managed?.stop()
+    await this.opencode?.stop?.()
     await this.engineInstance?.drainRunnerCleanup()
   }
 

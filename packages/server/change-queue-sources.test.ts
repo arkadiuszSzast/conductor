@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import { execFileSync } from "node:child_process"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { realProcessRunner } from "./src/process.ts"
@@ -85,6 +85,19 @@ describe("ChangeQueueSources.readMerged (temp git repo with a bare remote)", () 
     expect(merged).toEqual({ kind: "known", names: new Set(["quest-outcomes"]), defaultBranch: "main", stale: false })
   })
 
+  it("fetches into its own ref and leaves origin/<default> and FETCH_HEAD to whoever else fetches in the checkout", async () => {
+    const { project, other } = repos("main")
+    const originBefore = git(project, "rev-parse", "refs/remotes/origin/main").trim()
+    mergeArchiveOnRemote(other, "main", "quest-outcomes")
+    const remoteHead = git(other, "rev-parse", "HEAD").trim()
+
+    const merged = await sources().readMerged(project)
+    expect(merged.kind === "known" && merged.names.has("quest-outcomes")).toBe(true)
+    expect(git(project, "rev-parse", "refs/conductor/merged/main").trim()).toBe(remoteHead)
+    expect(git(project, "rev-parse", "refs/remotes/origin/main").trim()).toBe(originBefore)
+    expect(existsSync(join(project, ".git", "FETCH_HEAD"))).toBe(false)
+  })
+
   it("does not count a change archived only in the local checkout", async () => {
     const { project } = repos("main")
     put(project, "openspec/changes/archive/2026-02-03-local-only/proposal.md")
@@ -150,7 +163,9 @@ describe("ChangeQueueSources.readMerged (temp git repo with a bare remote)", () 
     const merged = await sources({ process: fake, fetchTimeoutMs: 1234 }).readMerged("/p")
     expect(merged.kind).toBe("unknown")
     const fetch = calls.find(call => call.command[1] === "fetch")!
-    expect(fetch.command).toEqual(["git", "fetch", "--quiet", "origin", "main"])
+    expect(fetch.command).toEqual([
+      "git", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--refmap=", "origin", "+refs/heads/main:refs/conductor/merged/main",
+    ])
     expect(fetch.timeoutMs).toBe(1234)
     expect(fetch.env).toEqual({ GIT_TERMINAL_PROMPT: "0" })
     expect(calls.some(call => call.command[1] === "ls-tree")).toBe(false)

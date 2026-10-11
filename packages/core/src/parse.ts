@@ -609,11 +609,16 @@ type StepBase = Pick<StepDef, "id" | "if" | "outcomes" | "onFail" | "retry">
 function readAgentBody(node: Node | null, base: StepBase, where: string, reader: Reader): StepDef | undefined {
   const map = readMap(node, `${where}: agent`, reader)
   if (map === undefined) return undefined
-  const fields = readFields(map, `${where}: agent`, ["role", "prompt", "interactive", "replaySafe", "ttlMs", "idleSilenceNudgeMs", "busySilenceNudgeMs", "maxNudges", "reviewHead", "fixFrom", "qualityFrom", "fixPrompt"], reader)
+  const fields = readFields(map, `${where}: agent`, ["role", "prompt", "cwd", "interactive", "replaySafe", "ttlMs", "idleSilenceNudgeMs", "busySilenceNudgeMs", "maxNudges", "reviewHead", "fixFrom", "qualityFrom", "fixPrompt"], reader)
   const roleNode = requireField(fields, "role", map, `${where}: agent`, reader)
   const promptNode = requireField(fields, "prompt", map, `${where}: agent`, reader)
   const role = roleNode === undefined ? undefined : readString(roleNode, `${where}: agent: role`, reader)
   const prompt = promptNode === undefined ? undefined : readString(promptNode, `${where}: agent: prompt`, reader)
+  const cwd = fields.has("cwd") ? readString(fields.get("cwd")!.value, `${where}: agent: cwd`, reader) : undefined
+  if (cwd !== undefined && cwd.trim() === "") {
+    reader.error(fields.get("cwd")!.value, `${where}: agent: cwd must be non-empty — omit it to use the job's working directory`)
+    return undefined
+  }
   let interactive: boolean | undefined
   if (fields.has("interactive")) {
     interactive = readBoolean(fields.get("interactive")!.value, `${where}: agent: interactive`, reader)
@@ -656,6 +661,7 @@ function readAgentBody(node: Node | null, base: StepBase, where: string, reader:
     type: "agent",
     role,
     prompt,
+    ...(cwd !== undefined ? { cwd } : {}),
     ...(interactive !== undefined ? { interactive } : {}),
     ...(replaySafe !== undefined ? { replaySafe } : {}),
     ...limits,

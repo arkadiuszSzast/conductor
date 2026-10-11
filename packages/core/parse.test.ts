@@ -207,6 +207,13 @@ describe("steps", () => {
     expect((off as { replaySafe?: boolean }).replaySafe).toBeUndefined()
   })
 
+  it("accepts a cwd template on agent steps and rejects an empty one", () => {
+    const step = parsed(wrap("      - id: s\n        agent: { role: r, prompt: p, cwd: \"/w/{{ feature.slug }}\" }\n")).jobs.main!.steps[0]!
+    expect(step).toMatchObject({ type: "agent", cwd: "/w/{{ feature.slug }}" })
+    const errors = failed(wrap("      - id: s\n        agent: { role: r, prompt: p, cwd: \" \" }\n"))
+    expect(messages(errors)).toContain("agent: cwd must be non-empty")
+  })
+
   it("rejects replaySafe on non-agent steps", () => {
     const errors = failed(wrap("      - id: s\n        command:\n          run: [ls]\n          replaySafe: true\n"))
     expect(messages(errors)).toContain('unknown field "replaySafe"')

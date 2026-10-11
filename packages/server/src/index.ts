@@ -108,7 +108,11 @@ export type {
 export { Engine } from "./engine.ts"
 export type { EngineDeps, EngineOptions, StartFeatureInput, StartFeatureResult } from "./engine.ts"
 
-export { composeManagedRunners, routeNewDispatch, transportOfBinding } from "./runner-router.ts"
+export { composeManagedRunners, composeOpencodeRunners, routeNewDispatch, transportOfBinding } from "./runner-router.ts"
+export { OpencodeSessions, OPENCODE_SESSION_CAPABILITIES, REPORT_PLUGIN_ID, deterministicId, messageIdFor, sessionIdForRun } from "./opencode/sessions.ts"
+export type { OpencodeFetch, OpencodeSessionsDeps } from "./opencode/sessions.ts"
+export { resolveModelSelection, splitModelRef, DEFAULT_OPENCODE_DEADLINES } from "./opencode/config.ts"
+export type { OpencodeProfileConfig, OpencodeRoleBinding, OpencodeDeadlines } from "./opencode/config.ts"
 export type { RouteDecision } from "./runner-router.ts"
 
 export { ActionHost, CapabilityDeniedError, realSleep } from "./action-host.ts"

@@ -2627,6 +2627,21 @@ export class Store implements RunnerSafetyStore {
     return row ? toRunnerBindingRecord(row) : null
   }
 
+  getRunnerBindingBySessionRef(sessionRef: string): RunnerBindingRecord | null {
+    const row = this.db.query("SELECT * FROM runner_binding WHERE session_ref = ?").get(sessionRef) as RunnerBindingRow | null
+    return row ? toRunnerBindingRecord(row) : null
+  }
+
+  /** Running attempts bound to one profile of one transport — the
+   *  per-profile concurrency limit for transports without local processes. */
+  countRunningBoundRuns(transport: RunnerTransport, profileId: string): number {
+    const row = this.db.query(
+      `SELECT COUNT(*) AS n FROM runner_binding b JOIN run r ON r.id = b.run_id
+       WHERE b.transport = ? AND b.profile_id = ? AND r.status = 'running'`,
+    ).get(transport, profileId) as { n: number }
+    return row.n
+  }
+
   /** Attach the adapter's opaque session/process identity once `session/new`
    *  actually completes. False when the run has no binding at all (a
    *  programming error upstream — `bindRunnerTransport` must always run

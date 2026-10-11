@@ -27,7 +27,7 @@ import type { OperationPurpose, RunnerOperationDelivery } from "./ports.ts"
  *  Set ONCE, at run insertion, before any process/session await — never
  *  reread from current config after that point (design.md: "Transport
  *  selection changes SHALL NOT reroute existing attempts"). */
-export type RunnerTransport = "native" | "acp"
+export type RunnerTransport = "native" | "acp" | "opencode"
 
 /** The four durable operation kinds (D5 `runner_operation.kind`). Every
  *  kind has its own logical-key derivation rule (see

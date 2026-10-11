@@ -7,7 +7,7 @@ import { Store } from "./src/store.ts"
 import { createRunnerSessionClient, NoLiveRunnerError } from "./src/runner-transport.ts"
 import { RunnerRegistry } from "./src/runner-registry.ts"
 import { Engine, type EngineDeps, type EngineOptions } from "./src/engine.ts"
-import type { ProcessExecOptions, ProcessExecResult, ProcessRunner, SessionClient } from "./src/ports.ts"
+import type { ProcessExecOptions, ProcessExecResult, ProcessRunner, ProviderTurnError, SessionClient } from "./src/ports.ts"
 import type { WorkflowSnapshot } from "./src/workflow-registry.ts"
 import type { ActionExecutor, ActionExecuteEffects, ActionHostExecuteResult } from "./src/action-host.ts"
 import type { ResolvedActionBinding, ResolvedActionBindings } from "./src/workflow-reservation.ts"
@@ -80,6 +80,10 @@ class FakeSessions implements SessionClient {
   async status(sessionID: string): Promise<"busy" | "idle" | "retry" | "missing"> {
     if (!this.liveSessions.has(sessionID)) return "missing"
     return this.statuses.get(sessionID) ?? "busy"
+  }
+  turnErrors = new Map<string, ProviderTurnError>()
+  async lastTurnError(sessionID: string): Promise<ProviderTurnError | undefined> {
+    return this.turnErrors.get(sessionID)
   }
 }
 
@@ -2260,6 +2264,39 @@ describe("Engine: nudge/reap", () => {
     const reaped = store.getRunById(run.id)!
     expect(reaped.status).toBe("reaped")
     expect(reaped.reason).toContain("idle without report after 1 nudge(s); 2 report(s) rejected, last: Invalid review: review.findings[0].id must match F<number>")
+  })
+
+  it("a session stopped on a persistent provider error fails at once, naming the provider", async () => {
+    const engine = makeEngine(linearWorkflow, { idleSilenceNudgeMs: 100, maxNudges: 2, nudgeIdleCycles: 1, runTtlMs: 10_000 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    sessions.statuses.set(run.sessionId!, "idle")
+    sessions.turnErrors.set(run.sessionId!, { type: "provider.invalid-request", message: "Combo has no executable targets", status: 404 })
+    const promptsBefore = sessions.prompts.length
+    await engine.reconcile()
+    const reaped = store.getRunById(run.id)!
+    expect(reaped.status).toBe("reaped")
+    expect(reaped.nudges).toBe(0)
+    expect(sessions.prompts).toHaveLength(promptsBefore)
+    expect(reaped.reason).toBe("provider error, not agent silence: provider.invalid-request (HTTP 404): Combo has no executable targets")
+    expect(reaped.failure).toMatchObject({ class: "invalid_config" })
+  })
+
+  it("a transient provider error keeps the nudge path and the reap names the provider", async () => {
+    const engine = makeEngine(linearWorkflow, { idleSilenceNudgeMs: 100, maxNudges: 1, nudgeIdleCycles: 1, runTtlMs: 10_000 })
+    const feature = await startedFeature(engine)
+    const run = store.getActiveRun(feature.id)!
+    sessions.statuses.set(run.sessionId!, "idle")
+    sessions.turnErrors.set(run.sessionId!, { type: "provider.internal", message: "terminated", status: 200 })
+    clock.advance(101)
+    await engine.reconcile()
+    expect(store.getRunById(run.id)?.nudges).toBe(1)
+    clock.advance(101)
+    await engine.reconcile()
+    const reaped = store.getRunById(run.id)!
+    expect(reaped.status).toBe("reaped")
+    expect(reaped.reason).toBe("provider error, not agent silence: provider.internal (HTTP 200): terminated")
+    expect(reaped.failure).toMatchObject({ class: "transient_upstream" })
   })
 
   it.each(["idle", "busy", "retry"] as const)("per-step %s limits override independently without leaking to siblings", async status => {

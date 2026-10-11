@@ -526,7 +526,7 @@ function validateExpressions(def: WorkflowDef, errors: string[], warnings: strin
         }
       }
       if (step.type === "agent" || (step.type === "human" && step.prompt !== undefined)) {
-        const templates = step.type === "agent" ? [step.prompt, step.fixPrompt, step.reviewHead] : [step.prompt]
+        const templates = step.type === "agent" ? [step.prompt, step.fixPrompt, step.reviewHead, step.cwd] : [step.prompt]
         for (const expression of templates.flatMap(template => template === undefined ? [] : extractExpressions(template))) {
           validateExpression(expression, {
             where: `${where}: prompt`,

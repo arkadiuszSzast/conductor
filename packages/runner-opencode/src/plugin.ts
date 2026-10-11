@@ -1,195 +1,61 @@
 /**
- * opencode plugin entry point — the adapter, not the host. opencode
- * instantiates the plugin once per project directory; every instance
- * shares one process-wide `OpencodeRunnerHub` (callback listener +
- * daemon registration) and registers its own directory-scoped session
- * transport with it. Nothing else of the seed's daemon remains here:
- * no SQLite, no interpreter, no reconciler, no dashboard — the
- * standalone daemon owns all of that; this plugin is session transport
- * plus daemon-backed tools.
+ * OpenCode v2 server plugin `conductor.report`. Shaped for `Plugin.define`
+ * from `@opencode/plugin` (an identity function), typed structurally so the
+ * package has no SDK dependency: the server provides the context at load.
  *
- * The hub singleton is keyed with `Symbol.for` exactly like the seed's
- * daemon singleton was — but unlike the seed, the ONLY state it holds
- * is the shared listener and the project→transport map, and nothing
- * observable depends on which instance created it: its configuration
- * comes entirely from the environment, which is identical for every
- * instance in the process.
+ * Install: list this package directory under `plugins` in the server's
+ * opencode.json (`{"package": "/path/to/packages/runner-opencode"}`).
  */
 
-import type { Plugin } from "@opencode-ai/plugin"
-import { tool } from "@opencode-ai/plugin"
-import { ApiClient } from "@conductor/cli"
-import { resolveRunnerConfig } from "./config.ts"
-import { OpencodeRunnerHub } from "./hub.ts"
-import { createOpencodeSessions, type RawOpencodeSessionApi } from "./sessions.ts"
-import { createConductorTools, type ConductorTools } from "./tools.ts"
-import { createAgentLogPusher } from "./agent-logs.ts"
+import { REPORT_DESCRIPTION, TOOL_SCHEMAS, createReportTools, type ToolResult } from "./report.ts"
 
-const HUB_KEY = Symbol.for("conductor.runner-opencode.hub")
-
-function getOrCreateHub(log: (message: string) => void): OpencodeRunnerHub {
-  const globalScope = globalThis as { [HUB_KEY]?: OpencodeRunnerHub }
-  const existing = globalScope[HUB_KEY]
-  if (existing) return existing
-  const config = resolveRunnerConfig(process.env)
-  const hub = new OpencodeRunnerHub(config, { log })
-  globalScope[HUB_KEY] = hub
-  return hub
+interface ToolEditor {
+  add(tool: {
+    name: string
+    description: string
+    input: unknown
+    options?: { codemode: boolean }
+    execute(input: unknown, context: { sessionID: string }): Promise<ToolResult>
+  }): void
 }
 
-export function createReportTool(tools: Pick<ConductorTools, "report">) {
-  return tool({
-    description:
-      "Report the outcome of a conductor pipeline step you were asked to execute. " +
-      "MANDATORY at the end of every conductor-driven task: pass the run_id from the task header " +
-      "plus either outcome (succeeded/failed) or verdict (for review steps). " +
-      "Structured gates also require review with the configured reviewed head and all gate findings. " +
-      "Use changes_requested when any blocking finding is new or reopened, otherwise approved. " +
-      "The daemon rejects stale heads, inconsistent verdicts and invalid lifecycle changes.",
-    args: {
-      run_id: tool.schema.string().describe("The run id from the [conductor] task header"),
-      outcome: tool.schema.enum(["succeeded", "failed"]).optional().describe("Step outcome (non-review steps)"),
-      verdict: tool.schema.string().optional().describe("Review verdict, e.g. approved / changes_requested"),
-      notes: tool.schema.string().optional().describe("Findings, failure reason, or summary for the next step"),
-      review: tool.schema.object({
-        head: tool.schema.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/),
-        findings: tool.schema.array(tool.schema.object({
-          id: tool.schema.string().regex(/^F[1-9][0-9]*$/).optional(),
-          path: tool.schema.string().min(1),
-          line: tool.schema.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
-          severity: tool.schema.enum(["blocker", "major", "minor", "nit"]),
-          blocking: tool.schema.boolean(),
-          body: tool.schema.string().min(1),
-          acceptanceTests: tool.schema.array(tool.schema.string().min(1)),
-          status: tool.schema.enum(["new", "fixed", "dismissed", "reopened"]),
-          resolution: tool.schema.string().min(1).optional(),
-        }).strict()),
-      }).strict().optional().describe(
-        "Structured gate report, not prose. Use repository-relative paths and positive lines; blocking findings " +
-        "require acceptanceTests. Reuse all previous F IDs, explicitly carrying forward, fixing or dismissing. " +
-        "Non-new dispositions require an existing ID and resolution; reopening requires a reason. " +
-        "Omit for ordinary reports and failures.",
-      ),
-    },
-    async execute(args) {
-      return tools.report(args)
-    },
-  })
+export interface PluginContext {
+  readonly session: { get(input: { sessionID: string }): Promise<unknown> }
+  readonly tool: { transform(edit: (editor: ToolEditor) => void): Promise<unknown> | unknown }
 }
 
-export const ConductorRunnerPlugin: Plugin = async input => {
-  const log = (message: string) => console.error(`[conductor-runner] ${message}`)
+export const PLUGIN_ID = "conductor.report"
 
-  const config = resolveRunnerConfig(process.env)
-  const hub = getOrCreateHub(log)
-  const sessions = createOpencodeSessions(input.client as unknown as RawOpencodeSessionApi)
-  await hub.registerProject(input.directory, sessions)
+const asRecord = (input: unknown): Record<string, unknown> => (input && typeof input === "object" ? input as Record<string, unknown> : {})
 
-  const client = new ApiClient({
-    url: config.daemonUrl,
-    ...(config.daemonToken !== undefined ? { token: config.daemonToken } : {}),
-  })
-  const tools = createConductorTools(client, input.directory)
-  const agentLogs = createAgentLogPusher({
-    client,
-    runIdForSession: sessionID => hub.runIdForSession(sessionID),
-    log,
-  })
-
-  return {
-    event: async ({ event }) => {
-      agentLogs.push(event)
-      // Session-idle is the natural conclusion moment for a step's
-      // output: flush whatever the debounce has not yet sent so the log
-      // is complete by the time the agent reports.
-      if (event.type === "session.idle") await agentLogs.flush()
-    },
-    dispose: async () => {
-      await agentLogs.flush()
-    },
-    tool: {
-      conductor_start: tool({
-        description:
-          "Start driving a feature through the configured conductor pipeline. " +
-          "The pipeline (steps, roles, models) comes from the project's conductor config. " +
-          "Returns the feature id; the conductor daemon drives progress autonomously.",
-        args: {
-          title: tool.schema.string().describe("Feature title (used for prompts, session names, and the branch slug)"),
-          description: tool.schema.string().optional().describe(
-            "Full feature description — requirements, context, constraints, acceptance criteria. " +
-            "This is the spec handed to the pipeline's intake/design steps; distill it from the " +
-            "conversation so far. Omit only for trivial self-explanatory titles.",
-          ),
-          pr: tool.schema.number().optional().describe("Existing PR number, when attaching the pipeline to an already-open PR"),
-          workflow: tool.schema.string().optional().describe(
-            "Named workflow from the project's conductor config `workflows` map (e.g. \"bugfix\"). Omit for the default pipeline.",
-          ),
-        },
-        async execute(args, context) {
-          return tools.start(args, { sessionID: context.sessionID })
-        },
-      }),
-
-      conductor_report: createReportTool(tools),
-
-      conductor_ask: tool({
-        description:
-          "Ask the human a question mid-step WITHOUT ending the conductor run — use ONLY when a human " +
-          "decision is required to proceed (ambiguous requirements, a choice between approaches). " +
-          "Only works on steps the workflow marks `interactive: true`; on other steps the daemon " +
-          "refuses — then decide autonomously and report an outcome instead. " +
-          "The answer arrives in this same session as a new message. Prefer a fenced " +
-          "```conductor-questions``` block containing a JSON array of {question, options?} so the " +
-          "web UI renders an answer form. After asking, end your turn and wait.",
-        args: {
-          run_id: tool.schema.string().describe("The run id from the [conductor] task header"),
-          question: tool.schema.string().describe(
-            "The question text. May embed a ```conductor-questions``` fenced block with " +
-            '[{"question": "...", "options": ["..."]}] for structured answers.',
-          ),
-        },
-        async execute(args) {
-          return tools.ask(args)
-        },
-      }),
-
-      conductor_status: tool({
-        description: "Show this project's active conductor features with their current step, status, and recent transitions.",
-        args: {},
-        async execute() {
-          return tools.status()
-        },
-      }),
-
-      conductor_request_changes: tool({
-        description:
-          "Reject a conductor step that is waiting for human approval (e.g. merge) and send the feature back for fixes. " +
-          "Your notes are handed to the fixing agent — describe what you want changed. " +
-          "Only effective when the feature status is waiting_human.",
-        args: {
-          feature_id: tool.schema.string().describe("Feature id (see conductor_status)"),
-          notes: tool.schema.string().describe("What should be changed — handed verbatim to the fixing agent"),
-        },
-        async execute(args) {
-          return tools.requestChanges(args)
-        },
-      }),
-
-      conductor_approve: tool({
-        description:
-          "Approve a conductor step that is waiting for human approval (e.g. merge, design gate). " +
-          "Only effective when the feature status is waiting_human. Optional notes travel to the " +
-          "next steps ({{human.<stepId>}}) — use them for 'approved, but adjust X' guidance.",
-        args: {
-          feature_id: tool.schema.string().describe("Feature id (see conductor_status)"),
-          notes: tool.schema.string().optional().describe("Optional guidance recorded with the approval and visible to downstream steps"),
-        },
-        async execute(args) {
-          return tools.approve(args)
-        },
-      }),
-    },
-  }
+export const ConductorReportPlugin = {
+  id: PLUGIN_ID,
+  async setup(ctx: PluginContext): Promise<void> {
+    const tools = createReportTools({ sessionMetadata: sessionID => ctx.session.get({ sessionID }) })
+    await ctx.tool.transform(editor => {
+      editor.add({
+        name: "conductor_report",
+        description: REPORT_DESCRIPTION,
+        input: TOOL_SCHEMAS.conductor_report,
+        options: { codemode: false },
+        execute: (input, context) => tools.report(asRecord(input), context.sessionID),
+      })
+      editor.add({
+        name: "conductor_ask",
+        description: "Ask a human on an interactive step; the step pauses until the answer arrives.",
+        input: TOOL_SCHEMAS.conductor_ask,
+        options: { codemode: false },
+        execute: (input, context) => tools.ask(asRecord(input), context.sessionID),
+      })
+      editor.add({
+        name: "conductor_status",
+        description: "Minimal status of this session's own Conductor run only.",
+        input: TOOL_SCHEMAS.conductor_status,
+        options: { codemode: false },
+        execute: (input, context) => tools.status(asRecord(input), context.sessionID),
+      })
+    })
+  },
 }
 
-export default ConductorRunnerPlugin
+export default ConductorReportPlugin

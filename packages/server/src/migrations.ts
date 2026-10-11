@@ -1051,6 +1051,36 @@ export const migrations: readonly Migration[] = [
       db.run("CREATE INDEX idx_notification_feature ON notification_outbox(feature_id, kind, channel, time_sent)")
     },
   },
+  {
+    id: "0028_runner_binding_opencode",
+    up(db) {
+      // SQLite cannot alter a CHECK constraint in place: rebuild the table
+      // with the widened transport set, copying every row unchanged.
+      db.run(`
+        CREATE TABLE runner_binding_new (
+          run_id              TEXT PRIMARY KEY REFERENCES run(id) ON DELETE CASCADE,
+          transport           TEXT NOT NULL CHECK(transport IN ('native','acp','opencode')),
+          profile_id          TEXT,
+          config_digest       TEXT,
+          directory           TEXT NOT NULL,
+          daemon_generation   INTEGER NOT NULL,
+          session_ref         TEXT UNIQUE,
+          remote_session_id   TEXT,
+          process_generation  INTEGER NOT NULL DEFAULT 0,
+          phase               TEXT NOT NULL DEFAULT 'active' CHECK(phase IN ('active','fenced','concluded')),
+          time_created        INTEGER NOT NULL,
+          time_updated        INTEGER NOT NULL
+        )
+      `)
+      db.run(`INSERT INTO runner_binding_new (run_id, transport, profile_id, config_digest, directory, daemon_generation,
+                session_ref, remote_session_id, process_generation, phase, time_created, time_updated)
+              SELECT run_id, transport, profile_id, config_digest, directory, daemon_generation,
+                session_ref, remote_session_id, process_generation, phase, time_created, time_updated FROM runner_binding`)
+      db.run("DROP TABLE runner_binding")
+      db.run("ALTER TABLE runner_binding_new RENAME TO runner_binding")
+      db.run("CREATE INDEX idx_runner_binding_generation ON runner_binding(daemon_generation)")
+    },
+  },
 ]
 
 function validateMigrations(ordered: readonly Migration[]): void {

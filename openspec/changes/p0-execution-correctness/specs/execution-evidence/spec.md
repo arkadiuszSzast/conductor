@@ -14,7 +14,7 @@ The push action SHALL resolve the named local branch before publication, publish
 
 ### Requirement: Checks are bound to declared commit and required names
 
-The check gate MUST require an expected full SHA and nonempty required check names. It SHALL observe check runs and latest status contexts for that exact SHA, verify PR head before and after observation, and fail explicitly if the PR head differs. All matching observations for each required name MUST pass; completed success, neutral, or skipped check runs count as passing, but missing, pending, malformed, or unknown evidence MUST NOT pass. Irrelevant names SHALL NOT block. Empty results SHALL remain pending until the durable deadline, then fail. Check polling SHALL retain its original deadline across restart.
+The check gate MUST require an expected full SHA and nonempty required check names. It SHALL observe check runs and latest status contexts for that exact SHA, verify PR head before and after observation, and fail explicitly if the PR head differs. A head that differs right after the expected SHA was pushed SHALL be treated as remote propagation lag: the gate SHALL keep polling and fail only after the head has stayed different for a bounded settle window (two minutes) or the deadline has passed. All matching observations for each required name MUST pass; completed success, neutral, or skipped check runs count as passing, but missing, pending, malformed, or unknown evidence MUST NOT pass. Irrelevant names SHALL NOT block. Empty results SHALL remain pending until the durable deadline, then fail. Check polling SHALL retain its original deadline across restart.
 
 #### Scenario: Old green checks and absent new checks
 - **WHEN** old-head checks are green but required checks for the expected head are absent or incomplete
@@ -27,8 +27,12 @@ The check gate MUST require an expected full SHA and nonempty required check nam
 - **THEN** the gate succeeds for the expected SHA
 
 #### Scenario: Head changes during observation
-- **WHEN** the PR head changes before or during a poll
+- **WHEN** the PR head differs from the expected SHA before or during a poll and still differs after the settle window
 - **THEN** the gate fails explicitly and does not silently follow the new head
+
+#### Scenario: Head lags behind a fresh push
+- **WHEN** the gate starts seconds after the expected SHA was pushed and GitHub still reports the previous head
+- **THEN** the gate stays pending and proceeds normally once the head reports the expected SHA
 
 ### Requirement: Command reruns carry durable step-specific diagnostics
 

@@ -32,12 +32,13 @@ const stepBase = (id: string, options: StepOptions = {}) => ({
   ...(options.onFail ? { onFail: options.onFail } : {}),
 })
 
-export function agentStep(id: string, role: string, prompt: string, options?: StepOptions & { interactive?: boolean; ttlMs?: number; replaySafe?: boolean }): AgentStep {
+export function agentStep(id: string, role: string, prompt: string, options?: StepOptions & { interactive?: boolean; ttlMs?: number; replaySafe?: boolean; cwd?: string }): AgentStep {
   return {
     ...stepBase(id, options),
     type: "agent",
     role,
     prompt,
+    ...(options?.cwd !== undefined ? { cwd: options.cwd } : {}),
     ...(options?.interactive !== undefined ? { interactive: options.interactive } : {}),
     ...(options?.replaySafe !== undefined ? { replaySafe: options.replaySafe } : {}),
     ...(options?.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {}),
