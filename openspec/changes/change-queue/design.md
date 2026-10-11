@@ -36,11 +36,12 @@ Today:
 
 ### D2 — "Merged" means archived on the remote default branch
 
-A dependency is merged when `git ls-tree` on `origin/<default>` (after a bounded `git fetch`) lists `openspec/changes/archive/*-<name>/`.
+A dependency is merged when `git ls-tree` on the fetched remote default branch (after a bounded `git fetch`) lists `openspec/changes/archive/*-<name>/`.
 
 - **Why:** this is exactly what a merged gloam PR produces, it does not depend on Conductor having watched the merge (a human may merge by hand), and it does not depend on the local checkout being current.
 - **Default branch:** read once per pass via `git symbolic-ref refs/remotes/origin/HEAD`, falling back to `main`.
-- **Fetch cost:** one `git fetch --quiet origin <default>` per project per scheduler pass, and only while the project has queue entries that are not terminal. The scheduler runs on its own interval (default 60 s), not on every reconcile cycle.
+- **Fetch target:** the fetch writes only the daemon-owned ref `refs/conductor/merged/<default>` (`--refmap=`, `--no-write-fetch-head`) and readiness lists that ref. It never updates `refs/remotes/origin/*`: the project checkout is shared with workflow steps (`cleanup/update_main` runs `git fetch origin main`), and two fetches updating the same remote-tracking ref at once fail on its lock — observed on the dogfood host.
+- **Fetch cost:** one fetch of `<default>` per project per scheduler pass, and only while the project has queue entries that are not terminal. The scheduler runs on its own interval (default 60 s), not on every reconcile cycle.
 - **Rejected — feature status `done`:** a `done` feature does not prove a merge (a workflow without a merge step finishes `done` too).
 - **Rejected — GitHub API:** ties the queue to one forge; git works for any remote.
 
@@ -96,7 +97,7 @@ The panel calls the queue API through the existing proxy, shows `depends_on` rea
 ## Risks / Trade-offs
 
 - **[Autonomous runs merge broken work while nobody watches]** → The queue does not merge anything; merge policy remains in `conductor.yaml`. A project that removes its human merge gate accepts that risk explicitly. The default parallelism of 1 keeps the blast radius to one change at a time.
-- **[A dependant starts from a `main` that has not yet absorbed a just-merged dependency]** → Readiness is computed from `origin/<default>` (D2), and the gloam workflow already syncs `main` before creating the worktree (`prepare/sync_main`).
+- **[A dependant starts from a `main` that has not yet absorbed a just-merged dependency]** → Readiness is computed from the fetched remote default branch (D2), and the gloam workflow already syncs `main` before creating the worktree (`prepare/sync_main`).
 - **[Merge conflicts between parallel independent changes]** → Independent by declaration does not mean conflict-free. The second PR's CI and review loop handle conflicts as they do today; the limit defaults to 1 so projects opt into parallelism knowingly.
 - **[Fetch load on the remote]** → Only projects with live queue entries fetch, one ref, on a 60 s interval.
 - **[An entry stuck in `starting` after a crash]** → Restart reconciliation (D4) links or releases it; the state carries the claim timestamp for diagnosis.

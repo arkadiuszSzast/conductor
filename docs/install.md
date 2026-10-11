@@ -718,9 +718,13 @@ On each pass, for each project with live queue entries, the daemon:
 
 1. finds the default branch (`git symbolic-ref refs/remotes/origin/HEAD`,
    falling back to `main`);
-2. runs one bounded `git fetch --quiet origin <default branch>` (30 s limit,
-   never a credential prompt);
-3. lists `openspec/changes/archive/` on `origin/<default branch>`.
+2. runs one bounded fetch of that branch (30 s limit, never a credential
+   prompt) into its own ref, `refs/conductor/merged/<default branch>`;
+3. lists `openspec/changes/archive/` on that ref.
+
+The fetch leaves `origin/<default branch>` and `FETCH_HEAD` untouched, so it
+cannot collide with a workflow step or a person running `git fetch` in the
+same checkout.
 
 This is exactly what a merged PR produces when the workflow archives the
 change on the feature branch, and it does not depend on Conductor having

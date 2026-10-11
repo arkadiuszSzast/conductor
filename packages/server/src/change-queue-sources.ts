@@ -61,7 +61,12 @@ export interface LocalChanges {
 }
 
 /**
- * Names archived on `origin/<default>`.
+ * Names archived on the remote default branch.
+ *
+ * The fetch lands in a daemon-owned ref (`refs/conductor/merged/<default>`)
+ * and leaves `refs/remotes/origin/*` and `FETCH_HEAD` alone: the checkout is
+ * shared with workflow steps and people who run `git fetch` themselves, and
+ * two fetches updating the same ref at once fail on its lock.
  *
  * Fetch-failure policy (a decision, not an accident): a failed or timed-out
  * `git fetch`, or a failed `ls-tree`, never crashes a pass. The failure is
@@ -120,6 +125,7 @@ const ARCHIVE_DIR = `${CHANGES_DIR}/archive`
 const ARCHIVE_NAME = /^\d{4}-\d{2}-\d{2}-(.+)$/
 const DEFAULT_BRANCH_FALLBACK = "main"
 const ORIGIN_REF_PREFIX = "refs/remotes/origin/"
+const MERGED_REF_PREFIX = "refs/conductor/merged/"
 const DEFAULT_FETCH_TIMEOUT_MS = 30_000
 const DEFAULT_GIT_TIMEOUT_MS = 10_000
 /** Never let git block on a credential prompt inside the daemon. */
@@ -195,7 +201,14 @@ export class ChangeQueueSources implements ChangeQueueSourcePort, ChangeQueueRea
   async readMerged(projectDir: string, options: ReadMergedOptions = {}): Promise<MergedChanges> {
     const deadline = options.budgetMs !== undefined ? Date.now() + options.budgetMs : undefined
     const defaultBranch = await this.defaultBranch(projectDir, deadline)
-    const fetched = await this.git(projectDir, ["fetch", "--quiet", "origin", defaultBranch], this.fetchTimeoutMs, deadline)
+    const mergedRef = `${MERGED_REF_PREFIX}${defaultBranch}`
+    const fetched = await this.git(
+      projectDir,
+      // An empty --refmap stops git from also updating origin/<default> opportunistically.
+      ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--refmap=", "origin", `+refs/heads/${defaultBranch}:${mergedRef}`],
+      this.fetchTimeoutMs,
+      deadline,
+    )
     if (fetched.code !== 0) {
       return this.fallback(
         projectDir,
@@ -205,7 +218,7 @@ export class ChangeQueueSources implements ChangeQueueSourcePort, ChangeQueueRea
     }
     const listed = await this.git(
       projectDir,
-      ["ls-tree", "--name-only", `origin/${defaultBranch}`, `${ARCHIVE_DIR}/`],
+      ["ls-tree", "--name-only", mergedRef, `${ARCHIVE_DIR}/`],
       this.gitTimeoutMs,
       deadline,
     )
@@ -213,7 +226,7 @@ export class ChangeQueueSources implements ChangeQueueSourcePort, ChangeQueueRea
       return this.fallback(
         projectDir,
         defaultBranch,
-        `git ls-tree origin/${defaultBranch} failed (exit ${listed.code}): ${firstLine(listed.stderr)}`,
+        `git ls-tree ${mergedRef} failed (exit ${listed.code}): ${firstLine(listed.stderr)}`,
       )
     }
     const names = new Set<string>()
